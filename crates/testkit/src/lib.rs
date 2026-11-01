@@ -517,6 +517,41 @@ pub fn script_pdf_with_font(script: &str, name: &str) -> Vec<u8> {
     assemble(&objects, "")
 }
 
+/// One Letter page with `fonts` unembedded Japanese fonts of different names (`CJKFont0001` ...),
+/// each with a line of text in the page. A reader that serves a system font for each name holds a
+/// copy of that font for each of them, in a file of a few hundred bytes per font.
+pub fn many_fonts_pdf(fonts: usize) -> Vec<u8> {
+    let mut resources = String::new();
+    let mut content = String::new();
+    for i in 0..fonts {
+        resources.push_str(&format!("/F{i} {} 0 R ", 5 + 2 * i));
+        content.push_str(&format!(
+            "BT /F{i} 4 Tf 20 {} Td <93FA967B8CEA> Tj ET
+",
+            780 - 5 * i as i32
+        ));
+    }
+    let mut objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << {resources}>> >> >>").into_bytes(),
+        stream_object("", &content),
+    ];
+    for i in 0..fonts {
+        let (font, descendant, _) = cid_font(
+            &format!("CJKFont{:04}", i + 1),
+            "90ms-RKSJ-H",
+            "Japan1",
+            2,
+            "",
+        );
+        // The font object is object 5 + 2i and its descendant 6 + 2i.
+        objects.push(font.replace("[6 0 R]", &format!("[{} 0 R]", 6 + 2 * i)).into_bytes());
+        objects.push(descendant.into_bytes());
+    }
+    assemble(&objects, "")
+}
+
 /// A Type 0 font with a predefined encoding of an Adobe collection, not embedded: the font object,
 /// its descendant, and the hex string of the text in that encoding.
 fn cid_font(

@@ -72,6 +72,9 @@ pub struct EngineConfig {
     /// Whether the app hands the engine system fonts for the scripts that PDFium's own fonts do not
     /// cover (see `system_fonts`). On by default; a test can turn it off.
     pub system_fonts: bool,
+    /// Font files to hand over instead of the ones the table finds (for tests of damaged and
+    /// odd fonts). The app never sets this; nothing a PDF says reaches it.
+    pub system_font_files: Option<Vec<(partridge_protocol::FontScript, std::path::PathBuf)>>,
 }
 
 impl EngineConfig {
@@ -83,6 +86,7 @@ impl EngineConfig {
             memory_limit: None,
             sandbox: SandboxPolicy::default_for_build(),
             system_fonts: true,
+            system_font_files: None,
         }
     }
 }
@@ -520,7 +524,12 @@ impl EngineClient {
 
     fn start(&self, inner: &mut Inner, document: Option<&File>) -> Result<(), ClientError> {
         // The fonts are opened for this engine only and closed again when it has them.
-        let fonts = if self.config.system_fonts {
+        let fonts = if let Some(files) = &self.config.system_font_files {
+            files
+                .iter()
+                .filter_map(|(script, path)| Some((*script, File::open(path).ok()?)))
+                .collect()
+        } else if self.config.system_fonts {
             system_fonts::open_all()
         } else {
             Vec::new()
