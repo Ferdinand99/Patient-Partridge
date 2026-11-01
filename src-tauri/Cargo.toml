@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "An open PDF reader: fast, small, no account, no cloud, no tracking"
+description = "An open source PDF reader and editor: fast, small, no account, no cloud, no tracking"
 
 [lib]
 name = "patient_partridge_lib"

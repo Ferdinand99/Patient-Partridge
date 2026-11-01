@@ -7,8 +7,8 @@
       http-equiv="Content-Security-Policy"
       content="default-src 'none'; script-src 'self' 'sha256-WZRJfWvsnNCPcxzZwvyhovnZGqhZaC+8gPGPRbx6wTk='; style-src 'self'; img-src 'self'; font-src 'self'; manifest-src 'self'; base-uri 'self'; form-action 'none'"
     />
-    <title>Patient Partridge — an open source PDF reader (in development)</title>
-    <meta name="description" content="Patient Partridge is an open source PDF reader for Windows, macOS and Linux from the Hedgerow family. It is meant to be fast and small, with no account, no cloud, no advertising and no tracking. In development: nothing is released yet." />
+    <title>Patient Partridge — an open source PDF reader and editor (in development)</title>
+    <meta name="description" content="Patient Partridge is an open source PDF reader and editor for Windows, macOS and Linux from the Hedgerow family. Reading PDFs works today and editing tools are planned. It is meant to be fast and small, with no account, no cloud, no advertising and no tracking. In development: nothing is released yet." />
     <script>document.documentElement.classList.add("js");</script>
     <link rel="canonical" href="https://hedgerow.tools/Patient-Partridge/" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
@@ -21,16 +21,16 @@
     <meta property="og:type" content="website" />
     <meta property="og:url" content="https://hedgerow.tools/Patient-Partridge/" />
     <meta property="og:site_name" content="Patient Partridge" />
-    <meta property="og:title" content="Patient Partridge — an open source PDF reader (in development)" />
-    <meta property="og:description" content="A PDF reader that needs no account, no cloud and no tracking. Open source, from the Hedgerow family. In development: nothing is released yet." />
+    <meta property="og:title" content="Patient Partridge — an open source PDF reader and editor (in development)" />
+    <meta property="og:description" content="A PDF reader and editor that needs no account, no cloud and no tracking. Reading works today; editing is planned. Open source, from the Hedgerow family. Nothing is released yet." />
     <meta property="og:image" content="https://hedgerow.tools/Patient-Partridge/og-image.png" />
     <meta property="og:image:type" content="image/png" />
     <meta property="og:image:width" content="1200" />
     <meta property="og:image:height" content="630" />
     <meta property="og:image:alt" content="Patient Partridge: an amber partridge on a dark tile, next to the title, the tagline An open source PDF reader, and the note In development." />
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="Patient Partridge — an open source PDF reader (in development)" />
-    <meta name="twitter:description" content="A PDF reader that needs no account, no cloud and no tracking. Open source, from the Hedgerow family. In development: nothing is released yet." />
+    <meta name="twitter:title" content="Patient Partridge — an open source PDF reader and editor (in development)" />
+    <meta name="twitter:description" content="A PDF reader and editor that needs no account, no cloud and no tracking. Reading works today; editing is planned. Open source, from the Hedgerow family. Nothing is released yet." />
     <meta name="twitter:image" content="https://hedgerow.tools/Patient-Partridge/og-image.png" />
     <link rel="preload" href="fonts/InterVariable.woff2" as="font" type="font/woff2" crossorigin />
     <link rel="stylesheet" href="styles.css" />
@@ -39,7 +39,7 @@
         "@context": "https://schema.org",
         "@type": "SoftwareApplication",
         "name": "Patient Partridge",
-        "description": "An open source PDF reader for Windows, macOS and Linux. In development: nothing is released yet.",
+        "description": "An open source PDF reader and editor for Windows, macOS and Linux. Reading works today; editing tools are planned. In development: nothing is released yet.",
         "url": "https://hedgerow.tools/Patient-Partridge/",
         "applicationCategory": "UtilitiesApplication",
         "operatingSystem": "Windows, macOS, Linux (planned)",
@@ -98,10 +98,11 @@
               <span>In development</span>
               <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#chevron-right"></use></svg>
             </a>
-            <h1 class="display" id="hero-title">A PDF reader that<br class="br-wide" /> keeps to itself.</h1>
+            <h1 class="display" id="hero-title">A PDF reader and editor<br class="br-wide" /> that keeps to itself.</h1>
             <p class="lead">
-              Patient Partridge is an open source PDF reader for Windows, macOS and Linux. It is meant
-              to be fast and small, and to work without an account, a cloud, advertising or tracking.
+              Patient Partridge is an open source PDF reader and editor for Windows, macOS and Linux.
+              Today it reads PDFs; the editing tools are planned. It is meant to be fast and small,
+              and to work without an account, a cloud, advertising or tracking.
             </p>
             <p class="hero-fine">Nothing is released yet, so there is nothing to download. Expect rough edges and missing features.</p>
             <div class="hero-actions">
@@ -154,9 +155,9 @@
         <div class="wrap">
           <header class="section-head reveal">
             <p class="eyebrow">Why Partridge</p>
-            <h2 class="headline" id="why-title">A reader, and nothing else.</h2>
+            <h2 class="headline" id="why-title">Your PDFs stay with you.</h2>
             <p class="sub">
-              A PDF reader needs no account, no cloud and no tracking. Partridge is built on that idea,
+              A PDF reader and editor needs no account, no cloud and no tracking. Partridge is built on that idea,
               and the points below are what it is meant to deliver.
             </p>
           </header>
@@ -239,7 +240,7 @@
         <div class="wrap">
           <header class="section-head reveal">
             <p class="eyebrow">Planned</p>
-            <h2 class="headline" id="planned-title">What may come next.</h2>
+            <h2 class="headline" id="planned-title">The editor, still to come.</h2>
             <p class="sub">
               Everything on this list is planned, and none of it exists yet. There are no dates:
               each step is done when it works.
@@ -255,22 +256,57 @@
             <li class="card feature reveal d1">
               <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#file"></use></svg></span>
               <h3>Forms</h3>
-              <p>Fill in forms and save them so they still work in other PDF programs.</p>
+              <p>Fill in forms, create fillable forms, and save them so they still work in other PDF programs.</p>
             </li>
             <li class="card feature reveal d2">
               <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#shield-check"></use></svg></span>
               <h3>Signatures</h3>
-              <p>View and validate digital signatures, and sign documents.</p>
+              <p>View and validate digital signatures, and sign documents, including filling in and signing a form.</p>
             </li>
             <li class="card feature reveal">
-              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#layers"></use></svg></span>
-              <h3>Page tools</h3>
-              <p>Merge, rotate, extract and delete pages.</p>
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#pencil"></use></svg></span>
+              <h3>Editing text and images</h3>
+              <p>Change the text and images on the page itself.</p>
             </li>
             <li class="card feature reveal d1">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#eye-off"></use></svg></span>
+              <h3>Real redaction</h3>
+              <p>Black out sensitive text and images and remove the content from the file, not just cover it.</p>
+            </li>
+            <li class="card feature reveal d2">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#layers"></use></svg></span>
+              <h3>Page tools</h3>
+              <p>Merge, split and reorder pages, and crop, rotate, extract and delete them.</p>
+            </li>
+            <li class="card feature reveal">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#archive"></use></svg></span>
+              <h3>Compressing</h3>
+              <p>Make large files smaller.</p>
+            </li>
+            <li class="card feature reveal d1">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#box"></use></svg></span>
+              <h3>Flattening</h3>
+              <p>Turn annotations and form fields into part of the page, so they can no longer be changed.</p>
+            </li>
+            <li class="card feature reveal d1">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#refresh"></use></svg></span>
+              <h3>Converting</h3>
+              <p>Convert to and from Word, Excel, PowerPoint and images, and turn images (JPG, PNG, HEIC), text and Office files into PDF, on your own computer.</p>
+            </li>
+            <li class="card feature reveal d2">
               <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#eye"></use></svg></span>
-              <h3>Local OCR</h3>
+              <h3>Local text recognition</h3>
               <p>Recognise the text in scanned documents on your own computer.</p>
+            </li>
+            <li class="card feature reveal">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#tag"></use></svg></span>
+              <h3>Watermarks and page numbers</h3>
+              <p>Add a watermark or page numbers to a document.</p>
+            </li>
+            <li class="card feature reveal d1">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#lock"></use></svg></span>
+              <h3>Password protection</h3>
+              <p>Protect a file with a password, or remove a password you already know.</p>
             </li>
             <li class="card feature reveal d2">
               <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#bolt"></use></svg></span>
@@ -373,7 +409,7 @@
               <div class="ms-body">
                 <p class="ms-status"><span class="pill">Planned</span></p>
                 <h3>Annotations and forms</h3>
-                <p>Highlights, notes, drawing and stamps, and filling in and saving forms.</p>
+                <p>Highlights, notes, drawing and stamps, and filling in, creating and saving forms.</p>
               </div>
             </li>
             <li class="milestone reveal">
@@ -381,7 +417,31 @@
               <div class="ms-body">
                 <p class="ms-status"><span class="pill">Planned</span></p>
                 <h3>Signatures and page tools</h3>
-                <p>Viewing, validating and making digital signatures, and merging, rotating, extracting and deleting pages.</p>
+                <p>Viewing, validating and making digital signatures, and merging, splitting, reordering, cropping, rotating, extracting and deleting pages.</p>
+              </div>
+            </li>
+            <li class="milestone reveal">
+              <span class="ms-marker" aria-hidden="true"></span>
+              <div class="ms-body">
+                <p class="ms-status"><span class="pill">Planned</span></p>
+                <h3>Editing and redaction</h3>
+                <p>Editing text and images on the page, and real redaction that removes the content from the file.</p>
+              </div>
+            </li>
+            <li class="milestone reveal">
+              <span class="ms-marker" aria-hidden="true"></span>
+              <div class="ms-body">
+                <p class="ms-status"><span class="pill">Planned</span></p>
+                <h3>Compressing and converting</h3>
+                <p>Making files smaller, flattening documents, and converting to and from Word, Excel, PowerPoint and images, including images, text and Office files into PDF, on your own computer.</p>
+              </div>
+            </li>
+            <li class="milestone reveal">
+              <span class="ms-marker" aria-hidden="true"></span>
+              <div class="ms-body">
+                <p class="ms-status"><span class="pill">Planned</span></p>
+                <h3>Watermarks, page numbers and passwords</h3>
+                <p>Adding watermarks and page numbers, protecting a file with a password, and removing a password you already know.</p>
               </div>
             </li>
             <li class="milestone reveal">
@@ -463,7 +523,7 @@
               <details>
                 <summary>What is Hedgerow?<svg class="icon" aria-hidden="true"><use href="assets/icons.svg#chevron-down"></use></svg></summary>
                 <div class="faq-body">
-                  <p>Hedgerow is a family of small, open source apps that fit together, like <a href="https://hedgerow.tools/Nimble-Newt/">Nimble Newt</a>, a fast text editor. Patient Partridge is the PDF reader.</p>
+                  <p>Hedgerow is a family of small, open source apps that fit together, like <a href="https://hedgerow.tools/Nimble-Newt/">Nimble Newt</a>, a fast text editor. Patient Partridge is the PDF reader and editor.</p>
                 </div>
               </details>
             </li>
