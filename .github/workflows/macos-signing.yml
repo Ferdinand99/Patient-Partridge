@@ -1,0 +1,105 @@
+# Checks macOS code signing and notarisation without publishing anything: builds the universal app
+# with the APPLE_* secrets (the same steps as the release workflow), then checks every program
+# inside it (the app, the engine, the PDFium library), Gatekeeper and the stapled ticket. Run it
+# from the Actions tab after changing certificates or keys. It also runs when the files that make
+# the signed build change, so a change is tested before it is merged.
+name: macOS signing check
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/macos-signing.yml
+      - scripts/macos-import-certificate.sh
+      - scripts/macos-verify.sh
+      - scripts/prepare-bundle.mjs
+      - scripts/bundle-config.mjs
+      - src-tauri/tauri.conf.json
+
+permissions:
+  contents: read
+
+jobs:
+  sign:
+    name: Sign and notarise (macOS, universal)
+    # Dependabot's branches never get the repository secrets, so the check can't run there; it runs
+    # again on main once the update is merged.
+    if: github.actor != 'dependabot[bot]'
+    runs-on: macos-latest
+    env:
+      IN_APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      IN_APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      IN_APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      IN_APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+      IN_APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+      IN_APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: macos-signing
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      - name: Check that the secrets are there
+        run: |
+          missing=""
+          for v in IN_APPLE_CERTIFICATE IN_APPLE_CERTIFICATE_PASSWORD IN_APPLE_SIGNING_IDENTITY \
+                   IN_APPLE_API_ISSUER IN_APPLE_API_KEY IN_APPLE_API_KEY_CONTENT; do
+            [ -n "${!v}" ] || missing="$missing ${v#IN_}"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error title=Missing secrets::Set these repository secrets (see docs/signing.md):$missing"
+            exit 1
+          fi
+
+      - name: Import the certificate
+        env:
+          APPLE_CERTIFICATE: ${{ env.IN_APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ env.IN_APPLE_CERTIFICATE_PASSWORD }}
+        run: scripts/macos-import-certificate.sh
+
+      - name: Write the notarisation key
+        run: |
+          key_path="$RUNNER_TEMP/AuthKey_${IN_APPLE_API_KEY}.p8"
+          printf '%s' "$IN_APPLE_API_KEY_CONTENT" > "$key_path"
+          {
+            echo "APPLE_SIGNING_IDENTITY=$IN_APPLE_SIGNING_IDENTITY"
+            echo "APPLE_API_ISSUER=$IN_APPLE_API_ISSUER"
+            echo "APPLE_API_KEY=$IN_APPLE_API_KEY"
+            echo "APPLE_API_KEY_PATH=$key_path"
+          } >> "$GITHUB_ENV"
+
+      # PDFium (both architectures, checked against pinned checksums), the engine for both, joined
+      # with lipo; the PDFium library is signed here, because Tauri does not sign resources.
+      - name: Prepare the bundle (universal)
+        env:
+          PARTRIDGE_UNIVERSAL: "1"
+        run: node scripts/prepare-bundle.mjs
+
+      - name: Build, sign and notarise
+        run: npx tauri build --target universal-apple-darwin --bundles app,dmg --config src-tauri/tauri.bundle.generated.conf.json -- --locked
+
+      - name: Check the result
+        run: |
+          APP="target/universal-apple-darwin/release/bundle/macos/Patient Partridge.app"
+          DMG=$(find target/universal-apple-darwin/release/bundle/dmg -name '*.dmg' | head -1)
+          scripts/macos-verify.sh "$APP" "$DMG"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: patient-partridge-macos-signed
+          path: target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          retention-days: 3

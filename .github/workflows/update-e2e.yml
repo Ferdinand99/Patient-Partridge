@@ -1,0 +1,96 @@
+# Runs a real update on Linux, Windows and macOS: an old and a new build of the app, signed with a
+# throwaway key made inside the job (the real key is not available to this workflow), a local
+# latest.json, and the old build installed the way a user has it and left to update itself.
+# See scripts/update-e2e.mjs for what is checked, and docs/updates.md for what this does and does
+# not prove.
+name: Update test
+
+on:
+  pull_request:
+    paths:
+      - src-tauri/**
+      - crates/engine-client/**
+      - scripts/update-e2e.mjs
+      - scripts/prepare-bundle.mjs
+      - scripts/bundle-config.mjs
+      - Cargo.lock
+      - package-lock.json
+      - .github/workflows/update-e2e.yml
+  push:
+    branches: [main]
+    paths:
+      - src-tauri/**
+      - crates/engine-client/**
+      - scripts/update-e2e.mjs
+      - scripts/prepare-bundle.mjs
+      - scripts/bundle-config.mjs
+      - Cargo.lock
+      - package-lock.json
+      - .github/workflows/update-e2e.yml
+  workflow_dispatch:
+
+concurrency:
+  group: update-e2e-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  update:
+    name: Update test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            os: ubuntu-22.04
+            args: --deb
+          - name: windows
+            os: windows-latest
+            args: ""
+          - name: macos
+            os: macos-latest
+            args: ""
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install Tauri Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libssl-dev pkg-config xvfb file procps libfuse2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: update-e2e-${{ matrix.name }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # On Linux the AppImage is mounted through FUSE, as a user's would be.
+      - name: Update from the old build to the new one
+        env:
+          E2E_FUSE: ${{ runner.os == 'Linux' && '1' || '0' }}
+        run: node scripts/update-e2e.mjs ${{ matrix.args }}
+      - name: Summary
+        if: always()
+        run: |
+          [ -f e2e-update/summary.md ] && cat e2e-update/summary.md >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: update-test-${{ matrix.name }}
+          path: |
+            e2e-update/summary.md
+            e2e-update/run/**/driver.log
+          if-no-files-found: ignore
+          retention-days: 7
