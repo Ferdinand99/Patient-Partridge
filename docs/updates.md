@@ -48,6 +48,17 @@ The setting is kept in `settings.json` in the app's data folder, next to the fil
 
 Everything else (a deb, a copy built from source, a program moved out of its bundle) is offered the notice and the link. The app also refuses the install on its own side, whatever the window asks for. `scripts/update-e2e.mjs --deb` runs the real deb with and without inherited AppImage variables.
 
+### Changes that are not saved
+
+The changes made to an open document live in its engine, so stopping the engines would throw them away. An update therefore never installs while a document has changes that are not saved:
+
+- The window tells the app whenever a document turns dirty or clean (`set_dirty`). The app keeps the set of dirty documents (`src-tauri/src/unsaved.rs`).
+- When the download is done and a document is dirty, the window asks: **Save and install** (saves every dirty document, then installs) or **Install later** (the download is kept, the pill in the toolbar reads "Install update" and asks again when pressed).
+- The app refuses on its own side too: `install_update` fails with the kind `unsaved` before it takes the download, closes the gate or stops an engine, so a change made after the question is not lost either. The window then goes back to "downloaded, waiting".
+- Closing the window or quitting is held back the same way while a document is dirty (the window asks Save, Quit without saving or Cancel).
+
+This is tested with the window code (`src/app/updater.test.ts`) and with the app-side check (`an_update_is_not_installed_while_a_document_has_unsaved_changes`). There is no editing feature yet that makes a document dirty, so it has not been tried in the running app.
+
 ### Stopping the engines, and the open files
 
 Windows cannot replace a program that is running, and each open document has an engine process of its own in the install folder. So before the install:

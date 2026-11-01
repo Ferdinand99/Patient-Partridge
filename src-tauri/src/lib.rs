@@ -13,6 +13,7 @@ mod links;
 mod locate;
 mod positions;
 mod session;
+mod unsaved;
 mod updates;
 
 use std::path::{Path, PathBuf};
@@ -20,15 +21,21 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use links::KnownLinks;
-use partridge_engine_client::{ClientError, EngineConfig, EnginePool, LinkTarget};
+use partridge_engine_client::{
+    ClientError, EngineConfig, EnginePool, LinkTarget, SaveOptions, SaveOutcome,
+};
 use positions::{Position, Positions};
 use serde::Serialize;
 use session::SessionStore;
 use tauri::webview::PageLoadEvent;
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_dialog::DialogExt;
 use updates::UpdateState;
 
 static START: OnceLock<Instant> = OnceLock::new();
+
+/// The event that asks the window to put the question "save the changes?" before the app closes.
+const QUIT_REQUESTED: &str = "quit-requested";
 
 /// Paths handed to us before the frontend is listening (command line, file association).
 /// `ready` and the queue share one lock, so a path can never slip in between "is the frontend
@@ -64,6 +71,25 @@ impl Pending {
     /// The page is starting again, so nobody is listening: paths wait until it asks for them.
     fn reset(&self) {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).ready = false;
+    }
+}
+
+/// What a request to close the window or to quit leads to.
+#[derive(Debug, PartialEq, Eq)]
+enum ExitAction {
+    /// Nothing is in the way.
+    Go,
+    /// An update is replacing the program: closing now would leave a half file.
+    Refuse,
+    /// A document has changes that are not saved: the window asks the user first.
+    Ask,
+}
+
+fn exit_action(state: Option<&UpdateState>) -> ExitAction {
+    match state {
+        Some(state) if state.is_close_blocked() => ExitAction::Refuse,
+        Some(state) if state.unsaved().holds_exit() => ExitAction::Ask,
+        _ => ExitAction::Go,
     }
 }
 
@@ -160,6 +186,10 @@ impl From<ClientError> for CommandError {
             ClientError::Engine { code, message } => CommandError {
                 code: code.name().into(),
                 message,
+            },
+            ClientError::Save(why) => CommandError {
+                code: why.code().into(),
+                message: why.to_string(),
             },
         }
     }
@@ -294,6 +324,136 @@ async fn close_pdf(
     })
     .await;
     Ok(())
+}
+
+/// The window says whether a document has changes that are not saved. The app then holds back
+/// closing, quitting and installing an update until the user has decided.
+#[tauri::command]
+fn set_dirty(update_state: State<'_, UpdateState>, doc: u64, dirty: bool) {
+    update_state.unsaved().set(doc, dirty);
+}
+
+/// The file a save wrote. The window shows the name, and uses the path as the tab's file.
+#[derive(Serialize)]
+struct SavedInfo {
+    path: String,
+    name: String,
+}
+
+impl From<SaveOutcome> for SavedInfo {
+    fn from(outcome: SaveOutcome) -> Self {
+        SavedInfo {
+            name: outcome
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            path: outcome.path.to_string_lossy().into_owned(),
+        }
+    }
+}
+
+/// Saves a document to the file it was opened from. The window never names a file: the app knows
+/// which one a document belongs to. `overwrite_changed` and `allow_signed` are the answers to the
+/// two questions a save can ask (the file changed on disk; the document is signed).
+#[tauri::command]
+async fn save_pdf(
+    engine: State<'_, Engine>,
+    update_state: State<'_, UpdateState>,
+    doc: u64,
+    overwrite_changed: bool,
+    allow_signed: bool,
+) -> Result<SavedInfo, CommandError> {
+    // Not while an update is being installed: it would end the engine in the middle of the save.
+    let _permit = update_state
+        .gate()
+        .enter()
+        .map_err(|_| updates::updating_error())?;
+    let pool = engine.0.clone();
+    let options = SaveOptions {
+        allow_signed,
+        overwrite_changed,
+    };
+    let outcome = blocking(move || pool.save(doc, options)).await?;
+    update_state.unsaved().set(doc, false);
+    Ok(outcome.into())
+}
+
+/// Asks the user where to save a copy (with the dialog of the system, which the app opens itself:
+/// the window cannot name a file to write), and saves the document there. The document belongs to
+/// the new file afterwards. `None` when the user cancels the dialog.
+#[tauri::command]
+async fn save_pdf_as(
+    app: AppHandle,
+    engine: State<'_, Engine>,
+    update_state: State<'_, UpdateState>,
+    doc: u64,
+    allow_signed: bool,
+) -> Result<Option<SavedInfo>, CommandError> {
+    let _permit = update_state
+        .gate()
+        .enter()
+        .map_err(|_| updates::updating_error())?;
+    let pool = engine.0.clone();
+    let Some(current) = pool.source_path(doc) else {
+        return Err(CommandError::from(ClientError::Engine {
+            code: partridge_protocol::ErrorCode::UnknownDocument,
+            message: "the document is not open".into(),
+        }));
+    };
+    let dialog_app = app.clone();
+    let chosen = tauri::async_runtime::spawn_blocking(move || {
+        let mut dialog = dialog_app
+            .dialog()
+            .file()
+            .add_filter("PDF documents", &["pdf"]);
+        if let Some(dir) = current.parent() {
+            dialog = dialog.set_directory(dir);
+        }
+        if let Some(name) = current.file_name() {
+            dialog = dialog.set_file_name(name.to_string_lossy());
+        }
+        dialog.blocking_save_file()
+    })
+    .await
+    .map_err(|e| CommandError {
+        code: "internal".into(),
+        message: e.to_string(),
+    })?;
+    let Some(chosen) = chosen else {
+        return Ok(None);
+    };
+    let Ok(mut target) = chosen.into_path() else {
+        return Err(CommandError {
+            code: "save_write_failed".into(),
+            message: "the place that was chosen is not a file on this computer".into(),
+        });
+    };
+    if target.extension().is_none() {
+        target.set_extension("pdf");
+    }
+    let options = SaveOptions {
+        allow_signed,
+        overwrite_changed: false,
+    };
+    let outcome = blocking(move || pool.save_as(doc, &target, options)).await?;
+    update_state.unsaved().set(doc, false);
+    let info = SavedInfo::from(outcome);
+    update_state.move_doc(doc, &info.path);
+    Ok(Some(info))
+}
+
+/// Quits the app after the user has decided what happens to the changes that are not saved.
+#[tauri::command]
+fn quit_app(app: AppHandle, update_state: State<'_, UpdateState>) {
+    update_state.unsaved().allow_exit();
+    app.exit(0);
+}
+
+/// The user answered "stay" to the question before closing: the next request to close asks again.
+#[tauri::command]
+fn stay_open(update_state: State<'_, UpdateState>) {
+    update_state.unsaved().disallow_exit();
 }
 
 /// One entry of the table of contents.
@@ -502,11 +662,14 @@ pub fn run() {
         // close is refused for those seconds.
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                if window
-                    .try_state::<UpdateState>()
-                    .is_some_and(|state| state.is_close_blocked())
-                {
-                    api.prevent_close();
+                match exit_action(window.try_state::<UpdateState>().as_deref()) {
+                    ExitAction::Go => {}
+                    ExitAction::Refuse => api.prevent_close(),
+                    ExitAction::Ask => {
+                        // Changes that are not saved: the window asks the user what to do.
+                        api.prevent_close();
+                        let _ = window.emit(QUIT_REQUESTED, ());
+                    }
                 }
             }
         })
@@ -577,6 +740,11 @@ pub fn run() {
             open_pdf,
             render_page,
             close_pdf,
+            set_dirty,
+            save_pdf,
+            save_pdf_as,
+            quit_app,
+            stay_open,
             set_position,
             clear_positions,
             session::get_reopen_tabs,
@@ -606,6 +774,21 @@ pub fn run() {
         .expect("error while building the app");
 
     app.run(|handle, event| {
+        // Quitting from the menu or the keyboard (Cmd+Q) does not go through the window's close
+        // request: changes that are not saved hold it back here too.
+        if let tauri::RunEvent::ExitRequested {
+            api, code: None, ..
+        } = &event
+        {
+            match exit_action(handle.try_state::<UpdateState>().as_deref()) {
+                ExitAction::Go => {}
+                ExitAction::Refuse => api.prevent_exit(),
+                ExitAction::Ask => {
+                    api.prevent_exit();
+                    let _ = handle.emit(QUIT_REQUESTED, ());
+                }
+            }
+        }
         // The engine must not outlive the app. A healthy engine ends by itself when its input
         // closes, but one that is stuck inside PDFium never looks at its input, and a request that
         // waits for it would hold the quit back. Killing it does not wait for any request.
@@ -673,6 +856,55 @@ mod tests {
         );
         assert!(positions.lock().unwrap().get("a.pdf").is_none());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn closing_waits_for_the_user_while_a_document_has_unsaved_changes() {
+        let state = UpdateState::new(None, updates::InstallMethod::Automatic);
+        assert_eq!(exit_action(Some(&state)), ExitAction::Go);
+        assert_eq!(exit_action(None), ExitAction::Go);
+
+        state.unsaved().set(4, true);
+        assert_eq!(exit_action(Some(&state)), ExitAction::Ask);
+        // The user chose to give the changes up: closing goes on. "Stay" asks again next time.
+        state.unsaved().allow_exit();
+        assert_eq!(exit_action(Some(&state)), ExitAction::Go);
+        state.unsaved().disallow_exit();
+        assert_eq!(exit_action(Some(&state)), ExitAction::Ask);
+        // Saved: nothing to ask.
+        state.unsaved().set(4, false);
+        assert_eq!(exit_action(Some(&state)), ExitAction::Go);
+        // A document that is closed takes its changes with it.
+        state.unsaved().set(5, true);
+        state.forget_doc(5);
+        assert_eq!(exit_action(Some(&state)), ExitAction::Go);
+        // The page starting again forgets them too.
+        state.unsaved().set(6, true);
+        state.forget_all_docs();
+        assert_eq!(exit_action(Some(&state)), ExitAction::Go);
+    }
+
+    #[test]
+    fn a_save_reports_the_file_it_wrote_by_name_and_path() {
+        let info = SavedInfo::from(SaveOutcome {
+            path: PathBuf::from("/docs/report.pdf"),
+            bytes: 10,
+        });
+        assert_eq!(info.name, "report.pdf");
+        assert_eq!(info.path, "/docs/report.pdf");
+    }
+
+    #[test]
+    fn a_failed_save_reaches_the_window_with_a_code_of_its_own() {
+        let changed = CommandError::from(ClientError::Save(
+            partridge_engine_client::SaveError::Changed,
+        ));
+        assert_eq!(changed.code, "save_changed");
+        let signed = CommandError::from(ClientError::Save(
+            partridge_engine_client::SaveError::Signed { signatures: 2 },
+        ));
+        assert_eq!(signed.code, "save_signed");
+        assert!(signed.message.contains("2 digital signatures"));
     }
 
     #[test]

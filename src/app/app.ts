@@ -2,8 +2,8 @@
 // Anything that touches the outside world (the engine, the file dialog, the window title, the
 // storage) comes in through `AppDeps`, so tests can run the whole flow with fakes.
 
-import type { OpenedDocument, OutlineEntry, SavedPosition } from "../lib/api";
-import { describeError, fileNameOf, toAppError, type AppErrorLike } from "../lib/errors";
+import type { OpenedDocument, OutlineEntry, SavedFile, SavedPosition } from "../lib/api";
+import { describeError, fileNameOf, isEngineLost, toAppError, type AppErrorLike } from "../lib/errors";
 import { classifyUri, visibleAddress } from "../lib/linkPolicy";
 import { parsePageInput } from "../lib/pageInput";
 import { MAX_OPEN_AT_ONCE, MAX_TABS, pickSessionTabs, wantedPdfPaths, type SessionTabs } from "../lib/paths";
@@ -20,6 +20,7 @@ import type { CopyResult, PageLinkInfo } from "../viewer/overlays";
 import { DocumentView, type ViewPosition, type ViewerOptions } from "../viewer/viewer";
 import { zoomLabel, type ZoomMode } from "../viewer/zoom";
 import { FindBar } from "./find";
+import { EditHistory, type Edit } from "./history";
 import { MenuController } from "./menu";
 import {
   PrintJob,
@@ -49,6 +50,11 @@ export interface AppDeps {
     openLink(doc: number, url: string): Promise<void>;
     measureMode(): Promise<boolean>;
     measureReport(openMs: number, firstPageMs: number, pages: number): Promise<void>;
+    setDirty(doc: number, dirty: boolean): Promise<void>;
+    save(doc: number, overwriteChanged: boolean, allowSigned: boolean): Promise<SavedFile>;
+    saveAs(doc: number, allowSigned: boolean): Promise<SavedFile | null>;
+    quitApp(): Promise<void>;
+    stayOpen(): Promise<void>;
   };
   /** Shows the file dialog. Resolves with the chosen paths, or an empty list when cancelled. */
   pickFiles(): Promise<string[]>;
@@ -83,6 +89,12 @@ interface Tab {
   doc: number;
   path: string;
   name: string;
+  /** What was changed in the document since it was opened, and whether it is saved. */
+  history: EditHistory;
+  /** What the app process was last told about unsaved changes of this document. */
+  dirtyTold: boolean;
+  /** True while the document is being saved. */
+  saving: boolean;
   view: DocumentView;
   /** What the side panel knows about this document. */
   sidebarDoc: SidebarDocument;
@@ -152,6 +164,8 @@ export class App {
   private lastSession: string | null = null;
   /** Files of the last session that could not be reached at this start: kept in the list once. */
   private kept: string[] = [];
+  /** True while the question before the app quits is open, so that it is not asked twice. */
+  private quitting = false;
 
   private readonly stage: HTMLElement;
   private readonly empty: HTMLElement;
@@ -188,7 +202,7 @@ export class App {
     this.positionDelay = deps.positionDelayMs ?? DEFAULT_POSITION_DELAY_MS;
     this.tabStrip = new TabStrip(byId(root, "tabs"), {
       select: (id) => this.activate(id),
-      close: (id) => this.closeTab(id),
+      close: (id) => void this.requestClose(id),
     });
     this.menu = new MenuController(byId(root, "menu-button"), byId(root, "menu"));
     this.selectionProxy = byId(root, "sel-proxy");
@@ -241,6 +255,25 @@ export class App {
   /** How many documents are open. */
   get tabCount(): number {
     return this.tabs.length;
+  }
+
+  /**
+   * The edit history of the document that is shown: a feature that changes a document pushes
+   * what it did here, and the tab, the window title and the questions before closing, quitting
+   * and updating follow.
+   */
+  get currentHistory(): EditHistory | null {
+    return this.active?.history ?? null;
+  }
+
+  /** Records an edit of the document that is shown. Does nothing when there is none. */
+  recordEdit(edit: Edit): void {
+    this.active?.history.push(edit);
+  }
+
+  /** How many documents have changes that are not saved. */
+  get unsavedCount(): number {
+    return this.tabs.filter((t) => t.history.dirty).length;
   }
 
   /**
@@ -537,6 +570,9 @@ export class App {
       doc: opened.doc,
       path,
       name: opened.name,
+      history: new EditHistory(),
+      dirtyTold: false,
+      saving: false,
       view: undefined as unknown as DocumentView,
       sidebarDoc: undefined as unknown as SidebarDocument,
       saveTimer: undefined,
@@ -576,6 +612,7 @@ export class App {
       },
       { start: opened.position ?? null, limits: this.deps.viewLimits },
     );
+    tab.history.onChange(() => this.historyChanged(tab));
     tab.sidebarDoc = {
       doc: opened.doc,
       pages: opened.pages,
@@ -638,6 +675,34 @@ export class App {
     next.view.element.focus({ preventScroll: true });
   }
 
+  /**
+   * Closes a tab at the user's request. A document with changes that are not saved asks first:
+   * save, give the changes up, or keep the tab. Resolves with true when the tab is closed.
+   */
+  async requestClose(id: number): Promise<boolean> {
+    const tab = this.tabs.find((t) => t.id === id);
+    if (!tab) return true;
+    if (!tab.history.dirty) {
+      this.closeTab(id);
+      return true;
+    }
+    const answer = await showNotice(this.noticeLayer, {
+      title: `Save changes to "${tab.name}"?`,
+      detail: "If you close it without saving, the changes you made are lost.",
+      buttons: [
+        { id: "cancel", label: "Cancel", safe: true },
+        { id: "discard", label: "Don't save" },
+        { id: "save", label: "Save", primary: true },
+      ],
+    });
+    if (answer.button === "cancel") return false;
+    if (answer.button === "save" && !(await this.saveTab(tab, false))) return false;
+    // The tab may be gone already (its engine stopped while the question was open).
+    if (this.tabs.includes(tab)) this.closeTab(tab.id);
+    return true;
+  }
+
+  /** Closes a tab at once, whatever it holds. The questions are asked by `requestClose`. */
   closeTab(id: number): void {
     const index = this.tabs.findIndex((t) => t.id === id);
     if (index < 0) return;
@@ -664,17 +729,235 @@ export class App {
   /** The engine of one document stopped and took the document with it. The other tabs carry on. */
   private async documentLost(tab: Tab, error: AppErrorLike): Promise<void> {
     if (!this.tabs.includes(tab)) return;
+    const lostChanges = tab.history.dirty;
     this.closeTab(tab.id);
     const text = describeError(error, tab.name);
     const answer = await showNotice(this.noticeLayer, {
       title: text.title,
-      detail: text.detail,
+      detail: lostChanges ? `${text.detail} The changes that were not saved are lost.` : text.detail,
       buttons: [
         { id: "close", label: "Close" },
         { id: "retry", label: "Open the file again", primary: true },
       ],
     });
     if (answer.button === "retry") await this.openPath(tab.path);
+  }
+
+  // ---- changes that are not saved ---------------------------------------------
+
+  /** The history of a tab changed: tell the app process if the document turned dirty or clean. */
+  private historyChanged(tab: Tab): void {
+    if (!this.tabs.includes(tab)) return;
+    const dirty = tab.history.dirty;
+    if (dirty !== tab.dirtyTold) {
+      tab.dirtyTold = dirty;
+      // If the app process does not get to know, the next change tries again.
+      this.deps.api.setDirty(tab.doc, dirty).catch(() => {
+        tab.dirtyTold = !dirty;
+      });
+    }
+    this.drawTabs();
+    this.drawTitle();
+  }
+
+  /** Saves the document that is shown, if it has changes. Resolves with true when nothing is left unsaved. */
+  async saveActive(): Promise<boolean> {
+    const tab = this.active;
+    if (!tab || !tab.history.dirty) return true;
+    return this.saveTab(tab, false);
+  }
+
+  /** Saves a copy of the document that is shown under a name the user chooses; the tab follows the copy. */
+  async saveActiveAs(): Promise<boolean> {
+    const tab = this.active;
+    if (!tab || tab.view.pageCount === 0) return false;
+    return this.saveTab(tab, true);
+  }
+
+  /** Saves every document that has changes. Resolves with true when all were saved. */
+  async saveAllChanges(): Promise<boolean> {
+    for (const tab of this.tabs.filter((t) => t.history.dirty)) {
+      if (!(await this.saveTab(tab, false))) return false;
+    }
+    return true;
+  }
+
+  /**
+   * Saves one document, in place or as a copy, and asks what the save asks: whether to go on when
+   * the file was changed by something else since it was opened, and when the document is signed
+   * (a save breaks a signature). A failure is told to the user. Resolves with true when saved.
+   */
+  private async saveTab(tab: Tab, asCopy: boolean): Promise<boolean> {
+    if (tab.saving) return false;
+    tab.saving = true;
+    // Edits made while the file is written are not in it.
+    const began = tab.history.position;
+    try {
+      const saved = asCopy ? await this.runSaveAs(tab, false) : await this.runSave(tab);
+      if (!saved) return false;
+      tab.history.markSaved(began);
+      if (saved.path !== tab.path || saved.name !== tab.name) {
+        tab.path = saved.path;
+        tab.name = saved.name;
+        this.syncChrome();
+      }
+      return true;
+    } finally {
+      tab.saving = false;
+    }
+  }
+
+  private async runSave(tab: Tab): Promise<SavedFile | null> {
+    let overwrite = false;
+    let allowSigned = false;
+    for (;;) {
+      try {
+        return await this.deps.api.save(tab.doc, overwrite, allowSigned);
+      } catch (e) {
+        const error = toAppError(e);
+        if (error.code === "save_signed" && !allowSigned) {
+          const answer = await this.askSigned(tab);
+          if (answer === "copy") return this.runSaveAs(tab, true);
+          if (answer !== "anyway") return null;
+          allowSigned = true;
+        } else if (error.code === "save_changed" && !overwrite) {
+          const answer = await this.askChanged(tab);
+          if (answer === "copy") return this.runSaveAs(tab, allowSigned);
+          if (answer !== "overwrite") return null;
+          overwrite = true;
+        } else {
+          await this.saveFailed(tab, error);
+          return null;
+        }
+      }
+    }
+  }
+
+  /** `allowSigned`: the user already agreed that the signature breaks (a copy was their choice). */
+  private async runSaveAs(tab: Tab, allowSigned: boolean): Promise<SavedFile | null> {
+    for (;;) {
+      try {
+        return await this.deps.api.saveAs(tab.doc, allowSigned);
+      } catch (e) {
+        const error = toAppError(e);
+        if (error.code === "save_signed" && !allowSigned) {
+          // A copy keeps the signed file as it is, and the copy is the changed document.
+          const answer = await this.askSigned(tab, true);
+          if (answer !== "anyway") return null;
+          allowSigned = true;
+          continue;
+        }
+        await this.saveFailed(tab, error);
+        return null;
+      }
+    }
+  }
+
+  private async askSigned(tab: Tab, copy = false): Promise<"copy" | "anyway" | "cancel"> {
+    const answer = await showNotice(this.noticeLayer, {
+      title: "This document is signed",
+      detail: copy
+        ? `"${tab.name}" has a digital signature. Saving writes the document out again, and that breaks the signature: programs that check it will say the document was changed after it was signed.`
+        : `"${tab.name}" has a digital signature. Saving writes the document out again, and that breaks the signature: programs that check it will say the document was changed after it was signed. A copy leaves the signed file as it is.`,
+      buttons: [
+        { id: "cancel", label: "Cancel", safe: true },
+        ...(copy ? [] : [{ id: "copy", label: "Save a copy…", primary: true }]),
+        { id: "anyway", label: copy ? "Save and break the signature" : "Save anyway", primary: copy },
+      ],
+    });
+    return answer.button === "copy" || answer.button === "anyway" ? answer.button : "cancel";
+  }
+
+  private async askChanged(tab: Tab): Promise<"copy" | "overwrite" | "cancel"> {
+    const answer = await showNotice(this.noticeLayer, {
+      title: "The file was changed by something else",
+      detail: `"${tab.name}" was changed on the disk after you opened it. If you save, your version replaces those changes. A copy keeps both.`,
+      buttons: [
+        { id: "cancel", label: "Cancel", safe: true },
+        { id: "copy", label: "Save a copy…", primary: true },
+        { id: "overwrite", label: "Replace the file" },
+      ],
+    });
+    return answer.button === "copy" || answer.button === "overwrite" ? answer.button : "cancel";
+  }
+
+  private async saveFailed(tab: Tab, error: AppErrorLike): Promise<void> {
+    // The engine of the document is gone: so are the changes, and the tab with them.
+    if (isEngineLost(error)) {
+      await this.documentLost(tab, error);
+      return;
+    }
+    const text = describeError(error, tab.name);
+    await showNotice(this.noticeLayer, {
+      title: text.title,
+      detail: text.detail,
+      buttons: [{ id: "ok", label: "OK", primary: true }],
+    });
+  }
+
+  /**
+   * The app asks the window to close: the user used the close button of the window, or quit. With
+   * changes that are not saved the user is asked first. Quitting goes on only when every change
+   * was saved or given up.
+   */
+  async requestQuit(): Promise<void> {
+    if (this.quitting) return;
+    this.quitting = true;
+    try {
+      const dirty = this.tabs.filter((t) => t.history.dirty);
+      if (dirty.length === 0) {
+        await this.deps.api.quitApp();
+        return;
+      }
+      const names = dirty.slice(0, 5).map((t) => `"${t.name}"`);
+      if (dirty.length > 5) names.push(`and ${dirty.length - 5} more`);
+      const answer = await showNotice(this.noticeLayer, {
+        title:
+          dirty.length === 1 ? `Save changes to "${dirty[0].name}"?` : `Save changes to ${dirty.length} documents?`,
+        detail:
+          dirty.length === 1
+            ? "If you quit without saving, the changes you made are lost."
+            : `${names.join(", ")} have changes that are not saved. If you quit without saving, they are lost.`,
+        buttons: [
+          { id: "cancel", label: "Cancel", safe: true },
+          { id: "discard", label: "Quit without saving" },
+          { id: "save", label: "Save and quit", primary: true },
+        ],
+      });
+      if (answer.button === "discard") {
+        await this.deps.api.quitApp();
+        return;
+      }
+      if (answer.button === "save" && (await this.saveAllChanges())) {
+        await this.deps.api.quitApp();
+        return;
+      }
+      await this.deps.api.stayOpen().catch(() => undefined);
+    } finally {
+      this.quitting = false;
+    }
+  }
+
+  private async undoActive(): Promise<void> {
+    await this.stepHistory("undo");
+  }
+
+  private async redoActive(): Promise<void> {
+    await this.stepHistory("redo");
+  }
+
+  private async stepHistory(direction: "undo" | "redo"): Promise<void> {
+    const tab = this.active;
+    if (!tab || tab.saving) return;
+    try {
+      await (direction === "undo" ? tab.history.undo() : tab.history.redo());
+    } catch {
+      await showNotice(this.noticeLayer, {
+        title: direction === "undo" ? "The change could not be taken back" : "The change could not be made again",
+        detail: "The document is as it was before. Nothing was lost.",
+        buttons: [{ id: "ok", label: "OK", primary: true }],
+      });
+    }
   }
 
   // ---- remembered positions --------------------------------------------------
@@ -806,10 +1089,7 @@ export class App {
     // Every change of the tabs (opened, closed, brought to the front) ends here.
     if (saveTabs) this.saveSession();
     const active = this.active;
-    this.tabStrip.render(
-      this.tabs.map((t) => ({ id: t.id, title: t.name, path: t.path })),
-      this.activeId,
-    );
+    this.drawTabs();
     this.empty.hidden = this.tabs.length > 0;
     this.setControlsEnabled(active !== null);
     this.sidebar.setDocument(active?.sidebarDoc ?? null);
@@ -818,14 +1098,31 @@ export class App {
     if (!active) {
       this.pageInput.value = "";
       this.pageTotal.textContent = "";
-      this.deps.setWindowTitle(APP_NAME);
+      this.drawTitle();
       this.buildZoomOptions(null);
       return;
     }
     this.pageTotal.textContent = `/ ${active.view.pageCount}`;
-    this.deps.setWindowTitle(`${active.name} - ${APP_NAME}`);
+    this.drawTitle();
     this.showZoom(active.view.zoomValue, active.view.zoomMode);
     this.showCurrentPage();
+  }
+
+  /** Draws the tab strip: one tab for each document, with a dot on those with unsaved changes. */
+  private drawTabs(): void {
+    this.tabStrip.render(
+      this.tabs.map((t) => ({ id: t.id, title: t.name, path: t.path, dirty: t.history.dirty })),
+      this.activeId,
+    );
+  }
+
+  private drawTitle(): void {
+    const active = this.active;
+    if (!active) {
+      this.deps.setWindowTitle(APP_NAME);
+      return;
+    }
+    this.deps.setWindowTitle(`${active.history.dirty ? "\u2022 " : ""}${active.name} - ${APP_NAME}`);
   }
 
   private setControlsEnabled(on: boolean): void {
@@ -954,7 +1251,18 @@ export class App {
       this.sidebar.setOpen(!this.sidebar.isOpen);
     } else if (action.type === "close-tab") {
       e.preventDefault();
-      if (this.activeId !== null) this.closeTab(this.activeId);
+      if (this.activeId !== null) void this.requestClose(this.activeId);
+    } else if (action.type === "save") {
+      e.preventDefault();
+      void this.saveActive();
+    } else if (action.type === "save-as") {
+      e.preventDefault();
+      void this.saveActiveAs();
+    } else if (action.type === "undo" || action.type === "redo") {
+      // In a text box, undo and redo belong to the box.
+      if (typing) return;
+      e.preventDefault();
+      void (action.type === "undo" ? this.undoActive() : this.redoActive());
     } else if (action.type === "next-tab" || action.type === "previous-tab") {
       e.preventDefault();
       this.stepTab(action.type === "next-tab" ? 1 : -1);

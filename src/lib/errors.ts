@@ -86,6 +86,60 @@ export function describeError(error: AppErrorLike, fileName?: string): Described
         detail: `Patient Partridge could not lock its PDF reader into the protective sandbox of this system, so it did not open ${fileName ? file : "this file"}. No part of the file was read.${error.message ? ` (${error.message})` : ""}`,
         action: "none",
       };
+    case "save_read_only":
+      return {
+        title: "The file cannot be saved here",
+        detail: `${file} is read-only, or it is in a folder that you may not write to. Nothing was changed. Save a copy under another name instead.`,
+        action: "none",
+      };
+    case "save_disk_full":
+      return {
+        title: "The disk is full",
+        detail: `There is not enough room to save ${file}. The file on the disk was not changed. Free some space and save again.`,
+        action: "none",
+      };
+    case "save_write_failed":
+      return {
+        title: "The file could not be saved",
+        detail: `${file} was not changed.${error.message ? ` (${error.message})` : ""} Your changes are still in the open document.`,
+        action: "none",
+      };
+    case "save_verify_failed":
+      return {
+        title: "The saved file did not pass the check",
+        detail: `Patient Partridge wrote the new file, opened it again to check it, and found that it is not right, so it was not used. ${file} was not changed, and your changes are still in the open document. Try saving a copy under another name.`,
+        action: "none",
+      };
+    case "save_protection_lost":
+      return {
+        title: "The password protection would be lost",
+        detail: `The new file would not have been protected by the password like ${file} is, so it was not used. ${file} was not changed, and your changes are still in the open document.`,
+        action: "none",
+      };
+    case "save_not_a_file":
+      return {
+        title: "That is not a file",
+        detail: "The place you chose is a folder or something else that cannot hold a PDF. Nothing was saved.",
+        action: "none",
+      };
+    case "save_busy":
+      return {
+        title: "Already saving",
+        detail: `${file} is being saved. Wait for that to finish.`,
+        action: "none",
+      };
+    case "save_failed":
+      return {
+        title: "The document could not be written",
+        detail: `The PDF engine could not write ${file} out. Nothing was saved, and the file on the disk was not changed. Your changes are still in the open document.`,
+        action: "none",
+      };
+    case "save_too_large":
+      return {
+        title: "The document is too big to save",
+        detail: `${file} would be larger than 512 MiB, which is more than Patient Partridge saves. Nothing was saved, and the file on the disk was not changed.`,
+        action: "none",
+      };
     case "updating":
       return {
         title: "An update is being installed",

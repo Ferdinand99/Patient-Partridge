@@ -11,8 +11,8 @@ use arbitrary::{Result, Unstructured};
 use partridge_protocol::{
     LinkTarget, Request, RequestBody, Response, ResponseBody, MAX_LINKS_PER_PAGE,
     MAX_MATCHES_PER_PAGE, MAX_OUTLINE_DEPTH, MAX_OUTLINE_ITEMS, MAX_OUTLINE_TITLE, MAX_PAGE_CHARS,
-    MAX_PAGE_TEXT_BYTES, MAX_QUERY_LEN, MAX_RENDER_PIXELS, MAX_RENDER_SIDE, MAX_STRING_LEN,
-    MAX_URI_LEN,
+    MAX_PAGE_TEXT_BYTES, MAX_QUERY_LEN, MAX_RENDER_PIXELS, MAX_RENDER_SIDE, MAX_SAVE_BYTES,
+    MAX_SAVE_CHUNK, MAX_STRING_LEN, MAX_URI_LEN,
 };
 
 use crate::chance;
@@ -34,6 +34,9 @@ pub fn check_request_caps(request: &Request) {
                 query.len()
             );
         }
+        RequestBody::SaveChunk { len, .. } => {
+            assert!(*len as usize <= MAX_SAVE_CHUNK, "piece of {len} bytes");
+        }
         _ => {}
     }
 }
@@ -53,7 +56,24 @@ pub fn check_response_caps(response: &Response) {
             assert!(pdfium_version.len() <= MAX_STRING_LEN);
             assert!(sandbox.len() <= MAX_STRING_LEN);
         }
-        ResponseBody::Opened { .. } | ResponseBody::Closed => {}
+        ResponseBody::Opened { .. }
+        | ResponseBody::Closed
+        | ResponseBody::DocInfo { .. }
+        | ResponseBody::SaveEnded => {}
+        ResponseBody::SaveReady { size } => {
+            assert!(*size as usize <= MAX_SAVE_BYTES, "a file of {size} bytes");
+        }
+        ResponseBody::SaveData { offset, data } => {
+            assert!(
+                data.len() <= MAX_SAVE_CHUNK,
+                "piece of {} bytes",
+                data.len()
+            );
+            assert!(
+                *offset as u64 + data.len() as u64 <= MAX_SAVE_BYTES as u64,
+                "a piece that ends past the biggest file"
+            );
+        }
         ResponseBody::Rendered {
             width,
             height,
@@ -133,7 +153,7 @@ fn header(tag: u8, id: u32) -> Vec<u8> {
 }
 
 /// How many cases `over_cap_request_case` has.
-pub const OVER_CAP_REQUESTS: usize = 2;
+pub const OVER_CAP_REQUESTS: usize = 3;
 
 /// A request that is valid except that one string is one byte over its cap. Returns a name and
 /// the payload; the decoder must return an error.
@@ -145,22 +165,33 @@ pub fn over_cap_request_case(case: usize, id: u32) -> (&'static str, Vec<u8>) {
             push_str(&mut p, MAX_STRING_LEN + 1);
             ("open password over the cap", p)
         }
-        _ => {
+        1 => {
             let mut p = header(8, id);
             push_u32(&mut p, 1);
             push_u32(&mut p, 0);
             push_str(&mut p, MAX_QUERY_LEN + 1);
             ("search text over the cap", p)
         }
+        _ => {
+            // A request for a piece of the saved file that is one byte longer than a piece may be.
+            let mut p = header(11, id);
+            push_u32(&mut p, 1);
+            push_u32(&mut p, 0);
+            push_u32(&mut p, MAX_SAVE_CHUNK as u32 + 1);
+            ("save piece one byte too long", p)
+        }
     }
 }
 
 /// How many cases `over_cap_response_case` has.
-pub const OVER_CAP_RESPONSES: usize = 13;
+pub const OVER_CAP_RESPONSES: usize = 20;
 
 /// The two cases that are 1.7 MB.
 const PAGE_TEXT_OVER: usize = 6;
 const PAGE_TEXT_AT_CAP: usize = 11;
+/// The two cases that are 1 MiB.
+const SAVE_PIECE_OVER: usize = 17;
+const SAVE_PIECE_AT_CAP: usize = 18;
 
 /// A response that is valid except for one thing, which is one over a cap. Two cases sit exactly
 /// at a cap instead (the biggest page text, the widest bitmap) and must be accepted. Returns a
@@ -270,7 +301,7 @@ pub fn over_cap_response_case(case: usize, id: u32) -> (&'static str, Vec<u8>, b
             p.resize(p.len() + width as usize * 4, 0);
             ("bitmap of the widest size", p, true)
         }
-        _ => {
+        12 => {
             // One pixel wide and one too many rows: only the height is over.
             let height = MAX_RENDER_SIDE + 1;
             let mut p = header(131, id);
@@ -280,6 +311,64 @@ pub fn over_cap_response_case(case: usize, id: u32) -> (&'static str, Vec<u8>, b
             p.resize(p.len() + height as usize * 4, 0);
             ("bitmap one pixel too high", p, false)
         }
+        13 => {
+            let mut p = header(138, id);
+            push_u32(&mut p, MAX_SAVE_BYTES as u32 + 1);
+            ("save size one byte over the biggest file", p, false)
+        }
+        14 => {
+            let mut p = header(138, id);
+            push_u32(&mut p, MAX_SAVE_BYTES as u32);
+            ("save size of the biggest file", p, true)
+        }
+        15 => {
+            // The last byte of the biggest file is the last byte this piece may reach.
+            let mut p = header(139, id);
+            push_u32(&mut p, MAX_SAVE_BYTES as u32 - 4);
+            push_u32(&mut p, 4);
+            p.extend_from_slice(b"tail");
+            (
+                "save piece that ends on the last byte of the biggest file",
+                p,
+                true,
+            )
+        }
+        16 => {
+            let mut p = header(139, id);
+            push_u32(&mut p, MAX_SAVE_BYTES as u32 - 4);
+            push_u32(&mut p, 5);
+            p.extend_from_slice(b"tail!");
+            (
+                "save piece that ends one byte past the biggest file",
+                p,
+                false,
+            )
+        }
+        n @ (SAVE_PIECE_OVER | SAVE_PIECE_AT_CAP) => {
+            let len = if n == SAVE_PIECE_OVER {
+                MAX_SAVE_CHUNK + 1
+            } else {
+                MAX_SAVE_CHUNK
+            };
+            let mut p = header(139, id);
+            push_u32(&mut p, 0);
+            push_u32(&mut p, len as u32);
+            p.resize(p.len() + len, b'a');
+            if n == SAVE_PIECE_OVER {
+                ("save piece one byte too long", p, false)
+            } else {
+                ("save piece of the biggest size", p, true)
+            }
+        }
+        19 => {
+            // The length says 10, the piece holds 9.
+            let mut p = header(139, id);
+            push_u32(&mut p, 0);
+            push_u32(&mut p, 10);
+            p.extend_from_slice(b"123456789");
+            ("save piece shorter than it says", p, false)
+        }
+        _ => unreachable!("the case number is taken modulo the number of cases"),
     }
 }
 
@@ -294,7 +383,11 @@ pub fn over_cap_request(u: &mut Unstructured) -> Result<(&'static str, Vec<u8>)>
 /// are picked less often than the rest.
 pub fn over_cap_response(u: &mut Unstructured) -> Result<(&'static str, Vec<u8>, bool)> {
     let mut case = u.int_in_range(0..=OVER_CAP_RESPONSES - 1)?;
-    if (case == PAGE_TEXT_OVER || case == PAGE_TEXT_AT_CAP) && !chance(u, 16)? {
+    let big = matches!(
+        case,
+        PAGE_TEXT_OVER | PAGE_TEXT_AT_CAP | SAVE_PIECE_OVER | SAVE_PIECE_AT_CAP
+    );
+    if big && !chance(u, 16)? {
         case = 0;
     }
     let id: u32 = u.arbitrary()?;

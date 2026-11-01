@@ -438,6 +438,16 @@
   }
 }
 
+/* A dot next to the name: the document has changes that are not saved. */
+.tab-dirty {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  margin-inline-end: 2px;
+  border-radius: var(--r-full);
+  background: currentcolor;
+}
+
 .tab-close {
   display: inline-flex;
   flex: none;

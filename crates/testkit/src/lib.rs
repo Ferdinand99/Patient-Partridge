@@ -238,6 +238,34 @@ BT /F1 12 Tf 72 400 Td 16 TL (A needle in a haystack.) Tj T* (Another NEEDLE her
     )
 }
 
+/// A one page document with one digital signature field that holds a signature dictionary. The
+/// signature is not a real one (the byte range and the contents are made up), but PDFium counts
+/// it, which is all a test of the save path needs. A save that rewrites the file cannot keep the
+/// bytes a real signature covers.
+pub fn signed_pdf() -> Vec<u8> {
+    let specs = [PageSpec {
+        width: 612,
+        height: 792,
+        content: Some(demo_content(1, 612, 792)),
+        extra: "/Annots [6 0 R]".into(),
+    }];
+    // Object numbers: 1 catalog, 2 tree, 3 font, 4 page, 5 content, then the field and the dictionary.
+    let extras: Vec<Vec<u8>> = vec![
+        b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Signature1) /Rect [50 50 250 100] /F 132 /P 4 0 R /V 7 0 R >>".to_vec(),
+        format!(
+            "<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /ByteRange [0 100 200 100] /Contents <{}> /M (D:20260101000000Z) /Reason (Approved) >>",
+            "30".repeat(64)
+        )
+        .into_bytes(),
+    ];
+    build(
+        &specs,
+        "/AcroForm << /Fields [6 0 R] /SigFlags 3 >>",
+        "",
+        extras,
+    )
+}
+
 /// Letters of the right-to-left test page, in reading order: the first ten letters of the Hebrew
 /// alphabet (U+05D0 to U+05D9).
 pub const RTL_LINE: &str = "\u{5d0}\u{5d1}\u{5d2}\u{5d3}\u{5d4}\u{5d5}\u{5d6}\u{5d7}\u{5d8}\u{5d9}";

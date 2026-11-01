@@ -11,6 +11,12 @@
 //! - `exit-once`: exits right after the first `Hello` (when the marker file does not exist yet).
 //! - `good`: behaves like an engine with one 612 x 792 document.
 //! - `no-sandbox`: like `good`, but greets without naming a sandbox.
+//! - `save-good`: like `good`, and saves a made-up file of 2 500 000 bytes (byte `i` is `i % 251`).
+//! - `save-signed`: like `save-good`, but the document holds two signatures.
+//! - `save-short`, `save-wrong-offset`, `save-big`, `save-error`, `save-lies`: like `save-good`
+//!   but a piece is a byte too short, a piece comes from the wrong offset, a piece is a 10 MiB
+//!   frame, the save fails with an error, or the end of the file is missing (the last piece is
+//!   answered with an error).
 
 // Like the engine, a program without a console on Windows (it is started with a restricted token).
 #![cfg_attr(windows, windows_subsystem = "windows")]
@@ -19,9 +25,12 @@ use std::io::{self, BufReader, BufWriter};
 use std::path::Path;
 
 use partridge_protocol::{
-    read_frame, write_frame, write_response, PageSize, Request, RequestBody, Response,
+    read_frame, write_frame, write_response, ErrorCode, PageSize, Request, RequestBody, Response,
     ResponseBody, PROTOCOL_VERSION,
 };
+
+/// The size of the file the stand-in saves.
+const SAVE_SIZE: u32 = 2_500_000;
 
 fn main() {
     // The client adds `--document <n>` and `--memory-limit <n>` to the command line; they are not
@@ -164,6 +173,69 @@ fn main() {
                 ),
                 _ => reply(&mut output, id, ResponseBody::Matches { matches: vec![] }),
             },
+            RequestBody::DocInfo { .. } => reply(
+                &mut output,
+                id,
+                ResponseBody::DocInfo {
+                    pages: 1,
+                    security: 0,
+                    signatures: if mode == "save-signed" { 2 } else { 0 },
+                },
+            ),
+            RequestBody::SaveBegin { .. } => match mode.as_str() {
+                "save-error" => reply(
+                    &mut output,
+                    id,
+                    ResponseBody::Error {
+                        code: ErrorCode::SaveFailed,
+                        message: "the stand-in cannot save".into(),
+                    },
+                ),
+                _ => reply(&mut output, id, ResponseBody::SaveReady { size: SAVE_SIZE }),
+            },
+            RequestBody::SaveChunk { offset, len, .. } => {
+                let piece = |from: u32, len: u32| -> Vec<u8> {
+                    (from..from + len).map(|i| (i % 251) as u8).collect()
+                };
+                match mode.as_str() {
+                    "save-short" => reply(
+                        &mut output,
+                        id,
+                        ResponseBody::SaveData {
+                            offset,
+                            data: piece(offset, len - 1),
+                        },
+                    ),
+                    "save-wrong-offset" => reply(
+                        &mut output,
+                        id,
+                        ResponseBody::SaveData {
+                            offset: offset + 1,
+                            data: piece(offset + 1, len),
+                        },
+                    ),
+                    "save-big" => {
+                        let _ = write_frame(&mut output, &vec![0u8; 10 * 1024 * 1024]);
+                    }
+                    "save-lies" if offset + len == SAVE_SIZE => reply(
+                        &mut output,
+                        id,
+                        ResponseBody::Error {
+                            code: ErrorCode::SaveFailed,
+                            message: "the end is missing".into(),
+                        },
+                    ),
+                    _ => reply(
+                        &mut output,
+                        id,
+                        ResponseBody::SaveData {
+                            offset,
+                            data: piece(offset, len),
+                        },
+                    ),
+                }
+            }
+            RequestBody::SaveEnd { .. } => reply(&mut output, id, ResponseBody::SaveEnded),
         }
     }
 }

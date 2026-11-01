@@ -27,6 +27,7 @@ use tauri::{AppHandle, State};
 use tauri_plugin_updater::UpdaterExt;
 
 use crate::positions::{create_private_dir, write_private_file};
+use crate::unsaved::Unsaved;
 use crate::{links, locate, now_seconds, CommandError, Engine};
 
 /// Where a person goes to install an update by hand.
@@ -479,6 +480,9 @@ pub enum FailureKind {
     Disabled,
     /// An update is being installed already.
     Busy,
+    /// A document has changes that are not saved. The install would end its engine, and the
+    /// changes with it, so nothing is installed until the user has saved or given them up.
+    Unsaved,
     /// This copy cannot install by itself (a deb package).
     Manual,
     Other,
@@ -576,6 +580,8 @@ pub struct UpdateState {
     /// The documents that are open, by handle: kept here so that the list for the restart is taken
     /// at the moment of the install, from the app's own knowledge, not from the window's.
     open_docs: Arc<Mutex<Vec<(u64, String)>>>,
+    /// The documents with changes that are not saved (see the `unsaved` module).
+    unsaved: Arc<Unsaved>,
     /// The documents of the last run, to be handed to the window once.
     restored: Mutex<Vec<String>>,
     restore_file: Option<PathBuf>,
@@ -594,6 +600,7 @@ impl UpdateState {
             installing: AtomicBool::new(false),
             close_blocked: Arc::new(AtomicBool::new(false)),
             open_docs: Arc::new(Mutex::new(Vec::new())),
+            unsaved: Arc::new(Unsaved::default()),
             restored: Mutex::new(Vec::new()),
             restore_file: data_dir.map(|d| d.join("restore-after-update.json")),
             method,
@@ -637,6 +644,27 @@ impl UpdateState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|(d, _)| *d != doc);
+        self.unsaved.forget(doc);
+    }
+
+    /// A document now belongs to another file (it was saved under a new name), so that is the
+    /// one to open again after an update.
+    pub fn move_doc(&self, doc: u64, path: &str) {
+        for (d, p) in self
+            .open_docs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter_mut()
+        {
+            if *d == doc {
+                *p = path.to_string();
+            }
+        }
+    }
+
+    /// The documents with changes that are not saved.
+    pub fn unsaved(&self) -> &Arc<Unsaved> {
+        &self.unsaved
     }
 
     /// The window that knew the documents is gone (a reload).
@@ -645,6 +673,7 @@ impl UpdateState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.unsaved.clear();
     }
 
     /// True while an update is being installed and the window must stay open.
@@ -785,6 +814,14 @@ pub async fn install(
     pool: Arc<EnginePool>,
     active: Option<String>,
 ) -> Result<(), UpdateFailure> {
+    // Before anything is taken or stopped: the engines hold the changes of the open documents.
+    // The download stays, so the install can be asked for again once the changes are saved.
+    if state.unsaved.any() {
+        return Err(failure(
+            FailureKind::Unsaved,
+            "a document has changes that are not saved, so nothing was installed",
+        ));
+    }
     let Some((update, bytes)) = state
         .downloaded
         .lock()
@@ -1642,6 +1679,28 @@ mod tests {
         let long = "é".repeat(MAX_NOTES_CHARS + 50);
         let cut = cut_notes(Some(long));
         assert_eq!(cut.chars().count(), MAX_NOTES_CHARS);
+    }
+
+    #[test]
+    fn an_update_is_not_installed_while_a_document_has_unsaved_changes() {
+        let state = UpdateState::new(None, InstallMethod::Automatic);
+        let pool = Arc::new(EnginePool::new(
+            partridge_engine_client::EngineConfig::new("no-such-engine"),
+            2,
+        ));
+        state.unsaved().set(7, true);
+        let err = tauri::async_runtime::block_on(install(&state, pool.clone(), None)).unwrap_err();
+        assert_eq!(err.kind, FailureKind::Unsaved);
+        // Nothing was stopped: the gate is open, and the engines were not told to end.
+        assert!(!state.gate().is_closed());
+        assert!(!err.engines_stopped);
+
+        // Once the changes are saved the install goes on to the next step (there is no download
+        // in this test, so it stops there).
+        state.unsaved().set(7, false);
+        let err = tauri::async_runtime::block_on(install(&state, pool, None)).unwrap_err();
+        assert_eq!(err.kind, FailureKind::Other);
+        assert!(err.message.contains("no update has been downloaded"));
     }
 
     #[test]

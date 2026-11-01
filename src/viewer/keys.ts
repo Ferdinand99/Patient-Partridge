@@ -27,7 +27,11 @@ export type Action =
   | { type: "find-next" }
   | { type: "find-previous" }
   | { type: "select-all" }
-  | { type: "print" };
+  | { type: "print" }
+  | { type: "save" }
+  | { type: "save-as" }
+  | { type: "undo" }
+  | { type: "redo" };
 
 /** CSS pixels one arrow key press scrolls. */
 export const LINE_SCROLL = 48;
@@ -73,6 +77,15 @@ export function actionForKey(e: KeyInfo): Action | null {
       case "p":
       case "P":
         return { type: "print" };
+      case "s":
+      case "S":
+        return { type: e.shiftKey ? "save-as" : "save" };
+      case "z":
+      case "Z":
+        return { type: e.shiftKey ? "redo" : "undo" };
+      case "y":
+      case "Y":
+        return { type: "redo" };
       case "Tab":
         return { type: e.shiftKey ? "previous-tab" : "next-tab" };
       case "PageDown":

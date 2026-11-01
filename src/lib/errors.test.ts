@@ -17,6 +17,31 @@ describe("toAppError", () => {
   });
 });
 
+describe("describeError: saving", () => {
+  it("has words for every way a save can fail, and says the file was not changed", () => {
+    const codes = [
+      "save_read_only",
+      "save_disk_full",
+      "save_write_failed",
+      "save_verify_failed",
+      "save_protection_lost",
+      "save_not_a_file",
+      "save_busy",
+      "save_failed",
+      "save_too_large",
+    ];
+    for (const code of codes) {
+      const d = describeError({ code, message: "detail" }, "tax.pdf");
+      expect(d.title, code).not.toBe("Something went wrong");
+      expect(d.action).toBe("none");
+    }
+    for (const code of ["save_read_only", "save_disk_full", "save_verify_failed", "save_failed", "save_too_large"]) {
+      expect(describeError({ code, message: "" }, "tax.pdf").detail, code).toContain('"tax.pdf"');
+    }
+    expect(describeError({ code: "save_write_failed", message: "no luck" }, "tax.pdf").detail).toContain("no luck");
+  });
+});
+
 describe("describeError", () => {
   it("asks for a password when the file needs one", () => {
     const d = describeError({ code: "password_required", message: "" }, "tax.pdf");

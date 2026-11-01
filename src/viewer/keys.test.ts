@@ -46,6 +46,18 @@ describe("actionForKey", () => {
     expect(actionForKey(key("o", { metaKey: true }))).toEqual({ type: "open-file" });
   });
 
+  it("saves with Ctrl or Cmd+S, saves a copy with Shift, and undoes and redoes", () => {
+    for (const mod of [{ ctrlKey: true }, { metaKey: true }]) {
+      expect(actionForKey(key("s", mod))).toEqual({ type: "save" });
+      expect(actionForKey(key("S", { ...mod, shiftKey: true }))).toEqual({ type: "save-as" });
+      expect(actionForKey(key("z", mod))).toEqual({ type: "undo" });
+      expect(actionForKey(key("Z", { ...mod, shiftKey: true }))).toEqual({ type: "redo" });
+      expect(actionForKey(key("y", mod))).toEqual({ type: "redo" });
+    }
+    expect(actionForKey(key("s"))).toBeNull();
+    expect(actionForKey(key("z"))).toBeNull();
+  });
+
   it("leaves other keys and Alt combinations alone", () => {
     expect(actionForKey(key("a"))).toBeNull();
     expect(actionForKey(key("c", { ctrlKey: true }))).toBeNull();

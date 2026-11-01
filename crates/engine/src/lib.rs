@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use partridge_protocol::{
     ErrorCode, PageSize, Request, RequestBody, Response, ResponseBody, MAX_RENDER_PIXELS,
-    MAX_RENDER_SIDE, PROTOCOL_VERSION,
+    MAX_RENDER_SIDE, MAX_SAVE_CHUNK, PROTOCOL_VERSION,
 };
 use pdfium_render::prelude::*;
 
@@ -24,6 +24,7 @@ pub mod fds;
 pub mod fonts;
 pub mod limits;
 pub mod sandbox;
+pub mod save;
 pub mod startup;
 pub mod stdio;
 pub mod text;
@@ -123,6 +124,8 @@ pub struct Engine {
     pdfium: Result<&'static Pdfium, String>,
     pdfium_version: String,
     docs: HashMap<u32, PdfDocument<'static>>,
+    /// The serialised form of a document between `SaveBegin` and `SaveEnd`.
+    saves: HashMap<u32, Vec<u8>>,
     next_doc: u32,
     /// The one document the app handed over. `Open` takes it.
     document: Option<File>,
@@ -155,6 +158,7 @@ impl Engine {
             pdfium,
             pdfium_version: version,
             docs: HashMap::new(),
+            saves: HashMap::new(),
             next_doc: 1,
             document: None,
             sandbox: String::new(),
@@ -231,6 +235,7 @@ impl Engine {
             RequestBody::Close { doc } => {
                 // Closing an unknown id is not an error: the end state is the same.
                 self.docs.remove(&doc);
+                self.saves.remove(&doc);
                 Ok(ResponseBody::Closed)
             }
             RequestBody::Outline { doc } => {
@@ -271,7 +276,52 @@ impl Engine {
                     matches: text::find_matches(&plain, &query),
                 })
             }),
+            RequestBody::DocInfo { doc } => Ok(save::doc_info(self.document(doc)?)),
+            RequestBody::SaveBegin { doc } => {
+                // A buffer from an earlier save is gone before the next one is made.
+                self.saves.remove(&doc);
+                let bytes = save::serialise(self.document(doc)?)?;
+                let size = bytes.len() as u32;
+                self.saves.insert(doc, bytes);
+                Ok(ResponseBody::SaveReady { size })
+            }
+            RequestBody::SaveChunk { doc, offset, len } => {
+                self.document(doc)?;
+                if len as usize > MAX_SAVE_CHUNK {
+                    return fail(ErrorCode::InvalidRequest, "the piece is too long");
+                }
+                let Some(bytes) = self.saves.get(&doc) else {
+                    return fail(ErrorCode::InvalidRequest, "no save is under way");
+                };
+                let start = offset as usize;
+                let end = start
+                    .checked_add(len as usize)
+                    .filter(|e| *e <= bytes.len());
+                let Some(end) = end else {
+                    return fail(ErrorCode::InvalidRequest, "the piece is past the end");
+                };
+                Ok(ResponseBody::SaveData {
+                    offset,
+                    data: bytes[start..end].to_vec(),
+                })
+            }
+            RequestBody::SaveEnd { doc } => {
+                self.saves.remove(&doc);
+                Ok(ResponseBody::SaveEnded)
+            }
         }
+    }
+
+    /// Test builds only: lets a test change an open document the way a later editing feature
+    /// will, so that a save has something to write.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn edit_for_tests<T>(
+        &mut self,
+        doc: u32,
+        edit: impl FnOnce(&mut PdfDocument<'static>) -> T,
+    ) -> Option<T> {
+        self.docs.get_mut(&doc).map(edit)
     }
 
     fn document(&self, doc: u32) -> Result<&PdfDocument<'static>, Failure> {

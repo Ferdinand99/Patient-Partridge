@@ -32,7 +32,8 @@ use std::time::Duration;
 
 use partridge_protocol::{
     read_frame_limited, write_request, ErrorCode, PageSize, Request, RequestBody, Response,
-    ResponseBody, MAX_QUERY_LEN, MAX_STRING_LEN, PROTOCOL_VERSION,
+    ResponseBody, MAX_QUERY_LEN, MAX_SAVE_BYTES, MAX_SAVE_CHUNK, MAX_STRING_LEN, PROTOCOL_VERSION,
+    SAVE_DATA_HEADER_LEN,
 };
 
 pub use spawn::{spawn_engine, EngineProcess, SandboxPolicy, SpawnRequest, SpawnedEngine};
@@ -41,6 +42,8 @@ pub use partridge_protocol::{LinkTarget, OutlineItem, PageLink, TextMatch};
 
 mod pool;
 pub use pool::EnginePool;
+mod save;
+pub use save::{verify_written, DocInfo, SaveError, SaveOptions, SaveOutcome};
 mod spawn;
 
 /// Largest answer to an open request. An `Opened` answer holds 8 bytes per page, so this allows
@@ -89,6 +92,8 @@ pub enum ClientError {
     EngineStopped(String),
     /// The engine is fine and refused or failed this one request.
     Engine { code: ErrorCode, message: String },
+    /// A save did not happen, and the file it was meant for is as it was.
+    Save(SaveError),
 }
 
 impl fmt::Display for ClientError {
@@ -96,6 +101,7 @@ impl fmt::Display for ClientError {
         match self {
             ClientError::EngineStopped(why) => write!(f, "the PDF engine stopped: {why}"),
             ClientError::Engine { message, .. } => write!(f, "{message}"),
+            ClientError::Save(why) => write!(f, "{why}"),
         }
     }
 }
@@ -141,6 +147,21 @@ enum Event {
     Failed(String),
     /// The engine closed its output: it exited.
     Closed,
+}
+
+/// Why [`EngineClient::save_to`] stopped.
+#[derive(Debug)]
+pub enum SaveStreamError {
+    /// The engine failed, broke the rules, or the document is gone.
+    Client(ClientError),
+    /// The caller's sink failed: the bytes could not be written.
+    Sink(std::io::Error),
+}
+
+impl From<ClientError> for SaveStreamError {
+    fn from(e: ClientError) -> Self {
+        SaveStreamError::Client(e)
+    }
 }
 
 /// The engine process, reachable from the request thread and from whoever kills it.
@@ -384,6 +405,89 @@ impl EngineClient {
         }
     }
 
+    /// What the app needs to know before it saves: pages, protection, signatures.
+    pub fn doc_info(&self, doc: u64) -> Result<DocInfo, ClientError> {
+        self.call(
+            doc,
+            "document info",
+            |doc| RequestBody::DocInfo { doc },
+            |body| match body {
+                ResponseBody::DocInfo {
+                    pages,
+                    security,
+                    signatures,
+                } => Ok(DocInfo {
+                    pages,
+                    security,
+                    signatures,
+                }),
+                other => Err(other),
+            },
+        )
+    }
+
+    /// Has the engine serialise the document, and hands every piece to `sink` as it arrives; the
+    /// pieces together are the file. Returns how many bytes there were.
+    ///
+    /// The engine is treated as hostile here too: the size it announces is held to
+    /// [`MAX_SAVE_BYTES`], every piece must be at the offset asked for and exactly as long as
+    /// asked, and the pieces must add up to the size announced. An engine that breaks one of
+    /// these is stopped, and the pieces already handed to `sink` are not a file. An error of the
+    /// sink (the disk is full) ends the save; the engine is told to drop its buffer.
+    pub fn save_to(
+        &self,
+        doc: u64,
+        sink: &mut dyn FnMut(&[u8]) -> std::io::Result<()>,
+    ) -> Result<u64, SaveStreamError> {
+        let mut inner = lock(&self.inner);
+        let Some(engine_doc) = Self::engine_doc(&inner, doc) else {
+            return Err(stale_document().into());
+        };
+        let size = match self.run(&mut inner, RequestBody::SaveBegin { doc: engine_doc })? {
+            ResponseBody::SaveReady { size } if size as usize <= MAX_SAVE_BYTES => size,
+            _ => {
+                return Err(self
+                    .unexpected::<()>(&mut inner, "save")
+                    .unwrap_err()
+                    .into())
+            }
+        };
+        let mut done: u32 = 0;
+        let result = loop {
+            if done == size {
+                break Ok(());
+            }
+            let len = (size - done).min(MAX_SAVE_CHUNK as u32);
+            let body = RequestBody::SaveChunk {
+                doc: engine_doc,
+                offset: done,
+                len,
+            };
+            match self.run(&mut inner, body) {
+                Ok(ResponseBody::SaveData { offset, data })
+                    if offset == done && data.len() == len as usize =>
+                {
+                    if let Err(e) = sink(&data) {
+                        break Err(SaveStreamError::Sink(e));
+                    }
+                    done += len;
+                }
+                Ok(_) => {
+                    break Err(self
+                        .unexpected::<()>(&mut inner, "save")
+                        .unwrap_err()
+                        .into());
+                }
+                Err(e) => break Err(e.into()),
+            }
+        };
+        // Freeing the buffer is housekeeping, and an engine that was stopped has none to free.
+        if inner.running.is_some() {
+            let _ = self.run(&mut inner, RequestBody::SaveEnd { doc: engine_doc });
+        }
+        result.map(|()| u64::from(size))
+    }
+
     /// Stops the engine process now. The documents it held are gone; opening a file starts a new
     /// engine. This works while another
     /// thread is waiting for an answer: that request then fails with `EngineStopped`.
@@ -437,6 +541,9 @@ impl EngineClient {
             RequestBody::Outline { .. } => MAX_OUTLINE_ANSWER,
             RequestBody::PageText { .. } => MAX_TEXT_ANSWER,
             RequestBody::PageLinks { .. } => MAX_LINKS_ANSWER,
+            RequestBody::SaveChunk { len, .. } => {
+                (SAVE_DATA_HEADER_LEN + (*len as usize).min(MAX_SAVE_CHUNK)).max(IDLE_LIMIT)
+            }
             // A search answer holds at most 2 000 matches of 8 bytes: it fits the idle limit.
             _ => IDLE_LIMIT,
         }
