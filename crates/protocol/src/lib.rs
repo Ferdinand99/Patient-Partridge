@@ -1486,6 +1486,35 @@ mod tests {
     }
 
     #[test]
+    fn a_bitmap_over_one_limit_only_is_refused_when_decoding() {
+        let bitmap = |width: u32, height: u32| {
+            let len = width as usize * height as usize * 4;
+            let mut bytes = vec![TAG_RES_RENDERED, 1, 0, 0, 0];
+            bytes.extend_from_slice(&width.to_le_bytes());
+            bytes.extend_from_slice(&height.to_le_bytes());
+            bytes.extend_from_slice(&(len as u32).to_le_bytes());
+            bytes.resize(bytes.len() + len, 0);
+            bytes
+        };
+        // Too high, but narrow: only the side limit is broken.
+        assert!(matches!(
+            Response::decode(bitmap(1, MAX_RENDER_SIDE + 1)),
+            Err(ProtocolError::InvalidLength)
+        ));
+        // Both sides are allowed, but there are too many pixels: only the pixel limit is broken.
+        // (This message holds 96 MB of pixels.)
+        let width = MAX_RENDER_SIDE;
+        let height = (MAX_RENDER_PIXELS / width as u64) as u32 + 1;
+        assert!(height <= MAX_RENDER_SIDE && width as u64 * height as u64 > MAX_RENDER_PIXELS);
+        assert!(matches!(
+            Response::decode(bitmap(width, height)),
+            Err(ProtocolError::InvalidLength)
+        ));
+        // One row less is fine.
+        assert!(Response::decode(bitmap(width, height - 1)).is_ok());
+    }
+
+    #[test]
     fn the_encoder_cuts_what_is_too_long_and_the_result_still_decodes() {
         let long_title = "é".repeat(MAX_OUTLINE_TITLE);
         let res = Response {
