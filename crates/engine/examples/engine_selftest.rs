@@ -8,7 +8,7 @@
 //!
 //! Usage (the engine's options first, then these):
 //! `engine_selftest [--pdfium-dir D] [--document N] [--memory-limit B] probe FILE DIR EXE PID PORT TITLE`
-//! `engine_selftest [...] memory MIB`
+//! `engine_selftest [...] memory MIB HOLD_SECONDS [app-only]`
 //! `engine_selftest [...] document`
 //! `engine_selftest control FILE DIR EXE PID PORT TITLE` runs the probes of `probe` in a program
 //! that is not locked in, to show that each attempt is one that works without the sandbox.
@@ -52,6 +52,12 @@ fn main() {
         return;
     }
 
+    // `app-only` switches the engine's own memory watch off (macOS), so that only the app's watch
+    // from outside can end the program. Set before anything else starts, while there is one thread.
+    if mode[0] == "memory" && mode.get(3).is_some_and(|m| m == "app-only") {
+        std::env::set_var("PARTRIDGE_TEST_NO_ENGINE_LIMIT", "1");
+    }
+
     let args = parse_args(engine_options).expect("engine options");
 
     // On Windows the network support is started before the lock-in, the way the engine's own
@@ -93,7 +99,11 @@ fn main() {
 
     match mode[0].as_str() {
         "probe" => probe(&mode[1..], &mut say),
-        "memory" => memory(mode[1].parse().expect("MiB"), &mut say),
+        "memory" => memory(
+            mode[1].parse().expect("MiB"),
+            mode[2].parse().expect("seconds"),
+            &mut say,
+        ),
         "document" => document(&mut engine, &mut say),
         _ => unreachable!(),
     }
@@ -579,8 +589,14 @@ fn executable_memory() -> Result<(), ()> {
     }
 }
 
-/// Uses more memory than the limit allows. If this returns, the limit did not work.
-fn memory(limit_mib: usize, say: &mut dyn FnMut(String)) {
+/// Uses more memory than the limit allows, and keeps it. If this returns, the limit did not work.
+///
+/// The program holds the memory for up to `hold_seconds` instead of ending as soon as it has it.
+/// Where the limit is a watch that looks every few tens of milliseconds (macOS), a program that
+/// takes a few hundred megabytes in less time than that and then ends is never seen, which is no
+/// failure of the limit: it is the one thing the watch does not promise. What it promises is that
+/// a program that stays over the limit is ended, and that is what this program is.
+fn memory(limit_mib: usize, hold_seconds: u64, say: &mut dyn FnMut(String)) {
     let mut held: Vec<Vec<u8>> = Vec::new();
     // Up to three times the limit, so a limit that works ends the program well before.
     for step in 1..=(limit_mib * 3 / 16) {
@@ -593,6 +609,11 @@ fn memory(limit_mib: usize, say: &mut dyn FnMut(String)) {
         if step % 4 == 0 {
             say(format!("memory: holding {} MiB", step * 16));
         }
+    }
+    say(format!("memory: holding it all ({} MiB)", held.len() * 16));
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(hold_seconds);
+    while std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
     say(format!("memory: SURVIVED with {} MiB", held.len() * 16));
 }
