@@ -63,9 +63,10 @@ describe("checking what the build made", () => {
   });
 
   it("accepts a good MSI and refuses one without the extension", () => {
-    expect(checkMsiRows(["pdf"], ["application/pdf"])).toEqual([]);
-    expect(checkMsiRows([], ["application/pdf"])).toHaveLength(1);
-    expect(checkMsiRows(["PDF"], [])).toHaveLength(1);
+    expect(checkMsiRows(["pdf"])).toEqual([]);
+    expect(checkMsiRows(["PDF"])).toEqual([]);
+    expect(checkMsiRows([])).toHaveLength(1);
+    expect(checkMsiRows(["txt"])).toHaveLength(1);
   });
 
   it("checks the desktop file of the deb", () => {

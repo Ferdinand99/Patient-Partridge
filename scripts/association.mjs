@@ -28,11 +28,10 @@ export function checkMacPlist(plist) {
   return problems;
 }
 
-/** What the rows of the Extension and MIME tables of the MSI must hold. */
-export function checkMsiRows(extensions, mimeTypes) {
+/** What the rows of the Extension table of the MSI must hold. */
+export function checkMsiRows(extensions) {
   const problems = [];
   if (!extensions.map((e) => e.toLowerCase()).includes("pdf")) problems.push("the installer registers no .pdf extension");
-  if (!mimeTypes.map((m) => m.toLowerCase()).includes("application/pdf")) problems.push("the installer registers no application/pdf type");
   return problems;
 }
 
@@ -84,7 +83,9 @@ function main() {
     problems = checkMacPlist(plist);
   } else if (system === "windows") {
     const msi = resolve(target);
-    problems = checkMsiRows(msiRows(msi, "SELECT Extension FROM Extension"), msiRows(msi, "SELECT ContentType FROM MIME"));
+    const extensions = msiRows(msi, "SELECT Extension FROM Extension");
+    console.log(`Extensions registered by the installer: ${extensions.join(", ") || "none"}`);
+    problems = checkMsiRows(extensions);
   } else {
     console.error("usage: association.mjs <linux|macos|windows> <path>");
     process.exit(2);

@@ -130,7 +130,13 @@ async function runOnce({ bin, pdf, memory }) {
   } finally {
     killTree(child);
     await sleep(200);
-    rmSync(dir, { recursive: true, force: true });
+    // The web view may still be writing its caches for a moment. A folder that cannot be removed
+    // is not a failure of the app, so it is only retried, never reported.
+    try {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
+    } catch {
+      // Left behind in the temporary folder.
+    }
   }
 }
 
