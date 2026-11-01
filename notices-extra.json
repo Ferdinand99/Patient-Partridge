@@ -23,28 +23,18 @@
       "holder": "Mads Marquart <mads@marquart.dk>, Mary <mary@mary.zone>"
     },
     {
+      "name": "minisign-verify",
+      "version": "0.3.0",
+      "license": "MIT",
+      "basis": "authors",
+      "authors": [
+        "Frank Denis <github@pureftpd.org>"
+      ],
+      "holder": "Frank Denis <github@pureftpd.org>"
+    },
+    {
       "name": "objc2",
       "version": "0.6.5",
-      "license": "MIT",
-      "basis": "authors",
-      "authors": [
-        "Mads Marquart <mads@marquart.dk>"
-      ],
-      "holder": "Mads Marquart <mads@marquart.dk>"
-    },
-    {
-      "name": "objc2-encode",
-      "version": "4.1.0",
-      "license": "MIT",
-      "basis": "authors",
-      "authors": [
-        "Mads Marquart <mads@marquart.dk>"
-      ],
-      "holder": "Mads Marquart <mads@marquart.dk>"
-    },
-    {
-      "name": "objc2-exception-helper",
-      "version": "0.1.1",
       "license": "MIT",
       "basis": "authors",
       "authors": [
@@ -77,7 +67,35 @@
       "holder": "Mads Marquart and the contributors of https://github.com/madsmtm/objc2"
     },
     {
+      "name": "objc2-encode",
+      "version": "4.1.0",
+      "license": "MIT",
+      "basis": "authors",
+      "authors": [
+        "Mads Marquart <mads@marquart.dk>"
+      ],
+      "holder": "Mads Marquart <mads@marquart.dk>"
+    },
+    {
+      "name": "objc2-exception-helper",
+      "version": "0.1.1",
+      "license": "MIT",
+      "basis": "authors",
+      "authors": [
+        "Mads Marquart <mads@marquart.dk>"
+      ],
+      "holder": "Mads Marquart <mads@marquart.dk>"
+    },
+    {
       "name": "objc2-foundation",
+      "version": "0.3.2",
+      "license": "MIT",
+      "basis": "repository",
+      "source": "https://github.com/madsmtm/objc2: the crate lists no authors and neither the crate nor the repository at the published commit has a copyright notice (LICENSE.md only names the licences). The other crates of the same repository name Mads Marquart as author.",
+      "holder": "Mads Marquart and the contributors of https://github.com/madsmtm/objc2"
+    },
+    {
+      "name": "objc2-osa-kit",
       "version": "0.3.2",
       "license": "MIT",
       "basis": "repository",
@@ -115,9 +133,73 @@
       ],
       "source": "The first two lines are the copyright header of build.rs in the crate (lines 2 and 3, followed by the MIT and Apache grant); LICENSE.md of the crate and the repository only name the licences. The third line is the authors field of the crate. The generator checks both header lines against build.rs and the authors against the crate metadata.",
       "verify": [
-        { "file": "build.rs", "contains": "Copyright 2021, pdfium-sys Developers" },
-        { "file": "build.rs", "contains": "Copyright 2022 - 2024, pdfium-render Developers" }
+        {
+          "file": "build.rs",
+          "contains": "Copyright 2021, pdfium-sys Developers"
+        },
+        {
+          "file": "build.rs",
+          "contains": "Copyright 2022 - 2024, pdfium-render Developers"
+        }
       ]
+    },
+    {
+      "name": "tauri-plugin-updater",
+      "version": "2.14.1",
+      "license": "MIT",
+      "basis": "authors",
+      "authors": [
+        "Tauri Programme within The Commons Conservancy"
+      ],
+      "holder": "Tauri Programme within The Commons Conservancy"
+    },
+    {
+      "name": "windows-registry",
+      "version": "0.6.1",
+      "license": "MIT",
+      "basis": "repository",
+      "source": "https://github.com/microsoft/windows-rs: the crate lists no authors and its licence file is a template; the repository's LICENSE-MIT names Microsoft Corporation as the copyright holder, as the other windows-rs crates do.",
+      "holder": "Microsoft Corporation"
+    },
+    {
+      "name": "windows-targets",
+      "version": "0.52.6",
+      "license": "MIT",
+      "basis": "authors",
+      "authors": [
+        "Microsoft"
+      ],
+      "holder": "Microsoft"
+    },
+    {
+      "name": "windows_aarch64_msvc",
+      "version": "0.52.6",
+      "license": "MIT",
+      "basis": "authors",
+      "authors": [
+        "Microsoft"
+      ],
+      "holder": "Microsoft"
+    },
+    {
+      "name": "windows_x86_64_gnu",
+      "version": "0.52.6",
+      "license": "MIT",
+      "basis": "authors",
+      "authors": [
+        "Microsoft"
+      ],
+      "holder": "Microsoft"
+    },
+    {
+      "name": "windows_x86_64_msvc",
+      "version": "0.52.6",
+      "license": "MIT",
+      "basis": "authors",
+      "authors": [
+        "Microsoft"
+      ],
+      "holder": "Microsoft"
     }
   ],
   "webview2": {

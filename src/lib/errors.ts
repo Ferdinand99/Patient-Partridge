@@ -80,6 +80,12 @@ export function describeError(error: AppErrorLike, fileName?: string): Described
         detail: `The PDF library is missing or damaged. Reinstalling Patient Partridge should fix this.${error.message ? ` (${error.message})` : ""}`,
         action: "none",
       };
+    case "updating":
+      return {
+        title: "An update is being installed",
+        detail: "Patient Partridge cannot open files until it has restarted. Restart the app, then open the file again.",
+        action: "none",
+      };
     default:
       return {
         title: "Something went wrong",

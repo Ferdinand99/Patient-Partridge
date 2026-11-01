@@ -22,6 +22,18 @@
     violations: [],
     title: "",
     missingFiles: [],
+    // The update side. `found` is what the next check returns (null: nothing new).
+    update: {
+      settings: { autoUpdate: true, method: "automatic", currentVersion: "0.1.0" },
+      found: null,
+      checkError: null,
+      installError: null,
+      downloadError: null,
+      restored: [],
+      installDelay: 0,
+      restarted: 0,
+      releasesPageOpened: 0,
+    },
   };
   window.__E2E__ = state;
 
@@ -40,6 +52,7 @@
       ["Third page", "The end of the book"],
     ],
     "/docs/second.pdf": [["Other document"], ["Its second page"]],
+    "/docs/no-ending": [["A file whose name does not end in .pdf"]],
     "/docs/rtl.pdf": [[]],
     "/docs/slivers.pdf": Array.from({ length: 5000 }, () => []),
     "/docs/crafted.pdf": Array.from({ length: 5000 }, () => []),
@@ -223,6 +236,38 @@
       case "search_page":
         return search(args.doc, args.page, args.query);
       case "open_link":
+        return null;
+      case "get_update_settings":
+        return { ...state.update.settings };
+      case "set_auto_update":
+        state.update.settings.autoUpdate = args.enabled;
+        return null;
+      case "check_update":
+        if (state.update.checkError) throw state.update.checkError;
+        return state.update.found;
+      case "download_update": {
+        // Sends the same messages the Rust side does, through the channel the window made.
+        const send = (index, message) => callbacks.get(args.onEvent.id)({ index, message });
+        send(0, { event: "progress", chunk: 524288, total: 2097152 });
+        await new Promise((r) => setTimeout(r, 50));
+        send(1, { event: "progress", chunk: 1572864, total: 2097152 });
+        if (state.update.downloadError) throw state.update.downloadError;
+        return null;
+      }
+      case "install_update":
+        await new Promise((r) => setTimeout(r, state.update.installDelay));
+        if (state.update.installError) throw state.update.installError;
+        return null;
+      case "take_restored_paths": {
+        const list = state.update.restored;
+        state.update.restored = [];
+        return list;
+      }
+      case "restart_app":
+        state.update.restarted += 1;
+        return null;
+      case "open_releases_page":
+        state.update.releasesPageOpened += 1;
         return null;
       case "set_position":
       case "clear_positions":

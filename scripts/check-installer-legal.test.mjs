@@ -102,6 +102,27 @@ describe("checkSystem (each installer format on its own)", () => {
   });
 });
 
+describe("the AppImage", () => {
+  const app = "appimage/usr/lib/Patient Partridge";
+  const libraries = { "appimage/usr/share/doc/libgtk/LICENSE": "LGPL of GTK", "appimage/usr/lib/webkit/THIRD-PARTY-NOTICES": "WebKit's own" };
+  it("is checked as its own format, without the Debian copyright file", () => {
+    expect(checkSystem("linux", installer({ ...full("deb/usr/lib/Patient Partridge"), "deb/usr/share/doc/patient-partridge/copyright": expected.license, "deb/usr/share/doc/patient-partridge/THIRD-PARTY-NOTICES": expected.notices, ...full(app) }), expected)).toEqual([]);
+  });
+  it("looks only at the app's own folder, not at the files of the libraries it carries", () => {
+    expect(checkLegal("linux", installer({ ...full(app), ...libraries }), expected, "appimage")).toEqual([]);
+    // The same files would be taken for the app's own texts in a deb.
+    expect(checkLegal("linux", installer({ ...full(app), ...libraries }), expected, "deb").join(" ")).toContain("not the LICENSE");
+  });
+  it("fails when the app folder lacks the notices, whatever the libraries have", () => {
+    const files = { ...full(app), ...libraries };
+    delete files[`${app}/THIRD-PARTY-NOTICES`];
+    expect(checkLegal("linux", installer(files), expected, "appimage")).toEqual(["THIRD-PARTY-NOTICES is not in the installer"]);
+  });
+  it("fails when it was not unpacked", () => {
+    expect(checkSystem("linux", installer({ ...full("deb/usr/lib/Patient Partridge"), "deb/usr/share/doc/patient-partridge/copyright": expected.license, "deb/usr/share/doc/patient-partridge/THIRD-PARTY-NOTICES": expected.notices }), expected)[0]).toContain("appimage: the appimage installer was not unpacked");
+  });
+});
+
 describe("pdfiumLicenses", () => {
   it("reads the licence files of a download", () => {
     const dir = installer({ LICENSE: "BSD", ...Object.fromEntries(pdfiumNames.map((n) => [`licenses/${n}.txt`, n])) });
