@@ -107,3 +107,5 @@ Installers for testing (not signed): `npm run bundle`.
 ## Licence
 
 Patient Partridge is free software under the [GNU Affero General Public License, version 3](LICENSE). PDFium is under a BSD-style licence; its licence files are shipped with the app.
+
+The licence texts of the Rust crates and npm packages inside the app are in [THIRD-PARTY-NOTICES](THIRD-PARTY-NOTICES), which every installer ships next to the AGPL text. The file is made by `scripts/notices.sh` (cargo-about, pinned) and CI fails when it is out of date or when a dependency has a licence that is not on the allowlist in `about.toml`. After changing a dependency, run `npm ci && scripts/notices.sh` and commit the result.
