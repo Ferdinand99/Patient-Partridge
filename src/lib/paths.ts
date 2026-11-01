@@ -25,6 +25,8 @@ export interface SessionTabs {
   paths: string[];
   /** Index into `paths` of the tab that was in view, or null. */
   active: number | null;
+  /** The paths (a part of `paths`) that could not be reached at the last start. */
+  failed?: string[];
 }
 
 /**

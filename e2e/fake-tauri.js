@@ -283,7 +283,7 @@
         return null;
       case "save_session":
         if (sessionStorage.getItem("e2e-reopen") !== "off") {
-          sessionStorage.setItem("e2e-session", JSON.stringify({ paths: args.paths, active: args.active }));
+          sessionStorage.setItem("e2e-session", JSON.stringify({ paths: args.paths, active: args.active, failed: args.failed }));
         }
         return null;
       case "take_session": {

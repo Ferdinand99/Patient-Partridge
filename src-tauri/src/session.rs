@@ -26,6 +26,10 @@ const MAX_PATH_CHARS: usize = 4096;
 pub struct TabList {
     pub paths: Vec<String>,
     pub active: Option<usize>,
+    /// The paths (a part of `paths`) that could not be reached at the last start. They are tried
+    /// once more, and forgotten if they fail again.
+    #[serde(default)]
+    pub failed: Vec<String>,
 }
 
 impl TabList {
@@ -58,7 +62,17 @@ impl TabList {
             paths = kept;
         }
         let active = active_path.and_then(|a| paths.iter().position(|p| *p == a));
-        TabList { paths, active }
+        let mut failed: Vec<String> = Vec::new();
+        for path in self.failed {
+            if paths.contains(&path) && !failed.contains(&path) {
+                failed.push(path);
+            }
+        }
+        TabList {
+            paths,
+            active,
+            failed,
+        }
     }
 }
 
@@ -67,6 +81,8 @@ struct Stored {
     version: u32,
     paths: Vec<String>,
     active: Option<usize>,
+    #[serde(default)]
+    failed: Vec<String>,
 }
 
 /// The remembered tabs: what the last run left, and what the current run has now.
@@ -98,6 +114,7 @@ impl Session {
                 TabList {
                     paths: s.paths,
                     active: s.active,
+                    failed: s.failed,
                 }
                 .cleaned()
             })
@@ -125,21 +142,31 @@ impl Session {
                 version: 1,
                 paths: list.paths,
                 active: list.active,
+                failed: list.failed,
             },
         )
     }
 
-    /// Forgets the list, in the app and on the disk.
+    /// Forgets the list, in the app and on the disk, also a temporary file that a crash or a failed
+    /// move left beside it. Both are tried even when the first cannot be deleted.
     pub fn clear(&mut self) -> io::Result<()> {
         self.startup = TabList::default();
         let Some(file) = &self.file else {
             return Ok(());
         };
-        match fs::remove_file(file) {
+        let remove = |path: &std::path::Path| match fs::remove_file(path) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
-        }
+        };
+        let list = remove(file);
+        let temp = remove(&temp_file(file));
+        list.and(temp)
     }
+}
+
+/// The temporary file beside the list, the one `write_json` writes before it moves it into place.
+fn temp_file(file: &std::path::Path) -> PathBuf {
+    file.with_extension("json.tmp")
 }
 
 /// The managed state: the remembered tabs.
@@ -166,17 +193,25 @@ pub fn get_reopen_tabs(state: State<'_, UpdateState>) -> bool {
 
 /// Turns "Reopen tabs at start" on or off. Turning it off deletes the list at once. The setting
 /// holds for this run even when it could not be written to the disk (the error says so).
+pub fn change_reopen_tabs(
+    state: &UpdateState,
+    session: &SessionStore,
+    enabled: bool,
+) -> io::Result<()> {
+    let saved = state.set_reopen_tabs(enabled);
+    if !enabled {
+        session.clear();
+    }
+    saved
+}
+
 #[tauri::command]
 pub fn set_reopen_tabs(
     state: State<'_, UpdateState>,
     session: State<'_, SessionStore>,
     enabled: bool,
 ) -> Result<(), CommandError> {
-    let saved = state.set_reopen_tabs(enabled);
-    if !enabled {
-        session.clear();
-    }
-    saved.map_err(internal)
+    change_reopen_tabs(&state, &session, enabled).map_err(internal)
 }
 
 /// Remembers the open tabs. Does nothing, and keeps no list, while the setting is off.
@@ -186,13 +221,17 @@ pub fn save_session(
     session: State<'_, SessionStore>,
     paths: Vec<String>,
     active: Option<usize>,
+    failed: Vec<String>,
 ) {
     let enabled = state.reopen_tabs();
-    let _ = session
-        .0
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .save(enabled, TabList { paths, active });
+    let _ = session.0.lock().unwrap_or_else(|e| e.into_inner()).save(
+        enabled,
+        TabList {
+            paths,
+            active,
+            failed,
+        },
+    );
 }
 
 /// The tabs the last run left, once. Empty while the setting is off.
@@ -239,6 +278,7 @@ mod tests {
         TabList {
             paths: paths.iter().map(|p| p.to_string()).collect(),
             active,
+            failed: Vec::new(),
         }
     }
 
@@ -301,7 +341,7 @@ mod tests {
             serde_json::from_slice(&fs::read(dir.file()).unwrap()).unwrap();
         let mut keys: Vec<_> = json.as_object().unwrap().keys().cloned().collect();
         keys.sort();
-        assert_eq!(keys, vec!["active", "paths", "version"]);
+        assert_eq!(keys, vec!["active", "failed", "paths", "version"]);
     }
 
     #[cfg(unix)]
@@ -356,12 +396,84 @@ mod tests {
         let cleaned = TabList {
             paths: many.clone(),
             active: Some(last),
+            failed: Vec::new(),
         }
         .cleaned();
         assert_eq!(cleaned.paths.len(), MAX_TABS);
         assert_eq!(cleaned.paths[MAX_TABS - 1], many[last]);
         assert_eq!(cleaned.active, Some(MAX_TABS - 1));
         assert_eq!(cleaned.paths[0], "/0.pdf");
+    }
+
+    #[test]
+    fn files_that_could_not_be_reached_are_listed_and_only_while_they_are_in_the_list() {
+        let dir = TempDir::new();
+        let mut session = Session::load(Some(dir.file()), true);
+        let mut tabs = list(&["/a.pdf", "/b.pdf"], Some(0));
+        tabs.failed = vec![
+            "/b.pdf".into(),
+            "/b.pdf".into(),
+            "/not-in-the-list.pdf".into(),
+        ];
+        session.save(true, tabs).unwrap();
+        let back = Session::load(Some(dir.file()), true).take_startup();
+        assert_eq!(back.failed, vec!["/b.pdf".to_string()]);
+        // A file from before the field existed has none.
+        fs::write(
+            dir.file(),
+            br#"{"version":1,"paths":["/a.pdf"],"active":0}"#,
+        )
+        .unwrap();
+        assert!(Session::load(Some(dir.file()), true)
+            .take_startup()
+            .failed
+            .is_empty());
+    }
+
+    #[test]
+    fn clearing_deletes_a_temporary_file_that_was_left_behind() {
+        let dir = TempDir::new();
+        let temp = dir.0.join("session.json.tmp");
+        let mut session = Session::load(Some(dir.file()), true);
+        session.save(true, list(&["/a.pdf"], Some(0))).unwrap();
+        fs::write(&temp, br#"{"version":1,"paths":["/left.pdf"]}"#).unwrap();
+        session.clear().unwrap();
+        assert!(!dir.file().exists() && !temp.exists());
+        // Turning the setting off at the start deletes it too.
+        fs::write(&temp, b"x").unwrap();
+        let _ = Session::load(Some(dir.file()), false);
+        assert!(!temp.exists());
+    }
+
+    #[test]
+    fn turning_the_setting_off_deletes_the_list() {
+        use crate::updates::InstallMethod;
+        let dir = TempDir::new();
+        let state = UpdateState::new(Some(dir.0.clone()), InstallMethod::Manual);
+        let store = SessionStore(std::sync::Mutex::new(Session::load(Some(dir.file()), true)));
+        store
+            .0
+            .lock()
+            .unwrap()
+            .save(true, list(&["/a.pdf"], Some(0)))
+            .unwrap();
+        assert!(dir.file().exists());
+
+        change_reopen_tabs(&state, &store, false).unwrap();
+        assert!(!state.reopen_tabs());
+        assert!(!dir.file().exists(), "the list must go at once");
+        // Nothing is kept while it is off, even if the window sends a list.
+        store
+            .0
+            .lock()
+            .unwrap()
+            .save(state.reopen_tabs(), list(&["/a.pdf"], Some(0)))
+            .unwrap();
+        assert!(!dir.file().exists());
+
+        change_reopen_tabs(&state, &store, true).unwrap();
+        assert!(state.reopen_tabs());
+        assert!(!dir.file().exists());
     }
 
     #[test]

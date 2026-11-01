@@ -18,6 +18,8 @@ export interface SavedTabs {
   paths: string[];
   /** Index into `paths` of the tab that was in view, or null. */
   active: number | null;
+  /** The paths (a part of `paths`) that could not be reached at the last start. */
+  failed?: string[];
 }
 
 export interface OpenedDocument {
@@ -158,8 +160,8 @@ export const api = {
   },
 
   /** Remembers which tabs are open (paths only), for the next start. Does nothing while the setting is off. */
-  async saveSession(paths: string[], active: number | null): Promise<void> {
-    await invoke<void>("save_session", { paths, active });
+  async saveSession(paths: string[], active: number | null, failed: string[]): Promise<void> {
+    await invoke<void>("save_session", { paths, active, failed });
   },
 
   /** The tabs the last run left, once. Empty while the setting is off. */

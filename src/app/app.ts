@@ -41,7 +41,7 @@ export interface AppDeps {
     clearPositions(): Promise<void>;
     getReopenTabs(): Promise<boolean>;
     setReopenTabs(enabled: boolean): Promise<void>;
-    saveSession(paths: string[], active: number | null): Promise<void>;
+    saveSession(paths: string[], active: number | null, failed: string[]): Promise<void>;
     getOutline(doc: number): Promise<OutlineEntry[]>;
     getPageText(doc: number, page: number): Promise<{ text: string; rects: number[] }>;
     getPageLinks(doc: number, page: number): Promise<PageLinkInfo[]>;
@@ -69,6 +69,11 @@ export interface AppDeps {
    * milliseconds. Default: LINK_ANSWER_DELAY_MS.
    */
   linkAnswerDelayMs?: number;
+  /**
+   * How long a tab of the last session may take to open at the start, in milliseconds. Default:
+   * SESSION_OPEN_LIMIT_MS.
+   */
+  sessionOpenLimitMs?: number;
   /** Limits on the text kept for each document. For tests; the defaults are meant for the app. */
   viewLimits?: ViewerOptions["limits"];
 }
@@ -97,8 +102,17 @@ interface Tab {
   rank: number;
 }
 
-/** What happened to one tab of the last session at the start. */
-type Reopened = "opened" | "locked" | "failed";
+/**
+ * What happened to one tab of the last session at the start. "unreached" is a file that gave no
+ * answer or could not be read: it may be there again next time (a network drive that was off).
+ */
+type Reopened = "opened" | "locked" | "failed" | "unreached";
+
+/** Errors of opening a file that may go away by themselves. */
+const UNREACHED_CODES = new Set(["io", "engine_unavailable", "engine_stopped", "updating", "internal"]);
+
+/** How long a tab of the last session may take to open at the start, in milliseconds. */
+export const SESSION_OPEN_LIMIT_MS = 10_000;
 
 const ZOOM_CHOICES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
 const DEFAULT_POSITION_DELAY_MS = 600;
@@ -136,6 +150,8 @@ export class App {
   private sessionHeld = false;
   /** What was last sent to be remembered, so that the same list is not sent twice. */
   private lastSession: string | null = null;
+  /** Files of the last session that could not be reached at this start: kept in the list once. */
+  private kept: string[] = [];
 
   private readonly stage: HTMLElement;
   private readonly empty: HTMLElement;
@@ -264,54 +280,110 @@ export class App {
         await this.reopenSession(from.session, given);
       }
     } finally {
-      this.sessionHeld = false;
-      this.saveSession();
+      this.releaseSession();
     }
   }
 
+  /** The list of tabs may be written from now on, with the tabs that are open at this moment. */
+  private releaseSession(): void {
+    this.sessionHeld = false;
+    this.saveSession();
+  }
+
   /**
-   * Reopens the tabs of the last session in their old order. The tab that was in view comes first
-   * and is shown; the files named at the start are opened next and take the focus; the other tabs
-   * follow one at a time behind them, so that many tabs do not hold the start back. Nothing asks a
-   * question: a file that cannot be opened is skipped, and one notice at the end says how many.
+   * Reopens the tabs of the last session in their old order. The files named at the start open
+   * first and take the focus, and no tab of the last session can hold them back. The tab that was
+   * in view comes first among the others and is shown when nothing else is; the rest follow one at
+   * a time, so that many tabs do not hold the start back. Nothing asks a question: a file that
+   * cannot be opened is skipped, and one notice at the end says how many. A file that does not
+   * answer within `sessionOpenLimitMs` counts as one that could not be opened.
    */
   private async reopenSession(saved: SessionTabs | null | undefined, given: string[]): Promise<void> {
     const named = wantedPdfPaths(given).slice(0, MAX_OPEN_AT_ONCE);
+    const naming = given.length > 0 ? this.openChosen(given) : Promise.resolve();
     const pick = pickSessionTabs(saved, MAX_TABS - named.length);
     if (pick.paths.length === 0) {
-      if (given.length > 0) await this.openChosen(given);
+      await naming;
       return;
     }
+    // A file that could not be reached gets one more start before it is forgotten: the network
+    // may have been down.
+    const failedBefore = new Set(saved?.failed ?? []);
+    this.kept = [];
     let failed = pick.left;
     let locked = 0;
-    const count = (result: Reopened) => {
+    const count = (result: Reopened, path: string) => {
       if (result === "locked") locked++;
-      else if (result === "failed") failed++;
+      else if (result !== "opened") {
+        failed++;
+        if (result === "unreached" && !failedBefore.has(path)) this.kept.push(path);
+      }
     };
-    count(await this.reopen(pick.paths[pick.active], true, pick.active));
-    // A file that is named at the start is opened by that, and takes the focus.
-    const naming = given.length > 0 ? this.openChosen(given) : Promise.resolve();
-    for (const [i, path] of pick.paths.entries()) {
-      if (i === pick.active || named.includes(path)) continue;
-      count(await this.reopen(path, false, i));
+    // The tab that was in view comes first, then the others in their old order.
+    const order = [pick.active, ...pick.paths.keys()].filter((v, i, all) => all.indexOf(v) === i);
+    for (const i of order) {
+      const path = pick.paths[i];
+      if (named.includes(path)) continue;
+      count(await this.reopen(path, i), path);
     }
     await naming;
     this.tellAboutSession(failed, locked, pick.left > 0);
   }
 
-  /** Opens a file of the last session without asking anything. */
-  private async reopen(path: string, activate: boolean, rank: number): Promise<Reopened> {
+  /**
+   * Opens a file of the last session without asking anything. It is shown only if nothing else is
+   * shown by then, so a file named at the start or opened by hand keeps the focus.
+   */
+  private async reopen(path: string, rank: number): Promise<Reopened> {
     if (this.tabs.some((t) => t.path === path) || this.opening.has(path)) return "opened";
     this.opening.add(path);
     const started = this.deps.now();
     try {
-      this.addTab(await this.deps.api.open(path), path, started, activate, rank);
+      const opened = await this.openWithin(path);
+      if (opened === null) return "unreached";
+      if (opened.pages.length === 0) {
+        // No dialog per file at the start: it counts in the one notice.
+        void this.deps.api.close(opened.doc).catch(() => undefined);
+        return "failed";
+      }
+      this.addTab(opened, path, started, false, rank);
       return "opened";
     } catch (e) {
+      const error = toAppError(e);
       // A protected file is not asked for its password at the start: it stays closed.
-      return describeError(toAppError(e)).action === "password" ? "locked" : "failed";
+      if (describeError(error).action === "password") return "locked";
+      return UNREACHED_CODES.has(error.code) ? "unreached" : "failed";
     } finally {
       this.opening.delete(path);
+    }
+  }
+
+  /**
+   * Asks the app process to open a file, and gives up on it after `sessionOpenLimitMs`: then the
+   * list of tabs is released and null is given. A document that arrives after that is closed.
+   */
+  private async openWithin(path: string): Promise<OpenedDocument | null> {
+    const limit = this.deps.sessionOpenLimitMs ?? SESSION_OPEN_LIMIT_MS;
+    const pending = this.deps.api.open(path);
+    let late = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const giveUp = new Promise<null>((resolve) => {
+      timer = setTimeout(() => {
+        late = true;
+        this.releaseSession();
+        resolve(null);
+      }, limit);
+    });
+    pending.then(
+      (doc) => {
+        if (late) void this.deps.api.close(doc.doc).catch(() => undefined);
+      },
+      () => undefined,
+    );
+    try {
+      return await Promise.race([pending, giveUp]);
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -649,6 +721,8 @@ export class App {
       tab.saveTimer = undefined;
       tab.forgottenAt = tab.view.getPosition();
     }
+    // The list of tabs goes with the positions, also the files that could not be reached.
+    this.kept = [];
     await this.deps.api.clearPositions().catch(() => undefined);
   }
 
@@ -657,12 +731,15 @@ export class App {
   /** Remembers which tabs are open, in order, and which one is in view. Paths only. */
   private saveSession(): void {
     if (this.sessionHeld || !this.reopenTabs) return;
-    const paths = this.tabs.map((t) => t.path);
+    const open = this.tabs.map((t) => t.path);
     const active = this.tabs.findIndex((t) => t.id === this.activeId);
-    const key = JSON.stringify([paths, active]);
+    // The files that could not be reached stay at the end of the list for one more start.
+    const failed = this.kept.filter((p) => !open.includes(p));
+    const paths = [...open, ...failed];
+    const key = JSON.stringify([paths, active, failed]);
     if (key === this.lastSession) return;
     this.lastSession = key;
-    void this.deps.api.saveSession(paths, active >= 0 ? active : null).catch(() => {
+    void this.deps.api.saveSession(paths, active >= 0 ? active : null, failed).catch(() => {
       this.lastSession = null;
     });
   }
