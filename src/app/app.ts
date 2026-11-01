@@ -2,7 +2,7 @@
 // Anything that touches the outside world (the engine, the file dialog, the window title, the
 // storage) comes in through `AppDeps`, so tests can run the whole flow with fakes.
 
-import type { OpenedDocument, SavedPosition } from "../lib/api";
+import type { OpenedDocument, OutlineEntry, SavedPosition } from "../lib/api";
 import { describeError, fileNameOf, toAppError, type AppErrorLike } from "../lib/errors";
 import { parsePageInput } from "../lib/pageInput";
 import {
@@ -18,6 +18,7 @@ import { DocumentView } from "../viewer/viewer";
 import { zoomLabel, type ZoomMode } from "../viewer/zoom";
 import { MenuController } from "./menu";
 import { showNotice } from "./notice";
+import { Sidebar, type SidebarDocument } from "./sidebar";
 import { TabStrip } from "./tabs";
 
 export interface AppDeps {
@@ -27,6 +28,7 @@ export interface AppDeps {
     close(doc: number): Promise<void>;
     setPosition(path: string, position: SavedPosition): Promise<void>;
     clearPositions(): Promise<void>;
+    getOutline(doc: number): Promise<OutlineEntry[]>;
     measureMode(): Promise<boolean>;
     measureReport(openMs: number, firstPageMs: number, pages: number): Promise<void>;
   };
@@ -38,6 +40,8 @@ export interface AppDeps {
   storage?: StorageLike | null;
   /** How long the reader must rest before the position is saved, in milliseconds. */
   positionDelayMs?: number;
+  /** How long the thumbnail list must rest before thumbnails are asked for, in milliseconds. */
+  thumbSettleMs?: number;
 }
 
 interface Tab {
@@ -46,6 +50,8 @@ interface Tab {
   path: string;
   name: string;
   view: DocumentView;
+  /** What the side panel knows about this document. */
+  sidebarDoc: SidebarDocument;
   saveTimer: ReturnType<typeof setTimeout> | undefined;
 }
 
@@ -79,6 +85,7 @@ export class App {
   private readonly zoomOut: HTMLButtonElement;
   private readonly tabStrip: TabStrip;
   private readonly menu: MenuController;
+  private readonly sidebar: Sidebar;
   private readonly positionDelay: number;
 
   constructor(
@@ -100,6 +107,11 @@ export class App {
       close: (id) => this.closeTab(id),
     });
     this.menu = new MenuController(byId(root, "menu-button"), byId(root, "menu"));
+    this.sidebar = new Sidebar(root, {
+      api: deps.api,
+      storage: deps.storage ?? null,
+      thumbs: deps.thumbSettleMs === undefined ? undefined : { settleMs: deps.thumbSettleMs },
+    });
   }
 
   init(): void {
@@ -232,6 +244,7 @@ export class App {
       path,
       name: opened.name,
       view: undefined as unknown as DocumentView,
+      sidebarDoc: undefined as unknown as SidebarDocument,
       saveTimer: undefined,
     };
     tab.view = new DocumentView(
@@ -239,13 +252,17 @@ export class App {
       this.deps.api,
       {
         onPageChange: (page) => {
-          if (this.active === tab) this.showCurrentPage(page);
+          if (this.active !== tab) return;
+          this.showCurrentPage(page);
+          this.sidebar.setCurrentPage(page);
         },
         onZoomChange: (zoom, mode) => {
           if (this.active === tab) this.showZoom(zoom, mode);
         },
         onFatal: (error) => void this.documentLost(tab, error),
         onFirstPaint: () => {
+          // Thumbnails wait for this: the page the reader asked for comes first.
+          if (this.active === tab) this.sidebar.notifyPainted();
           // The measurement run opens one file; report that one.
           if (!this.measuring || this.reported) return;
           this.reported = true;
@@ -256,6 +273,13 @@ export class App {
       },
       { start: opened.position ?? null },
     );
+    tab.sidebarDoc = {
+      doc: opened.doc,
+      pages: opened.pages,
+      goToPage: (index) => tab.view.goToPage(index),
+      hasPainted: () => tab.view.hasPainted,
+      currentPage: () => tab.view.currentPageIndex,
+    };
     this.tabs.push(tab);
     this.stage.append(tab.view.element);
 
@@ -304,6 +328,7 @@ export class App {
     this.saveNow(tab);
     clearTimeout(tab.saveTimer);
     tab.view.destroy();
+    this.sidebar.forget(tab.doc);
     void this.deps.api.close(tab.doc).catch(() => undefined);
     if (this.activeId === id) {
       this.activeId = null;
@@ -400,6 +425,7 @@ export class App {
     );
     this.empty.hidden = this.tabs.length > 0;
     this.setControlsEnabled(active !== null);
+    this.sidebar.setDocument(active?.sidebarDoc ?? null);
     if (!active) {
       this.pageInput.value = "";
       this.pageTotal.textContent = "";
@@ -509,6 +535,9 @@ export class App {
         this.pageInput.focus();
         this.pageInput.select();
       }
+    } else if (action.type === "toggle-sidebar") {
+      e.preventDefault();
+      this.sidebar.setOpen(!this.sidebar.isOpen);
     } else if (action.type === "close-tab") {
       e.preventDefault();
       if (this.activeId !== null) this.closeTab(this.activeId);

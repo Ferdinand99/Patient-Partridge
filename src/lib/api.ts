@@ -20,6 +20,14 @@ export interface OpenedDocument {
   position?: SavedPosition | null;
 }
 
+/** One entry of the table of contents, in reading order. */
+export interface OutlineEntry {
+  depth: number;
+  /** The page the entry leads to, counted from 0, or null when it leads nowhere in the document. */
+  page: number | null;
+  title: string;
+}
+
 interface OpenedWire {
   doc: number;
   pages: [number, number][];
@@ -45,6 +53,11 @@ export const api = {
 
   async close(doc: number): Promise<void> {
     await invoke<void>("close_pdf", { doc });
+  },
+
+  /** The table of contents of a document. Empty when it has none. */
+  getOutline(doc: number): Promise<OutlineEntry[]> {
+    return invoke<OutlineEntry[]>("get_outline", { doc });
   },
 
   /** Remembers where the reader is in a file. Kept in a file on this computer, nowhere else. */

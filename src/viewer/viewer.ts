@@ -157,6 +157,11 @@ export class DocumentView {
     return this.active;
   }
 
+  /** True once the first page has been drawn. */
+  get hasPainted(): boolean {
+    return this.painted;
+  }
+
   /** True once the pages have been laid out (a view opened behind another waits until shown). */
   get hasStarted(): boolean {
     return this.started;

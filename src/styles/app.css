@@ -69,12 +69,191 @@
   min-width: 9.5rem;
 }
 
+/* Workspace: the side panel next to the stage */
+.workspace {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
 /* Stage: where the open document is shown */
 .stage {
   position: relative;
   flex: 1 1 auto;
+  min-width: 0;
   min-height: 0;
   background: var(--bg-2);
+}
+
+/* Side panel: thumbnails and the table of contents */
+.sidebar {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  width: 15.5rem;
+  min-height: 0;
+  border-inline-end: 1px solid var(--line);
+  background: var(--bg);
+}
+
+.sidebar-head {
+  flex: none;
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid var(--line);
+}
+
+.thumbs,
+.outline {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+}
+
+.thumbs:focus-visible,
+.outline:focus-visible {
+  outline-offset: -2px;
+}
+
+.thumbs-pages {
+  position: relative;
+}
+
+.thumb {
+  position: absolute;
+  inset-inline-start: 50%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  /* Centred: half of THUMB_WIDTH in src/app/thumbnails.ts */
+  margin-inline-start: -74px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+
+.thumb-paper {
+  display: block;
+  width: 100%;
+  background: var(--paper);
+  box-shadow: var(--paper-shadow);
+  outline: 2px solid transparent;
+  outline-offset: 2px;
+}
+
+.thumb-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.thumb[aria-current="page"] {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.thumb[aria-current="page"] .thumb-paper {
+  outline-color: var(--brand);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .thumb:hover .thumb-paper {
+    outline-color: var(--line-strong);
+  }
+
+  .thumb[aria-current="page"]:hover .thumb-paper {
+    outline-color: var(--brand);
+  }
+}
+
+.thumb:focus-visible {
+  outline: none;
+}
+
+.thumb:focus-visible .thumb-paper {
+  outline-color: var(--brand);
+}
+
+.side-message {
+  padding: var(--sp-4);
+  color: var(--muted);
+  font-size: 0.8125rem;
+}
+
+.outline-list {
+  margin: 0;
+  padding: var(--sp-2);
+  list-style: none;
+}
+
+.outline-row {
+  display: flex;
+  align-items: flex-start;
+  padding-inline-start: calc(var(--depth, 0) * 14px);
+}
+
+.outline-toggle {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--muted);
+}
+
+button.outline-toggle {
+  border-radius: var(--r-xs);
+  cursor: pointer;
+}
+
+.outline-toggle .icon {
+  width: 14px;
+  height: 14px;
+}
+
+.outline-link,
+.outline-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 5px 8px;
+  border: 0;
+  border-radius: var(--r-xs);
+  background: none;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.8125rem;
+  line-height: 1.35;
+  text-align: start;
+  overflow-wrap: anywhere;
+}
+
+.outline-link {
+  cursor: pointer;
+}
+
+.outline-link[aria-current="location"] {
+  background: var(--brand-fill);
+  color: var(--brand);
+  font-weight: 600;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .outline-link:hover,
+  button.outline-toggle:hover {
+    background: var(--fill);
+  }
 }
 
 .stage > .empty {

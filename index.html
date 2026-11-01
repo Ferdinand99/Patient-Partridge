@@ -70,6 +70,10 @@
           </button>
         </div>
         <div class="toolbar" id="toolbar">
+          <button class="btn btn-icon btn-plain" id="sidebar-toggle" type="button" title="Show the side panel (Ctrl+B)" aria-label="Side panel" aria-pressed="false" aria-controls="sidebar">
+            <svg class="icon" aria-hidden="true"><use href="#i-panel"></use></svg>
+          </button>
+          <span class="toolbar-sep" aria-hidden="true"></span>
           <label class="page-box">
             <span class="vh">Page number</span>
             <input class="field-input" id="page-input" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" size="4" disabled />
@@ -93,6 +97,22 @@
         </div>
       </header>
 
+      <div class="workspace">
+      <aside class="sidebar" id="sidebar" aria-label="Pages and contents" hidden>
+        <div class="sidebar-head">
+          <div class="segmented segmented-block" role="tablist" aria-label="Side panel">
+            <button type="button" role="tab" id="side-tab-pages" data-panel="pages" aria-controls="thumbs" aria-selected="true">
+              <svg class="icon" aria-hidden="true"><use href="#i-grid"></use></svg><span>Pages</span>
+            </button>
+            <button type="button" role="tab" id="side-tab-contents" data-panel="contents" aria-controls="outline" aria-selected="false">
+              <svg class="icon" aria-hidden="true"><use href="#i-list"></use></svg><span>Contents</span>
+            </button>
+          </div>
+        </div>
+        <div class="thumbs" id="thumbs" role="tabpanel" aria-labelledby="side-tab-pages" tabindex="-1"></div>
+        <div class="outline" id="outline" role="tabpanel" aria-labelledby="side-tab-contents" tabindex="-1" hidden></div>
+      </aside>
+
       <main class="stage" id="stage">
         <div class="empty" id="empty">
           <div class="empty-icon"><svg class="icon" aria-hidden="true"><use href="#i-file"></use></svg></div>
@@ -107,6 +127,7 @@
         </div>
         <div class="drop-overlay" id="drop-overlay" hidden><span>Drop a PDF to open it</span></div>
       </main>
+      </div>
 
       <div class="menu" id="menu" role="menu" aria-label="Settings" hidden>
         <p class="menu-label" id="theme-label">Appearance</p>
