@@ -7,6 +7,9 @@
 //     for rtl_pdf() in crates/testkit: letters in reading order, the first one at the right end
 //   - /docs/slivers.pdf: 5000 pages one point high, each with the most text a page can have
 //     (100,000 characters). It stands for a small file made to fill the memory of the window.
+//   - /docs/crafted.pdf: 5000 pages one point high, each with 10,000 characters that need a box for
+//     every two of them, and 500 links. It stands for a small file made to fill the window with
+//     elements.
 //
 // Nothing here is part of the app. The app code is the real code, built by Vite and served with the
 // same content security policy as the real window.
@@ -39,12 +42,22 @@
     "/docs/second.pdf": [["Other document"], ["Its second page"]],
     "/docs/rtl.pdf": [[]],
     "/docs/slivers.pdf": Array.from({ length: 5000 }, () => []),
+    "/docs/crafted.pdf": Array.from({ length: 5000 }, () => []),
   };
 
   // The text of a sliver page: 100,000 tiny boxes. Every call gives new arrays, as a message from
   // the Rust side would, so what the window keeps is really kept.
   const SLIVER_TEXT = "x".repeat(100000);
   const SLIVER_TEMPLATE = Array.from({ length: 100000 }, () => [0, 0.2, 0.5, 0.8]).flat();
+
+  // The text of a crafted page: characters that alternate between the right and the left of the page,
+  // so that the selection needs a box for every two of them.
+  const CRAFTED_TEXT = "x".repeat(10000);
+  const CRAFTED_TEMPLATE = Array.from({ length: 10000 }, (_, i) =>
+    i % 2 === 0 ? [300, 0.1, 300.5, 0.9] : [10, 0.1, 10.5, 0.9],
+  ).flat();
+  // 500 links to pages, the most the engine reports for one page.
+  const CRAFTED_LINKS = Array.from({ length: 500 }, (_, i) => ({ rect: [0, 0, 1, 1], uri: null, page: i % 5000 }));
 
   // Text copied from the output of the real engine for the page of rtl_pdf() (see reader.rs).
   const RTL_TEXT = "\u05D0\u05D1\u05D2\u05D3\u05D4\u05D5\u05D6\u05D7\u05D8\u05D9\n\u05D5\u05D6\u05D7\u05D8\u05D9";
@@ -71,6 +84,7 @@
   function pageData(path, page) {
     if (path === "/docs/rtl.pdf") return { text: RTL_TEXT, rects: RTL_RECTS };
     if (path === "/docs/slivers.pdf") return { text: SLIVER_TEXT, rects: SLIVER_TEMPLATE.slice() };
+    if (path === "/docs/crafted.pdf") return { text: CRAFTED_TEXT, rects: CRAFTED_TEMPLATE.slice() };
     return boxesFor(LINES[path]?.[page] ?? []);
   }
 
@@ -104,7 +118,7 @@
     return {
       doc,
       name: path.split("/").pop(),
-      pages: pages.map(() => (path === "/docs/slivers.pdf" ? [PAGE.w, 1] : [PAGE.w, PAGE.h])),
+      pages: pages.map(() => (path === "/docs/slivers.pdf" || path === "/docs/crafted.pdf" ? [PAGE.w, 1] : [PAGE.w, PAGE.h])),
       position: null,
     };
   }
@@ -115,7 +129,7 @@
     const rgba = new Uint8ClampedArray(w * h * 4).fill(255);
     const d = docs.get(doc);
     if (!d) throw { code: "unknown_document", message: "gone" };
-    if (d.path === "/docs/slivers.pdf") return rgba.buffer;
+    if (d.path === "/docs/slivers.pdf" || d.path === "/docs/crafted.pdf") return rgba.buffer;
     const { rects } = pageData(d.path, page);
     const sx = w / PAGE.w;
     const sy = h / PAGE.h;
@@ -204,6 +218,7 @@
       case "get_page_text":
         return pageData(docs.get(args.doc)?.path, args.page);
       case "get_page_links":
+        if (docs.get(args.doc)?.path === "/docs/crafted.pdf") return CRAFTED_LINKS.slice();
         return LINKS[docs.get(args.doc)?.path]?.[args.page] ?? [];
       case "search_page":
         return search(args.doc, args.page, args.query);

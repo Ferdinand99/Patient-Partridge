@@ -67,6 +67,39 @@ describe("blockReload", () => {
     expect(page.defaultPrevented).toBe(true);
   });
 
+  it("keeps the menu of the web view for every kind of text box", () => {
+    blockReload(document, true);
+    for (const type of ["text", "search", "password", "number"]) {
+      const input = document.createElement("input");
+      input.type = type;
+      document.body.append(input);
+      const menu = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
+      input.dispatchEvent(menu);
+      expect(menu.defaultPrevented, type).toBe(false);
+    }
+    const area = document.createElement("textarea");
+    document.body.append(area);
+    const menu = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
+    area.dispatchEvent(menu);
+    expect(menu.defaultPrevented).toBe(false);
+  });
+
+  it("stops the menu on a radio button or a check box, where the menu of the web view holds Reload", () => {
+    blockReload(document, true);
+    for (const type of ["radio", "checkbox", "button", "range"]) {
+      const input = document.createElement("input");
+      input.type = type;
+      const label = document.createElement("label");
+      label.append(input, " This page");
+      document.body.append(label);
+      for (const target of [input, label]) {
+        const menu = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
+        target.dispatchEvent(menu);
+        expect(menu.defaultPrevented, type).toBe(true);
+      }
+    }
+  });
+
   it("stops Ctrl+R on a layout without Latin letters", () => {
     blockReload(document, true);
     expect(press({ key: "\u043A", code: "KeyR", ctrlKey: true }).defaultPrevented).toBe(true);
