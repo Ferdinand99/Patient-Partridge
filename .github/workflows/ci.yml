@@ -171,7 +171,7 @@ jobs:
         include:
           - name: linux
             os: ubuntu-latest
-            bundles: deb
+            bundles: deb,appimage
           - name: windows
             os: windows-latest
             bundles: msi,nsis
@@ -208,7 +208,7 @@ jobs:
       - name: Collect installers
         run: |
           mkdir -p out
-          find target/release/bundle -type f \( -name '*.msi' -o -name '*.exe' -o -name '*.dmg' -o -name '*.deb' \) -exec cp {} out/ \;
+          find target/release/bundle -type f \( -name '*.msi' -o -name '*.exe' -o -name '*.dmg' -o -name '*.deb' -o -name '*.AppImage' \) -exec cp {} out/ \;
           ls -la out
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -255,6 +255,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/deb"
           dpkg-deb -x out/*.deb "$RUNNER_TEMP/deb"
           node scripts/association.mjs linux "$RUNNER_TEMP/deb"
+          # The AppImage has its own desktop file (it is made from the same template).
+          node scripts/association.mjs linux "$RUNNER_TEMP/unpacked/appimage/usr/share/applications"
       - name: Check the file association (macOS)
         if: runner.os == 'macOS'
         run: |

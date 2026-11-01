@@ -4,6 +4,7 @@
 #
 # Usage: scripts/unpack-installer.sh <linux|macos|windows> <folder with the installers> <output folder>
 #   linux:   every .deb         -> <output>/deb
+#            every .AppImage    -> <output>/appimage (its own `--appimage-extract`, which needs no FUSE)
 #   macos:   every .dmg         -> <output>/dmg (the volume as a user sees it when it is opened)
 #   windows: every .msi         -> <output>/msi (administrative install, nothing is installed)
 #            every NSIS setup   -> <output>/nsis (unpacked with 7-Zip)
@@ -28,6 +29,18 @@ case "$kind" in
     for f in "$from"/*.deb; do
       mkdir -p "$out/deb"
       dpkg-deb -x "$f" "$out/deb"
+    done
+    need_one '*.AppImage'
+    for f in "$from"/*.AppImage; do
+      work="$(mktemp -d)"
+      cp "$f" "$work/app.AppImage"
+      chmod +x "$work/app.AppImage"
+      # Unpacks the file system inside the AppImage into squashfs-root, the way the AppImage
+      # itself would mount it.
+      (cd "$work" && ./app.AppImage --appimage-extract >/dev/null)
+      mkdir -p "$out/appimage"
+      cp -R "$work/squashfs-root"/. "$out/appimage"/
+      rm -rf "$work"
     done
     ;;
   macos)
