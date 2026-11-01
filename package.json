@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "An open PDF reader: fast, small, no account, no cloud, no tracking",
+  "description": "An open source PDF reader and editor: fast, small, no account, no cloud, no tracking",
   "license": "AGPL-3.0-only",
   "scripts": {
     "dev": "vite",

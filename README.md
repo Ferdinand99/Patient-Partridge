@@ -1,6 +1,8 @@
 # Patient Partridge
 
-An open PDF reader for Windows, macOS and Linux. It is meant to be fast and small, and to work without an account, a cloud, advertising or tracking.
+An open source PDF reader and editor for Windows, macOS and Linux. It is meant to be fast and small, and to work without an account, a cloud, advertising or tracking.
+
+Today it reads PDFs. The editing tools are planned and do not exist yet.
 
 Patient Partridge is part of the Hedgerow family of apps, next to [Nimble Newt](https://github.com/Ferdinand99/Nimble-Newt).
 
@@ -16,7 +18,19 @@ Patient Partridge is part of the Hedgerow family of apps, next to [Nimble Newt](
 
 ## What is not there yet
 
-Tabs, page thumbnails, the table of contents, selecting and copying text, search, printing, dark mode, remembering where you stopped reading, annotations, forms, signatures and OCR. They are planned and will come step by step.
+Tabs, page thumbnails, the table of contents, selecting and copying text, search, printing, dark mode and remembering where you stopped reading.
+
+The editor side is also planned, and none of it exists yet. There are no dates; each step is done when it works:
+
+- Annotations, filling in forms, creating fillable forms, and digital signatures (viewing, validating and signing).
+- Editing text and images on the page.
+- Real redaction that removes the content, not just covers it.
+- Merging, splitting, reordering and cropping pages.
+- Flattening a document, so annotations and form fields become part of the page.
+- Compressing files.
+- Converting to and from Word, Excel, PowerPoint and images, locally, and converting images (JPG, PNG, HEIC), text and Office files to PDF.
+- Text recognition (OCR) for scanned documents, locally.
+- Watermarks, page numbers, password protection, and removing a password you already know.
 
 ## How it is built
 

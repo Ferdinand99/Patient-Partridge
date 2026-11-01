@@ -38,7 +38,7 @@
       "icons/icon.ico"
     ],
     "category": "Productivity",
-    "shortDescription": "An open PDF reader",
+    "shortDescription": "An open source PDF reader and editor",
     "licenseFile": "../LICENSE",
     "macOS": {
       "minimumSystemVersion": "11.0"
