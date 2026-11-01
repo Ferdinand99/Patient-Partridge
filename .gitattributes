@@ -1,3 +1,4 @@
 * text=auto
 *.sh text eol=lf
 *.mjs text eol=lf
+*.desktop text eol=lf

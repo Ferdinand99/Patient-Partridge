@@ -6,6 +6,7 @@ import "./styles/tokens.css";
 import "./styles/components.css";
 import "./styles/app.css";
 import { App } from "./app/app";
+import { Updater } from "./app/updater";
 import { api } from "./lib/api";
 import { blockReload } from "./lib/reload";
 
@@ -55,6 +56,13 @@ const app = new App(document, {
   },
 });
 app.init();
+
+// Updates: the app process checks, downloads and installs; the window only asks and shows.
+new Updater(document, {
+  api,
+  openPaths: () => app.openDocumentPaths(),
+  closeMenu: () => app.closeMenu(),
+}).init();
 
 function openAll(paths: string[]): void {
   void app.openChosen(paths);

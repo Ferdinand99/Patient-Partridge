@@ -208,6 +208,22 @@ export class App {
     return this.tabs.length;
   }
 
+  /**
+   * The paths of the open documents, the one in view first. The place of the reader in each of them
+   * is written down first, because the app is about to be restarted (after an update).
+   */
+  openDocumentPaths(): string[] {
+    this.saveAll();
+    const active = this.active;
+    const others = this.tabs.filter((t) => t !== active).map((t) => t.path);
+    return active ? [active.path, ...others] : others;
+  }
+
+  /** Closes the settings menu, if it is open. */
+  closeMenu(): void {
+    this.menu.close();
+  }
+
   setDropActive(active: boolean): void {
     this.dropOverlay.hidden = !active;
   }

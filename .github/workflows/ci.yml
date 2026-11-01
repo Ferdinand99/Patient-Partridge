@@ -73,6 +73,10 @@ jobs:
       - name: Clippy
         if: matrix.lint
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # The test builds of the update test (scripts/update-e2e.mjs) turn this feature on.
+      - name: Clippy (update driver)
+        if: matrix.lint
+        run: cargo clippy -p patient-partridge --all-targets --features update-driver --locked -- -D warnings
       - name: Test
         run: cargo test --workspace --locked
       - name: The engine has no network code, the app does not link PDFium
