@@ -682,7 +682,10 @@ mod tests {
         );
         // A private mapping that grows down is not counted as data either.
         assert_eq!(
-            mmap(libc::PROT_READ | libc::PROT_WRITE, private | libc::MAP_GROWSDOWN),
+            mmap(
+                libc::PROT_READ | libc::PROT_WRITE,
+                private | libc::MAP_GROWSDOWN
+            ),
             EPERM_ANSWER
         );
     }
