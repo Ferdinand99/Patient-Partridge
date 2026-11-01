@@ -770,7 +770,17 @@ pub mod driver {
     }
 
     pub fn start(app: AppHandle, restored: &[String]) {
-        let Some(file) = std::env::var_os("PARTRIDGE_UPDATE_DRIVER").map(PathBuf::from) else {
+        // The Windows installer starts the new version without the environment of the old one, so
+        // the log can also be named by a file in the app's data folder.
+        let named_by_file = || {
+            let dir = app.path().app_data_dir().ok()?;
+            let text = std::fs::read_to_string(dir.join("update-driver.path")).ok()?;
+            Some(PathBuf::from(text.trim()))
+        };
+        let Some(file) = std::env::var_os("PARTRIDGE_UPDATE_DRIVER")
+            .map(PathBuf::from)
+            .or_else(named_by_file)
+        else {
             return;
         };
         let _ = LOG.set(file.clone());

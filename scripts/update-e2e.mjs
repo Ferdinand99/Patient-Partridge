@@ -296,34 +296,32 @@ async function runCase(name, setup, expectations, { seconds = 150 } = {}) {
   mkdirSync(home, { recursive: true });
   if (win) {
     const data = join(process.env.APPDATA ?? "", "com.ferdinand99.patientpartridge");
+    mkdirSync(data, { recursive: true });
     rmSync(join(data, "restore-after-update.json"), { force: true });
     rmSync(join(data, "settings.json"), { force: true });
+    // The installer starts the new version without our environment: it finds the log by this file.
+    writeFileSync(join(data, "update-driver.path"), log);
   }
   const installed = installOld(join(dir, "install"));
   setup?.();
   const before = existsSync(installed.file) && !mac ? sha256(installed.file) : null;
   const child = spawn(installed.command, [pdf], { env: appEnv(home, log), stdio: "ignore", detached: !win });
   child.unref();
-  let done = await waitFor(log, expectations.finish, seconds);
+  const done = await waitFor(log, expectations.finish, seconds);
   const startedByInstaller = done;
   if (win && !done && has(readLog(log), /^documents open before the stop/)) {
-    // The app handed over to the installer. Say what the computer looks like, and, if the new
-    // version is there but was not started, start it, so that the rest can still be checked.
+    // The app handed over to the installer. Say what the computer looks like.
     const ps = (command) => spawnSync("powershell", ["-NoProfile", "-Command", command], { encoding: "utf8" }).stdout.trim();
     console.log(`    [windows] processes:\n${ps("Get-Process | Where-Object { $_.Name -match 'partridge|setup|msiexec|nsis' } | Select-Object Name,Id | Out-String")}`);
     const version = ps(`(Get-Item '${installed.file}').VersionInfo.ProductVersion`);
     console.log(`    [windows] version of the installed program: ${version}`);
     console.log(`    [windows] install folder:\n${ps(`Get-ChildItem '${dirname(installed.file)}' | Select-Object Name,Length,LastWriteTime | Out-String`)}`);
-    if (version.startsWith(NEW)) {
-      const again = spawn(installed.command, [pdf], { env: appEnv(home, log), stdio: "ignore" });
-      again.unref();
-      done = await waitFor(log, expectations.finish, 90);
-    }
   }
   await sleep(1500);
   const lines = readLog(log);
   console.log(lines.map((l) => `    ${l}`).join("\n"));
   killApps();
+  if (win) rmSync(join(process.env.APPDATA ?? "", "com.ferdinand99.patientpartridge", "update-driver.path"), { force: true });
   return { lines, done, installed, before, dir, startedByInstaller };
 }
 
