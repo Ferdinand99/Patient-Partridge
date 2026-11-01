@@ -110,7 +110,8 @@ jobs:
           DMG=$(find target/universal-apple-darwin/release/bundle/dmg -name '*.dmg' | head -1)
           mount="$RUNNER_TEMP/dmg"
           mkdir -p "$mount" "$RUNNER_TEMP/copy"
-          hdiutil attach -nobrowse -readonly -mountpoint "$mount" "$DMG" > /dev/null
+          # The disk image has a licence agreement, which `hdiutil` asks to accept ("attach canceled" otherwise).
+          echo Y | hdiutil attach -nobrowse -readonly -noverify -mountpoint "$mount" "$DMG" > /dev/null
           cp -R "$mount/Patient Partridge.app" "$RUNNER_TEMP/copy/"
           hdiutil detach "$mount" > /dev/null
           APP="$RUNNER_TEMP/copy/Patient Partridge.app"
