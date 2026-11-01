@@ -76,6 +76,16 @@ describe("pageScrollDistance", () => {
     expect(actionForKey(key("w"))).toBeNull();
   });
 
+  it("finds, finds again and selects all", () => {
+    expect(actionForKey(key("f", { ctrlKey: true }))).toEqual({ type: "find" });
+    expect(actionForKey(key("F", { metaKey: true }))).toEqual({ type: "find" });
+    expect(actionForKey(key("F3"))).toEqual({ type: "find-next" });
+    expect(actionForKey(key("F3", { shiftKey: true }))).toEqual({ type: "find-previous" });
+    expect(actionForKey(key("a", { ctrlKey: true }))).toEqual({ type: "select-all" });
+    expect(actionForKey(key("f"))).toBeNull();
+    expect(actionForKey(key("a"))).toBeNull();
+  });
+
   it("shows and hides the side panel with Ctrl+B", () => {
     expect(actionForKey(key("b", { ctrlKey: true }))).toEqual({ type: "toggle-sidebar" });
     expect(actionForKey(key("B", { metaKey: true }))).toEqual({ type: "toggle-sidebar" });

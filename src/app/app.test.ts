@@ -57,6 +57,11 @@ const flush = async () => {
 };
 
 const letter = { width: 612, height: 792 };
+
+/** Boxes for a line of text, 6 x 10 points per character, as the engine reports them. */
+function layoutRects(text: string): number[] {
+  return Array.from(text).flatMap((_, i) => [50 + i * 6, 100, 56 + i * 6, 110]);
+}
 const opened = (
   doc: number,
   pages: number,
@@ -97,6 +102,24 @@ function make(options: { measureOn?: boolean; storage?: MemoryStorage } = {}) {
         { depth: 0, page: 2, title: "End" },
       ]),
     ),
+    getPageText: vi.fn((_doc: number, _page: number) =>
+      Promise.resolve({ text: "Hello world", rects: layoutRects("Hello world") }),
+    ),
+    getPageLinks: vi.fn((_doc: number, page: number) =>
+      Promise.resolve(
+        page === 0
+          ? [
+              { rect: [10, 10, 60, 30] as [number, number, number, number], uri: "https://example.com/a", page: null },
+              { rect: [10, 40, 60, 60] as [number, number, number, number], uri: "file:///etc/passwd", page: null },
+              { rect: [10, 70, 60, 90] as [number, number, number, number], uri: null, page: 2 },
+            ]
+          : [],
+      ),
+    ),
+    searchPage: vi.fn((_doc: number, page: number, _query: string) =>
+      Promise.resolve(page === 1 ? ([[0, 5]] as [number, number][]) : []),
+    ),
+    openLink: vi.fn((_doc: number, _url: string) => Promise.resolve()),
     measureMode: vi.fn(() => Promise.resolve(options.measureOn ?? false)),
     measureReport: vi.fn((_a: number, _b: number, _c: number) => Promise.resolve()),
   };
@@ -109,6 +132,7 @@ function make(options: { measureOn?: boolean; storage?: MemoryStorage } = {}) {
     storage,
     positionDelayMs: 5,
     thumbSettleMs: 5,
+    findDebounceMs: 5,
   };
   const app = new App(document, deps);
   app.init();
@@ -709,6 +733,189 @@ describe("App: the side panel", () => {
     key("w", { ctrlKey: true });
     await flush();
     expect(document.querySelectorAll(".thumb").length).toBe(0);
+  });
+});
+
+describe("App: search", () => {
+  const findInput = () => q<HTMLInputElement>("#find-input");
+
+  async function search(text: string) {
+    findInput().value = text;
+    findInput().dispatchEvent(new Event("input"));
+    await new Promise((r) => setTimeout(r, 120));
+    await flush();
+  }
+
+  it("opens with Ctrl+F, searches the document in front and shows the result", async () => {
+    const { app, api } = make();
+    await app.openPath("/a.pdf");
+    await flush();
+    expect(q<HTMLButtonElement>("#find-button").disabled).toBe(false);
+    key("f", { ctrlKey: true });
+    expect(q("#findbar").hidden).toBe(false);
+    expect(document.activeElement).toBe(findInput());
+    await search("hello");
+    expect(api.searchPage).toHaveBeenCalledWith(1, 0, "hello");
+    expect(q("#find-status").textContent).toBe("1 of 1");
+    await flush();
+    // The match is on page 2: the view went there.
+    expect(app.currentView?.currentPageIndex).toBe(1);
+  });
+
+  it("closes with Escape and clears the highlights", async () => {
+    const { app } = make();
+    await app.openPath("/a.pdf");
+    await flush();
+    key("f", { ctrlKey: true });
+    await search("hello");
+    findInput().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    expect(q("#findbar").hidden).toBe(true);
+    expect(document.querySelectorAll(".hl-find")).toHaveLength(0);
+  });
+
+  it("is off while no document is open and goes with the tab", async () => {
+    const { app } = make();
+    expect(q<HTMLButtonElement>("#find-button").disabled).toBe(true);
+    key("f", { ctrlKey: true });
+    expect(q("#findbar").hidden).toBe(true);
+    await app.openPath("/a.pdf");
+    await flush();
+    key("w", { ctrlKey: true });
+    await flush();
+    expect(q<HTMLButtonElement>("#find-button").disabled).toBe(true);
+  });
+
+  it("keeps Ctrl+A for the find box", async () => {
+    const { app } = make();
+    await app.openPath("/a.pdf");
+    await flush();
+    key("f", { ctrlKey: true });
+    const event = new KeyboardEvent("keydown", { key: "a", ctrlKey: true, bubbles: true, cancelable: true });
+    findInput().dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(false);
+    expect(app.currentView?.hasSelection).toBe(false);
+  });
+});
+
+describe("App: selecting and copying text", () => {
+  function copyEvent() {
+    const setData = vi.fn();
+    const event = new Event("copy", { bubbles: true, cancelable: true }) as Event & {
+      clipboardData: { setData: typeof setData };
+    };
+    event.clipboardData = { setData };
+    return { event, setData };
+  }
+
+  it("selects all with Ctrl+A and copies the text on Copy", async () => {
+    const { app } = make();
+    await app.openPath("/a.pdf");
+    await flush();
+    key("a", { ctrlKey: true });
+    await flush();
+    expect(app.currentView?.hasSelection).toBe(true);
+    const { event, setData } = copyEvent();
+    document.body.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(true);
+    expect(setData).toHaveBeenCalledWith("text/plain", "Hello world\nHello world\nHello world");
+    // The text is also real, selected text off screen, so the Copy of the system has something to copy.
+    expect(q("#sel-proxy").textContent).toBe("Hello world\nHello world\nHello world");
+    expect(String(document.getSelection())).toContain("Hello world");
+  });
+
+  it("clears the selection with Escape and leaves Copy alone when nothing is selected", async () => {
+    const { app } = make();
+    await app.openPath("/a.pdf");
+    await flush();
+    key("a", { ctrlKey: true });
+    await flush();
+    key("Escape");
+    expect(app.currentView?.hasSelection).toBe(false);
+    expect(q("#sel-proxy").textContent).toBe("");
+    const { event, setData } = copyEvent();
+    document.body.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(false);
+    expect(setData).not.toHaveBeenCalled();
+  });
+
+  it("leaves Copy in a text box to the box", async () => {
+    const { app } = make();
+    await app.openPath("/a.pdf");
+    await flush();
+    key("a", { ctrlKey: true });
+    await flush();
+    const { event, setData } = copyEvent();
+    q("#page-input").dispatchEvent(event);
+    expect(setData).not.toHaveBeenCalled();
+  });
+});
+
+describe("App: links in a document", () => {
+  const links = () => [...document.querySelectorAll<HTMLElement>(".page-link")];
+
+  it("asks before it opens a web address, shows the whole address, and does nothing on Cancel", async () => {
+    const { app, api } = make();
+    await app.openPath("/a.pdf");
+    await flush();
+    links()[0].click();
+    await flush();
+    expect(notice()?.textContent).toContain("Open this link in your browser?");
+    expect(notice()?.textContent).toContain("example.com");
+    expect(document.querySelector(".sheet-url")?.textContent).toBe("https://example.com/a");
+    // The safe answer has the focus.
+    expect(document.activeElement).toBe(button("Cancel"));
+    expect(api.openLink).not.toHaveBeenCalled();
+    click(button("Cancel"));
+    await flush();
+    expect(api.openLink).not.toHaveBeenCalled();
+  });
+
+  it("opens the address only after the user says so", async () => {
+    const { app, api } = make();
+    await app.openPath("/a.pdf");
+    await flush();
+    links()[0].click();
+    await flush();
+    click(button("Open in browser"));
+    await flush();
+    expect(api.openLink).toHaveBeenCalledWith(1, "https://example.com/a");
+  });
+
+  it("never opens anything but http and https: another kind is explained and not offered", async () => {
+    const { app, api } = make();
+    await app.openPath("/a.pdf");
+    await flush();
+    links()[1].click();
+    await flush();
+    expect(notice()?.textContent).toContain("This link is not opened");
+    expect(notice()?.textContent).toContain("file:");
+    expect(button("Open in browser")).toBeNull();
+    click(button("OK"));
+    await flush();
+    expect(api.openLink).not.toHaveBeenCalled();
+  });
+
+  it("goes to the page of a link inside the document without asking", async () => {
+    const { app, api } = make();
+    await app.openPath("/a.pdf");
+    await flush();
+    links()[2].click();
+    await flush();
+    expect(notice()).toBeNull();
+    expect(app.currentView?.currentPageIndex).toBe(2);
+    expect(api.openLink).not.toHaveBeenCalled();
+  });
+
+  it("tells the user when the browser could not be started", async () => {
+    const { app, api } = make();
+    api.openLink.mockRejectedValueOnce({ code: "link_refused", message: "no" });
+    await app.openPath("/a.pdf");
+    await flush();
+    links()[0].click();
+    await flush();
+    click(button("Open in browser"));
+    await flush();
+    expect(notice()?.textContent).toContain("could not be opened");
   });
 });
 

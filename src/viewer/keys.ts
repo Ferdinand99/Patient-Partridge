@@ -22,7 +22,11 @@ export type Action =
   | { type: "close-tab" }
   | { type: "next-tab" }
   | { type: "previous-tab" }
-  | { type: "toggle-sidebar" };
+  | { type: "toggle-sidebar" }
+  | { type: "find" }
+  | { type: "find-next" }
+  | { type: "find-previous" }
+  | { type: "select-all" };
 
 /** CSS pixels one arrow key press scrolls. */
 export const LINE_SCROLL = 48;
@@ -59,6 +63,12 @@ export function actionForKey(e: KeyInfo): Action | null {
       case "b":
       case "B":
         return { type: "toggle-sidebar" };
+      case "f":
+      case "F":
+        return { type: "find" };
+      case "a":
+      case "A":
+        return { type: "select-all" };
       case "Tab":
         return { type: e.shiftKey ? "previous-tab" : "next-tab" };
       case "PageDown":
@@ -75,6 +85,8 @@ export function actionForKey(e: KeyInfo): Action | null {
   }
 
   switch (e.key) {
+    case "F3":
+      return { type: e.shiftKey ? "find-previous" : "find-next" };
     case "ArrowDown":
       return { type: "scroll-by", x: 0, y: LINE_SCROLL };
     case "ArrowUp":
