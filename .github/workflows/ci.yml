@@ -274,6 +274,9 @@ jobs:
       # that the engine, the PDFium library and the app policy work together in a release build.
       - name: Make a test PDF
         run: cargo run --release --locked -p partridge-testkit --bin make-pdf -- 500 "$RUNNER_TEMP/test-500.pdf"
+      - name: The release engine on its own (diagnosis)
+        if: always() && runner.os == 'Linux'
+        run: cargo run --release --locked -p partridge-engine --example cold_open -- "$RUNNER_TEMP/test-500.pdf" 1 || true
       - name: Open the PDF in the release build
         run: |
           BIN=target/release/patient-partridge
