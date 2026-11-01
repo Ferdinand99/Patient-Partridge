@@ -35,8 +35,8 @@ describe("the file association in the app configuration", () => {
     expect(csp).toContain("default-src 'self'");
     expect(csp).toContain("script-src 'self'");
     expect(csp).not.toMatch(/unsafe-/);
-    // Pictures only from the window itself: the pages prepared for printing are blob: pictures.
-    expect(csp).toContain("img-src blob:;");
+    // Pictures only from the app itself and the pages prepared for printing (blob: pictures).
+    expect(csp).toContain("img-src 'self' blob:;");
     expect(csp).not.toMatch(/img-src[^;]*(data:|\*)/);
     // The only address is the app's own channel to its Rust side, on this computer.
     expect(csp.replace("http://ipc.localhost", "")).not.toMatch(/https?:/);
