@@ -68,6 +68,16 @@ function openAll(paths: string[]): void {
   void app.openChosen(paths);
 }
 
+// The start: the files that were open before an update (all of them), or else the tabs of the last
+// session; then the files named on the command line, which take the focus. Asking for the named
+// files also tells the app that the window is listening, so it is done last of the three.
+void (async () => {
+  const restored = await api.takeRestoredPaths().catch((): string[] => []);
+  const session = await api.takeSession().catch(() => null);
+  const given = await api.takePendingPaths().catch((): string[] => []);
+  await app.start({ restored, session, given });
+})();
+
 // Files dropped on the window. Tauri hands us real paths; the page never reads the file itself.
 void getCurrentWebview().onDragDropEvent((event) => {
   const payload = event.payload;
@@ -82,9 +92,3 @@ void getCurrentWebview().onDragDropEvent((event) => {
 // Files named on the command line, or sent by a second copy of the app (also "Open with" from a
 // file manager, once for every file chosen).
 void listen<string[]>("open-paths", (event) => openAll(event.payload));
-void api.takePendingPaths().then(openAll);
-// The files that were open before an update come back, all of them.
-void api
-  .takeRestoredPaths()
-  .then((paths) => app.restorePaths(paths))
-  .catch(() => undefined);
