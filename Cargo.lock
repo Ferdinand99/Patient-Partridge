@@ -2495,17 +2495,22 @@ dependencies = [
 name = "partridge-engine"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "partridge-engine-client",
  "partridge-protocol",
  "partridge-testkit",
  "pdfium-render",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "partridge-engine-client"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "partridge-protocol",
+ "partridge-testkit",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

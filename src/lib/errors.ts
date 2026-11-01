@@ -80,6 +80,12 @@ export function describeError(error: AppErrorLike, fileName?: string): Described
         detail: `The PDF library is missing or damaged. Reinstalling Patient Partridge should fix this.${error.message ? ` (${error.message})` : ""}`,
         action: "none",
       };
+    case "sandbox_unavailable":
+      return {
+        title: "The file was not opened",
+        detail: `Patient Partridge could not lock its PDF reader into the protective sandbox of this system, so it did not open ${fileName ? file : "this file"}. No part of the file was read.${error.message ? ` (${error.message})` : ""}`,
+        action: "none",
+      };
     default:
       return {
         title: "Something went wrong",

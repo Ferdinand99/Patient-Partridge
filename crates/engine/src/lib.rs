@@ -22,7 +22,12 @@ use pdfium_render::prelude::*;
 /// Most documents the engine keeps open at once.
 pub const MAX_OPEN_DOCUMENTS: usize = 64;
 
+#[cfg(unix)]
+pub mod fds;
+pub mod fonts;
 pub mod limits;
+pub mod sandbox;
+pub mod startup;
 pub mod stdio;
 pub mod text;
 
@@ -31,6 +36,13 @@ pub mod text;
 pub struct Args {
     /// Folder that holds the PDFium library. The engine never searches anywhere else.
     pub pdfium_dir: Option<PathBuf>,
+    /// Folder with fonts to read into memory before the sandbox is applied. Defaults to `fonts`
+    /// inside the PDFium folder.
+    pub fonts_dir: Option<PathBuf>,
+    /// The document the app handed over: a descriptor number on Unix, a handle value on Windows.
+    pub document: Option<u64>,
+    /// Memory limit in bytes. Defaults to [`limits::MEMORY_LIMIT_BYTES`].
+    pub memory_limit: Option<u64>,
 }
 
 /// Reads the engine's command line (without the program name).
@@ -41,11 +53,24 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<Args, Str
         if arg == "--pdfium-dir" {
             let value = it.next().ok_or("--pdfium-dir needs a folder")?;
             out.pdfium_dir = Some(PathBuf::from(value));
+        } else if arg == "--fonts-dir" {
+            let value = it.next().ok_or("--fonts-dir needs a folder")?;
+            out.fonts_dir = Some(PathBuf::from(value));
+        } else if arg == "--document" {
+            out.document = Some(number(it.next(), "--document")?);
+        } else if arg == "--memory-limit" {
+            out.memory_limit = Some(number(it.next(), "--memory-limit")?);
         } else {
             return Err(format!("unknown argument {}", arg.to_string_lossy()));
         }
     }
     Ok(out)
+}
+
+fn number(value: Option<OsString>, name: &str) -> Result<u64, String> {
+    value
+        .and_then(|v| v.to_str().and_then(|s| s.parse().ok()))
+        .ok_or_else(|| format!("{name} needs a number"))
 }
 
 /// Reads the build number out of the `VERSION` file that ships with the PDFium binaries.
@@ -102,22 +127,64 @@ pub struct Engine {
     pdfium_version: String,
     docs: HashMap<u32, PdfDocument<'static>>,
     next_doc: u32,
+    /// The one document the app handed over. `Open` takes it.
+    document: Option<File>,
+    /// The sandbox layers in force, as reported in the greeting. Empty when there is none.
+    sandbox: String,
+    /// When set, every request fails with this error and the engine reads nothing.
+    refusal: Option<Failure>,
 }
 
 impl Engine {
     /// Loads PDFium from `pdfium_dir`. When that fails the engine still starts and answers every
     /// request with an `EngineUnavailable` error, so the app can tell the user what is wrong.
     pub fn new(pdfium_dir: &Path) -> Engine {
+        Engine::with_fonts(pdfium_dir, &pdfium_dir.join("fonts"))
+    }
+
+    /// As [`Engine::new`], with the folder to read fonts from. Everything the engine will need
+    /// later is loaded here, because after the sandbox is applied it cannot open files: the library,
+    /// the fonts, and the code paths of PDFium that are first used when a page is drawn.
+    pub fn with_fonts(pdfium_dir: &Path, fonts_dir: &Path) -> Engine {
         let version = std::fs::read_to_string(pdfium_dir.join("VERSION"))
             .ok()
             .and_then(|text| parse_pdfium_version(&text))
             .unwrap_or_else(|| "PDFium".to_string());
+        let pdfium = load_pdfium(pdfium_dir, fonts_dir);
+        if let Ok(pdfium) = &pdfium {
+            warm_up(pdfium);
+        }
         Engine {
-            pdfium: load_pdfium(pdfium_dir),
+            pdfium,
             pdfium_version: version,
             docs: HashMap::new(),
             next_doc: 1,
+            document: None,
+            sandbox: String::new(),
+            refusal: None,
         }
+    }
+
+    /// Hands the engine the document it may open. This does not read it.
+    pub fn set_document(&mut self, file: File) {
+        self.document = Some(file);
+    }
+
+    /// Records which sandbox layers are in force (for the greeting).
+    pub fn set_sandbox(&mut self, layers: &str) {
+        self.sandbox = layers.to_string();
+    }
+
+    /// Makes every request fail with `message`, and drops the document without reading it. Used
+    /// when the sandbox could not be applied.
+    pub fn refuse(&mut self, code: ErrorCode, message: &str) {
+        self.document = None;
+        self.refusal = Some((code, message.to_string()));
+    }
+
+    /// True once [`Engine::refuse`] was called: the engine answers the next request and stops.
+    pub fn is_refusing(&self) -> bool {
+        self.refusal.is_some()
     }
 
     /// Answers one request.
@@ -133,6 +200,9 @@ impl Engine {
     }
 
     fn dispatch(&mut self, body: RequestBody) -> Result<ResponseBody, Failure> {
+        if let Some(refusal) = &self.refusal {
+            return Err(refusal.clone());
+        }
         let pdfium = match &self.pdfium {
             Ok(p) => *p,
             Err(message) => return fail(ErrorCode::EngineUnavailable, message.clone()),
@@ -151,9 +221,10 @@ impl Engine {
                     protocol_version: PROTOCOL_VERSION,
                     engine_version: env!("CARGO_PKG_VERSION").to_string(),
                     pdfium_version: self.pdfium_version.clone(),
+                    sandbox: self.sandbox.clone(),
                 })
             }
-            RequestBody::Open { path, password } => self.open(pdfium, &path, password.as_deref()),
+            RequestBody::Open { password } => self.open(pdfium, password.as_deref()),
             RequestBody::Render {
                 doc,
                 page,
@@ -233,19 +304,24 @@ impl Engine {
     fn open(
         &mut self,
         pdfium: &'static Pdfium,
-        path: &str,
         password: Option<&str>,
     ) -> Result<ResponseBody, Failure> {
         if self.docs.len() >= MAX_OPEN_DOCUMENTS {
             return fail(ErrorCode::InvalidRequest, "too many documents are open");
         }
-        let file = File::open(path)
-            .map_err(|e| (ErrorCode::Io, format!("the file could not be opened: {e}")))?;
+        // The engine does not open files. It reads the one the app handed over, once.
+        let Some(file) = self.document.take() else {
+            return fail(
+                ErrorCode::InvalidRequest,
+                "no document was handed to the engine, or it was opened already",
+            );
+        };
         let is_file = file.metadata().map(|m| m.is_file()).unwrap_or(false);
         if !is_file {
-            return fail(ErrorCode::Io, "the path is not a file");
+            return fail(ErrorCode::Io, "the handle is not a file");
         }
-        // The file is read on demand by PDFium; it is not loaded into memory as a whole.
+        // The file is read on demand by PDFium (through a custom reader that seeks and reads the
+        // inherited handle); it is not loaded into memory as a whole.
         let doc = pdfium
             .load_pdf_from_reader(file, password)
             .map_err(|e| map_open_error(e, password.is_some()))?;
@@ -303,7 +379,7 @@ impl Engine {
     }
 }
 
-fn load_pdfium(dir: &Path) -> Result<&'static Pdfium, String> {
+fn load_pdfium(dir: &Path, fonts_dir: &Path) -> Result<&'static Pdfium, String> {
     let dir = std::fs::canonicalize(dir)
         .map_err(|e| format!("the PDFium folder {} is not usable: {e}", dir.display()))?;
     let library = Pdfium::pdfium_platform_library_name_at_path(&dir);
@@ -313,8 +389,32 @@ fn load_pdfium(dir: &Path) -> Result<&'static Pdfium, String> {
             library.display()
         )
     })?;
+    let mut pdfium = Pdfium::new(bindings);
+    // PDFium must not look for fonts on the system: it cannot open files once the sandbox is on.
+    // It gets the fonts of the `fonts` folder from memory, and its built-in ones for the rest.
+    pdfium.set_custom_font_provider(Box::new(fonts::MemoryFonts::load_dir(fonts_dir)));
     // The engine lives as long as the process: leaking gives every document a 'static library.
-    Ok(Box::leak(Box::new(Pdfium::new(bindings))))
+    Ok(Box::leak(Box::new(pdfium)))
+}
+
+/// A small document in the engine itself. Drawing it before the sandbox is applied makes PDFium
+/// set up everything it sets up lazily (font tables, decoders, caches), so that this does not
+/// happen later, when the engine can no longer ask the system for anything.
+const WARM_UP_PDF: &[u8] = include_bytes!("warm-up.pdf");
+
+fn warm_up(pdfium: &'static Pdfium) {
+    let Ok(doc) = pdfium.load_pdf_from_byte_slice(WARM_UP_PDF, None) else {
+        return;
+    };
+    let pages = doc.pages();
+    for index in 0..pages.len() {
+        let Ok(page) = pages.get(index) else { continue };
+        let config = PdfRenderConfig::new().set_target_size(240, 320);
+        let _ = page.render_with_config(&config).map(|b| b.as_rgba_bytes());
+        let _ = text::page_chars(&page, true);
+        let _ = text::page_links(&page, pages.len() as usize);
+    }
+    let _ = text::outline(&doc);
 }
 
 fn map_open_error(error: PdfiumError, password_given: bool) -> Failure {

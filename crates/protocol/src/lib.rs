@@ -17,7 +17,7 @@ use std::fmt;
 use std::io::{self, Read, Write};
 
 /// Version of this protocol. Both sides check it in the `Hello` exchange.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Largest frame (payload) either side accepts: 128 MiB, enough for the biggest allowed bitmap.
 pub const MAX_FRAME_LEN: usize = 128 * 1024 * 1024;
@@ -160,6 +160,9 @@ pub enum ErrorCode {
     ProtocolMismatch = 11,
     /// Anything else.
     Internal = 12,
+    /// The engine could not lock itself into the operating system sandbox, so it refuses to read
+    /// any document.
+    SandboxUnavailable = 13,
 }
 
 impl ErrorCode {
@@ -177,6 +180,7 @@ impl ErrorCode {
             10 => ErrorCode::EngineUnavailable,
             11 => ErrorCode::ProtocolMismatch,
             12 => ErrorCode::Internal,
+            13 => ErrorCode::SandboxUnavailable,
             _ => return None,
         })
     }
@@ -196,6 +200,7 @@ impl ErrorCode {
             ErrorCode::EngineUnavailable => "engine_unavailable",
             ErrorCode::ProtocolMismatch => "protocol_mismatch",
             ErrorCode::Internal => "internal",
+            ErrorCode::SandboxUnavailable => "sandbox_unavailable",
         }
     }
 }
@@ -211,11 +216,10 @@ pub struct PageSize {
 pub enum RequestBody {
     /// First message on a connection.
     Hello { protocol_version: u32 },
-    /// Open a PDF from a path on disk.
-    Open {
-        path: String,
-        password: Option<String>,
-    },
+    /// Open the one document the app handed to the engine when it started it (an inherited,
+    /// read-only file handle). The engine never opens files by path. It opens that document
+    /// once; a second `Open` is refused.
+    Open { password: Option<String> },
     /// Draw one page into a bitmap of exactly `width` by `height` pixels.
     Render {
         doc: u32,
@@ -283,6 +287,9 @@ pub enum ResponseBody {
         protocol_version: u32,
         engine_version: String,
         pdfium_version: String,
+        /// The layers of the operating system sandbox the engine runs in, for example
+        /// `seccomp+landlock`. Empty when the engine is not sandboxed (debug builds only).
+        sandbox: String,
     },
     Opened {
         doc: u32,
@@ -381,10 +388,9 @@ impl Request {
                 put_u32(&mut out, self.id);
                 put_u32(&mut out, *protocol_version);
             }
-            RequestBody::Open { path, password } => {
+            RequestBody::Open { password } => {
                 out.push(TAG_REQ_OPEN);
                 put_u32(&mut out, self.id);
-                put_str(&mut out, path);
                 put_opt_str(&mut out, password.as_deref());
             }
             RequestBody::Render {
@@ -442,7 +448,6 @@ impl Request {
                 protocol_version: r.u32()?,
             },
             TAG_REQ_OPEN => RequestBody::Open {
-                path: r.string()?,
                 password: r.opt_string()?,
             },
             TAG_REQ_RENDER => RequestBody::Render {
@@ -489,12 +494,14 @@ impl Response {
                 protocol_version,
                 engine_version,
                 pdfium_version,
+                sandbox,
             } => {
                 out.push(TAG_RES_HELLO);
                 put_u32(&mut out, self.id);
                 put_u32(&mut out, *protocol_version);
                 put_str(&mut out, engine_version);
                 put_str(&mut out, pdfium_version);
+                put_str(&mut out, sandbox);
             }
             ResponseBody::Opened { doc, pages } => {
                 out.push(TAG_RES_OPENED);
@@ -614,6 +621,7 @@ impl Response {
                 protocol_version: r.u32()?,
                 engine_version: r.string()?,
                 pdfium_version: r.string()?,
+                sandbox: r.string()?,
             },
             TAG_RES_OPENED => {
                 let doc = r.u32()?;
@@ -913,15 +921,11 @@ mod tests {
             },
             Request {
                 id: 2,
-                body: RequestBody::Open {
-                    path: "C:\\Users\\Ægir\\bok 📕.pdf".into(),
-                    password: None,
-                },
+                body: RequestBody::Open { password: None },
             },
             Request {
                 id: 3,
                 body: RequestBody::Open {
-                    path: "/tmp/a.pdf".into(),
                     password: Some("hemmelig ✓".into()),
                 },
             },
@@ -969,6 +973,7 @@ mod tests {
                     protocol_version: PROTOCOL_VERSION,
                     engine_version: "0.1.0".into(),
                     pdfium_version: "PDFium 8125".into(),
+                    sandbox: "seccomp+landlock".into(),
                 },
             },
             Response {
@@ -1194,10 +1199,7 @@ mod tests {
         ));
         let mut bad_flag = Request {
             id: 1,
-            body: RequestBody::Open {
-                path: String::new(),
-                password: None,
-            },
+            body: RequestBody::Open { password: None },
         }
         .encode();
         let last = bad_flag.len() - 1;
@@ -1220,16 +1222,15 @@ mod tests {
 
     #[test]
     fn invalid_utf8_and_long_strings_are_refused() {
-        let mut bytes = vec![TAG_REQ_OPEN, 1, 0, 0, 0];
+        let mut bytes = vec![TAG_REQ_OPEN, 1, 0, 0, 0, 1];
         bytes.extend_from_slice(&2u32.to_le_bytes());
         bytes.extend_from_slice(&[0xff, 0xfe]);
-        bytes.push(0);
         assert!(matches!(
             Request::decode(&bytes),
             Err(ProtocolError::InvalidUtf8)
         ));
 
-        let mut long = vec![TAG_REQ_OPEN, 1, 0, 0, 0];
+        let mut long = vec![TAG_REQ_OPEN, 1, 0, 0, 0, 1];
         long.extend_from_slice(&((MAX_STRING_LEN + 1) as u32).to_le_bytes());
         assert!(matches!(
             Request::decode(&long),
@@ -1242,19 +1243,20 @@ mod tests {
         let req = Request {
             id: 1,
             body: RequestBody::Open {
-                path: "é".repeat(MAX_STRING_LEN),
-                password: None,
+                password: Some("é".repeat(MAX_STRING_LEN)),
             },
         };
         let Request {
-            body: RequestBody::Open { path, .. },
+            body: RequestBody::Open {
+                password: Some(password),
+            },
             ..
         } = Request::decode(&req.encode()).unwrap()
         else {
             panic!("wrong body");
         };
-        assert!(path.len() <= MAX_STRING_LEN);
-        assert!(path.chars().all(|c| c == 'é'));
+        assert!(password.len() <= MAX_STRING_LEN);
+        assert!(password.chars().all(|c| c == 'é'));
     }
 
     #[test]
@@ -1525,12 +1527,12 @@ mod tests {
 
     #[test]
     fn error_codes_round_trip_and_have_names() {
-        for v in 1..=12u8 {
+        for v in 1..=13u8 {
             let code = ErrorCode::from_u8(v).unwrap();
             assert_eq!(code as u8, v);
             assert!(!code.name().is_empty());
         }
         assert!(ErrorCode::from_u8(0).is_none());
-        assert!(ErrorCode::from_u8(13).is_none());
+        assert!(ErrorCode::from_u8(14).is_none());
     }
 }

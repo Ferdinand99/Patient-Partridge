@@ -21,9 +21,9 @@
 
 use std::ffi::OsString;
 use std::fmt;
-use std::io::BufReader;
+use std::fs::File;
+use std::io::{BufReader, Read, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -35,10 +35,13 @@ use partridge_protocol::{
     ResponseBody, MAX_QUERY_LEN, MAX_STRING_LEN, PROTOCOL_VERSION,
 };
 
+pub use spawn::{spawn_engine, EngineProcess, SandboxPolicy, SpawnRequest, SpawnedEngine};
+
 pub use partridge_protocol::{LinkTarget, OutlineItem, PageLink, TextMatch};
 
 mod pool;
 pub use pool::EnginePool;
+mod spawn;
 
 /// Largest answer to an open request. An `Opened` answer holds 8 bytes per page, so this allows
 /// more than a million pages.
@@ -61,6 +64,10 @@ pub struct EngineConfig {
     pub args: Vec<OsString>,
     /// Longest the engine may take to answer one request before it is considered hung and killed.
     pub timeout: Duration,
+    /// Most memory the engine may use, in bytes. `None` leaves the engine's own limit (3 GiB).
+    pub memory_limit: Option<u64>,
+    /// Whether an engine without a working sandbox is refused. Release builds always insist.
+    pub sandbox: SandboxPolicy,
 }
 
 impl EngineConfig {
@@ -69,6 +76,8 @@ impl EngineConfig {
             program: program.into(),
             args: Vec::new(),
             timeout: Duration::from_secs(60),
+            memory_limit: None,
+            sandbox: SandboxPolicy::default_for_build(),
         }
     }
 }
@@ -98,6 +107,8 @@ impl std::error::Error for ClientError {}
 pub struct EngineInfo {
     pub engine_version: String,
     pub pdfium_version: String,
+    /// The sandbox layers the engine reports, such as `seccomp+landlock`. Empty without a sandbox.
+    pub sandbox: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -131,9 +142,12 @@ enum Event {
     Closed,
 }
 
+/// The engine process, reachable from the request thread and from whoever kills it.
+type SharedProcess = Arc<Mutex<Box<dyn EngineProcess>>>;
+
 struct Running {
-    child: Arc<Mutex<Child>>,
-    stdin: ChildStdin,
+    child: SharedProcess,
+    stdin: Box<dyn Write + Send>,
     events: Receiver<Event>,
     info: EngineInfo,
     /// Number of this engine process, counted from 1 over the life of the client.
@@ -156,7 +170,7 @@ pub struct EngineClient {
     inner: Mutex<Inner>,
     /// The running child, reachable without the request lock, so the engine can be killed while a
     /// request is waiting for it (when the app quits, or the user gives up).
-    killer: Mutex<Option<Arc<Mutex<Child>>>>,
+    killer: Mutex<Option<SharedProcess>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -185,27 +199,34 @@ impl EngineClient {
         lock(&self.killer).as_ref().map(|c| lock(c).id())
     }
 
-    /// Starts the engine if needed and reports what it is.
+    /// Starts the engine if needed and reports what it is. An engine started for this is not
+    /// given a document.
     pub fn info(&self) -> Result<EngineInfo, ClientError> {
         let mut inner = lock(&self.inner);
         self.ensure_running(&mut inner)?;
         Ok(inner.running.as_ref().expect("just started").info.clone())
     }
 
+    /// Opens a file. The app opens it, and a new engine process gets a read-only handle to it
+    /// when it starts: the engine never opens files by path, and it opens this one only. An engine
+    /// that ran before in this client is ended, so every document has an engine of its own.
     pub fn open(&self, path: &str, password: Option<&str>) -> Result<OpenedDocument, ClientError> {
-        // The protocol cuts long strings. A path or password that was cut would be a different
-        // path or password, so too long ones are refused here, before anything is sent.
-        if path.len() > MAX_STRING_LEN || password.is_some_and(|p| p.len() > MAX_STRING_LEN) {
+        // The protocol cuts long strings. A password that was cut would be a different password,
+        // so a too long one is refused here, before anything is sent.
+        if password.is_some_and(|p| p.len() > MAX_STRING_LEN) {
             return Err(ClientError::Engine {
                 code: ErrorCode::InvalidRequest,
-                message: "the path or the password is too long".into(),
+                message: "the password is too long".into(),
             });
         }
+        let file = open_document(path)?;
         let mut inner = lock(&self.inner);
-        self.ensure_running(&mut inner)?;
+        self.stop(&mut inner);
+        self.start(&mut inner, Some(&file))?;
+        // The engine has its own handle now.
+        drop(file);
         let generation = inner.running.as_ref().expect("just started").generation;
         let body = RequestBody::Open {
-            path: path.to_string(),
             password: password.map(str::to_string),
         };
         match self.run(&mut inner, body)? {
@@ -487,33 +508,29 @@ impl EngineClient {
                 }
             }
         }
-        self.start(inner)
+        self.start(inner, None)
     }
 
-    fn start(&self, inner: &mut Inner) -> Result<(), ClientError> {
-        let mut command = Command::new(&self.config.program);
-        command
-            .args(&self.config.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            // CREATE_NO_WINDOW: no console window flashes up next to the app.
-            command.creation_flags(0x0800_0000);
-        }
-        let mut child = command.spawn().map_err(|e| {
+    fn start(&self, inner: &mut Inner, document: Option<&File>) -> Result<(), ClientError> {
+        let spawned = spawn_engine(&SpawnRequest {
+            program: &self.config.program,
+            args: &self.config.args,
+            document,
+            memory_limit: self.config.memory_limit,
+            policy: self.config.sandbox,
+        })
+        .map_err(|e| {
             ClientError::EngineStopped(format!(
                 "{} could not be started ({e})",
                 self.config.program.display()
             ))
         })?;
-        #[cfg(windows)]
-        end_with_app(&child);
         inner.spawns += 1;
-        let stdin = child.stdin.take().expect("stdin is piped");
-        let stdout = child.stdout.take().expect("stdout is piped");
+        let SpawnedEngine {
+            process: child,
+            stdin,
+            stdout,
+        } = spawned;
         let in_flight = Arc::new(AtomicBool::new(false));
         let limit = Arc::new(AtomicUsize::new(IDLE_LIMIT));
         // Room for one frame: the reader waits when the app has not taken the last one yet, so a
@@ -529,6 +546,7 @@ impl EngineClient {
             info: EngineInfo {
                 engine_version: String::new(),
                 pdfium_version: String::new(),
+                sandbox: String::new(),
             },
             generation: inner.spawns,
             in_flight,
@@ -545,10 +563,22 @@ impl EngineClient {
                 protocol_version,
                 engine_version,
                 pdfium_version,
+                sandbox,
             }) if protocol_version == PROTOCOL_VERSION => {
+                // An engine that is not locked in does not get to read documents, unless this is a
+                // development build that said it is fine with that.
+                if sandbox.is_empty() && self.config.sandbox == SandboxPolicy::Required {
+                    self.stop(inner);
+                    return Err(ClientError::Engine {
+                        code: ErrorCode::SandboxUnavailable,
+                        message: "the PDF engine did not report a sandbox, so it was not used"
+                            .into(),
+                    });
+                }
                 inner.running.as_mut().expect("just started").info = EngineInfo {
                     engine_version,
                     pdfium_version,
+                    sandbox,
                 };
                 Ok(())
             }
@@ -600,7 +630,7 @@ impl Drop for EngineClient {
 
 /// Reads frames from the engine and hands them over one at a time.
 fn spawn_reader(
-    stdout: std::process::ChildStdout,
+    stdout: Box<dyn Read + Send>,
     tx: SyncSender<Event>,
     in_flight: Arc<AtomicBool>,
     limit: Arc<AtomicUsize>,
@@ -630,63 +660,31 @@ fn spawn_reader(
     });
 }
 
+/// Opens the file the user chose, for reading. A file system object that is not a plain file (a
+/// folder, a pipe, a device) is refused here, before any engine is started.
+fn open_document(path: &str) -> Result<File, ClientError> {
+    let refuse = |message: String| ClientError::Engine {
+        code: ErrorCode::Io,
+        message,
+    };
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| refuse(format!("the file could not be opened: {e}")))?;
+    if !metadata.is_file() {
+        return Err(refuse("the path is not a file".into()));
+    }
+    let file =
+        File::open(path).map_err(|e| refuse(format!("the file could not be opened: {e}")))?;
+    // The path may have been swapped for something else between the two calls.
+    if !file.metadata().map(|m| m.is_file()).unwrap_or(false) {
+        return Err(refuse("the path is not a file".into()));
+    }
+    Ok(file)
+}
+
 fn stale_document() -> ClientError {
     ClientError::Engine {
         code: ErrorCode::UnknownDocument,
         message: "the document is gone: the PDF engine was restarted".into(),
-    }
-}
-
-/// Puts the engine in a job object that ends all its processes when the app's last handle to the
-/// job closes, which happens when the app exits or crashes. Without it a Windows engine that is
-/// stuck inside PDFium would outlive the app.
-#[cfg(windows)]
-fn end_with_app(child: &Child) {
-    use std::ffi::c_void;
-    use std::os::windows::io::AsRawHandle;
-    use std::sync::OnceLock;
-
-    extern "system" {
-        fn CreateJobObjectW(attributes: *const c_void, name: *const u16) -> *mut c_void;
-        fn SetInformationJobObject(
-            job: *mut c_void,
-            class: i32,
-            info: *const c_void,
-            length: u32,
-        ) -> i32;
-        fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
-    }
-    const EXTENDED_LIMIT_INFORMATION: i32 = 9;
-    const KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
-
-    // One job for the whole app, kept open until the app ends.
-    static JOB: OnceLock<usize> = OnceLock::new();
-    let job = *JOB.get_or_init(|| {
-        // JOBOBJECT_EXTENDED_LIMIT_INFORMATION is 144 bytes on 64-bit Windows; LimitFlags is the
-        // u32 at offset 16.
-        let mut info = [0u8; 144];
-        info[16..20].copy_from_slice(&KILL_ON_JOB_CLOSE.to_le_bytes());
-        // SAFETY: documented Win32 calls with a live buffer of the size the class expects.
-        unsafe {
-            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-            if job.is_null()
-                || SetInformationJobObject(
-                    job,
-                    EXTENDED_LIMIT_INFORMATION,
-                    info.as_ptr().cast(),
-                    info.len() as u32,
-                ) == 0
-            {
-                return 0;
-            }
-            job as usize
-        }
-    });
-    if job != 0 {
-        // SAFETY: both handles are valid; the child handle belongs to `child`, which is alive.
-        unsafe {
-            AssignProcessToJobObject(job as *mut c_void, child.as_raw_handle());
-        }
     }
 }
 
@@ -700,10 +698,20 @@ mod tests {
         matches!(err, ClientError::EngineStopped(_))
     }
 
+    /// A file for the client to open. The stand-in engines in these tests never read it.
+    fn some_file() -> partridge_testkit::TempFile {
+        partridge_testkit::TempFile::new(
+            "a.pdf",
+            b"%PDF-1.7
+",
+        )
+    }
+
     #[test]
     fn a_missing_program_is_reported_not_panicked() {
         let client = EngineClient::new(EngineConfig::new("/definitely/not/an/engine"));
-        let err = client.open("a.pdf", None).unwrap_err();
+        let file = some_file();
+        let err = client.open(&file.path_str(), None).unwrap_err();
         assert!(is_stopped(&err), "{err:?}");
         // And again: the failure leaves no half-started state behind.
         assert!(is_stopped(&client.info().unwrap_err()));
@@ -715,7 +723,8 @@ mod tests {
         let mut config = EngineConfig::new(std::env::current_exe().unwrap());
         config.args = vec!["--help".into()];
         let client = EngineClient::new(config);
-        let err = client.open("a.pdf", None).unwrap_err();
+        let file = some_file();
+        let err = client.open(&file.path_str(), None).unwrap_err();
         assert!(is_stopped(&err), "{err:?}");
     }
 
@@ -723,31 +732,49 @@ mod tests {
     #[test]
     fn an_engine_that_exits_at_once_is_reported() {
         let client = EngineClient::new(EngineConfig::new("true"));
-        let err = client.open("a.pdf", None).unwrap_err();
+        let file = some_file();
+        let err = client.open(&file.path_str(), None).unwrap_err();
         assert!(is_stopped(&err), "{err:?}");
     }
 
     #[cfg(unix)]
     #[test]
     fn a_hung_engine_is_killed_after_the_timeout() {
-        let mut config = EngineConfig::new("sleep");
-        config.args = vec!["30".into()];
+        // The client adds its own options after these; the shell keeps them as positional words.
+        let mut config = EngineConfig::new("sh");
+        config.args = vec!["-c".into(), "sleep 30".into()];
         config.timeout = Duration::from_millis(300);
         let client = EngineClient::new(config);
+        let file = some_file();
         let started = Instant::now();
-        let err = client.open("a.pdf", None).unwrap_err();
+        let err = client.open(&file.path_str(), None).unwrap_err();
         assert!(is_stopped(&err), "{err:?}");
         assert!(started.elapsed() < Duration::from_secs(10));
         assert!(err.to_string().contains("did not answer"), "{err}");
     }
 
     #[test]
-    fn a_path_or_password_that_does_not_fit_is_refused_before_anything_starts() {
+    fn a_password_that_does_not_fit_is_refused_before_anything_starts() {
         let client = EngineClient::new(EngineConfig::new("/definitely/not/an/engine"));
         let long = "x".repeat(MAX_STRING_LEN + 1);
-        for (path, password) in [(long.as_str(), None), ("a.pdf", Some(long.as_str()))] {
-            match client.open(path, password).unwrap_err() {
-                ClientError::Engine { code, .. } => assert_eq!(code, ErrorCode::InvalidRequest),
+        let file = some_file();
+        match client.open(&file.path_str(), Some(&long)).unwrap_err() {
+            ClientError::Engine { code, .. } => assert_eq!(code, ErrorCode::InvalidRequest),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(client.spawn_count(), 0);
+    }
+
+    #[test]
+    fn a_path_that_is_not_a_file_is_refused_before_an_engine_starts() {
+        let client = EngineClient::new(EngineConfig::new("/definitely/not/an/engine"));
+        let dir = std::env::temp_dir();
+        for path in [
+            dir.to_string_lossy().into_owned(),
+            "/no/such/file.pdf".to_string(),
+        ] {
+            match client.open(&path, None).unwrap_err() {
+                ClientError::Engine { code, .. } => assert_eq!(code, ErrorCode::Io, "{path}"),
                 other => panic!("{other:?}"),
             }
         }

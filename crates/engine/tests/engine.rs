@@ -11,6 +11,8 @@ use partridge_testkit as kit;
 fn client() -> EngineClient {
     let mut config = EngineConfig::new(env!("CARGO_BIN_EXE_partridge-engine"));
     config.args = vec!["--pdfium-dir".into(), kit::pdfium_dir().into_os_string()];
+    // The tests insist on the sandbox: an engine that cannot lock itself in fails them.
+    config.sandbox = partridge_engine_client::SandboxPolicy::Required;
     EngineClient::new(config)
 }
 
@@ -120,7 +122,7 @@ fn zoomed_pages_render_at_other_sizes() {
 }
 
 #[test]
-fn a_damaged_file_gives_an_error_and_the_engine_keeps_working() {
+fn a_damaged_file_gives_an_error_and_the_next_open_still_works() {
     let client = client();
     let good = kit::TempFile::new("good.pdf", &kit::simple_pdf(1));
     for (name, bytes) in [
@@ -131,14 +133,11 @@ fn a_damaged_file_gives_an_error_and_the_engine_keeps_working() {
         let file = kit::TempFile::new(name, &bytes);
         let err = client.open(&file.path_str(), None).unwrap_err();
         assert_eq!(code_of(err), ErrorCode::Corrupt, "{name}");
-        // The same engine process still opens a good file afterwards.
+        // The next file gets an engine of its own and opens fine.
         assert!(client.open(&good.path_str(), None).is_ok());
     }
-    assert_eq!(
-        client.spawn_count(),
-        1,
-        "the engine must not have been restarted"
-    );
+    // Every document has its own engine process: six opens, six engines.
+    assert_eq!(client.spawn_count(), 6);
 }
 
 #[test]
@@ -183,7 +182,8 @@ fn a_password_protected_file_asks_for_a_password() {
     assert_eq!(doc.pages.len(), 2);
     let bitmap = client.render(doc.doc, 1, 120, 156).unwrap();
     assert_eq!(pixel(&bitmap, 5, 5), [255, 255, 255, 255]);
-    assert_eq!(client.spawn_count(), 1);
+    // The engine opens the one document it was given, once, so each try has an engine of its own.
+    assert_eq!(client.spawn_count(), 3);
 }
 
 #[test]
@@ -242,7 +242,8 @@ fn closing_a_document_frees_it() {
 }
 
 #[test]
-fn many_documents_can_be_open_at_once() {
+fn a_client_holds_one_document_and_opening_another_replaces_it() {
+    // Many documents at once is the job of the pool (tests/pool.rs): one engine each.
     let file = kit::TempFile::new("many.pdf", &kit::simple_pdf(1));
     let client = client();
     let ids: Vec<u64> = (0..5)
@@ -252,9 +253,14 @@ fn many_documents_can_be_open_at_once() {
     unique.sort_unstable();
     unique.dedup();
     assert_eq!(unique.len(), 5);
-    for id in ids {
-        assert!(client.render(id, 0, 100, 130).is_ok());
+    for id in &ids[..4] {
+        assert_eq!(
+            code_of(client.render(*id, 0, 100, 130).unwrap_err()),
+            ErrorCode::UnknownDocument
+        );
     }
+    assert!(client.render(ids[4], 0, 100, 130).is_ok());
+    assert_eq!(client.spawn_count(), 5);
 }
 
 #[test]

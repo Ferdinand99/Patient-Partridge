@@ -10,6 +10,7 @@
 //! - `hang`: never answers `Open`.
 //! - `exit-once`: exits right after the first `Hello` (when the marker file does not exist yet).
 //! - `good`: behaves like an engine with one 612 x 792 document.
+//! - `no-sandbox`: like `good`, but greets without naming a sandbox.
 
 use std::io::{self, BufReader, BufWriter};
 use std::path::Path;
@@ -20,7 +21,18 @@ use partridge_protocol::{
 };
 
 fn main() {
-    let mut args = std::env::args().skip(1);
+    // The client adds `--document <n>` and `--memory-limit <n>` to the command line; they are not
+    // for this program.
+    let mut words = Vec::new();
+    let mut raw = std::env::args().skip(1);
+    while let Some(word) = raw.next() {
+        if word == "--document" || word == "--memory-limit" {
+            raw.next();
+        } else {
+            words.push(word);
+        }
+    }
+    let mut args = words.into_iter();
     let mode = args.next().unwrap_or_else(|| "good".into());
     let marker = args.next();
 
@@ -44,6 +56,11 @@ fn main() {
                         protocol_version: PROTOCOL_VERSION,
                         engine_version: "fake".into(),
                         pdfium_version: "fake".into(),
+                        sandbox: if mode == "no-sandbox" {
+                            String::new()
+                        } else {
+                            "fake".into()
+                        },
                     },
                 );
                 match mode.as_str() {

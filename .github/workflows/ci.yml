@@ -75,6 +75,31 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --workspace --locked
+      # What the engine tried after it locked itself in (open a file, connect, start a program,
+      # write a file) and what the system answered, on each system.
+      - name: Sandbox proof
+        run: cargo test -p partridge-engine --locked --test sandbox -- --nocapture --test-threads 1
+      # The seccomp filter is the base on Linux and Landlock only an extra. Run the engine tests
+      # once more with Landlock switched off, so the filter alone is shown to be enough.
+      - name: Engine tests with seccomp alone
+        if: runner.os == 'Linux'
+        env:
+          PARTRIDGE_TEST_NO_LANDLOCK: "1"
+        run: cargo test -p partridge-engine -p partridge-engine-client --locked
+      - name: The sandbox log (macOS)
+        if: failure() && runner.os == 'macOS'
+        run: log show --last 10m --predicate 'sender == "Sandbox"' --style compact | tail -150 || true
+      # The test switches and the self-test program exist in debug builds only.
+      - name: The release engine has no test code
+        if: matrix.lint
+        run: |
+          cargo build --release --locked -p partridge-engine
+          if grep -aq 'PARTRIDGE_TEST_' target/release/partridge-engine; then
+            echo "The release engine contains test switches." >&2
+            exit 1
+          fi
+          ls target/release/examples 2>/dev/null | grep -q selftest && { echo "The self-test program was built in release." >&2; exit 1; }
+          echo "ok: no test switches in the release engine"
       - name: The engine has no network code, the app does not link PDFium
         if: matrix.lint
         run: scripts/check-engine-deps.sh

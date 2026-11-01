@@ -66,6 +66,7 @@ describe("describeError", () => {
       "invalid_request",
       "render_failed",
       "engine_unavailable",
+      "sandbox_unavailable",
       "protocol_mismatch",
       "internal",
       "engine_stopped",
