@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MAX_KEPT_CHARS } from "./textlayer";
-import { DocumentView, type ViewerApi, type ViewerEvents, type ViewerOptions } from "./viewer";
-import type { PageLinkInfo } from "./overlays";
+import { DocumentView, MAX_MOUNTED_PAGES, type ViewerApi, type ViewerEvents, type ViewerOptions } from "./viewer";
+import { MAX_LINK_BUTTONS, MAX_OVERLAY_BOXES, type PageLinkInfo } from "./overlays";
 
 const letter = { width: 612, height: 792 };
 const putImageData = vi.fn();
@@ -652,5 +652,152 @@ describe("copying one document at a time", () => {
     await flush();
     expect(view.selectedText().cut).toBe(1);
     expect(view.selectedText().missing).toEqual([]);
+  });
+});
+
+const mountedPages = (view: DocumentView) =>
+  [...view.element.querySelectorAll<HTMLElement>(".viewer-page")].map((el) => Number(el.dataset.page));
+
+/** A view of `pages` pages of the given size, with the engine answers given by `api`. */
+function openPages(
+  pages: number,
+  size: { width: number; height: number },
+  api: Partial<ViewerApi>,
+  limits?: ViewerOptions["limits"],
+) {
+  const onTextLimit = vi.fn();
+  const events = {
+    onPageChange: vi.fn(),
+    onZoomChange: vi.fn(),
+    onFatal: vi.fn(),
+    onFirstPaint: vi.fn(),
+    onTextLimit,
+  } satisfies ViewerEvents;
+  const view = new DocumentView(
+    { doc: 5, pages: Array.from({ length: pages }, () => size) },
+    { render: (_d, _p, w, h) => Promise.resolve(new ArrayBuffer(w * h * 4)), ...api },
+    events,
+    { limits },
+  );
+  document.body.append(view.element);
+  view.start();
+  return { view, onTextLimit };
+}
+
+describe("a PDF made to fill the window with boxes and link buttons", () => {
+  const sliver = { width: 612, height: 1 };
+  // 10,000 characters whose places alternate between the right and the left of the page: the
+  // selection needs one box for every two characters, 5,000 on each page.
+  const zigzag = {
+    text: "x".repeat(10_000),
+    rects: Array.from({ length: 10_000 }, (_, i) =>
+      i % 2 === 0 ? [300, 0.1, 300.5, 0.9] : [10, 0.1, 10.5, 0.9],
+    ).flat(),
+  };
+  // Every page has 500 links, the most the engine reports for one page, none with an address.
+  const links: PageLinkInfo[] = Array.from({ length: 500 }, () => ({ rect: [0, 0, 1, 1], uri: null, page: 0 }));
+
+  function openCrafted() {
+    return openPages(5000, sliver, {
+      getPageText: () => Promise.resolve({ text: zigzag.text, rects: zigzag.rects.slice() }),
+      getPageLinks: () => Promise.resolve(links),
+    });
+  }
+
+  it("mounts a fixed number of pages at most, however many fit in the window", async () => {
+    const { view } = openCrafted();
+    await flush();
+    const mounted = mountedPages(view);
+    expect(mounted.length).toBeGreaterThan(0);
+    expect(mounted.length).toBeLessThanOrEqual(MAX_MOUNTED_PAGES);
+    // The pages kept are the ones in the middle of the window, so the one at the top is drawn.
+    expect(mounted).toContain(0);
+  });
+
+  it("draws a fixed number of selection boxes and link buttons for the whole document", { timeout: 60_000 }, async () => {
+    const { view, onTextLimit } = openCrafted();
+    await flush();
+    view.selectAll();
+    await flush();
+    await flush();
+    const boxes = highlights(view, "hl-select").length;
+    const buttons = highlights(view, "page-link").length;
+    // The limit is for the document, not for each page: the mounted pages could hold 5,000 boxes
+    // and 500 buttons each.
+    expect(boxes).toBeGreaterThan(0);
+    expect(boxes).toBeLessThanOrEqual(MAX_OVERLAY_BOXES);
+    expect(buttons).toBeGreaterThan(0);
+    expect(buttons).toBeLessThanOrEqual(MAX_LINK_BUTTONS);
+    expect(onTextLimit).toHaveBeenCalledTimes(1);
+    // Everything in the view, the layers and canvases included, stays within a fixed size.
+    expect(view.element.querySelectorAll("*").length).toBeLessThan(MAX_OVERLAY_BOXES + MAX_LINK_BUTTONS + 2000);
+  });
+
+  it("draws a fixed number of boxes for the matches of a search, too", { timeout: 60_000 }, async () => {
+    const { view } = openCrafted();
+    await flush();
+    const everywhere = new Map<number, [number, number][]>();
+    for (const page of mountedPages(view)) everywhere.set(page, [[0, 10_000]]);
+    view.setFind(everywhere, null);
+    await flush();
+    const boxes = highlights(view, "hl-find").length;
+    expect(boxes).toBeGreaterThan(0);
+    expect(boxes).toBeLessThanOrEqual(MAX_OVERLAY_BOXES);
+  });
+
+  it("keeps the match that is picked out when there are too many boxes", { timeout: 60_000 }, async () => {
+    const { view } = openCrafted();
+    await flush();
+    const pages = mountedPages(view).sort((a, b) => a - b);
+    const last = pages[pages.length - 1];
+    const everywhere = new Map<number, [number, number][]>();
+    for (const page of pages) everywhere.set(page, [[0, 10_000]]);
+    view.setFind(everywhere, { page: last, start: 0, len: 10_000 });
+    await flush();
+    expect(highlights(view, "hl-current").length).toBeGreaterThan(0);
+  });
+
+  it("leaves ordinary documents as they were", async () => {
+    const { view } = open({ 0: [{ rect: [72, 72, 172, 92], uri: null, page: 1 }] });
+    await flush();
+    view.selectAll();
+    await flush();
+    expect(highlights(view, "hl-select").length).toBeGreaterThan(0);
+    expect(highlights(view, "page-link")).toHaveLength(1);
+  });
+});
+
+describe("a page that cannot be read", () => {
+  it("is asked for a few times at most while it is selected, not again and again", async () => {
+    const { view, getPageText } = open({}, 3);
+    // A loop would never end: after 500 calls the engine stops answering.
+    let calls = 0;
+    getPageText.mockImplementation((_d: number, page: number) => {
+      if (page !== 1) return Promise.resolve(wire("fine"));
+      calls++;
+      return (calls > 500 ? new Promise(() => undefined) : Promise.reject(new Error("corrupt"))) as ReturnType<
+        typeof getPageText
+      >;
+    });
+    await flush();
+    view.selectAll();
+    await flush();
+    await flush();
+    expect(calls).toBeGreaterThan(0);
+    expect(calls).toBeLessThanOrEqual(4);
+  });
+
+  it("is asked for again when it is mounted again", async () => {
+    const { view, getPageText } = open({}, 3);
+    getPageText.mockImplementation((_d: number, page: number) =>
+      page === 1 ? Promise.reject(new Error("corrupt")) : Promise.resolve(wire("fine")),
+    );
+    await flush();
+    const first = getPageText.mock.calls.filter((c) => c[1] === 1).length;
+    expect(first).toBeGreaterThan(0);
+    view.setActive(false);
+    view.setActive(true);
+    await flush();
+    expect(getPageText.mock.calls.filter((c) => c[1] === 1).length).toBeGreaterThan(first);
   });
 });

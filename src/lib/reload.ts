@@ -16,6 +16,21 @@ export function isReloadKey(e: Pick<KeyboardEvent, "key" | "code" | "ctrlKey" | 
 }
 
 /**
+ * True for a box the reader types in, which keeps the menu of the web view (Cut, Copy, Paste). A
+ * radio button, a check box, and a text box that is disabled or read only are not one: their menu
+ * is the page menu, which holds Reload.
+ */
+export function isTextBox(target: Element): boolean {
+  const box = target.closest("input, textarea");
+  if (!box) return false;
+  // A box that cannot be edited (greyed out, or read only) gets the page menu from the web view.
+  if (box instanceof HTMLTextAreaElement) return !box.disabled && !box.readOnly;
+  return box instanceof HTMLInputElement && TEXT_TYPES.has(box.type) && !box.disabled && !box.readOnly;
+}
+
+const TEXT_TYPES: ReadonlySet<string> = new Set(["text", "search", "password", "email", "tel", "url", "number"]);
+
+/**
  * Stops the reload keys and the context menu. Does nothing when `enabled` is false, which is the
  * case in a development build, where reloading the page is how a change is seen.
  */
@@ -27,7 +42,7 @@ export function blockReload(doc: Document, enabled: boolean): void {
     "contextmenu",
     (e) => {
       const target = e.target;
-      if (target instanceof Element && target.closest("input, textarea")) return;
+      if (target instanceof Element && isTextBox(target)) return;
       e.preventDefault();
     },
     true,
