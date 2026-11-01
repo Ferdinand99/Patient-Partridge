@@ -216,12 +216,25 @@ impl Drop for Temp {
     }
 }
 
-fn temp_prefix(name: &str) -> String {
-    format!(".{name}.partridge-")
+/// The part of a file name that the name of the new file carries: at most 100 bytes, cut on a
+/// character boundary, so that the whole name stays below the limit of 255 bytes of most file
+/// systems.
+fn short_name(name: &str) -> &str {
+    let mut end = name.len().min(100);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    &name[..end]
 }
 
-/// Creates a new file next to `target`, with a name that cannot clash with anything.
-fn create_temp(target: &Path) -> Result<(Temp, File), SaveError> {
+fn temp_prefix(name: &str) -> String {
+    format!(".{}.partridge-", short_name(name))
+}
+
+/// Creates a new file next to `target`, with a name that cannot clash with anything. `private`:
+/// nobody but the owner may read it while it is written (the file replaces one that was private,
+/// and gets that file's permissions at the end).
+fn create_temp(target: &Path, private: bool) -> Result<(Temp, File), SaveError> {
     let dir = target
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -230,8 +243,6 @@ fn create_temp(target: &Path) -> Result<(Temp, File), SaveError> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .ok_or(SaveError::NotAFile)?;
-    // Names are cut so that the temporary name stays below the limit of 255 bytes.
-    let name: String = name.chars().take(100).collect();
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
@@ -243,7 +254,16 @@ fn create_temp(target: &Path) -> Result<(Temp, File), SaveError> {
             std::process::id(),
             nanos.wrapping_add(attempt)
         ));
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if private {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        #[cfg(not(unix))]
+        let _ = private;
+        match options.open(&path) {
             Ok(file) => return Ok((Temp { path, keep: false }, file)),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(from_io(&e, "the folder")),
@@ -266,7 +286,7 @@ fn remove_stale_temps(target: &Path) {
     } else {
         dir
     };
-    let prefix = temp_prefix(&name.to_string_lossy().chars().take(100).collect::<String>());
+    let prefix = temp_prefix(&name.to_string_lossy());
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -404,7 +424,7 @@ pub(crate) fn save_document(
     check_unchanged(&target, expected, options)?;
     remove_stale_temps(&target);
 
-    let (mut temp, mut file) = create_temp(&target)?;
+    let (mut temp, mut file) = create_temp(&target, existing.is_some())?;
     let mut written: u64 = 0;
     let total = client.save_to(doc, &mut |piece| {
         file.write_all(piece)?;
@@ -919,6 +939,32 @@ mod tests {
         let err = save_error(save(&client, doc, &path, None, SaveOptions::default()));
         assert!(matches!(err, SaveError::ReadOnly(_)), "{err:?}");
         assert_eq!(fs::read(&path).unwrap(), ORIGINAL);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_new_file_can_be_read_by_nobody_else_while_it_is_written() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = Dir::new("private");
+        let path = original_in(&dir);
+        let (temp, _file) = create_temp(&path, true).unwrap();
+        let mode = fs::metadata(&temp.path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode & 0o077, 0, "mode {mode:o}");
+    }
+
+    #[test]
+    fn a_long_name_with_wide_characters_still_makes_a_name_the_file_system_takes() {
+        let dir = Dir::new("long");
+        // 120 characters of 2 bytes each: 240 bytes, near the limit of most file systems.
+        let name = format!("{}.pdf", "\u{e9}".repeat(120));
+        let path = dir.file(&name);
+        fs::write(&path, ORIGINAL).unwrap();
+        assert!(short_name(&name).len() <= 100);
+        assert!(name.starts_with(short_name(&name)));
+        let (client, doc) = client("save-good");
+        save(&client, doc, &path, None, SaveOptions::default()).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), fake_bytes());
+        assert_eq!(dir.names(), vec![name]);
     }
 
     /// The test program starts itself with this variable to be killed in the middle of a save.
