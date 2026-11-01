@@ -107,7 +107,8 @@ impl std::error::Error for ClientError {}
 pub struct EngineInfo {
     pub engine_version: String,
     pub pdfium_version: String,
-    /// The sandbox layers the engine reports, such as `seccomp+landlock`. Empty without a sandbox.
+    /// The sandbox layers the engine reports, such as `seccomp+landlock`; `none: <reason>` without
+    /// a sandbox (see [`sandbox_in_force`]).
     pub sandbox: String,
 }
 
@@ -564,12 +565,18 @@ impl EngineClient {
             }) if protocol_version == PROTOCOL_VERSION => {
                 // An engine that is not locked in does not get to read documents, unless this is a
                 // development build that said it is fine with that.
-                if sandbox.is_empty() && self.config.sandbox == SandboxPolicy::Required {
+                if !sandbox_in_force(&sandbox) && self.config.sandbox == SandboxPolicy::Required {
                     self.stop(inner);
                     return Err(ClientError::Engine {
                         code: ErrorCode::SandboxUnavailable,
-                        message: "the PDF engine did not report a sandbox, so it was not used"
-                            .into(),
+                        message: format!(
+                            "the PDF engine did not report a sandbox, so it was not used ({})",
+                            if sandbox.is_empty() {
+                                "no reason given"
+                            } else {
+                                &sandbox
+                            }
+                        ),
                     });
                 }
                 inner.running.as_mut().expect("just started").info = EngineInfo {
@@ -655,6 +662,11 @@ fn spawn_reader(
             }
         }
     });
+}
+
+/// True when the engine's greeting names a sandbox. An engine without one says `none` and why.
+pub fn sandbox_in_force(report: &str) -> bool {
+    !report.is_empty() && !report.starts_with("none")
 }
 
 /// Says how the engine ended. The pipe closes a moment before the system reports the exit, so this

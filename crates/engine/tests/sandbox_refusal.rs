@@ -50,7 +50,9 @@ fn an_engine_that_cannot_apply_its_sandbox_refuses_to_open_the_document() {
         std::env::remove_var("PARTRIDGE_TEST_ENFORCE");
     }
     let client = EngineClient::new(config(SandboxPolicy::BestEffort));
-    assert_eq!(client.info().unwrap().sandbox, "");
+    let report = client.info().unwrap().sandbox;
+    assert!(report.starts_with("none: "), "{report}");
+    assert!(report.contains("forced by a test"), "{report}");
     // The app side refuses such an engine when it insists on a sandbox.
     let client = EngineClient::new(config(SandboxPolicy::Required));
     assert!(matches!(

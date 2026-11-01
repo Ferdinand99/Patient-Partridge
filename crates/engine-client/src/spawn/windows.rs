@@ -4,7 +4,8 @@
 //!   privilege removed, every group (and the user) turned into deny-only, and one restricting SID,
 //!   the null SID, which no object grants access to. With such a token almost no securable object
 //!   can be opened: no file, no registry key, no socket device, no named pipe, no other process.
-//! - **Untrusted integrity level**, below everything the user owns.
+//! - **Untrusted integrity level**, below everything the user owns (set by the engine on its own
+//!   token just before it gives up the start identity).
 //! - **A job object of its own** (so no race with another job): a single process, no child
 //!   processes, a memory limit, ended when the app lets go of it, and no access to the desktop,
 //!   clipboard, user handles, global atoms or system parameters.
@@ -37,10 +38,9 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Security::{
     CreateRestrictedToken, DuplicateTokenEx, GetTokenInformation, SecurityImpersonation,
-    SetTokenInformation, TokenGroups, TokenImpersonation, TokenIntegrityLevel, TokenPrimary,
-    TokenUser, DISABLE_MAX_PRIVILEGE, SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES,
-    TOKEN_ADJUST_DEFAULT, TOKEN_ALL_ACCESS, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_GROUPS,
-    TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER,
+    TokenGroups, TokenImpersonation, TokenPrimary, TokenUser, DISABLE_MAX_PRIVILEGE,
+    SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES, TOKEN_ADJUST_DEFAULT, TOKEN_ALL_ACCESS,
+    TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE,
@@ -210,11 +210,6 @@ fn null_sid() -> Vec<u8> {
     simple_sid(0, 0)
 }
 
-/// The untrusted mandatory level, S-1-16-0.
-fn untrusted_sid() -> Vec<u8> {
-    simple_sid(16, 0)
-}
-
 fn token_info(token: HANDLE, class: i32) -> io::Result<Vec<u8>> {
     let mut needed = 0u32;
     // SAFETY: the first call only asks for the size.
@@ -367,22 +362,10 @@ fn make_tokens() -> io::Result<(Owned, Owned)> {
         )?;
         let lockdown = Owned::new(primary)?;
 
-        let mut label_sid = untrusted_sid();
-        let label = TOKEN_MANDATORY_LABEL {
-            Label: SID_AND_ATTRIBUTES {
-                Sid: label_sid.as_mut_ptr().cast(),
-                Attributes: SE_GROUP_INTEGRITY,
-            },
-        };
-        check(
-            SetTokenInformation(
-                lockdown.raw(),
-                TokenIntegrityLevel,
-                (&label as *const TOKEN_MANDATORY_LABEL).cast::<c_void>(),
-                (size_of::<TOKEN_MANDATORY_LABEL>() + label_sid.len()) as u32,
-            ),
-            "SetTokenInformation (integrity level)",
-        )?;
+        // The integrity level stays the app's own for now. The system lets the first thread
+        // impersonate a token only if its integrity level is not above that of the process, so
+        // the two start out equal, and the engine lowers its own level to untrusted just before
+        // it gives up the start identity (see `partridge-engine`).
         drop(nobody);
         Ok((lockdown, initial))
     }

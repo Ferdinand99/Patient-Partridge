@@ -123,7 +123,11 @@ pub fn prepare(args: Args) -> Prepared {
             engine.set_sandbox(&applied.describe());
             None
         }
-        Err(why) => Some(why),
+        Err(why) => {
+            // The greeting says why, so the app (and a developer) can see the reason.
+            engine.set_sandbox(&format!("none: {why}"));
+            Some(why)
+        }
     };
     // A release build never goes on without a sandbox. A debug build can be told to act like one.
     let enforce = !cfg!(debug_assertions) || test_switch("PARTRIDGE_TEST_ENFORCE");

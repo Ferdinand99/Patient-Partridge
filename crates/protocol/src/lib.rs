@@ -288,7 +288,8 @@ pub enum ResponseBody {
         engine_version: String,
         pdfium_version: String,
         /// The layers of the operating system sandbox the engine runs in, for example
-        /// `seccomp+landlock`. Empty when the engine is not sandboxed (debug builds only).
+        /// `seccomp+landlock`. When the engine is not sandboxed (debug builds only) it starts
+        /// with `none`, followed by the reason.
         sandbox: String,
     },
     Opened {

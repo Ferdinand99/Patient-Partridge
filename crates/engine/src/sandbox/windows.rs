@@ -14,19 +14,21 @@ use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::null_mut;
 
-use windows_sys::Win32::Foundation::{FALSE, HANDLE};
+use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE};
 use windows_sys::Win32::Security::{
-    GetTokenInformation, IsTokenRestricted, RevertToSelf, TokenIntegrityLevel,
-    TOKEN_MANDATORY_LABEL,
+    GetTokenInformation, IsTokenRestricted, RevertToSelf, SetTokenInformation, TokenIntegrityLevel,
+    SID_AND_ATTRIBUTES, TOKEN_ADJUST_DEFAULT, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
 };
 use windows_sys::Win32::System::JobObjects::IsProcessInJob;
 use windows_sys::Win32::System::SystemServices::{
     PROCESS_MITIGATION_DYNAMIC_CODE_POLICY, PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetProcessMitigationPolicy, ProcessDynamicCodePolicy,
+    GetCurrentProcess, GetProcessMitigationPolicy, OpenProcessToken, ProcessDynamicCodePolicy,
     ProcessExtensionPointDisablePolicy,
 };
+
+const SE_GROUP_INTEGRITY: u32 = 0x0000_0020;
 
 /// The integrity level of a process is the last sub-authority of the SID in its token. Medium is
 /// 0x2000.
@@ -130,8 +132,46 @@ fn verify() -> Result<(), String> {
     Ok(())
 }
 
+/// Lowers the integrity level of this process to untrusted. This has to happen while the thread
+/// still has the start identity: the engine's own token is not open to the restricted one.
+fn lower_integrity() -> Result<(), String> {
+    // SID S-1-16-0: revision 1, one sub-authority, authority 16, sub-authority 0.
+    let mut sid = [1u8, 1, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0];
+    // SAFETY: documented Win32 calls; the SID and the label outlive the calls.
+    unsafe {
+        let mut token: HANDLE = null_mut();
+        if OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_DEFAULT | TOKEN_QUERY,
+            &mut token,
+        ) == 0
+        {
+            return Err(format!("OpenProcessToken: {}", last_error()));
+        }
+        let label = TOKEN_MANDATORY_LABEL {
+            Label: SID_AND_ATTRIBUTES {
+                Sid: sid.as_mut_ptr().cast(),
+                Attributes: SE_GROUP_INTEGRITY,
+            },
+        };
+        let ok = SetTokenInformation(
+            token,
+            TokenIntegrityLevel,
+            (&label as *const TOKEN_MANDATORY_LABEL).cast::<c_void>(),
+            (size_of::<TOKEN_MANDATORY_LABEL>() + sid.len()) as u32,
+        );
+        let error = last_error();
+        CloseHandle(token);
+        if ok == 0 {
+            return Err(format!("lowering the integrity level: {error}"));
+        }
+    }
+    Ok(())
+}
+
 /// Ends the start-up identity and checks that the restrictions are in force.
 pub fn lock_down() -> Result<Vec<&'static str>, String> {
+    lower_integrity()?;
     // SAFETY: no arguments. Ends the impersonation of the first thread, if there is one.
     unsafe {
         RevertToSelf();

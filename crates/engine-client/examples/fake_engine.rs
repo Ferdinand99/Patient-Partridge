@@ -57,7 +57,7 @@ fn main() {
                         engine_version: "fake".into(),
                         pdfium_version: "fake".into(),
                         sandbox: if mode == "no-sandbox" {
-                            String::new()
+                            "none: the stand-in has none".to_string()
                         } else {
                             "fake".into()
                         },

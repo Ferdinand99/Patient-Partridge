@@ -13,7 +13,8 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
 
 use partridge_engine_client::{
     spawn_engine, ClientError, EngineClient, EngineConfig, SandboxPolicy, SpawnRequest,
@@ -59,14 +60,37 @@ fn run_selftest(
     })
     .expect("the program starts");
     drop(engine.stdin);
-    let mut output = String::new();
-    let mut raw = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(120);
-    engine.stdout.read_to_end(&mut raw).ok();
-    output.push_str(&String::from_utf8_lossy(&raw));
-    assert!(Instant::now() < deadline, "the program took too long");
-    let status = engine.process.wait();
-    let ended_well = status.is_ok() && engine.process.try_wait().ok().flatten().is_some();
+    // The output is read by a thread, so that a program that hangs fails the test instead of
+    // holding it for ever.
+    let collected = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let (finished_tx, finished) = mpsc::channel();
+    {
+        let collected = collected.clone();
+        let mut stdout = engine.stdout;
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 4096];
+            while let Ok(n) = stdout.read(&mut buffer) {
+                if n == 0 {
+                    break;
+                }
+                collected.lock().unwrap().extend_from_slice(&buffer[..n]);
+            }
+            let _ = finished_tx.send(());
+        });
+    }
+    let on_time = finished.recv_timeout(Duration::from_secs(90)).is_ok();
+    if !on_time {
+        let _ = engine.process.kill();
+        let _ = engine.process.wait();
+        let so_far = String::from_utf8_lossy(&collected.lock().unwrap()).into_owned();
+        panic!(
+            "the program did not end within 90 seconds. Output so far:
+{so_far}"
+        );
+    }
+    let _ = engine.process.wait();
+    let ended_well = engine.process.try_wait().ok().flatten().is_some();
+    let output = String::from_utf8_lossy(&collected.lock().unwrap()).into_owned();
     (output.lines().map(str::to_string).collect(), ended_well)
 }
 
@@ -273,6 +297,17 @@ fn text_in_a_script_that_needs_a_missing_font_does_not_hurt_the_engine() {
 
 /// Sends raw requests to an engine started by hand and returns its answers.
 fn talk(requests: Vec<RequestBody>, document: Option<&std::fs::File>) -> Vec<Response> {
+    // Run in a thread with a time limit: an engine that hangs must fail the test, not hold it.
+    let document = document.map(|d| d.try_clone().unwrap());
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(talk_unbounded(requests, document.as_ref()));
+    });
+    rx.recv_timeout(Duration::from_secs(90))
+        .expect("the engine did not answer within 90 seconds")
+}
+
+fn talk_unbounded(requests: Vec<RequestBody>, document: Option<&std::fs::File>) -> Vec<Response> {
     let config = real_config();
     let mut engine = spawn_engine(&SpawnRequest {
         program: &config.program,
