@@ -51,12 +51,22 @@ fn watch_memory(pid: u32, limit: u64) {
     }
     std::thread::spawn(move || {
         let mut started: Option<u64> = None;
+        let mut failures = 0;
         loop {
             std::thread::sleep(std::time::Duration::from_millis(25));
             let Some((footprint, start)) = usage(pid) else {
-                // The process is gone.
-                return;
+                // The numbers may not be there yet (the process is still being started) or any
+                // more (it has ended). Look for it a while before giving up; a process that does
+                // not exist is gone for sure.
+                failures += 1;
+                // SAFETY: signal 0 only asks whether the process exists.
+                let exists = unsafe { libc::kill(pid as i32, 0) } == 0;
+                if !exists || failures > 400 {
+                    return;
+                }
+                continue;
             };
+            failures = 0;
             // The same process as before, and not another one that got the number.
             if *started.get_or_insert(start) != start {
                 return;
