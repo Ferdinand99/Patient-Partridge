@@ -106,9 +106,19 @@ async function runOnce({ bin, pdf, memory }) {
     env.XDG_DATA_HOME = join(dir, "home", ".local", "share");
     env.XDG_CACHE_HOME = join(dir, "home", ".cache");
   }
-  const child = spawn(bin, [pdf], { env, stdio: "ignore" });
+  const child = spawn(bin, [pdf], { env: { ...env, RUST_BACKTRACE: "1" }, stdio: ["ignore", "pipe", "pipe"] });
+  // Keep the end of what the app wrote, to show it if the run fails.
+  let output = "";
+  const keep = (chunk) => {
+    output = (output + chunk).slice(-6000);
+  };
+  child.stdout.on("data", keep);
+  child.stderr.on("data", keep);
   let exited = false;
-  child.on("exit", () => (exited = true));
+  child.on("exit", (code, signal) => {
+    exited = true;
+    keep(`\n[the app exited: code ${code}, signal ${signal}]\n`);
+  });
   try {
     const deadline = Date.now() + 90_000;
     while (Date.now() < deadline) {
@@ -117,7 +127,9 @@ async function runOnce({ bin, pdf, memory }) {
       await sleep(100);
     }
     if (!existsSync(report) || !readFileSync(report, "utf8").trim()) {
-      throw new Error("The app did not report a drawn page (it exited or took longer than 90 s).");
+      throw new Error(
+        `The app did not report a drawn page (it exited or took longer than 90 s). What it wrote:\n${output}`,
+      );
     }
     await sleep(300);
     const result = JSON.parse(readFileSync(report, "utf8"));

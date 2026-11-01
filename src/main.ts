@@ -17,6 +17,15 @@ function storage(): Storage | null {
   }
 }
 
+// An error in the window is also written to the app's error stream, where a terminal or the log of
+// a test run shows it. It carries only the text of the error.
+window.addEventListener("error", (e) => {
+  void api.frontendError(`${e.message} (${e.filename}:${e.lineno})`).catch(() => undefined);
+});
+window.addEventListener("unhandledrejection", (e) => {
+  void api.frontendError(`unhandled rejection: ${String(e.reason)}`).catch(() => undefined);
+});
+
 const app = new App(document, {
   api,
   async pickFiles() {

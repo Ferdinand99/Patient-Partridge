@@ -307,6 +307,15 @@ fn take_pending_paths(pending: State<'_, Pending>) -> Vec<String> {
     pending.take()
 }
 
+/// Writes an error of the window to the standard error stream of the app, so that a failure in the
+/// window shows up in a terminal or in the log of a test run. It goes nowhere else. The text is cut
+/// to a short length.
+#[tauri::command]
+fn frontend_error(message: String) {
+    let short: String = message.chars().take(2000).collect();
+    eprintln!("window error: {short}");
+}
+
 /// True when a measurement run asked the app to report its timings (see `scripts/measure.sh`).
 #[tauri::command]
 fn measure_mode() -> bool {
@@ -409,6 +418,7 @@ pub fn run() {
             search_page,
             take_pending_paths,
             measure_mode,
+            frontend_error,
             measure_report,
         ])
         .build(tauri::generate_context!())

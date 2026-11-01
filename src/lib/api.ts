@@ -67,6 +67,11 @@ export const api = {
     return invoke<string[]>("take_pending_paths");
   },
 
+  /** Tells the app process about an error in the window. It is written to the app's error stream. */
+  frontendError(message: string): Promise<void> {
+    return invoke<void>("frontend_error", { message });
+  },
+
   measureMode(): Promise<boolean> {
     return invoke<boolean>("measure_mode");
   },
