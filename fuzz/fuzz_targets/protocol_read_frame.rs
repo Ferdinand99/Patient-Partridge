@@ -5,7 +5,7 @@
 //! - they never allocate by the announced length: the biggest single allocation of a run is
 //!   measured and must stay in proportion to the bytes that were really there (a 4 byte header
 //!   that announces 128 MiB must not cost 128 MiB). This needs input longer than the first chunk
-//!   the reader makes room for (64 KiB), so run it with `-max_len` above 65536;
+//!   the reader makes room for (64 KiB), so run it with `-max_len` above 65536 (any larger value is fine);
 //! - a stream that arrives in small pieces, with interrupted reads, gives the same frames and the
 //!   same ending as one that arrives whole;
 //! - every frame that comes out can be given to both decoders, and what they return is inside
@@ -73,10 +73,11 @@ enum Ending {
     Other(String),
 }
 
-fn drain<R: Read>(r: &mut R, limit: u16) -> (Vec<Vec<u8>>, Ending) {
+fn drain<R: Read>(r: &mut R, limit: u16, input_len: usize) -> (Vec<Vec<u8>>, Ending) {
     let mut frames = Vec::new();
-    // Each frame takes at least 4 bytes of input, so this ends; the cap is only a safety net.
-    for _ in 0..100_000 {
+    // Each frame takes at least 4 bytes of input, so there are at most a quarter of the input in
+    // frames, and one more read finds the end. The limit is only a safety net.
+    for _ in 0..input_len / 4 + 2 {
         let result = if limit == 0 {
             read_frame(r)
         } else {
@@ -98,14 +99,19 @@ fuzz_target!(|raw: &[u8]| {
         return;
     };
     BIGGEST.store(0, Relaxed);
-    let (whole, whole_end) = drain(&mut Cursor::new(input.data), input.limit);
-    let (pieces, pieces_end) = drain(&mut ChunkReader::new(input.data, input.pieces), input.limit);
+    let (whole, whole_end) = drain(&mut Cursor::new(input.data), input.limit, input.data.len());
+    let (pieces, pieces_end) = drain(
+        &mut ChunkReader::new(input.data, input.pieces),
+        input.limit,
+        input.data.len(),
+    );
 
-    // A frame buffer grows by doubling, so twice the data is the most it can take; the list of
-    // frames takes 24 bytes for each frame of at least 4 bytes. Room for 128 MiB would not fit.
+    // A frame buffer grows by doubling, so twice the data is the most it can take. The list of
+    // frames takes 24 bytes for each frame of at least 4 bytes and also grows by doubling, so
+    // twelve times the input is the most it can take. Room for 128 MiB would not fit.
     let biggest = BIGGEST.load(Relaxed);
     assert!(
-        biggest <= 8 * raw.len() + 256 * 1024,
+        biggest <= 12 * raw.len() + 256 * 1024,
         "an allocation of {biggest} bytes for {} bytes of input",
         raw.len()
     );

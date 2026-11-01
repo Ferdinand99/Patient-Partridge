@@ -528,6 +528,9 @@ fn main() {
         ("outline_wide", kit::outline_wide_pdf(20)),
         ("outline_deep", kit::outline_deep_pdf(6)),
         ("links", kit::many_links_pdf(12)),
+        // One link more than a page may report (about 89 000 bytes, under the engine target's
+        // `-max_len` of 100000).
+        ("links_over_the_cap", kit::many_links_pdf(501)),
         ("encrypted", kit::encrypted_pdf("secret", 1)),
         ("truncated", kit::truncated_pdf()),
         ("corrupt", kit::corrupt_pdf()),

@@ -162,7 +162,7 @@ pub fn over_cap_request_case(case: usize, id: u32) -> (&'static str, Vec<u8>) {
 }
 
 /// How many cases `over_cap_response_case` has.
-pub const OVER_CAP_RESPONSES: usize = 12;
+pub const OVER_CAP_RESPONSES: usize = 13;
 
 /// The two cases that are 1.7 MB.
 const PAGE_TEXT_OVER: usize = 6;
@@ -267,7 +267,7 @@ pub fn over_cap_response_case(case: usize, id: u32) -> (&'static str, Vec<u8>, b
             p.resize(p.len() + width as usize * 4, 0);
             ("bitmap one pixel too wide", p, false)
         }
-        _ => {
+        10 => {
             let width = MAX_RENDER_SIDE;
             let mut p = header(131, id);
             push_u32(&mut p, width);
@@ -275,6 +275,16 @@ pub fn over_cap_response_case(case: usize, id: u32) -> (&'static str, Vec<u8>, b
             push_u32(&mut p, width * 4);
             p.resize(p.len() + width as usize * 4, 0);
             ("bitmap of the widest size", p, true)
+        }
+        _ => {
+            // One pixel wide and one too many rows: only the height is over.
+            let height = MAX_RENDER_SIDE + 1;
+            let mut p = header(131, id);
+            push_u32(&mut p, 1);
+            push_u32(&mut p, height);
+            push_u32(&mut p, height * 4);
+            p.resize(p.len() + height as usize * 4, 0);
+            ("bitmap one pixel too high", p, false)
         }
     }
 }

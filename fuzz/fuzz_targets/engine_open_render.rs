@@ -12,13 +12,17 @@
 //!
 //! What is checked, on the answer as the engine builds it (before the encoder cuts any list):
 //! - Open: page sizes are finite, positive and not above 14 400 points.
-//! - Outline, Close: the right kind of answer. An outline has at most 5 000 entries, depth at
-//!   most 15, titles at most 512 bytes, and an entry that has a page names a page that exists.
-//!   Close answers `Closed`, and the document is gone afterwards.
-//! - PageText: at most 100 000 characters, one box for each.
-//! - PageLinks: at most 500, addresses not empty and at most 2 048 bytes, and a link to a page
-//!   names a page that exists (the seeds include documents whose link and outline destinations
-//!   are page numbers far past the end or negative).
+//! - Outline, Close: the right kind of answer. An outline has depth at most 15, titles at most
+//!   512 bytes, and an entry that has a page names a page that exists. Close answers `Closed`,
+//!   and the document is gone afterwards. (The check for at most 5 000 entries is there, but no
+//!   input reaches it: such an outline is far bigger than the `-max_len`.)
+//! - PageText: the check for at most 100 000 characters is there, but no input reaches it (the
+//!   test kit writes no compressed streams, so such a page does not fit in the `-max_len`).
+//!   One box for each character cannot fail here: the engine builds both from one list.
+//! - PageLinks: at most 500 (the seed `links_over_the_cap` has 501), addresses not empty and at
+//!   most 2 048 bytes, and a link to a page names a page that exists (the seeds include
+//!   documents whose link and outline destinations are page numbers far past the end or
+//!   negative).
 //! - Search: matches are not empty, in order, do not overlap, and lie inside the text of the page
 //!   (counted in characters of the `PageText` answer), and the text they cover reads like the
 //!   search text (checked with a second, separate way of folding case and white space). Besides
