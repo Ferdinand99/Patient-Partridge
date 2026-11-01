@@ -14,23 +14,30 @@ use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::null_mut;
 
-use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE};
+use windows_sys::Win32::Foundation::{FALSE, HANDLE};
 use windows_sys::Win32::Security::{
     GetTokenInformation, IsTokenRestricted, RevertToSelf, TokenIntegrityLevel,
-    TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+    TOKEN_MANDATORY_LABEL,
 };
 use windows_sys::Win32::System::JobObjects::IsProcessInJob;
 use windows_sys::Win32::System::SystemServices::{
     PROCESS_MITIGATION_DYNAMIC_CODE_POLICY, PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetProcessMitigationPolicy, OpenProcessToken, ProcessDynamicCodePolicy,
+    GetCurrentProcess, GetProcessMitigationPolicy, ProcessDynamicCodePolicy,
     ProcessExtensionPointDisablePolicy,
 };
 
 /// The integrity level of a process is the last sub-authority of the SID in its token. Medium is
 /// 0x2000.
 const MEDIUM_INTEGRITY: u32 = 0x2000;
+
+/// The pseudo handle for the token of the process itself (`GetCurrentProcessToken` in C). The
+/// engine cannot open its own token the usual way: with the restricted token it has now, the
+/// access check on the token object fails.
+fn own_token() -> HANDLE {
+    -4isize as HANDLE
+}
 
 fn last_error() -> String {
     std::io::Error::last_os_error().to_string()
@@ -40,10 +47,7 @@ fn last_error() -> String {
 fn integrity_level() -> Result<u32, String> {
     // SAFETY: documented Win32 calls; the buffer is as large as the call asks for.
     unsafe {
-        let mut token: HANDLE = null_mut();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
-            return Err(format!("OpenProcessToken: {}", last_error()));
-        }
+        let token = own_token();
         let mut needed = 0u32;
         GetTokenInformation(token, TokenIntegrityLevel, null_mut(), 0, &mut needed);
         let mut buffer = vec![0u8; needed as usize];
@@ -54,7 +58,6 @@ fn integrity_level() -> Result<u32, String> {
             needed,
             &mut needed,
         );
-        CloseHandle(token);
         if ok == 0 {
             return Err(format!("GetTokenInformation: {}", last_error()));
         }
@@ -75,13 +78,7 @@ fn check_layers() -> Result<Vec<&'static str>, String> {
     let mut layers = Vec::new();
     // SAFETY: documented Win32 calls with live out parameters.
     unsafe {
-        let mut token: HANDLE = null_mut();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
-            return Err(format!("OpenProcessToken: {}", last_error()));
-        }
-        let restricted = IsTokenRestricted(token) != 0;
-        CloseHandle(token);
-        if !restricted {
+        if IsTokenRestricted(own_token()) == 0 {
             return Err("the token of the engine is not restricted".to_string());
         }
         layers.push("restricted-token");
