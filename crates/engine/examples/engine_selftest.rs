@@ -376,14 +376,50 @@ fn windows_probes(title: &str, say: &mut dyn FnMut(String)) {
         EnumWindows(Some(count), &mut windows as *mut u32 as isize);
         say(format!("windows_on_the_desktop: {windows}"));
 
-        // The clipboard: reading what is on it and replacing it.
-        let opened = OpenClipboard(std::ptr::null_mut()) != 0;
+        // The clipboard: reading what is on it, clearing it, and putting something of our own on
+        // it. (Putting something on it needs a window of our own that owns the clipboard.)
+        let class = wide_text("STATIC");
+        let owner = windows_sys::Win32::UI::WindowsAndMessaging::CreateWindowExW(
+            0,
+            class.as_ptr(),
+            std::ptr::null(),
+            0x8000_0000, // WS_POPUP
+            0,
+            0,
+            1,
+            1,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        );
+        say(format!(
+            "window_created: {}",
+            if owner.is_null() { "no" } else { "yes" }
+        ));
+        let opened = OpenClipboard(owner) != 0;
         let read = opened && !GetClipboardData(13).is_null();
-        let wrote = opened && EmptyClipboard() != 0;
+        let cleared = opened && EmptyClipboard() != 0;
+        let mut wrote = false;
+        if cleared {
+            let memory = windows_sys::Win32::System::Memory::GlobalAlloc(
+                windows_sys::Win32::System::Memory::GMEM_MOVEABLE,
+                2,
+            );
+            if !memory.is_null() {
+                let p = windows_sys::Win32::System::Memory::GlobalLock(memory) as *mut u8;
+                *p = b'x';
+                *p.add(1) = 0;
+                windows_sys::Win32::System::Memory::GlobalUnlock(memory);
+                wrote = !windows_sys::Win32::System::DataExchange::SetClipboardData(1, memory)
+                    .is_null();
+            }
+        }
         if opened {
             CloseClipboard();
         }
         say(verdict("clipboard_read", !read, String::new()));
+        say(verdict("clipboard_clear", !cleared, String::new()));
         say(verdict("clipboard_write", !wrote, String::new()));
     }
 
@@ -488,6 +524,15 @@ fn afd_endpoint() -> String {
             if status >= 0 { "ALLOWED" } else { "other" }
         )
     }
+}
+
+#[cfg(windows)]
+fn wide_text(s: &str) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    std::ffi::OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 /// Tries to map memory that can run code.

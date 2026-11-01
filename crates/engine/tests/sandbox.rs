@@ -433,7 +433,18 @@ fn a_locked_in_engine_cannot_open_files_use_the_network_or_start_programs() {
                 "the control cannot read the clipboard either"
             );
         }
+        println!(
+            "clipboard: clear {} / write {} (window made: {})",
+            line(lines, "clipboard_clear"),
+            line(lines, "clipboard_write"),
+            line(lines, "window_created")
+        );
         assert!(line(lines, "clipboard_write").contains("denied"));
+        assert!(
+            line(&control, "clipboard_write").contains("ALLOWED"),
+            "the control cannot write the clipboard either: {}",
+            line(&control, "clipboard_write")
+        );
     }
 
     assert!(lines.last().is_some_and(|l| l == "done"), "{lines:#?}");
