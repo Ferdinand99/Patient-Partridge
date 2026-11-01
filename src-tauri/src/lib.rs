@@ -361,6 +361,16 @@ fn frontend_error(message: String) {
     eprintln!("window error: {short}");
 }
 
+/// Opens the print dialog of the web view. Only macOS needs this, because `window.print()` does
+/// nothing in its web view; everywhere else the window calls `window.print()` itself.
+#[tauri::command]
+fn print_webview(window: tauri::WebviewWindow) -> Result<(), CommandError> {
+    window.print().map_err(|e| CommandError {
+        code: "internal".into(),
+        message: e.to_string(),
+    })
+}
+
 /// True when a measurement run asked the app to report its timings (see `scripts/measure.sh`).
 #[tauri::command]
 fn measure_mode() -> bool {
@@ -462,6 +472,7 @@ pub fn run() {
             get_page_text,
             get_page_links,
             open_link,
+            print_webview,
             search_page,
             take_pending_paths,
             measure_mode,

@@ -16,6 +16,7 @@ Patient Partridge is part of the Hedgerow family of apps, next to [Nimble Newt](
 - Select text with the mouse (double click for a word, triple click for a line, Ctrl+A for everything) and copy it with Ctrl+C or the system's Copy. The text and the place of every character come from PDFium through the engine; nothing is read from the file by the window.
 - Search in the document (Ctrl+F). The matches are highlighted on the pages, Enter and Shift+Enter (or F3) move between them, and the count is shown. Search ignores upper and lower case and line breaks, and runs page by page in the background, so you can stop it at any time. Words that a PDF writes with a ligature such as "fi" in one character may not be found.
 - Links inside a PDF are never opened by themselves. Pressing one shows the whole address and asks first. Only web addresses (http and https) can be opened, in your normal browser; anything else (a file, a program, a script, a mail address) is refused with an explanation. Links to another page of the same document just go there. Attachments in a PDF are never opened or even listed.
+- Print (Ctrl+P): all pages, the page in view, or a list such as 1-3, 7, 9-. The pages are drawn by the engine at 150 dpi, packed as JPEG pictures one at a time (a few hundred kilobytes each) and then the print dialog of your system opens; nothing is sent anywhere else. A printed page is a picture of the page, not text. This is covered by unit tests with a fake printer; it has not been tried on a real printer on every system yet.
 - Zoom in and out, or fit the page to the window width. Ctrl with the mouse wheel zooms too.
 - Move with the mouse wheel, the arrow keys, Page Up and Page Down, Space, Home and End, or jump to a page number (Ctrl+G).
 - Patient Partridge remembers where you stopped in each file and puts you back there when you open it again. The place (page, how far down, zoom) is kept in a small file on your computer, together with the path of the file, for the last 500 files. Nothing is sent anywhere. "Forget remembered positions" in the settings menu (the three dots) empties it.
@@ -24,8 +25,6 @@ Patient Partridge is part of the Hedgerow family of apps, next to [Nimble Newt](
 - The installers register Patient Partridge as a viewer for PDF files, so it appears under "Open with". It does not take over as the default reader by itself.
 
 ## What is not there yet
-
-Printing.
 
 The editor side is also planned, and none of it exists yet. There are no dates; each step is done when it works:
 

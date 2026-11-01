@@ -87,6 +87,11 @@ export const api = {
     await invoke<void>("open_link", { doc, url });
   },
 
+  /** Opens the print dialog of the web view. Only needed on macOS: elsewhere `window.print()` works. */
+  async printWebview(): Promise<void> {
+    await invoke<void>("print_webview");
+  },
+
   /** Remembers where the reader is in a file. Kept in a file on this computer, nowhere else. */
   async setPosition(path: string, position: SavedPosition): Promise<void> {
     await invoke<void>("set_position", {

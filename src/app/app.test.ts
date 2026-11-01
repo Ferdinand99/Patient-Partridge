@@ -86,6 +86,7 @@ class MemoryStorage {
 
 function make(options: { measureOn?: boolean; storage?: MemoryStorage } = {}) {
   let nextDoc = 1;
+  let urlCounter = 0;
   const api = {
     open: vi.fn((path: string, _password?: string) =>
       Promise.resolve(opened(nextDoc++, 3, path.split("/").pop())),
@@ -133,6 +134,12 @@ function make(options: { measureOn?: boolean; storage?: MemoryStorage } = {}) {
     positionDelayMs: 5,
     thumbSettleMs: 5,
     findDebounceMs: 5,
+    print: {
+      encode: vi.fn(() => Promise.resolve(new Blob(["jpeg"]))),
+      createUrl: vi.fn(() => `blob:test/${++urlCounter}`),
+      revokeUrl: vi.fn(),
+      print: vi.fn(() => Promise.resolve()),
+    },
   };
   const app = new App(document, deps);
   app.init();
@@ -916,6 +923,96 @@ describe("App: links in a document", () => {
     click(button("Open in browser"));
     await flush();
     expect(notice()?.textContent).toContain("could not be opened");
+  });
+});
+
+describe("App: printing", () => {
+  const printButton = () => q<HTMLButtonElement>("#print-button");
+  const submitDialog = () => document.querySelector(".print-dialog")?.dispatchEvent(new Event("submit", { cancelable: true }));
+  const radio = (value: string) => q<HTMLInputElement>(`.print-dialog input[value="${value}"]`);
+
+  it("is off while no document is open", async () => {
+    const { app } = make();
+    expect(printButton().disabled).toBe(true);
+    key("p", { ctrlKey: true });
+    expect(document.querySelector(".print-dialog")).toBeNull();
+    await app.openPath("/a.pdf");
+    await flush();
+    expect(printButton().disabled).toBe(false);
+  });
+
+  it("asks which pages, prepares them at print size and opens the print dialog", async () => {
+    const { app, api, deps } = make();
+    await app.openPath("/book.pdf");
+    await flush();
+    api.render.mockClear();
+    key("p", { ctrlKey: true });
+    expect(document.querySelector(".print-dialog")?.textContent).toContain("book.pdf has 3 pages");
+    radio("current").checked = true;
+    radio("current").dispatchEvent(new Event("change"));
+    submitDialog();
+    await flush();
+    await flush();
+    // One page, drawn for paper: 150 dpi, not for the screen.
+    expect(api.render).toHaveBeenCalledTimes(1);
+    expect(api.render.mock.calls[0]).toEqual([1, 0, Math.round((612 / 72) * 150), Math.round((792 / 72) * 150)]);
+    expect(deps.print.print).toHaveBeenCalledTimes(1);
+    expect(document.querySelectorAll("#print-root img")).toHaveLength(1);
+    expect(notice()).toBeNull();
+    // When printing is over, the pictures go.
+    window.dispatchEvent(new Event("afterprint"));
+    expect(document.querySelectorAll("#print-root img")).toHaveLength(0);
+    expect(deps.print.revokeUrl).toHaveBeenCalledTimes(1);
+  });
+
+  it("prints all the pages", async () => {
+    const { app, api, deps } = make();
+    await app.openPath("/book.pdf");
+    await flush();
+    api.render.mockClear();
+    click(printButton());
+    submitDialog();
+    await flush();
+    await flush();
+    expect(api.render.mock.calls.map((c) => c[1])).toEqual([0, 1, 2]);
+    expect(document.querySelectorAll("#print-root img")).toHaveLength(3);
+    expect(deps.print.print).toHaveBeenCalledTimes(1);
+  });
+
+  it("does nothing when the question is cancelled", async () => {
+    const { app, api, deps } = make();
+    await app.openPath("/book.pdf");
+    await flush();
+    api.render.mockClear();
+    key("p", { ctrlKey: true });
+    document.querySelector<HTMLElement>(".print-dialog .btn-secondary")?.click();
+    await flush();
+    expect(api.render).not.toHaveBeenCalled();
+    expect(deps.print.print).not.toHaveBeenCalled();
+    expect(document.querySelector(".print-dialog")).toBeNull();
+  });
+
+  it("says so when a page cannot be drawn, and sends nothing to the printer", async () => {
+    const { app, api, deps } = make();
+    await app.openPath("/book.pdf");
+    await flush();
+    api.render.mockRejectedValueOnce({ code: "engine_stopped", message: "it exited" });
+    click(printButton());
+    submitDialog();
+    await flush();
+    await flush();
+    expect(notice()?.textContent).toContain("could not be printed");
+    expect(notice()?.textContent).toContain("Nothing was sent to the printer");
+    expect(deps.print.print).not.toHaveBeenCalled();
+  });
+
+  it("asks only once at a time", async () => {
+    const { app } = make();
+    await app.openPath("/book.pdf");
+    await flush();
+    key("p", { ctrlKey: true });
+    key("p", { ctrlKey: true });
+    expect(document.querySelectorAll(".print-dialog")).toHaveLength(1);
   });
 });
 
