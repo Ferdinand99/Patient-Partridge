@@ -477,10 +477,7 @@ impl EngineClient {
             Ok(Event::Response(_)) => Err("it answered a different request".into()),
             Ok(Event::Failed(why)) => Err(format!("its answer was unreadable ({why})")),
             Ok(Event::Closed) | Err(RecvTimeoutError::Disconnected) => {
-                Err(match lock(&running.child).try_wait() {
-                    Ok(Some(status)) => format!("it exited ({status})"),
-                    _ => "it exited".to_string(),
-                })
+                Err(exit_text(&running.child))
             }
             Err(RecvTimeoutError::Timeout) => Err(format!(
                 "it did not answer within {} seconds",
@@ -658,6 +655,18 @@ fn spawn_reader(
             }
         }
     });
+}
+
+/// Says how the engine ended. The pipe closes a moment before the system reports the exit, so this
+/// waits a little for the exit status.
+fn exit_text(child: &SharedProcess) -> String {
+    for _ in 0..40 {
+        if let Ok(Some(status)) = lock(child).try_wait() {
+            return format!("it exited ({status})");
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    "it exited".to_string()
 }
 
 /// Opens the file the user chose, for reading. A file system object that is not a plain file (a

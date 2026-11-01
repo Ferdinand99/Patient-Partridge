@@ -24,7 +24,12 @@ fn rss_mib(pid: u32) -> f64 {
         .args(["-o", "rss=", "-p", &pid.to_string()])
         .output()
         .ok()
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<f64>().ok())
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<f64>()
+                .ok()
+        })
         .map_or(0.0, |kib| kib / 1024.0)
 }
 
