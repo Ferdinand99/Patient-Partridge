@@ -4,6 +4,9 @@
 //! done by `partridge-engine`, a separate process that this app starts and supervises. If the
 //! engine crashes or hangs on a bad file, the command that was waiting returns an error, the
 //! window stays up, and the next command starts a new engine.
+//!
+//! Every open document has its own engine process (see `EnginePool`), so a file that crashes its
+//! engine closes only its own tab.
 
 mod locate;
 
@@ -11,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use partridge_engine_client::{ClientError, EngineClient, EngineConfig};
+use partridge_engine_client::{ClientError, EngineConfig, EnginePool, LinkTarget};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -49,8 +52,11 @@ impl Pending {
     }
 }
 
-/// The supervised engine process.
-struct Engine(Arc<EngineClient>);
+/// Most documents open at once. Each one has an engine process of its own, about 4 MiB when idle.
+const MAX_DOCUMENTS: usize = 16;
+
+/// The supervised engine processes, one per open document.
+struct Engine(Arc<EnginePool>);
 
 /// What the frontend sees when a command fails: a stable code and a short detail.
 #[derive(Serialize, Debug, PartialEq)]
@@ -76,9 +82,8 @@ impl From<ClientError> for CommandError {
 
 #[derive(Serialize)]
 struct OpenedInfo {
-    /// Handle of the document. It holds the number of the engine process in its upper half, so
-    /// it stays unique after the engine is replaced (see `partridge-engine-client`). It is below
-    /// 2^53, so the window reads it exactly.
+    /// Handle of the document. Counted up from 1 and never reused, so a handle that outlives its
+    /// document cannot reach another one. It is far below 2^53, so the window reads it exactly.
     doc: u64,
     /// Page sizes in PDF points, `[width, height]`.
     pages: Vec<[f32; 2]>,
@@ -106,15 +111,15 @@ async fn open_pdf(
     path: String,
     password: Option<String>,
 ) -> Result<OpenedInfo, CommandError> {
-    let client = engine.0.clone();
+    let pool = engine.0.clone();
     let name = Path::new(&path)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.clone());
-    let opened = blocking(move || client.open(&path, password.as_deref())).await?;
+    let (doc, pages) = blocking(move || pool.open(&path, password.as_deref())).await?;
     Ok(OpenedInfo {
-        doc: opened.doc,
-        pages: opened.pages.iter().map(|p| [p.width, p.height]).collect(),
+        doc,
+        pages: pages.iter().map(|p| [p.width, p.height]).collect(),
         name,
     })
 }
@@ -129,17 +134,121 @@ async fn render_page(
     width: u32,
     height: u32,
 ) -> Result<tauri::ipc::Response, CommandError> {
-    let client = engine.0.clone();
-    let bitmap = blocking(move || client.render(doc, page, width, height)).await?;
+    let pool = engine.0.clone();
+    let bitmap = blocking(move || pool.render(doc, page, width, height)).await?;
     Ok(tauri::ipc::Response::new(bitmap.rgba))
 }
 
 #[tauri::command]
 async fn close_pdf(engine: State<'_, Engine>, doc: u64) -> Result<(), CommandError> {
-    let client = engine.0.clone();
-    // If the engine is gone the document is gone with it, which is what closing wants anyway.
-    let _ = blocking(move || client.close(doc)).await;
+    let pool = engine.0.clone();
+    // Closing a document that is gone is fine: the end state is what the caller wants.
+    let _ = blocking(move || {
+        pool.close(doc);
+        Ok(())
+    })
+    .await;
     Ok(())
+}
+
+/// One entry of the table of contents.
+#[derive(Serialize)]
+struct OutlineEntry {
+    depth: u8,
+    /// The page the entry leads to, counted from 0, or null when it leads nowhere in the document.
+    page: Option<u32>,
+    title: String,
+}
+
+#[tauri::command]
+async fn get_outline(
+    engine: State<'_, Engine>,
+    doc: u64,
+) -> Result<Vec<OutlineEntry>, CommandError> {
+    let pool = engine.0.clone();
+    let items = blocking(move || pool.outline(doc)).await?;
+    Ok(items
+        .into_iter()
+        .map(|i| OutlineEntry {
+            depth: i.depth,
+            page: i.page,
+            title: i.title,
+        })
+        .collect())
+}
+
+/// Rounds a coordinate to a hundredth of a point, which is far finer than a pixel and keeps the
+/// text of a page small when it is sent to the window.
+fn round2(v: f32) -> f32 {
+    (v * 100.0).round() / 100.0
+}
+
+/// The text of a page. `rects` holds four numbers for every character of `text`, in order:
+/// left, top, right and bottom, in points from the top left of the page as it is drawn.
+#[derive(Serialize)]
+struct PageTextInfo {
+    text: String,
+    rects: Vec<f32>,
+}
+
+#[tauri::command]
+async fn get_page_text(
+    engine: State<'_, Engine>,
+    doc: u64,
+    page: u32,
+) -> Result<PageTextInfo, CommandError> {
+    let pool = engine.0.clone();
+    let text = blocking(move || pool.page_text(doc, page)).await?;
+    Ok(PageTextInfo {
+        text: text.text,
+        rects: text.rects.iter().flatten().map(|v| round2(*v)).collect(),
+    })
+}
+
+/// A link on a page, with the box it covers (left, top, right, bottom, in points from the top
+/// left of the page as it is drawn). Exactly one of `uri` and `page` is set.
+#[derive(Serialize)]
+struct LinkInfo {
+    rect: [f32; 4],
+    uri: Option<String>,
+    page: Option<u32>,
+}
+
+#[tauri::command]
+async fn get_page_links(
+    engine: State<'_, Engine>,
+    doc: u64,
+    page: u32,
+) -> Result<Vec<LinkInfo>, CommandError> {
+    let pool = engine.0.clone();
+    let links = blocking(move || pool.page_links(doc, page)).await?;
+    Ok(links
+        .into_iter()
+        .map(|l| {
+            let (uri, page) = match l.target {
+                LinkTarget::Uri(u) => (Some(u), None),
+                LinkTarget::Page(p) => (None, Some(p)),
+            };
+            LinkInfo {
+                rect: l.rect.map(round2),
+                uri,
+                page,
+            }
+        })
+        .collect())
+}
+
+/// Finds a text on one page. Each match is `[start, length]` in characters of the page text.
+#[tauri::command]
+async fn search_page(
+    engine: State<'_, Engine>,
+    doc: u64,
+    page: u32,
+    query: String,
+) -> Result<Vec<[u32; 2]>, CommandError> {
+    let pool = engine.0.clone();
+    let found = blocking(move || pool.search_page(doc, page, &query)).await?;
+    Ok(found.into_iter().map(|m| [m.start, m.len]).collect())
 }
 
 /// The paths the app was started with. Also tells the app that the frontend is now listening.
@@ -214,7 +323,10 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(Pending::default())
         .setup(|app| {
-            app.manage(Engine(Arc::new(EngineClient::new(engine_config(app)))));
+            app.manage(Engine(Arc::new(EnginePool::new(
+                engine_config(app),
+                MAX_DOCUMENTS,
+            ))));
             let args: Vec<PathBuf> = locate::existing_files(
                 std::env::args().skip(1),
                 std::env::current_dir().ok().as_deref(),
@@ -233,6 +345,10 @@ pub fn run() {
             open_pdf,
             render_page,
             close_pdf,
+            get_outline,
+            get_page_text,
+            get_page_links,
+            search_page,
             take_pending_paths,
             measure_mode,
             measure_report,
@@ -246,7 +362,7 @@ pub fn run() {
         // waits for it would hold the quit back. Killing it does not wait for any request.
         if let tauri::RunEvent::Exit = &event {
             if let Some(engine) = handle.try_state::<Engine>() {
-                engine.0.kill();
+                engine.0.kill_all();
             }
         }
         // A file opened from the dock or Finder on macOS arrives as an event, not as an argument.

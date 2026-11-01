@@ -102,6 +102,37 @@ fn main() {
                 );
             }
             RequestBody::Close { .. } => reply(&mut output, id, ResponseBody::Closed),
+            RequestBody::Outline { .. } => match mode.as_str() {
+                "wrong-kind" => reply(&mut output, id, ResponseBody::Closed),
+                "big-text" => {
+                    let _ = write_frame(&mut output, &vec![0u8; 10 * 1024 * 1024]);
+                }
+                _ => reply(&mut output, id, ResponseBody::Outline { items: vec![] }),
+            },
+            RequestBody::PageText { .. } => match mode.as_str() {
+                "big-text" => {
+                    let _ = write_frame(&mut output, &vec![0u8; 10 * 1024 * 1024]);
+                }
+                _ => reply(
+                    &mut output,
+                    id,
+                    ResponseBody::PageText {
+                        text: "hi".into(),
+                        rects: vec![[0.0; 4]; 2],
+                    },
+                ),
+            },
+            RequestBody::PageLinks { .. } => {
+                reply(&mut output, id, ResponseBody::PageLinks { links: vec![] })
+            }
+            RequestBody::Search { .. } => match mode.as_str() {
+                "text-wrong-id" => reply(
+                    &mut output,
+                    id + 1,
+                    ResponseBody::Matches { matches: vec![] },
+                ),
+                _ => reply(&mut output, id, ResponseBody::Matches { matches: vec![] }),
+            },
         }
     }
 }

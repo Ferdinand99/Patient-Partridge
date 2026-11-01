@@ -17,7 +17,7 @@ use std::fmt;
 use std::io::{self, Read, Write};
 
 /// Version of this protocol. Both sides check it in the `Hello` exchange.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Largest frame (payload) either side accepts: 128 MiB, enough for the biggest allowed bitmap.
 pub const MAX_FRAME_LEN: usize = 128 * 1024 * 1024;
@@ -31,15 +31,53 @@ pub const MAX_RENDER_PIXELS: u64 = 24_000_000;
 /// Largest bitmap side the engine renders, in pixels.
 pub const MAX_RENDER_SIDE: u32 = 16_384;
 
+/// Most outline entries the engine reports for one document.
+pub const MAX_OUTLINE_ITEMS: usize = 5_000;
+
+/// Deepest outline level reported (0 is the top level). Deeper entries are left out.
+pub const MAX_OUTLINE_DEPTH: u8 = 15;
+
+/// Longest outline title, in bytes. Longer titles are cut on a character boundary.
+pub const MAX_OUTLINE_TITLE: usize = 512;
+
+/// Most characters of text the engine reports for one page.
+pub const MAX_PAGE_CHARS: usize = 100_000;
+
+/// Most bytes of page text on the wire: every character is at most 4 bytes in UTF-8.
+pub const MAX_PAGE_TEXT_BYTES: usize = MAX_PAGE_CHARS * 4;
+
+/// Most links the engine reports for one page.
+pub const MAX_LINKS_PER_PAGE: usize = 500;
+
+/// Longest link address, in bytes. Links with a longer address are left out.
+pub const MAX_URI_LEN: usize = 2_048;
+
+/// Longest search text, in bytes.
+pub const MAX_QUERY_LEN: usize = 256;
+
+/// Most matches the engine reports for one page.
+pub const MAX_MATCHES_PER_PAGE: usize = 2_000;
+
+/// Stands for "no page" in an outline entry.
+const NO_PAGE: u32 = u32::MAX;
+
 const TAG_REQ_HELLO: u8 = 1;
 const TAG_REQ_OPEN: u8 = 2;
 const TAG_REQ_RENDER: u8 = 3;
 const TAG_REQ_CLOSE: u8 = 4;
+const TAG_REQ_OUTLINE: u8 = 5;
+const TAG_REQ_PAGE_TEXT: u8 = 6;
+const TAG_REQ_PAGE_LINKS: u8 = 7;
+const TAG_REQ_SEARCH: u8 = 8;
 
 const TAG_RES_HELLO: u8 = 129;
 const TAG_RES_OPENED: u8 = 130;
 const TAG_RES_RENDERED: u8 = 131;
 const TAG_RES_CLOSED: u8 = 132;
+const TAG_RES_OUTLINE: u8 = 133;
+const TAG_RES_PAGE_TEXT: u8 = 134;
+const TAG_RES_PAGE_LINKS: u8 = 135;
+const TAG_RES_MATCHES: u8 = 136;
 const TAG_RES_ERROR: u8 = 255;
 
 /// What went wrong while reading or decoding a frame.
@@ -187,6 +225,50 @@ pub enum RequestBody {
     },
     /// Forget a document and free its memory.
     Close { doc: u32 },
+    /// The table of contents of a document (its bookmarks).
+    Outline { doc: u32 },
+    /// The text of one page, character by character, with the place of every character.
+    PageText { doc: u32, page: u32 },
+    /// The links of one page that point to a web address or to a page of the same document.
+    PageLinks { doc: u32, page: u32 },
+    /// Find `query` on one page, ignoring case and runs of white space.
+    Search { doc: u32, page: u32, query: String },
+}
+
+/// One entry of the table of contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutlineItem {
+    /// Nesting level: 0 for the top level.
+    pub depth: u8,
+    /// Page the entry leads to (counted from 0), when it leads to a page of this document.
+    pub page: Option<u32>,
+    pub title: String,
+}
+
+/// Where a link on a page leads. Links that do anything else (open a file, run a program, go to
+/// another document) are never reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkTarget {
+    /// A web address, as written in the document. It can be any scheme: the app decides.
+    Uri(String),
+    /// A page of the same document, counted from 0.
+    Page(u32),
+}
+
+/// A link on a page. The box is `[left, top, right, bottom]` in points from the top left of the
+/// page as it is drawn (after the page's own rotation).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PageLink {
+    pub rect: [f32; 4],
+    pub target: LinkTarget,
+}
+
+/// One match of a search on a page. `start` and `len` count characters of the page text as
+/// reported by `PageText`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextMatch {
+    pub start: u32,
+    pub len: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -213,6 +295,22 @@ pub enum ResponseBody {
         rgba: Vec<u8>,
     },
     Closed,
+    Outline {
+        items: Vec<OutlineItem>,
+    },
+    /// `text` holds one entry per character; `rects` holds `[left, top, right, bottom]` for each
+    /// of them, in points from the top left of the page as it is drawn. A character without a
+    /// place on the page (a line break) has an empty box of zeros.
+    PageText {
+        text: String,
+        rects: Vec<[f32; 4]>,
+    },
+    PageLinks {
+        links: Vec<PageLink>,
+    },
+    Matches {
+        matches: Vec<TextMatch>,
+    },
     Error {
         code: ErrorCode,
         message: String,
@@ -246,6 +344,22 @@ fn put_str(out: &mut Vec<u8>, s: &str) {
     }
     put_u32(out, end as u32);
     out.extend_from_slice(&s.as_bytes()[..end]);
+}
+
+/// Writes a string cut to at most `max` bytes on a character boundary.
+fn put_str_max(out: &mut Vec<u8>, s: &str, max: usize) {
+    let mut end = s.len().min(max);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    put_u32(out, end as u32);
+    out.extend_from_slice(&s.as_bytes()[..end]);
+}
+
+fn put_rect(out: &mut Vec<u8>, rect: &[f32; 4]) {
+    for v in rect {
+        put_f32(out, *v);
+    }
 }
 
 fn put_opt_str(out: &mut Vec<u8>, s: Option<&str>) {
@@ -291,6 +405,30 @@ impl Request {
                 put_u32(&mut out, self.id);
                 put_u32(&mut out, *doc);
             }
+            RequestBody::Outline { doc } => {
+                out.push(TAG_REQ_OUTLINE);
+                put_u32(&mut out, self.id);
+                put_u32(&mut out, *doc);
+            }
+            RequestBody::PageText { doc, page } => {
+                out.push(TAG_REQ_PAGE_TEXT);
+                put_u32(&mut out, self.id);
+                put_u32(&mut out, *doc);
+                put_u32(&mut out, *page);
+            }
+            RequestBody::PageLinks { doc, page } => {
+                out.push(TAG_REQ_PAGE_LINKS);
+                put_u32(&mut out, self.id);
+                put_u32(&mut out, *doc);
+                put_u32(&mut out, *page);
+            }
+            RequestBody::Search { doc, page, query } => {
+                out.push(TAG_REQ_SEARCH);
+                put_u32(&mut out, self.id);
+                put_u32(&mut out, *doc);
+                put_u32(&mut out, *page);
+                put_str_max(&mut out, query, MAX_QUERY_LEN);
+            }
         }
         out
     }
@@ -314,6 +452,20 @@ impl Request {
                 height: r.u32()?,
             },
             TAG_REQ_CLOSE => RequestBody::Close { doc: r.u32()? },
+            TAG_REQ_OUTLINE => RequestBody::Outline { doc: r.u32()? },
+            TAG_REQ_PAGE_TEXT => RequestBody::PageText {
+                doc: r.u32()?,
+                page: r.u32()?,
+            },
+            TAG_REQ_PAGE_LINKS => RequestBody::PageLinks {
+                doc: r.u32()?,
+                page: r.u32()?,
+            },
+            TAG_REQ_SEARCH => RequestBody::Search {
+                doc: r.u32()?,
+                page: r.u32()?,
+                query: r.string_max(MAX_QUERY_LEN)?,
+            },
             other => return Err(ProtocolError::UnknownTag(other)),
         };
         r.finish()?;
@@ -357,6 +509,70 @@ impl Response {
             ResponseBody::Closed => {
                 out.push(TAG_RES_CLOSED);
                 put_u32(&mut out, self.id);
+            }
+            ResponseBody::Outline { items } => {
+                out.push(TAG_RES_OUTLINE);
+                put_u32(&mut out, self.id);
+                let items = &items[..items.len().min(MAX_OUTLINE_ITEMS)];
+                put_u32(&mut out, items.len() as u32);
+                for item in items {
+                    out.push(item.depth.min(MAX_OUTLINE_DEPTH));
+                    put_u32(&mut out, item.page.unwrap_or(NO_PAGE));
+                    put_str_max(&mut out, &item.title, MAX_OUTLINE_TITLE);
+                }
+            }
+            ResponseBody::PageText { text, rects } => {
+                out.push(TAG_RES_PAGE_TEXT);
+                put_u32(&mut out, self.id);
+                // Whole characters only, so the text and the boxes always agree on the count.
+                let chars = text.chars().count().min(rects.len()).min(MAX_PAGE_CHARS);
+                let end = text
+                    .char_indices()
+                    .nth(chars)
+                    .map(|(i, _)| i)
+                    .unwrap_or(text.len());
+                put_u32(&mut out, chars as u32);
+                put_u32(&mut out, end as u32);
+                out.extend_from_slice(&text.as_bytes()[..end]);
+                for rect in &rects[..chars] {
+                    put_rect(&mut out, rect);
+                }
+            }
+            ResponseBody::PageLinks { links } => {
+                out.push(TAG_RES_PAGE_LINKS);
+                put_u32(&mut out, self.id);
+                let links: Vec<&PageLink> = links
+                    .iter()
+                    .filter(|l| match &l.target {
+                        LinkTarget::Uri(u) => u.len() <= MAX_URI_LEN,
+                        LinkTarget::Page(_) => true,
+                    })
+                    .take(MAX_LINKS_PER_PAGE)
+                    .collect();
+                put_u32(&mut out, links.len() as u32);
+                for link in links {
+                    put_rect(&mut out, &link.rect);
+                    match &link.target {
+                        LinkTarget::Uri(u) => {
+                            out.push(0);
+                            put_str_max(&mut out, u, MAX_URI_LEN);
+                        }
+                        LinkTarget::Page(p) => {
+                            out.push(1);
+                            put_u32(&mut out, *p);
+                        }
+                    }
+                }
+            }
+            ResponseBody::Matches { matches } => {
+                out.push(TAG_RES_MATCHES);
+                put_u32(&mut out, self.id);
+                let matches = &matches[..matches.len().min(MAX_MATCHES_PER_PAGE)];
+                put_u32(&mut out, matches.len() as u32);
+                for m in matches {
+                    put_u32(&mut out, m.start);
+                    put_u32(&mut out, m.len);
+                }
             }
             ResponseBody::Error { code, message } => {
                 out.push(TAG_RES_ERROR);
@@ -441,6 +657,81 @@ impl Response {
                 });
             }
             TAG_RES_CLOSED => ResponseBody::Closed,
+            TAG_RES_OUTLINE => {
+                let count = r.u32()? as usize;
+                // An entry takes at least 9 bytes: depth, page, and the length of the title.
+                if count > MAX_OUTLINE_ITEMS || count > r.remaining() / 9 {
+                    return Err(ProtocolError::InvalidLength);
+                }
+                let mut items = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let depth = r.u8()?;
+                    if depth > MAX_OUTLINE_DEPTH {
+                        return Err(ProtocolError::UnknownValue(depth));
+                    }
+                    let page = match r.u32()? {
+                        NO_PAGE => None,
+                        p => Some(p),
+                    };
+                    items.push(OutlineItem {
+                        depth,
+                        page,
+                        title: r.string_max(MAX_OUTLINE_TITLE)?,
+                    });
+                }
+                ResponseBody::Outline { items }
+            }
+            TAG_RES_PAGE_TEXT => {
+                let count = r.u32()? as usize;
+                let text_len = r.u32()? as usize;
+                if count > MAX_PAGE_CHARS || text_len > MAX_PAGE_TEXT_BYTES {
+                    return Err(ProtocolError::InvalidLength);
+                }
+                let text_bytes = r.take(text_len)?;
+                let text = std::str::from_utf8(text_bytes)
+                    .map_err(|_| ProtocolError::InvalidUtf8)?
+                    .to_string();
+                if text.chars().count() != count || count > r.remaining() / 16 {
+                    return Err(ProtocolError::InvalidLength);
+                }
+                let mut rects = Vec::with_capacity(count);
+                for _ in 0..count {
+                    rects.push(r.rect()?);
+                }
+                ResponseBody::PageText { text, rects }
+            }
+            TAG_RES_PAGE_LINKS => {
+                let count = r.u32()? as usize;
+                // A link takes at least 21 bytes: the box, the kind and a page or a length.
+                if count > MAX_LINKS_PER_PAGE || count > r.remaining() / 21 {
+                    return Err(ProtocolError::InvalidLength);
+                }
+                let mut links = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let rect = r.rect()?;
+                    let target = match r.u8()? {
+                        0 => LinkTarget::Uri(r.string_max(MAX_URI_LEN)?),
+                        1 => LinkTarget::Page(r.u32()?),
+                        other => return Err(ProtocolError::UnknownValue(other)),
+                    };
+                    links.push(PageLink { rect, target });
+                }
+                ResponseBody::PageLinks { links }
+            }
+            TAG_RES_MATCHES => {
+                let count = r.u32()? as usize;
+                if count > MAX_MATCHES_PER_PAGE || count > r.remaining() / 8 {
+                    return Err(ProtocolError::InvalidLength);
+                }
+                let mut matches = Vec::with_capacity(count);
+                for _ in 0..count {
+                    matches.push(TextMatch {
+                        start: r.u32()?,
+                        len: r.u32()?,
+                    });
+                }
+                ResponseBody::Matches { matches }
+            }
             TAG_RES_ERROR => {
                 let raw = r.u8()?;
                 let code = ErrorCode::from_u8(raw).ok_or(ProtocolError::UnknownValue(raw))?;
@@ -493,9 +784,24 @@ impl<'a> Reader<'a> {
         Ok(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 
+    /// A box of four numbers. A number that is not finite becomes 0, so nothing downstream has to
+    /// deal with NaN or infinity.
+    fn rect(&mut self) -> Result<[f32; 4], ProtocolError> {
+        let mut out = [0.0f32; 4];
+        for v in &mut out {
+            let x = self.f32()?;
+            *v = if x.is_finite() { x } else { 0.0 };
+        }
+        Ok(out)
+    }
+
     fn string(&mut self) -> Result<String, ProtocolError> {
+        self.string_max(MAX_STRING_LEN)
+    }
+
+    fn string_max(&mut self, max: usize) -> Result<String, ProtocolError> {
         let len = self.u32()? as usize;
-        if len > MAX_STRING_LEN {
+        if len > max {
             return Err(ProtocolError::StringTooLong(len));
         }
         let bytes = self.take(len)?;
@@ -632,6 +938,26 @@ mod tests {
                 id: 5,
                 body: RequestBody::Close { doc: 7 },
             },
+            Request {
+                id: 6,
+                body: RequestBody::Outline { doc: 7 },
+            },
+            Request {
+                id: 7,
+                body: RequestBody::PageText { doc: 7, page: 12 },
+            },
+            Request {
+                id: 8,
+                body: RequestBody::PageLinks { doc: 7, page: 0 },
+            },
+            Request {
+                id: 9,
+                body: RequestBody::Search {
+                    doc: 7,
+                    page: 3,
+                    query: "blåbær ✓".into(),
+                },
+            },
         ]
     }
 
@@ -685,6 +1011,66 @@ mod tests {
                 body: ResponseBody::Error {
                     code: ErrorCode::PasswordRequired,
                     message: "This file is protected by a password.".into(),
+                },
+            },
+            Response {
+                id: 7,
+                body: ResponseBody::Outline {
+                    items: vec![
+                        OutlineItem {
+                            depth: 0,
+                            page: Some(0),
+                            title: "Kapittel 1 ✓".into(),
+                        },
+                        OutlineItem {
+                            depth: 1,
+                            page: None,
+                            title: String::new(),
+                        },
+                    ],
+                },
+            },
+            Response {
+                id: 8,
+                body: ResponseBody::PageText {
+                    text: "Hé\n📕".into(),
+                    rects: vec![
+                        [1.0, 2.0, 3.0, 4.0],
+                        [5.0, 6.0, 7.0, 8.0],
+                        [0.0; 4],
+                        [9.0, 10.0, 11.0, 12.0],
+                    ],
+                },
+            },
+            Response {
+                id: 9,
+                body: ResponseBody::PageText {
+                    text: String::new(),
+                    rects: vec![],
+                },
+            },
+            Response {
+                id: 10,
+                body: ResponseBody::PageLinks {
+                    links: vec![
+                        PageLink {
+                            rect: [10.0, 20.0, 30.0, 40.0],
+                            target: LinkTarget::Uri("https://example.com/a?b=c".into()),
+                        },
+                        PageLink {
+                            rect: [1.5, 2.5, 3.5, 4.5],
+                            target: LinkTarget::Page(41),
+                        },
+                    ],
+                },
+            },
+            Response {
+                id: 11,
+                body: ResponseBody::Matches {
+                    matches: vec![
+                        TextMatch { start: 3, len: 5 },
+                        TextMatch { start: 90, len: 1 },
+                    ],
                 },
             },
         ]
@@ -929,7 +1315,9 @@ mod tests {
             let mut bytes: Vec<u8> = (0..len).map(|_| rng.next()).collect();
             // Make most inputs start with a valid tag so the field readers get exercised.
             if round % 4 != 0 && !bytes.is_empty() {
-                let tags = [1u8, 2, 3, 4, 129, 130, 131, 132, 255];
+                let tags = [
+                    1u8, 2, 3, 4, 5, 6, 7, 8, 129, 130, 131, 132, 133, 134, 135, 136, 255,
+                ];
                 bytes[0] = tags[(rng.next() as usize) % tags.len()];
             }
             let _ = Request::decode(&bytes);
@@ -985,6 +1373,153 @@ mod tests {
         assert!(matches!(
             Response::decode(bytes),
             Err(ProtocolError::InvalidLength)
+        ));
+    }
+
+    #[test]
+    fn the_encoder_cuts_what_is_too_long_and_the_result_still_decodes() {
+        let long_title = "é".repeat(MAX_OUTLINE_TITLE);
+        let res = Response {
+            id: 1,
+            body: ResponseBody::Outline {
+                items: vec![
+                    OutlineItem {
+                        depth: 200,
+                        page: Some(1),
+                        title: long_title,
+                    };
+                    MAX_OUTLINE_ITEMS + 10
+                ],
+            },
+        };
+        let ResponseBody::Outline { items } = Response::decode(res.encode()).unwrap().body else {
+            panic!("wrong body");
+        };
+        assert_eq!(items.len(), MAX_OUTLINE_ITEMS);
+        assert!(items.iter().all(|i| i.depth == MAX_OUTLINE_DEPTH));
+        assert!(items.iter().all(|i| i.title.len() <= MAX_OUTLINE_TITLE));
+        assert!(items.iter().all(|i| i.title.chars().all(|c| c == 'é')));
+    }
+
+    #[test]
+    fn page_text_with_a_wrong_count_is_refused() {
+        let good = Response {
+            id: 1,
+            body: ResponseBody::PageText {
+                text: "ab".into(),
+                rects: vec![[0.0; 4]; 2],
+            },
+        }
+        .encode();
+        // Claim three characters while the text holds two (and there are only two boxes).
+        let mut wrong = good.clone();
+        wrong[5] = 3;
+        assert!(matches!(
+            Response::decode(wrong),
+            Err(ProtocolError::InvalidLength)
+        ));
+        // Claim a huge count.
+        let mut huge = good.clone();
+        huge[5..9].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            Response::decode(huge),
+            Err(ProtocolError::InvalidLength)
+        ));
+        // A text length that runs past the frame.
+        let mut long_text = good;
+        long_text[9..13].copy_from_slice(&1000u32.to_le_bytes());
+        assert!(Response::decode(long_text).is_err());
+    }
+
+    #[test]
+    fn page_text_is_cut_to_whole_characters_that_have_a_box() {
+        let res = Response {
+            id: 1,
+            body: ResponseBody::PageText {
+                text: "abcd".into(),
+                rects: vec![[1.0; 4]; 3],
+            },
+        };
+        let ResponseBody::PageText { text, rects } = Response::decode(res.encode()).unwrap().body
+        else {
+            panic!("wrong body");
+        };
+        assert_eq!(text, "abc");
+        assert_eq!(rects.len(), 3);
+    }
+
+    #[test]
+    fn numbers_that_are_not_finite_become_zero() {
+        let res = Response {
+            id: 1,
+            body: ResponseBody::PageLinks {
+                links: vec![PageLink {
+                    rect: [f32::NAN, f32::INFINITY, 1.0, f32::NEG_INFINITY],
+                    target: LinkTarget::Page(0),
+                }],
+            },
+        };
+        let ResponseBody::PageLinks { links } = Response::decode(res.encode()).unwrap().body else {
+            panic!("wrong body");
+        };
+        assert_eq!(links[0].rect, [0.0, 0.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn links_with_a_too_long_address_are_left_out() {
+        let res = Response {
+            id: 1,
+            body: ResponseBody::PageLinks {
+                links: vec![
+                    PageLink {
+                        rect: [0.0; 4],
+                        target: LinkTarget::Uri("a".repeat(MAX_URI_LEN + 1)),
+                    },
+                    PageLink {
+                        rect: [0.0; 4],
+                        target: LinkTarget::Uri("https://example.com".into()),
+                    },
+                ],
+            },
+        };
+        let ResponseBody::PageLinks { links } = Response::decode(res.encode()).unwrap().body else {
+            panic!("wrong body");
+        };
+        assert_eq!(links.len(), 1);
+    }
+
+    #[test]
+    fn counts_that_do_not_fit_the_frame_are_refused_without_allocating() {
+        for tag in [
+            TAG_RES_OUTLINE,
+            TAG_RES_PAGE_LINKS,
+            TAG_RES_MATCHES,
+            TAG_RES_PAGE_TEXT,
+        ] {
+            let mut bytes = vec![tag, 1, 0, 0, 0];
+            bytes.extend_from_slice(&1_000_000u32.to_le_bytes());
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            assert!(Response::decode(bytes).is_err(), "tag {tag}");
+        }
+    }
+
+    #[test]
+    fn a_too_long_query_is_refused_and_an_unknown_link_kind_too() {
+        let mut long = vec![TAG_REQ_SEARCH, 1, 0, 0, 0];
+        long.extend_from_slice(&[0u8; 8]);
+        long.extend_from_slice(&((MAX_QUERY_LEN + 1) as u32).to_le_bytes());
+        assert!(matches!(
+            Request::decode(&long),
+            Err(ProtocolError::StringTooLong(_))
+        ));
+        let mut bad_kind = vec![TAG_RES_PAGE_LINKS, 1, 0, 0, 0];
+        bad_kind.extend_from_slice(&1u32.to_le_bytes());
+        bad_kind.extend_from_slice(&[0u8; 16]);
+        bad_kind.push(9);
+        bad_kind.extend_from_slice(&[0u8; 8]);
+        assert!(matches!(
+            Response::decode(bad_kind),
+            Err(ProtocolError::UnknownValue(9))
         ));
     }
 

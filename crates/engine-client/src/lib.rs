@@ -11,6 +11,9 @@
 //! for such a handle fails with `UnknownDocument` without bothering the engine, and closing it does
 //! nothing.
 //!
+//! One client talks to one engine process. The app keeps one client per open document (see
+//! [`EnginePool`]), so a document that crashes its engine takes down only itself.
+//!
 //! The engine is treated as hostile: only one request is in flight, every answer is limited to the
 //! size that request can produce, a frame that nobody asked for ends the engine, and at most a
 //! couple of frames wait in memory at any time.
@@ -28,8 +31,13 @@ use std::time::Duration;
 
 use partridge_protocol::{
     read_frame_limited, write_request, ErrorCode, PageSize, Request, RequestBody, Response,
-    ResponseBody, MAX_STRING_LEN, PROTOCOL_VERSION,
+    ResponseBody, MAX_QUERY_LEN, MAX_STRING_LEN, PROTOCOL_VERSION,
 };
+
+pub use partridge_protocol::{LinkTarget, OutlineItem, PageLink, TextMatch};
+
+mod pool;
+pub use pool::EnginePool;
 
 /// Largest answer to an open request. An `Opened` answer holds 8 bytes per page, so this allows
 /// more than a million pages.
@@ -38,6 +46,12 @@ const MAX_SMALL_ANSWER: usize = 9 * 1024 * 1024;
 const IDLE_LIMIT: usize = 70 * 1024;
 /// Header of a `Rendered` answer in front of the pixels.
 const RENDERED_HEADER: usize = 17;
+/// Largest outline answer: 5 000 entries of at most 512 bytes of title and 9 bytes of framing.
+const MAX_OUTLINE_ANSWER: usize = 3 * 1024 * 1024;
+/// Largest page text answer: 100 000 characters of at most 4 bytes and 16 bytes of box each.
+const MAX_TEXT_ANSWER: usize = 2_200_000;
+/// Largest links answer: 500 links with an address of at most 2 048 bytes.
+const MAX_LINKS_ANSWER: usize = 1_300_000;
 
 /// How to start and supervise the engine.
 #[derive(Debug, Clone)]
@@ -91,6 +105,14 @@ pub struct OpenedDocument {
     /// document number in the low 32 bits. Never reused, even after the engine was replaced.
     pub doc: u64,
     pub pages: Vec<PageSize>,
+}
+
+/// The text of one page: one entry in `text` and one box in `rects` for every character.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PageText {
+    pub text: String,
+    /// `[left, top, right, bottom]` in points from the top left of the page as it is drawn.
+    pub rects: Vec<[f32; 4]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,6 +247,94 @@ impl EngineClient {
         }
     }
 
+    /// Sends a request about an open document and picks the wanted kind of answer out of the
+    /// reply. A handle from a replaced engine is refused without asking the engine. An answer of
+    /// another kind means the two sides disagree, and the engine is stopped.
+    fn call<T>(
+        &self,
+        doc: u64,
+        what: &str,
+        make: impl FnOnce(u32) -> RequestBody,
+        pick: impl FnOnce(ResponseBody) -> Result<T, ResponseBody>,
+    ) -> Result<T, ClientError> {
+        let mut inner = lock(&self.inner);
+        let Some(engine_doc) = Self::engine_doc(&inner, doc) else {
+            return Err(stale_document());
+        };
+        let body = self.run(&mut inner, make(engine_doc))?;
+        match pick(body) {
+            Ok(value) => Ok(value),
+            Err(_) => self.unexpected(&mut inner, what),
+        }
+    }
+
+    /// The table of contents of a document.
+    pub fn outline(&self, doc: u64) -> Result<Vec<OutlineItem>, ClientError> {
+        self.call(
+            doc,
+            "outline",
+            |doc| RequestBody::Outline { doc },
+            |body| match body {
+                ResponseBody::Outline { items } => Ok(items),
+                other => Err(other),
+            },
+        )
+    }
+
+    /// The text of one page with the box of every character.
+    pub fn page_text(&self, doc: u64, page: u32) -> Result<PageText, ClientError> {
+        self.call(
+            doc,
+            "page text",
+            |doc| RequestBody::PageText { doc, page },
+            |body| match body {
+                ResponseBody::PageText { text, rects } => Ok(PageText { text, rects }),
+                other => Err(other),
+            },
+        )
+    }
+
+    /// The links of one page that lead to a web address or to a page of the document.
+    pub fn page_links(&self, doc: u64, page: u32) -> Result<Vec<PageLink>, ClientError> {
+        self.call(
+            doc,
+            "page links",
+            |doc| RequestBody::PageLinks { doc, page },
+            |body| match body {
+                ResponseBody::PageLinks { links } => Ok(links),
+                other => Err(other),
+            },
+        )
+    }
+
+    /// Finds `query` on one page. A search text that is too long is refused here.
+    pub fn search_page(
+        &self,
+        doc: u64,
+        page: u32,
+        query: &str,
+    ) -> Result<Vec<TextMatch>, ClientError> {
+        if query.len() > MAX_QUERY_LEN {
+            return Err(ClientError::Engine {
+                code: ErrorCode::InvalidRequest,
+                message: "the search text is too long".into(),
+            });
+        }
+        self.call(
+            doc,
+            "search",
+            |doc| RequestBody::Search {
+                doc,
+                page,
+                query: query.to_string(),
+            },
+            |body| match body {
+                ResponseBody::Matches { matches } => Ok(matches),
+                other => Err(other),
+            },
+        )
+    }
+
     /// Closes a document. A handle from an engine that is gone is already closed: nothing happens,
     /// and no engine is started for it.
     pub fn close(&self, doc: u64) -> Result<(), ClientError> {
@@ -287,6 +397,10 @@ impl EngineClient {
                 pixels.saturating_add(RENDERED_HEADER).max(IDLE_LIMIT)
             }
             RequestBody::Open { .. } => MAX_SMALL_ANSWER,
+            RequestBody::Outline { .. } => MAX_OUTLINE_ANSWER,
+            RequestBody::PageText { .. } => MAX_TEXT_ANSWER,
+            RequestBody::PageLinks { .. } => MAX_LINKS_ANSWER,
+            // A search answer holds at most 2 000 matches of 8 bytes: it fits the idle limit.
             _ => IDLE_LIMIT,
         }
     }
