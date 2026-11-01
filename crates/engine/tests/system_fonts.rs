@@ -46,6 +46,32 @@ fn draw(script: &str, system_fonts: bool) -> usize {
     ink(&bitmap)
 }
 
+/// Scripts that this system must have a font for (`PARTRIDGE_REQUIRE_FONT_SCRIPTS`, names separated
+/// by commas, or `all`). CI sets it for what a normal install of each runner has; anywhere else a
+/// script without a font is reported and skipped.
+fn required() -> Vec<FontScript> {
+    let Ok(list) = std::env::var("PARTRIDGE_REQUIRE_FONT_SCRIPTS") else {
+        return Vec::new();
+    };
+    if list.trim() == "all" {
+        return FontScript::ALL.to_vec();
+    }
+    list.split(',')
+        .filter(|n| !n.trim().is_empty())
+        .map(|n| FontScript::from_name(n.trim()).unwrap_or_else(|| panic!("no script {n}")))
+        .collect()
+}
+
+/// Adds a line to the summary of the CI run, if there is one.
+fn summary(line: &str) {
+    use std::io::Write;
+    if let Some(path) = std::env::var_os("GITHUB_STEP_SUMMARY") {
+        if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+}
+
 #[test]
 fn what_this_system_has() {
     let found = system_fonts::found();
@@ -54,22 +80,50 @@ fn what_this_system_has() {
     for (_, path) in found {
         assert!(path.is_absolute());
     }
+    for script in FontScript::ALL {
+        match found.iter().find(|(s, _)| *s == script) {
+            Some((_, path)) => println!("{}: {}", script.name(), path.display()),
+            None => println!("{}: NO FONT ON THIS SYSTEM", script.name()),
+        }
+    }
+    for script in required() {
+        assert!(
+            found.iter().any(|(s, _)| *s == script),
+            "{}: this system must have a font for it, and the table finds none",
+            script.name()
+        );
+    }
 }
 
 #[test]
 fn a_page_in_each_script_is_drawn_with_the_font_the_app_found() {
-    let available = system_fonts::available();
+    let found = system_fonts::found();
     let mut drawn = Vec::new();
     let mut skipped = Vec::new();
+    summary("| script | font handed to the engine | dark pixels with it | dark pixels without |");
+    summary("|---|---|---|---|");
     for name in kit::SCRIPT_NAMES {
         let script = FontScript::from_name(name).unwrap();
-        if !available.contains(&script) {
+        let Some((_, path)) = found.iter().find(|(s, _)| *s == script) else {
             skipped.push(name);
+            let without = draw(name, false);
+            println!("{name}: no font on this system; blanks ({without} dark pixels)");
+            println!(
+                "::notice title=No font for {name}::This runner has none of the fonts the app looks for, so the {name} page is drawn as blanks."
+            );
+            summary(&format!("| {name} | none on this system | - | {without} |"));
             continue;
-        }
+        };
         let with = draw(name, true);
         let without = draw(name, false);
-        println!("{name}: {with} dark pixels with the system font, {without} without");
+        println!(
+            "{name}: {} gives {with} dark pixels, {without} without",
+            path.display()
+        );
+        summary(&format!(
+            "| {name} | `{}` | {with} | {without} |",
+            path.display()
+        ));
         drawn.push((name, with, without));
     }
     println!("scripts drawn: {drawn:?}; no font on this system: {skipped:?}");
@@ -81,6 +135,13 @@ fn a_page_in_each_script_is_drawn_with_the_font_the_app_found() {
             "{name}: {with} dark pixels with the font and {without} without"
         );
     }
+    for script in required() {
+        assert!(
+            !skipped.contains(&script.name()),
+            "{}: this system must draw it",
+            script.name()
+        );
+    }
 }
 
 #[test]
@@ -90,26 +151,21 @@ fn a_page_without_a_font_for_its_script_shows_blanks_and_the_engine_stays_up() {
     }
 }
 
-/// The engine holds the document, one handle for each font, the three standard descriptors and the
-/// copy of its output, and nothing else.
-#[cfg(unix)]
-#[test]
-fn the_engine_holds_only_the_handles_it_was_given() {
+/// How many descriptors (handles on Windows) a locked-in engine holds when it was given these
+/// fonts, counted by the engine itself after the lock-in.
+fn engine_handles(fonts: &[(FontScript, std::fs::File)]) -> usize {
     use std::io::Read;
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::Duration;
 
-    let fonts = system_fonts::open_all();
     let document = kit::TempFile::new("handles.pdf", &kit::simple_pdf(1));
     let handle = std::fs::File::open(document.path()).unwrap();
     let selftest = {
         let exe = std::env::current_exe().unwrap();
-        exe.parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("examples")
-            .join("engine_selftest")
+        exe.parent().unwrap().parent().unwrap().join("examples").join(format!(
+            "engine_selftest{}",
+            std::env::consts::EXE_SUFFIX
+        ))
     };
     let args: Vec<std::ffi::OsString> = vec![
         "--pdfium-dir".into(),
@@ -123,7 +179,7 @@ fn the_engine_holds_only_the_handles_it_was_given() {
             document: Some(&handle),
             memory_limit: None,
             policy: SandboxPolicy::Required,
-            fonts: &fonts,
+            fonts,
         })
         .unwrap();
     drop(engine.stdin);
@@ -143,13 +199,44 @@ fn the_engine_holds_only_the_handles_it_was_given() {
         .expect("the program ended");
     let _ = engine.process.wait();
     let text = out.lock().unwrap().clone();
-    let count: usize = text
-        .lines()
+    text.lines()
         .find_map(|l| l.strip_prefix("descriptors: "))
         .unwrap_or_else(|| panic!("no count in {text}"))
         .trim()
         .parse()
-        .unwrap();
-    // 0, 1, 2; the document; one for each font; the copy of the output.
-    assert_eq!(count, 3 + 1 + fonts.len() + 1, "{text}");
+        .unwrap_or_else(|_| panic!("no count in {text}"))
+}
+
+/// The engine holds one handle for each font it was given, and no other: with all seven scripts it
+/// holds seven more than with none. (On Linux the whole count is known: the standard descriptors,
+/// the document, the fonts and the copy of the output.) Whatever fonts the system has, stand-in
+/// files are used for the count, so the same test runs on every system.
+#[test]
+fn the_engine_holds_only_the_handles_it_was_given() {
+    let stand_in = kit::TempFile::new("font-stand-in.ttf", &kit::simple_pdf(1));
+    let seven: Vec<_> = FontScript::ALL
+        .into_iter()
+        .map(|s| (s, std::fs::File::open(stand_in.path()).unwrap()))
+        .collect();
+    let none = engine_handles(&[]);
+    let all = engine_handles(&seven);
+    let one = engine_handles(&seven[..1]);
+    println!("handles in the engine: {none} with no font, {one} with one, {all} with seven");
+    assert_eq!(one, none + 1);
+    assert_eq!(all, none + 7);
+
+    // The fonts this system really has.
+    let real = system_fonts::open_all();
+    let with_real = engine_handles(&real);
+    println!(
+        "handles in the engine: {with_real} with the {} fonts of this system",
+        real.len()
+    );
+    assert_eq!(with_real, none + real.len());
+
+    #[cfg(target_os = "linux")]
+    {
+        // 0, 1, 2; the document; the copy of the output.
+        assert_eq!(none, 3 + 1 + 1);
+    }
 }

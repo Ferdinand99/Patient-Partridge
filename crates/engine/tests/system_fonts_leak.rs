@@ -2,8 +2,6 @@
 //! descriptor behind in the app. In a test program of its own, so that no other test opens or closes
 //! a file while the descriptors are counted.
 
-#![cfg(target_os = "linux")]
-
 use partridge_engine_client::{EngineClient, EngineConfig, SandboxPolicy};
 use partridge_testkit as kit;
 
@@ -18,7 +16,6 @@ fn config() -> EngineConfig {
 /// descriptor behind in the app.
 #[test]
 fn the_app_leaks_no_descriptors_when_it_starts_engines() {
-    let open_descriptors = || std::fs::read_dir("/proc/self/fd").unwrap().count();
     let file = kit::TempFile::new("leak.pdf", &kit::simple_pdf(1));
     // One engine first, so that lazily opened things are open already.
     {
@@ -37,4 +34,24 @@ fn the_app_leaks_no_descriptors_when_it_starts_engines() {
         after <= before + 2,
         "{before} descriptors before, {after} after"
     );
+}
+
+/// How many descriptors (handles on Windows) this program holds.
+#[cfg(target_os = "linux")]
+fn open_descriptors() -> usize {
+    std::fs::read_dir("/proc/self/fd").unwrap().count()
+}
+
+#[cfg(target_os = "macos")]
+fn open_descriptors() -> usize {
+    std::fs::read_dir("/dev/fd").unwrap().count()
+}
+
+#[cfg(windows)]
+fn open_descriptors() -> usize {
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+    let mut count = 0u32;
+    // SAFETY: the pseudo handle of this process and a number to write into.
+    assert_ne!(unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) }, 0);
+    count as usize
 }

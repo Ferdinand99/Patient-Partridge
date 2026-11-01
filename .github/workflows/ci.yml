@@ -72,6 +72,13 @@ jobs:
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           echo "PARTRIDGE_TEST_REQUIRE_EMPTY_ROOT=1" >> "$GITHUB_ENV"
+      - name: List the fonts of this system (temporary)
+        if: runner.os != 'Linux'
+        run: |
+          ls -la /c/Windows/Fonts 2>/dev/null | head -400 || true
+          ls -la /System/Library/Fonts /System/Library/Fonts/Supplemental /Library/Fonts 2>/dev/null | head -400 || true
+          find /System/Library/AssetsV2 -iname '*.ttc' -o -iname '*.ttf' -o -iname '*.otf' 2>/dev/null | head -100 || true
+          sw_vers 2>/dev/null || true
       - name: Create stub dist/
         run: |
           mkdir -p dist
@@ -100,6 +107,13 @@ jobs:
         env:
           PARTRIDGE_TEST_NO_LANDLOCK: "1"
         run: cargo test -p partridge-engine -p partridge-engine-client --locked
+      # A page in each script that needs a system font, drawn with the fonts of this system. The
+      # test says for each script which file the app handed over, or that this system has none.
+      - name: System fonts proof
+        if: always()
+        env:
+          PARTRIDGE_REQUIRE_FONT_SCRIPTS: ${{ runner.os == 'Linux' && 'all' || '' }}
+        run: cargo test -p partridge-engine --locked --test system_fonts -- --nocapture --test-threads 1
       - name: Does an AppContainer stop the network on Windows (diagnosis)
         if: always() && runner.os == 'Windows'
         run: cargo test -p partridge-engine --locked --test windows_appcontainer -- --ignored --nocapture

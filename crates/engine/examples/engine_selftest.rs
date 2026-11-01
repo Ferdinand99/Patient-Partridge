@@ -107,7 +107,8 @@ fn main() {
         ),
         "document" => document(&mut engine, &mut say),
         "descriptors" => {
-            // How many descriptors are open: the ones the engine was given and nothing else.
+            // How many descriptors (handles on Windows) are open: the ones the engine was given
+            // and what the system and the libraries hold, which is the same for every run.
             #[cfg(unix)]
             {
                 // SAFETY: asking about a descriptor number only reads the descriptor table.
@@ -115,6 +116,20 @@ fn main() {
                     .filter(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } >= 0)
                     .count();
                 say(format!("descriptors: {open}"));
+            }
+            #[cfg(windows)]
+            {
+                use windows_sys::Win32::System::Threading::{
+                    GetCurrentProcess, GetProcessHandleCount,
+                };
+                let mut count = 0u32;
+                // SAFETY: the pseudo handle of this process and a number to write into.
+                let ok = unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) };
+                if ok == 0 {
+                    say("descriptors: unknown".to_string());
+                } else {
+                    say(format!("descriptors: {count}"));
+                }
             }
         }
         _ => unreachable!(),
