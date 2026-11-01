@@ -1406,9 +1406,17 @@ mod tests {
         let mut config = EngineConfig::new(fake);
         config.args = vec!["good".into()];
         let pool = EnginePool::new(config, 4);
+        // The app opens the file itself and hands it to the engine, so the file has to exist.
+        let dir = std::env::temp_dir().join(format!("partridge-update-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
         let handles: Vec<u64> = (0..3)
-            .map(|i| pool.open(&format!("doc{i}.pdf"), None).unwrap().0)
+            .map(|i| {
+                let doc = dir.join(format!("doc{i}.pdf"));
+                std::fs::write(&doc, partridge_testkit::simple_pdf(1)).unwrap();
+                pool.open(&doc.to_string_lossy(), None).unwrap().0
+            })
             .collect();
+        let _ = std::fs::remove_dir_all(&dir);
         let pids: Vec<u32> = handles.iter().filter_map(|h| pool.pid(*h)).collect();
         assert_eq!(pids.len(), 3, "three engines should be running");
         #[cfg(unix)]
