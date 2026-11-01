@@ -28,6 +28,9 @@ fn quiet_crashes() {}
 
 fn main() -> ExitCode {
     quiet_crashes();
+    // Set before anything from a PDF is read. A failure to set it is not fatal.
+    partridge_engine::limits::limit_memory();
+    partridge_engine::limits::exit_with_parent();
 
     let args = match parse_args(std::env::args_os().skip(1)) {
         Ok(a) => a,

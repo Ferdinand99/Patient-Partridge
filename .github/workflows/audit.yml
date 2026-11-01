@@ -1,14 +1,15 @@
-# Known vulnerabilities, licenses and banned crates in the Rust dependencies (cargo-deny):
+# Known vulnerabilities, licenses and banned crates in the Rust dependencies (cargo-deny), and
+# known vulnerabilities in the npm packages that ship in the app:
 # on every pull request and push to main that changes the lock file or the deny rules, and once a
 # week so a new advisory against an unchanged lock file is noticed too.
 name: Audit
 
 on:
   pull_request:
-    paths: ["**/Cargo.lock", "**/Cargo.toml", "deny.toml", ".github/workflows/audit.yml"]
+    paths: ["**/Cargo.lock", "**/Cargo.toml", "deny.toml", "package-lock.json", ".github/workflows/audit.yml"]
   push:
     branches: [main]
-    paths: ["**/Cargo.lock", "**/Cargo.toml", "deny.toml", ".github/workflows/audit.yml"]
+    paths: ["**/Cargo.lock", "**/Cargo.toml", "deny.toml", "package-lock.json", ".github/workflows/audit.yml"]
   schedule:
     - cron: "17 6 * * 1"
   workflow_dispatch:
@@ -22,6 +23,21 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check
+
+  npm:
+    name: npm audit (packages that ship in the app)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+      # Only the packages that end up in the app. Build and test tools are not part of it.
+      - run: npm audit --omit=dev --audit-level=moderate

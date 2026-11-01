@@ -41,6 +41,8 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - name: Install Tauri Linux dependencies
         if: runner.os == 'Linux'
         run: |
@@ -82,6 +84,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 22
@@ -113,6 +117,8 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - name: Install Tauri Linux dependencies
         if: runner.os == 'Linux'
         run: |
@@ -131,7 +137,7 @@ jobs:
       # Fetches PDFium (checksum checked), builds the engine, and builds the installers with the
       # engine and the library inside. This is a build for testing: nothing is signed or released.
       - name: Build installers
-        run: npm run bundle -- --bundles ${{ matrix.bundles }}
+        run: npm run bundle -- --bundles ${{ matrix.bundles }} -- --locked
 
       - name: Collect installers
         run: |
@@ -164,6 +170,18 @@ jobs:
             cat smoke.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # The desktop file must pass the file to the app (%F) and end its MimeType list with ';',
+      # or opening a PDF from a file manager starts an empty app.
+      - name: Check the Linux desktop entry
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p "$RUNNER_TEMP/deb"
+          dpkg-deb -x out/*.deb "$RUNNER_TEMP/deb"
+          f=$(find "$RUNNER_TEMP/deb" -name '*.desktop' | head -n1)
+          cat "$f"
+          grep -q '^Exec=.* %F$' "$f"
+          grep -q '^MimeType=application/pdf;$' "$f"
 
       - name: Installer sizes
         if: always()

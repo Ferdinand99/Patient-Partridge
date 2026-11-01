@@ -149,6 +149,16 @@ describe("bitmapSize", () => {
     expect(bitmapSize(letter, 1, 0.5)).toEqual({ width: 816, height: 1056 });
   });
 
+  it("caps the longest side too, for narrow and tall pages", () => {
+    const strip = { width: 100, height: 14_400 };
+    const size = bitmapSize(strip, 8, 2);
+    expect(Math.max(size.width, size.height)).toBeLessThanOrEqual(16_384);
+    expect(size.height).toBe(16_384);
+    expect(size.width).toBeGreaterThanOrEqual(1);
+    // A normal page is not touched.
+    expect(bitmapSize(letter, 1, 1)).toEqual({ width: 816, height: 1056 });
+  });
+
   it("is capped so memory stays bounded and the shape is kept", () => {
     const size = bitmapSize(letter, 8, 2);
     expect(size.width * size.height).toBeLessThanOrEqual(16_000_000);

@@ -76,7 +76,10 @@ impl From<ClientError> for CommandError {
 
 #[derive(Serialize)]
 struct OpenedInfo {
-    doc: u32,
+    /// Handle of the document. It holds the number of the engine process in its upper half, so
+    /// it stays unique after the engine is replaced (see `partridge-engine-client`). It is below
+    /// 2^53, so the window reads it exactly.
+    doc: u64,
     /// Page sizes in PDF points, `[width, height]`.
     pages: Vec<[f32; 2]>,
     name: String,
@@ -121,7 +124,7 @@ async fn open_pdf(
 #[tauri::command]
 async fn render_page(
     engine: State<'_, Engine>,
-    doc: u32,
+    doc: u64,
     page: u32,
     width: u32,
     height: u32,
@@ -132,7 +135,7 @@ async fn render_page(
 }
 
 #[tauri::command]
-async fn close_pdf(engine: State<'_, Engine>, doc: u32) -> Result<(), CommandError> {
+async fn close_pdf(engine: State<'_, Engine>, doc: u64) -> Result<(), CommandError> {
     let client = engine.0.clone();
     // If the engine is gone the document is gone with it, which is what closing wants anyway.
     let _ = blocking(move || client.close(doc)).await;
@@ -238,6 +241,14 @@ pub fn run() {
         .expect("error while building the app");
 
     app.run(|handle, event| {
+        // The engine must not outlive the app. A healthy engine ends by itself when its input
+        // closes, but one that is stuck inside PDFium never looks at its input, and a request that
+        // waits for it would hold the quit back. Killing it does not wait for any request.
+        if let tauri::RunEvent::Exit = &event {
+            if let Some(engine) = handle.try_state::<Engine>() {
+                engine.0.kill();
+            }
+        }
         // A file opened from the dock or Finder on macOS arrives as an event, not as an argument.
         #[cfg(target_os = "macos")]
         if let tauri::RunEvent::Opened { urls } = &event {
@@ -248,8 +259,6 @@ pub fn run() {
                 .collect();
             deliver_paths(handle, paths);
         }
-        #[cfg(not(target_os = "macos"))]
-        let _ = (handle, event);
     });
 }
 

@@ -1,4 +1,5 @@
-// A small message box for errors and the password question. One at a time, drawn over the app.
+// A small message box for errors and the password question, drawn over the app. If a second one
+// is shown while the first is open (a drop or an engine error), they stack and the newest is on top.
 
 export interface NoticeButton {
   id: string;

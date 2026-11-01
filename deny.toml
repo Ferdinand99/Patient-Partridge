@@ -14,7 +14,8 @@ ignore = [
 ]
 
 [licenses]
-# Licenses of the crates we depend on. Strong copyleft is not on this list.
+# Licenses of the crates we depend on. Strong copyleft is not on this list. The project's own
+# crates (AGPL-3.0-only, publish = false) are private and skipped.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -32,11 +33,19 @@ allow = [
     "BSL-1.0",
     "OpenSSL",
     "CDLA-Permissive-2.0",
-    "AGPL-3.0-only",
 ]
 confidence-threshold = 0.9
+
+[licenses.private]
+ignore = true
 
 [bans]
 multiple-versions = "allow"
 wildcards = "warn"
 allow-wildcard-paths = true
+
+[sources]
+# Only crates.io. A git or unknown registry source fails the check.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

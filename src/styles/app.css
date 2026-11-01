@@ -203,6 +203,9 @@ input:focus-visible,
   overflow: auto;
   outline: none;
   overscroll-behavior: contain;
+  /* Keep room for the scroll bar, so it appearing or going does not change the width of the pages
+     and start a loop of fit-width zoom changes. */
+  scrollbar-gutter: stable;
 }
 
 .viewer-pages {

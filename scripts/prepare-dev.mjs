@@ -10,7 +10,7 @@ import { fetchPdfium } from "./fetch-pdfium.mjs";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 await fetchPdfium();
-const build = spawnSync("cargo", ["build", "-p", "partridge-engine"], {
+const build = spawnSync("cargo", ["build", "-p", "partridge-engine", "--locked"], {
   cwd: root,
   stdio: "inherit",
   shell: process.platform === "win32",

@@ -2,6 +2,8 @@
 //! the app uses. Needs the PDFium library: run `node scripts/fetch-pdfium.mjs` first, or set
 //! `PARTRIDGE_PDFIUM_DIR`.
 
+use std::time::Duration;
+
 use partridge_engine_client::{ClientError, EngineClient, EngineConfig};
 use partridge_protocol::ErrorCode;
 use partridge_testkit as kit;
@@ -243,7 +245,7 @@ fn closing_a_document_frees_it() {
 fn many_documents_can_be_open_at_once() {
     let file = kit::TempFile::new("many.pdf", &kit::simple_pdf(1));
     let client = client();
-    let ids: Vec<u32> = (0..5)
+    let ids: Vec<u64> = (0..5)
         .map(|_| client.open(&file.path_str(), None).unwrap().doc)
         .collect();
     let mut unique = ids.clone();
@@ -266,14 +268,77 @@ fn the_app_survives_an_engine_crash_and_gets_a_fresh_engine() {
     // Simulate the engine dying (as it would on a file that crashes the parser).
     client.kill();
 
-    // The old document is gone with the old process. The new engine says so; nothing panics.
+    // The old document is gone with the old process. The client says so without starting a new
+    // engine; nothing panics.
     let err = client.render(doc.doc, 0, 100, 130).unwrap_err();
     assert_eq!(code_of(err), ErrorCode::UnknownDocument);
-    assert_eq!(client.spawn_count(), 2);
+    assert_eq!(client.spawn_count(), 1);
 
-    // Reopening works.
+    // Reopening works, with a fresh engine.
     let doc = client.open(&file.path_str(), None).unwrap();
+    assert_eq!(client.spawn_count(), 2);
     assert!(client.render(doc.doc, 1, 100, 130).is_ok());
+}
+
+#[test]
+fn an_old_handle_cannot_touch_a_document_of_the_new_engine() {
+    let a = kit::TempFile::new("a.pdf", &kit::simple_pdf(2));
+    let b = kit::TempFile::new("b.pdf", &kit::simple_pdf(7));
+    let client = client();
+    let old = client.open(&a.path_str(), None).unwrap();
+    client.kill();
+    // The new engine numbers its documents from 1 again, as the old one did.
+    let new = client.open(&b.path_str(), None).unwrap();
+    assert_ne!(old.doc, new.doc);
+    assert_eq!(new.pages.len(), 7);
+
+    // What the app does when it replaces a document: close the old one. This must be a no-op.
+    client.close(old.doc).unwrap();
+    assert!(client.render(new.doc, 6, 100, 130).is_ok());
+    assert_eq!(
+        code_of(client.render(old.doc, 0, 100, 130).unwrap_err()),
+        ErrorCode::UnknownDocument
+    );
+    assert_eq!(client.spawn_count(), 2);
+}
+
+/// If the app dies without closing the engine's input (a crash, or a kill), an engine that is
+/// stuck inside PDFium would never see the end of its input. It watches its parent instead.
+#[cfg(unix)]
+#[test]
+fn the_engine_ends_when_its_parent_is_gone() {
+    use std::process::{Command, Stdio};
+
+    // A shell starts the engine in the background with an input that never ends, prints the
+    // engine's pid, waits a second so the engine is up and has noted its parent, and exits. The
+    // engine is left without its parent.
+    let script = format!(
+        "sleep 60 2>/dev/null | \"{}\" --pdfium-dir \"{}\" >/dev/null 2>&1 & echo $!; sleep 1",
+        env!("CARGO_BIN_EXE_partridge-engine"),
+        kit::pdfium_dir().display()
+    );
+    let out = Command::new("sh")
+        .args(["-c", &script])
+        .stdout(Stdio::piped())
+        .output()
+        .unwrap();
+    let pid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(pid.parse::<u32>().is_ok(), "pid was {pid:?}");
+
+    let alive = || {
+        let ps = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&ps.stdout).trim().to_string();
+        // Gone, or a zombie that only waits to be reaped.
+        !state.is_empty() && !state.starts_with('Z')
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while alive() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!alive(), "the engine {pid} is still running");
 }
 
 #[test]

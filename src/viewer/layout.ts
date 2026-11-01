@@ -143,6 +143,8 @@ export function scrollTopForAnchor(layout: Layout, anchor: Anchor): number {
 
 /** Limit on the size of one rendered bitmap, in pixels. Keeps memory in check at high zoom. */
 export const MAX_BITMAP_PIXELS = 16_000_000;
+/** Limit on one side of a rendered bitmap. The engine refuses anything longer (16384). */
+export const MAX_BITMAP_SIDE = 16_384;
 
 export interface BitmapSize {
   width: number;
@@ -151,7 +153,8 @@ export interface BitmapSize {
 
 /**
  * Size in device pixels of the bitmap to ask the engine for. The bitmap is sharp on screens with
- * a pixel ratio above 1 and never bigger than [`MAX_BITMAP_PIXELS`].
+ * a pixel ratio above 1, and never bigger than `MAX_BITMAP_PIXELS` in area or `MAX_BITMAP_SIDE`
+ * on a side (a narrow, tall page can pass the side limit long before the area limit).
  */
 export function bitmapSize(
   page: PageSizePt,
@@ -164,6 +167,12 @@ export function bitmapSize(
   let height = Math.max(1, Math.round(page.height * k));
   if (width * height > maxPixels) {
     const shrink = Math.sqrt(maxPixels / (width * height));
+    width = Math.max(1, Math.floor(width * shrink));
+    height = Math.max(1, Math.floor(height * shrink));
+  }
+  const longest = Math.max(width, height);
+  if (longest > MAX_BITMAP_SIDE) {
+    const shrink = MAX_BITMAP_SIDE / longest;
     width = Math.max(1, Math.floor(width * shrink));
     height = Math.max(1, Math.floor(height * shrink));
   }

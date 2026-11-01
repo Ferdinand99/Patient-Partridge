@@ -236,7 +236,9 @@ fn put_f32(out: &mut Vec<u8>, v: f32) {
 }
 
 /// Writes a string, cut to at most [`MAX_STRING_LEN`] bytes on a character boundary, so that
-/// everything the encoder writes can always be decoded.
+/// everything the encoder writes can always be decoded. A cut value is a different value, so
+/// callers must refuse a path or password that is too long before encoding (the engine client
+/// does); the cut is only a safety net, and fine for error messages.
 fn put_str(out: &mut Vec<u8>, s: &str) {
     let mut end = s.len().min(MAX_STRING_LEN);
     while !s.is_char_boundary(end) {
@@ -385,7 +387,8 @@ impl Response {
         h
     }
 
-    /// Decodes a response. Takes the frame by value so a bitmap can be handed on without a copy.
+    /// Decodes a response. Takes the frame by value so the bitmap can reuse its buffer: the 17 header
+    /// bytes are cut off the front (one move inside the buffer, no new allocation).
     pub fn decode(mut payload: Vec<u8>) -> Result<Response, ProtocolError> {
         let mut r = Reader::new(&payload);
         let tag = r.u8()?;
@@ -416,7 +419,15 @@ impl Response {
                 let width = r.u32()?;
                 let height = r.u32()?;
                 let len = r.u32()? as usize;
-                if len != r.remaining() || (width as u64) * (height as u64) * 4 != len as u64 {
+                let pixels = (width as u64) * (height as u64);
+                // The product of two u32 fits in a u64; times 4 is checked anyway.
+                let expected = pixels.checked_mul(4).ok_or(ProtocolError::InvalidLength)?;
+                if len != r.remaining()
+                    || expected != len as u64
+                    || width > MAX_RENDER_SIDE
+                    || height > MAX_RENDER_SIDE
+                    || pixels > MAX_RENDER_PIXELS
+                {
                     return Err(ProtocolError::InvalidLength);
                 }
                 payload.drain(..RENDERED_HEADER_LEN);
@@ -544,8 +555,19 @@ pub fn write_response<W: Write>(w: &mut W, response: &Response) -> Result<(), Pr
     }
 }
 
-/// Reads one frame. Returns `Ok(None)` when the stream ends cleanly between two frames.
+/// Reads one frame of at most [`MAX_FRAME_LEN`] bytes. Returns `Ok(None)` when the stream ends
+/// cleanly between two frames.
 pub fn read_frame<R: Read>(r: &mut R) -> Result<Option<Vec<u8>>, ProtocolError> {
+    read_frame_limited(r, || MAX_FRAME_LEN)
+}
+
+/// Like [`read_frame`], but the largest accepted frame is asked for after the length has arrived
+/// (`limit` is called once per frame). A reader that knows what it expects can refuse anything
+/// bigger before a single byte of it is stored.
+pub fn read_frame_limited<R: Read>(
+    r: &mut R,
+    limit: impl FnOnce() -> usize,
+) -> Result<Option<Vec<u8>>, ProtocolError> {
     let mut len_bytes = [0u8; 4];
     let mut got = 0;
     while got < 4 {
@@ -558,7 +580,7 @@ pub fn read_frame<R: Read>(r: &mut R) -> Result<Option<Vec<u8>>, ProtocolError> 
         }
     }
     let len = u32::from_le_bytes(len_bytes) as usize;
-    if len > MAX_FRAME_LEN {
+    if len > limit().min(MAX_FRAME_LEN) {
         return Err(ProtocolError::FrameTooLarge(len as u64));
     }
     // Do not trust the announced length for the allocation: grow while data actually arrives.
@@ -930,6 +952,40 @@ mod tests {
                 assert!(Response::decode(bytes[..cut].to_vec()).is_err());
             }
         }
+    }
+
+    #[test]
+    fn a_reader_can_refuse_frames_bigger_than_it_expects() {
+        let mut wire = Vec::new();
+        write_frame(&mut wire, &[7u8; 100]).unwrap();
+        let ok = read_frame_limited(&mut Cursor::new(wire.clone()), || 100).unwrap();
+        assert_eq!(ok.unwrap().len(), 100);
+        let err = read_frame_limited(&mut Cursor::new(wire), || 99).unwrap_err();
+        assert!(matches!(err, ProtocolError::FrameTooLarge(100)), "{err:?}");
+    }
+
+    #[test]
+    fn a_bitmap_larger_than_the_limits_is_refused_when_decoding() {
+        // Huge sides with no data: must be an error, not an overflow or a panic.
+        let mut bytes = vec![TAG_RES_RENDERED, 1, 0, 0, 0];
+        bytes.extend_from_slice(&(1u32 << 31).to_le_bytes());
+        bytes.extend_from_slice(&(1u32 << 31).to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        assert!(matches!(
+            Response::decode(bytes),
+            Err(ProtocolError::InvalidLength)
+        ));
+        // Consistent but over the side limit.
+        let side = MAX_RENDER_SIDE + 1;
+        let mut bytes = vec![TAG_RES_RENDERED, 1, 0, 0, 0];
+        bytes.extend_from_slice(&side.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&(side * 4).to_le_bytes());
+        bytes.extend(std::iter::repeat_n(0u8, (side * 4) as usize));
+        assert!(matches!(
+            Response::decode(bytes),
+            Err(ProtocolError::InvalidLength)
+        ));
     }
 
     #[test]

@@ -22,6 +22,8 @@ use pdfium_render::prelude::*;
 /// Most documents the engine keeps open at once.
 pub const MAX_OPEN_DOCUMENTS: usize = 64;
 
+pub mod limits;
+
 /// Command line of the engine.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Args {
@@ -67,10 +69,17 @@ pub fn check_render_size(width: u32, height: u32) -> Result<(), String> {
     Ok(())
 }
 
-/// A page size that can be laid out: finite and positive, else a Letter page.
+/// Largest page side PDF allows, in points (200 inches).
+const MAX_PAGE_SIDE: f32 = 14_400.0;
+
+/// A page size that can be laid out: finite and positive and not above the PDF limit. A size that
+/// is broken becomes a Letter page, a size that is too big is cut to the limit.
 fn sane_size(width: f32, height: f32) -> PageSize {
     if width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0 {
-        PageSize { width, height }
+        PageSize {
+            width: width.min(MAX_PAGE_SIDE),
+            height: height.min(MAX_PAGE_SIDE),
+        }
     } else {
         PageSize {
             width: 612.0,
@@ -176,15 +185,13 @@ impl Engine {
         let doc = pdfium
             .load_pdf_from_reader(file, password)
             .map_err(|e| map_open_error(e, password.is_some()))?;
-        let sizes = doc.pages().page_sizes().map_err(|_| {
-            (
-                ErrorCode::Corrupt,
-                "the page list could not be read".to_string(),
-            )
-        })?;
-        let pages = sizes
-            .iter()
-            .map(|r| sane_size(r.width().value, r.height().value))
+        // One unreadable page must not refuse the whole document: it gets a placeholder size.
+        let page_list = doc.pages();
+        let pages = (0..page_list.len())
+            .map(|i| match page_list.page_size(i) {
+                Ok(r) => sane_size(r.width().value, r.height().value),
+                Err(_) => sane_size(0.0, 0.0),
+            })
             .collect();
         let id = self.next_doc;
         self.next_doc = self.next_doc.wrapping_add(1).max(1);
@@ -328,6 +335,9 @@ mod tests {
             let s = sane_size(w, h);
             assert_eq!((s.width, s.height), (612.0, 792.0));
         }
+        // A huge MediaBox is cut to what PDF allows.
+        let huge = sane_size(1.0e9, 100.0);
+        assert_eq!((huge.width, huge.height), (14_400.0, 100.0));
     }
 
     #[test]

@@ -1,12 +1,11 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Permissions for the main window",
+  "description": "Permissions for the main window: events (file drops and paths), the window title and the open dialog",
   "windows": ["main"],
   "permissions": [
-    "core:default",
+    "core:event:default",
     "core:window:allow-set-title",
-    "core:window:allow-set-focus",
     "dialog:allow-open"
   ]
 }
