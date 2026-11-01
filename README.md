@@ -77,7 +77,7 @@ Please read this before you open files from people you do not trust.
 - **The engine is not sandboxed by the operating system yet.** Being in a separate process protects the app from crashes and hangs, but it is not a security boundary. If an attacker finds a bug in PDFium and builds a PDF that exploits it, the code would run with your user rights: it could read your files and use the network, even though the engine's own code never does. A real sandbox (restricted rights per operating system) is planned and is a requirement for the first release.
 - "No network" for the engine means that its code contains none, which CI checks. It does not mean the operating system blocks the engine from the network. (The app process, which is not the engine, does the update check and download described above.)
 - What the engine does have today: a limit on the memory it may use (3 GiB on Linux and Windows, none on macOS), it ends when the app ends (even when stuck inside PDFium), the app treats everything it receives from the engine as untrusted, and PDFium is loaded only from the app's own folder after a checksum check at build time.
-- PDFium is the main attack surface. It is pinned to one release and updated by hand for now; nothing warns yet when a newer release exists.
+- PDFium is the main attack surface. It is pinned to one release and updated by hand ([steps](docs/pdfium-updates.md)); a workflow that runs twice a week keeps one issue open while a newer release exists, and CI checks that the library that ships has no JavaScript engine (V8).
 
 ## Building from source
 
@@ -99,6 +99,8 @@ npm run build && npx playwright install chromium && npm run e2e   # the window i
 
 The browser tests (`e2e/`) run the real window code in Chromium with the content security policy of the app and a stand-in for the Rust side that serves two made-up documents. They cover tabs, the light and dark look, thumbnails and contents, selecting and copying with the mouse, search, the question before a link is opened, and printing. They do not start the Rust side, the engine or a real web view; the CI job "Build" does that for the release build (it opens a generated 500-page PDF and checks that the first page is drawn).
 
+The protocol decoders and the engine (with PDFium) are also fuzzed: see [docs/fuzzing.md](docs/fuzzing.md).
+
 Installers for testing (not signed, no update files): `npm run bundle`. Releases are made by the release workflow, with the macOS app signed and notarised ([docs/signing.md](docs/signing.md)) and the update files signed ([docs/updates.md](docs/updates.md)). An update can be tried from start to end on one computer with `node scripts/update-e2e.mjs` (it makes a throwaway key, builds two versions and lets the old one update itself; see docs/updates.md).
 
 ## Measuring speed and memory
@@ -108,3 +110,5 @@ Installers for testing (not signed, no update files): `npm run bundle`. Releases
 ## Licence
 
 Patient Partridge is free software under the [GNU Affero General Public License, version 3](LICENSE). PDFium is under a BSD-style licence; its licence files are shipped with the app.
+
+The licence texts of the Rust crates and npm packages inside the app are in [THIRD-PARTY-NOTICES](THIRD-PARTY-NOTICES), which every installer ships next to the AGPL text. The file is made by `scripts/notices.sh` (cargo-about, pinned) and CI fails when it is out of date or when a dependency has a licence that is not on the allowlist in `about.toml`. After changing a dependency, run `npm ci && scripts/notices.sh` and commit the result.
