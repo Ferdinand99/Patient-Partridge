@@ -9,7 +9,9 @@
 //! - macOS: the system does not enforce `RLIMIT_DATA` and `RLIMIT_AS`. The limit that holds is the
 //!   one the app keeps: it reads the memory footprint of the engine from outside and ends it
 //!   (`partridge-engine-client`, `spawn/unix.rs`). A thread of the engine does the same as a first
-//!   line, but code that has taken the engine over can stop that thread.
+//!   line, but code that has taken the engine over can stop that thread. Both are watches that look
+//!   every 20 to 25 ms, not walls: an engine that stays over the limit is ended within a fraction
+//!   of a second, and one that takes memory and lets go of it again within one look is not seen.
 //!
 //! A limit is not a sandbox: it does nothing against code that PDFium is tricked into running.
 
