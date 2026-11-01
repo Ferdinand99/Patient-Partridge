@@ -1,37 +1,57 @@
-// The app: the toolbar, opening files, and showing one document at a time.
-// Anything that touches the outside world (the engine, the file dialog, the window title) comes
-// in through `AppDeps`, so tests can run the whole flow with fakes.
+// The app: the tab strip, the toolbar, opening files, and showing one document at a time.
+// Anything that touches the outside world (the engine, the file dialog, the window title, the
+// storage) comes in through `AppDeps`, so tests can run the whole flow with fakes.
 
+import type { OpenedDocument, SavedPosition } from "../lib/api";
 import { describeError, fileNameOf, toAppError, type AppErrorLike } from "../lib/errors";
-import type { OpenedDocument } from "../lib/api";
 import { parsePageInput } from "../lib/pageInput";
+import {
+  THEME_CHOICES,
+  applyTheme,
+  loadTheme,
+  parseTheme,
+  saveTheme,
+  type StorageLike,
+} from "../lib/theme";
 import { actionForKey } from "../viewer/keys";
 import { DocumentView } from "../viewer/viewer";
 import { zoomLabel, type ZoomMode } from "../viewer/zoom";
+import { MenuController } from "./menu";
 import { showNotice } from "./notice";
+import { TabStrip } from "./tabs";
 
 export interface AppDeps {
   api: {
     open(path: string, password?: string): Promise<OpenedDocument>;
     render(doc: number, page: number, width: number, height: number): Promise<ArrayBuffer>;
     close(doc: number): Promise<void>;
+    setPosition(path: string, position: SavedPosition): Promise<void>;
+    clearPositions(): Promise<void>;
     measureMode(): Promise<boolean>;
     measureReport(openMs: number, firstPageMs: number, pages: number): Promise<void>;
   };
-  /** Shows the file dialog. Resolves with a path, or null when the user cancelled. */
-  pickFile(): Promise<string | null>;
+  /** Shows the file dialog. Resolves with the chosen paths, or an empty list when cancelled. */
+  pickFiles(): Promise<string[]>;
   setWindowTitle(title: string): void;
   now(): number;
+  /** Where the colour theme choice is kept. Without it the choice lasts until the app closes. */
+  storage?: StorageLike | null;
+  /** How long the reader must rest before the position is saved, in milliseconds. */
+  positionDelayMs?: number;
 }
 
-interface CurrentDocument {
+interface Tab {
+  id: number;
   doc: number;
   path: string;
   name: string;
   view: DocumentView;
+  saveTimer: ReturnType<typeof setTimeout> | undefined;
 }
 
 const ZOOM_CHOICES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
+const DEFAULT_POSITION_DELAY_MS = 600;
+const APP_NAME = "Patient Partridge";
 
 function byId<T extends HTMLElement>(root: Document, id: string): T {
   const el = root.getElementById(id);
@@ -40,9 +60,13 @@ function byId<T extends HTMLElement>(root: Document, id: string): T {
 }
 
 export class App {
-  private current: CurrentDocument | null = null;
-  private openToken = 0;
+  private tabs: Tab[] = [];
+  private activeId: number | null = null;
+  private nextTabId = 1;
+  /** Paths that are being opened right now, so that one file is not opened twice at once. */
+  private readonly opening = new Set<string>();
   private measuring = false;
+  private reported = false;
 
   private readonly stage: HTMLElement;
   private readonly empty: HTMLElement;
@@ -53,6 +77,9 @@ export class App {
   private readonly zoomSelect: HTMLSelectElement;
   private readonly zoomIn: HTMLButtonElement;
   private readonly zoomOut: HTMLButtonElement;
+  private readonly tabStrip: TabStrip;
+  private readonly menu: MenuController;
+  private readonly positionDelay: number;
 
   constructor(
     private readonly root: Document,
@@ -67,57 +94,101 @@ export class App {
     this.zoomSelect = byId(root, "zoom-select");
     this.zoomIn = byId(root, "zoom-in");
     this.zoomOut = byId(root, "zoom-out");
+    this.positionDelay = deps.positionDelayMs ?? DEFAULT_POSITION_DELAY_MS;
+    this.tabStrip = new TabStrip(byId(root, "tabs"), {
+      select: (id) => this.activate(id),
+      close: (id) => this.closeTab(id),
+    });
+    this.menu = new MenuController(byId(root, "menu-button"), byId(root, "menu"));
   }
 
   init(): void {
     byId(this.root, "open-button").addEventListener("click", () => void this.openDialog());
     byId(this.root, "empty-open").addEventListener("click", () => void this.openDialog());
-    this.zoomIn.addEventListener("click", () => this.current?.view.stepZoom(1));
-    this.zoomOut.addEventListener("click", () => this.current?.view.stepZoom(-1));
+    this.zoomIn.addEventListener("click", () => this.active?.view.stepZoom(1));
+    this.zoomOut.addEventListener("click", () => this.active?.view.stepZoom(-1));
     this.zoomSelect.addEventListener("change", () => this.onZoomSelect());
     this.pageInput.addEventListener("keydown", (e) => this.onPageInputKey(e));
     this.pageInput.addEventListener("blur", () => this.showCurrentPage());
     this.root.addEventListener("keydown", (e) => this.onKeyDown(e));
+    this.initTheme();
+    byId(this.root, "forget-positions").addEventListener("click", () => void this.forgetPositions());
+    // The reader's place is saved when they rest, and again when the window goes away.
+    this.root.addEventListener("visibilitychange", () => {
+      if (this.root.visibilityState === "hidden") this.saveAll();
+    });
+    this.root.defaultView?.addEventListener("pagehide", () => this.saveAll());
     this.buildZoomOptions(null);
+    this.syncChrome();
     void this.deps.api.measureMode().then((on) => (this.measuring = on));
   }
 
-  /** The document that is open, if any. */
+  /** The document that is shown, if any. */
   get currentView(): DocumentView | null {
-    return this.current?.view ?? null;
+    return this.active?.view ?? null;
+  }
+
+  /** How many documents are open. */
+  get tabCount(): number {
+    return this.tabs.length;
   }
 
   setDropActive(active: boolean): void {
     this.dropOverlay.hidden = !active;
   }
 
-  async openDialog(): Promise<void> {
-    const path = await this.deps.pickFile();
-    if (path) await this.openPath(path);
+  private get active(): Tab | null {
+    return this.tabs.find((t) => t.id === this.activeId) ?? null;
   }
 
-  /** Opens a file. If it needs a password the user is asked for one. */
-  async openPath(path: string, password?: string): Promise<void> {
-    const token = ++this.openToken;
+  // ---- opening and closing ---------------------------------------------------
+
+  async openDialog(): Promise<void> {
+    const paths = await this.deps.pickFiles();
+    if (paths.length > 0) await this.openPaths(paths);
+  }
+
+  /** Opens several files. The first one is shown; the others open in tabs behind it. */
+  async openPaths(paths: string[]): Promise<void> {
+    await Promise.all(paths.map((path, i) => this.openPath(path, undefined, i === 0)));
+  }
+
+  /** Opens a file in a tab. If it needs a password the user is asked for one. */
+  async openPath(path: string, password?: string, activate = true): Promise<void> {
+    const existing = this.tabs.find((t) => t.path === path);
+    if (existing) {
+      if (activate) this.activate(existing.id);
+      return;
+    }
+    if (this.opening.has(path)) return;
+    this.opening.add(path);
+    try {
+      await this.openNew(path, password, activate);
+    } finally {
+      this.opening.delete(path);
+    }
+  }
+
+  /** Opens a file that is not open yet. A question about it (password, try again) stays inside. */
+  private async openNew(path: string, password: string | undefined, activate: boolean): Promise<void> {
     const name = fileNameOf(path);
     const started = this.deps.now();
     let opened: OpenedDocument;
     try {
       opened = await this.deps.api.open(path, password);
     } catch (e) {
-      if (token !== this.openToken) return;
-      await this.openFailed(path, name, toAppError(e));
+      await this.openFailed(path, name, toAppError(e), activate);
       return;
     }
-    if (token !== this.openToken) {
-      // Another file was opened while this one was loading: this one is not wanted any more.
-      void this.deps.api.close(opened.doc).catch(() => undefined);
-      return;
-    }
-    this.showDocument(opened, path, started);
+    this.addTab(opened, path, started, activate);
   }
 
-  private async openFailed(path: string, name: string, error: AppErrorLike): Promise<void> {
+  private async openFailed(
+    path: string,
+    name: string,
+    error: AppErrorLike,
+    activate: boolean,
+  ): Promise<void> {
     const text = describeError(error, name);
     if (text.action === "password") {
       const answer = await showNotice(this.noticeLayer, {
@@ -130,7 +201,7 @@ export class App {
         ],
       });
       if (answer.button === "open" && answer.password) {
-        await this.openPath(path, answer.password);
+        await this.openNew(path, answer.password, activate);
       }
       return;
     }
@@ -143,7 +214,7 @@ export class App {
           { id: "retry", label: "Try again", primary: true },
         ],
       });
-      if (answer.button === "retry") await this.openPath(path);
+      if (answer.button === "retry") await this.openNew(path, undefined, activate);
       return;
     }
     await showNotice(this.noticeLayer, {
@@ -153,36 +224,49 @@ export class App {
     });
   }
 
-  private showDocument(opened: OpenedDocument, path: string, started: number): void {
-    this.closeCurrent();
+  private addTab(opened: OpenedDocument, path: string, started: number, activate: boolean): void {
     const openedAfter = this.deps.now() - started;
-
-    const view = new DocumentView(
+    const tab: Tab = {
+      id: this.nextTabId++,
+      doc: opened.doc,
+      path,
+      name: opened.name,
+      view: undefined as unknown as DocumentView,
+      saveTimer: undefined,
+    };
+    tab.view = new DocumentView(
       { doc: opened.doc, pages: opened.pages },
       this.deps.api,
       {
         onPageChange: (page) => {
-          if (this.current?.view === view) this.showCurrentPage(page);
+          if (this.active === tab) this.showCurrentPage(page);
         },
         onZoomChange: (zoom, mode) => {
-          if (this.current?.view === view) this.showZoom(zoom, mode);
+          if (this.active === tab) this.showZoom(zoom, mode);
         },
-        onFatal: (error) => void this.documentLost(view, error),
+        onFatal: (error) => void this.documentLost(tab, error),
         onFirstPaint: () => {
-          if (!this.measuring) return;
+          // The measurement run opens one file; report that one.
+          if (!this.measuring || this.reported) return;
+          this.reported = true;
           const paintedAfter = this.deps.now() - started;
           void this.deps.api.measureReport(openedAfter, paintedAfter, opened.pages.length);
         },
+        onViewChange: () => this.scheduleSave(tab),
       },
+      { start: opened.position ?? null },
     );
+    this.tabs.push(tab);
+    this.stage.append(tab.view.element);
 
-    this.current = { doc: opened.doc, path, name: opened.name, view };
-    this.empty.hidden = true;
-    this.stage.append(view.element);
-    this.setControlsEnabled(true);
-    this.pageTotal.textContent = `/ ${opened.pages.length}`;
-    this.deps.setWindowTitle(`${opened.name} - Patient Partridge`);
-    view.start();
+    const showIt = activate || this.activeId === null;
+    if (showIt) {
+      this.activate(tab.id);
+    } else {
+      // Opened behind the one that is shown: it starts when its tab is first selected.
+      tab.view.setActive(false);
+      this.syncChrome();
+    }
     if (opened.pages.length === 0) {
       void showNotice(this.noticeLayer, {
         title: "This PDF has no pages",
@@ -192,26 +276,48 @@ export class App {
     }
   }
 
-  private closeCurrent(): void {
-    const current = this.current;
-    if (!current) return;
-    this.current = null;
-    current.view.destroy();
-    void this.deps.api.close(current.doc).catch(() => undefined);
+  /** Brings a tab to the front. */
+  activate(id: number): void {
+    const next = this.tabs.find((t) => t.id === id);
+    if (!next) return;
+    const previous = this.active;
+    if (previous && previous !== next) {
+      this.saveNow(previous);
+      previous.view.setActive(false);
+    }
+    this.activeId = id;
+    if (!next.view.isActive) {
+      // A tab that was behind: it comes back where it was (or starts, if it was never shown).
+      next.view.setActive(true);
+    } else if (!next.view.hasStarted) {
+      // A tab that was just opened: it is active already, but has not been laid out yet.
+      next.view.start();
+    }
+    this.syncChrome();
+    next.view.element.focus({ preventScroll: true });
   }
 
-  /** The engine stopped and took the document with it. The app itself carries on. */
-  private async documentLost(view: DocumentView, error: AppErrorLike): Promise<void> {
-    const lost = this.current;
-    if (!lost || lost.view !== view) return;
-    this.current = null;
-    view.destroy();
-    this.empty.hidden = false;
-    this.setControlsEnabled(false);
-    this.pageInput.value = "";
-    this.pageTotal.textContent = "";
-    this.deps.setWindowTitle("Patient Partridge");
-    const text = describeError(error, lost.name);
+  closeTab(id: number): void {
+    const index = this.tabs.findIndex((t) => t.id === id);
+    if (index < 0) return;
+    const [tab] = this.tabs.splice(index, 1);
+    this.saveNow(tab);
+    clearTimeout(tab.saveTimer);
+    tab.view.destroy();
+    void this.deps.api.close(tab.doc).catch(() => undefined);
+    if (this.activeId === id) {
+      this.activeId = null;
+      const neighbour = this.tabs[index] ?? this.tabs[index - 1];
+      if (neighbour) this.activate(neighbour.id);
+    }
+    this.syncChrome();
+  }
+
+  /** The engine of one document stopped and took the document with it. The other tabs carry on. */
+  private async documentLost(tab: Tab, error: AppErrorLike): Promise<void> {
+    if (!this.tabs.includes(tab)) return;
+    this.closeTab(tab.id);
+    const text = describeError(error, tab.name);
     const answer = await showNotice(this.noticeLayer, {
       title: text.title,
       detail: text.detail,
@@ -220,28 +326,110 @@ export class App {
         { id: "retry", label: "Open the file again", primary: true },
       ],
     });
-    if (answer.button === "retry") await this.openPath(lost.path);
+    if (answer.button === "retry") await this.openPath(tab.path);
   }
 
-  // ---- toolbar ---------------------------------------------------------------
+  // ---- remembered positions --------------------------------------------------
+
+  private scheduleSave(tab: Tab): void {
+    clearTimeout(tab.saveTimer);
+    tab.saveTimer = setTimeout(() => this.saveNow(tab), this.positionDelay);
+  }
+
+  private saveNow(tab: Tab): void {
+    clearTimeout(tab.saveTimer);
+    tab.saveTimer = undefined;
+    if (tab.view.pageCount === 0) return;
+    void this.deps.api.setPosition(tab.path, tab.view.getPosition()).catch(() => undefined);
+  }
+
+  private saveAll(): void {
+    for (const tab of this.tabs) this.saveNow(tab);
+  }
+
+  private async forgetPositions(): Promise<void> {
+    this.menu.close();
+    const answer = await showNotice(this.noticeLayer, {
+      title: "Forget remembered positions?",
+      detail:
+        "Patient Partridge remembers where you stopped reading in each file, on this computer only. Forgetting them opens every file at the top again.",
+      buttons: [
+        { id: "cancel", label: "Keep them", safe: true },
+        { id: "forget", label: "Forget positions", primary: true },
+      ],
+    });
+    if (answer.button !== "forget") return;
+    // Clear the file first, then the timers: nothing may write a position back after this.
+    for (const tab of this.tabs) {
+      clearTimeout(tab.saveTimer);
+      tab.saveTimer = undefined;
+    }
+    await this.deps.api.clearPositions().catch(() => undefined);
+  }
+
+  // ---- colour theme ----------------------------------------------------------
+
+  private initTheme(): void {
+    const storage = this.deps.storage ?? null;
+    const apply = (value: string) => {
+      const pref = parseTheme(value);
+      applyTheme(this.root.documentElement, pref);
+      return pref;
+    };
+    const current = loadTheme(storage);
+    apply(current);
+    const radios = this.root.querySelectorAll<HTMLInputElement>('#theme-choice input[name="theme"]');
+    for (const radio of radios) {
+      radio.checked = radio.value === current;
+      radio.addEventListener("change", () => {
+        if (!radio.checked) return;
+        saveTheme(storage, apply(radio.value));
+      });
+    }
+    if (radios.length !== THEME_CHOICES.length) throw new Error("the menu lacks a theme choice");
+  }
+
+  // ---- toolbar and tabs ------------------------------------------------------
+
+  /** Brings the tab strip, the toolbar, the title and the empty state in step with the tabs. */
+  private syncChrome(): void {
+    const active = this.active;
+    this.tabStrip.render(
+      this.tabs.map((t) => ({ id: t.id, title: t.name, path: t.path })),
+      this.activeId,
+    );
+    this.empty.hidden = this.tabs.length > 0;
+    this.setControlsEnabled(active !== null);
+    if (!active) {
+      this.pageInput.value = "";
+      this.pageTotal.textContent = "";
+      this.deps.setWindowTitle(APP_NAME);
+      this.buildZoomOptions(null);
+      return;
+    }
+    this.pageTotal.textContent = `/ ${active.view.pageCount}`;
+    this.deps.setWindowTitle(`${active.name} - ${APP_NAME}`);
+    this.showZoom(active.view.zoomValue, active.view.zoomMode);
+    this.showCurrentPage();
+  }
 
   private setControlsEnabled(on: boolean): void {
     for (const el of [this.pageInput, this.zoomSelect, this.zoomIn, this.zoomOut]) el.disabled = !on;
   }
 
   private showCurrentPage(page?: number): void {
-    const current = this.current;
-    if (!current) return;
+    const active = this.active;
+    if (!active) return;
     // Do not overwrite what the user is typing in the box.
     if (page === undefined || this.root.activeElement !== this.pageInput) {
       this.pageInput.value = String(
-        (page ?? current.view.currentPageIndex) + (current.view.pageCount === 0 ? 0 : 1),
+        (page ?? active.view.currentPageIndex) + (active.view.pageCount === 0 ? 0 : 1),
       );
     }
   }
 
   private onPageInputKey(e: KeyboardEvent): void {
-    const view = this.current?.view;
+    const view = this.active?.view;
     if (!view) return;
     if (e.key === "Enter") {
       e.preventDefault();
@@ -289,7 +477,7 @@ export class App {
   }
 
   private onZoomSelect(): void {
-    const view = this.current?.view;
+    const view = this.active?.view;
     if (!view) return;
     const value = this.zoomSelect.value;
     if (value === "fit") view.setFitWidth();
@@ -321,8 +509,21 @@ export class App {
         this.pageInput.focus();
         this.pageInput.select();
       }
-    } else if (this.current?.view.handleAction(action)) {
+    } else if (action.type === "close-tab") {
+      e.preventDefault();
+      if (this.activeId !== null) this.closeTab(this.activeId);
+    } else if (action.type === "next-tab" || action.type === "previous-tab") {
+      e.preventDefault();
+      this.stepTab(action.type === "next-tab" ? 1 : -1);
+    } else if (this.active?.view.handleAction(action)) {
       e.preventDefault();
     }
+  }
+
+  private stepTab(direction: 1 | -1): void {
+    if (this.tabs.length < 2) return;
+    const index = this.tabs.findIndex((t) => t.id === this.activeId);
+    const next = this.tabs[(index + direction + this.tabs.length) % this.tabs.length];
+    this.activate(next.id);
   }
 }

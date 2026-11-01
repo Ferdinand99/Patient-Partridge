@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MARGIN, PAGE_GAP } from "./layout";
-import { DocumentView, type ViewerApi, type ViewerEvents } from "./viewer";
+import { DocumentView, type ViewerApi, type ViewerEvents, type ViewerOptions } from "./viewer";
 
 const VIEWPORT = { width: 900, height: 800 };
 const letter = { width: 612, height: 792 };
@@ -61,6 +61,8 @@ interface Harness {
 function open(
   pageCount: number,
   render?: (doc: number, page: number, w: number, h: number) => Promise<ArrayBuffer>,
+  options: ViewerOptions = {},
+  startNow = true,
 ): Harness {
   const fake = vi.fn(
     render ?? ((_d: number, _p: number, w: number, h: number) => Promise.resolve(new ArrayBuffer(w * h * 4))),
@@ -76,9 +78,10 @@ function open(
     { doc: 7, pages: Array.from({ length: pageCount }, () => letter) },
     api,
     events,
+    options,
   );
   document.body.append(view.element);
-  view.start();
+  if (startNow) view.start();
   return { view, render: fake, events };
 }
 
@@ -281,5 +284,114 @@ describe("DocumentView", () => {
     await flush();
     view.destroy();
     expect(document.body.querySelector(".viewer")).toBeNull();
+  });
+
+  describe("position and visibility", () => {
+    it("reports the reading position and starts there again", async () => {
+      const first = open(20);
+      await flush();
+      first.view.setZoom(1.5);
+      first.view.element.scrollTop = 4 * (792 * 2 + PAGE_GAP) + 700;
+      first.view.element.dispatchEvent(new Event("scroll"));
+      await flush();
+      const place = first.view.getPosition();
+      expect(place.zoom).toBe(1.5);
+      expect(place.page).toBeGreaterThanOrEqual(2);
+      expect(place.offset).toBeGreaterThanOrEqual(0);
+      expect(place.offset).toBeLessThanOrEqual(1);
+
+      document.body.replaceChildren();
+      const again = open(20, undefined, { start: place });
+      await flush();
+      expect(again.view.zoomMode).toEqual({ kind: "custom", zoom: 1.5 });
+      const back = again.view.getPosition();
+      expect(back.page).toBe(place.page);
+      expect(back.offset).toBeCloseTo(place.offset, 1);
+    });
+
+    it("keeps fit width as null in the position", async () => {
+      const { view } = open(3);
+      await flush();
+      expect(view.getPosition()).toEqual({ page: 0, offset: 0, zoom: null });
+    });
+
+    it("asks first for the pages at the saved place, not for page 1", async () => {
+      const { render } = open(50, undefined, { start: { page: 30, offset: 0.2, zoom: null } });
+      await flush();
+      const asked = render.mock.calls.map((c) => c[1] as number);
+      expect(asked.length).toBeGreaterThan(0);
+      expect(asked.every((p) => p >= 29 && p <= 31)).toBe(true);
+    });
+
+    it("clamps a saved place that does not fit the document", async () => {
+      const { view } = open(5, undefined, { start: { page: 400, offset: 9, zoom: 100 } });
+      await flush();
+      const place = view.getPosition();
+      expect(place.page).toBe(4);
+      expect(place.zoom).toBeLessThanOrEqual(8);
+      const nan = open(5, undefined, { start: { page: -3, offset: Number.NaN, zoom: null } });
+      await flush();
+      expect(nan.view.getPosition().page).toBe(0);
+    });
+
+    it("gives up its canvases and asks the engine for nothing while hidden, then comes back", async () => {
+      const { view, render } = open(30);
+      await flush();
+      view.element.scrollTop = 5000;
+      view.element.dispatchEvent(new Event("scroll"));
+      await flush();
+      const before = view.getPosition();
+      view.setActive(false);
+      expect(view.isActive).toBe(false);
+      expect(view.element.hidden).toBe(true);
+      expect(mountedPages(view)).toEqual([]);
+      // Layout changes while hidden are not acted on: a hidden view has no size.
+      render.mockClear();
+      window.dispatchEvent(new Event("resize"));
+      await flush();
+      expect(render).not.toHaveBeenCalled();
+      expect(view.getPosition()).toEqual(before);
+
+      view.element.scrollTop = 0;
+      view.setActive(true);
+      await flush();
+      expect(view.element.hidden).toBe(false);
+      expect(view.getPosition().page).toBe(before.page);
+      expect(mountedPages(view).length).toBeGreaterThan(0);
+      expect(render).toHaveBeenCalled();
+    });
+
+    it("does not lay out a view that was opened hidden until it is shown", async () => {
+      const { view, render } = open(10, undefined, { start: { page: 3, offset: 0, zoom: 1 } }, false);
+      view.setActive(false);
+      await flush();
+      expect(render).not.toHaveBeenCalled();
+      expect(view.hasStarted).toBe(false);
+      // Its saved place is known without laying it out.
+      expect(view.getPosition()).toEqual({ page: 3, offset: 0, zoom: 1 });
+      view.setActive(true);
+      await flush();
+      expect(view.hasStarted).toBe(true);
+      expect(view.getPosition().page).toBe(3);
+      expect(render.mock.calls.every((c) => (c[1] as number) >= 2)).toBe(true);
+    });
+
+    it("tells when the view changes, so the place can be saved", () => {
+      const onViewChange = vi.fn();
+      const view = new DocumentView(
+        { doc: 1, pages: [letter, letter] },
+        { render: vi.fn(() => Promise.resolve(new ArrayBuffer(4))) },
+        {
+          onPageChange: vi.fn(),
+          onZoomChange: vi.fn(),
+          onFatal: vi.fn(),
+          onFirstPaint: vi.fn(),
+          onViewChange,
+        },
+      );
+      document.body.append(view.element);
+      view.start();
+      expect(onViewChange).toHaveBeenCalled();
+    });
   });
 });

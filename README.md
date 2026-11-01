@@ -10,15 +10,18 @@ Patient Partridge is part of the Hedgerow family of apps, next to [Nimble Newt](
 
 ## What works now
 
-- Open a PDF from the Open button (Ctrl+O), by dropping a file on the window, or from the command line.
-- Read it in one continuous scrolling view. Only the pages you can see (and a few around them) are drawn, so opening is quick and memory stays flat as documents get longer.
+- Open one or more PDFs from the Open button (Ctrl+O), by dropping files on the window, from the command line, or with "Open with" from a file manager. Each file opens in its own tab (Ctrl+W closes a tab, Ctrl+Tab and Ctrl+Shift+Tab move between tabs). Opening a file that is already open shows its tab.
+- Read in one continuous scrolling view. Only the pages you can see (and a few around them) are drawn, so opening is quick and memory stays flat as documents get longer. A tab you are not looking at gives up its drawn pages.
 - Zoom in and out, or fit the page to the window width. Ctrl with the mouse wheel zooms too.
 - Move with the mouse wheel, the arrow keys, Page Up and Page Down, Space, Home and End, or jump to a page number (Ctrl+G).
+- Patient Partridge remembers where you stopped in each file and puts you back there when you open it again. The place (page, how far down, zoom) is kept in a small file on your computer, together with the path of the file, for the last 500 files. Nothing is sent anywhere. "Forget remembered positions" in the settings menu (the three dots) empties it.
+- The look follows the system's light or dark setting. The settings menu has Auto, Light and Dark. The pages themselves stay white, like paper.
 - Password-protected files ask for the password. A damaged file, or a file that is not a PDF, gives a clear message instead of a crash.
+- The installers register Patient Partridge as a viewer for PDF files, so it appears under "Open with". It does not take over as the default reader by itself.
 
 ## What is not there yet
 
-Tabs, page thumbnails, the table of contents, selecting and copying text, search, printing, dark mode and remembering where you stopped reading.
+Page thumbnails, the table of contents, selecting and copying text, search and printing.
 
 The editor side is also planned, and none of it exists yet. There are no dates; each step is done when it works:
 
@@ -36,7 +39,7 @@ The editor side is also planned, and none of it exists yet. There are no dates; 
 
 - The window is a [Tauri 2](https://tauri.app/) app written in TypeScript (Vite) with a small Rust core.
 - PDF files are read by a separate program, `partridge-engine`, which uses [PDFium](https://pdfium.googlesource.com/pdfium/) (the PDF library of Chrome) through [pdfium-render](https://crates.io/crates/pdfium-render). The app starts it and talks to it over standard input and output with a small binary protocol.
-- A PDF is untrusted input. It is read in its own process, so a file that crashes or hangs the reader cannot take the app down: you get an error message and can open another file.
+- A PDF is untrusted input. Every open document is read by an engine process of its own, so a file that crashes or hangs its engine closes only its own tab: you get an error message, the other tabs carry on, and you can open another file. At most 16 documents are open at once.
 - PDF JavaScript is turned off. The PDFium build used has no JavaScript engine at all.
 - The engine code has no network code, and a check in CI keeps it that way. The app makes no network connections, and the window loads nothing from the internet (strict content security policy).
 

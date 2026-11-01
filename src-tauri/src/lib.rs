@@ -9,12 +9,14 @@
 //! engine closes only its own tab.
 
 mod locate;
+mod positions;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use partridge_engine_client::{ClientError, EngineConfig, EnginePool, LinkTarget};
+use positions::{Position, Positions};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -58,6 +60,16 @@ const MAX_DOCUMENTS: usize = 16;
 /// The supervised engine processes, one per open document.
 struct Engine(Arc<EnginePool>);
 
+/// Where the reader was in each file, kept in a file in the app's data folder.
+struct PositionStore(Mutex<Positions>);
+
+fn now_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// What the frontend sees when a command fails: a stable code and a short detail.
 #[derive(Serialize, Debug, PartialEq)]
 struct CommandError {
@@ -88,6 +100,8 @@ struct OpenedInfo {
     /// Page sizes in PDF points, `[width, height]`.
     pages: Vec<[f32; 2]>,
     name: String,
+    /// Where this file was left the last time, if it was.
+    position: Option<Position>,
 }
 
 /// Runs a blocking engine call off the thread that handles the window.
@@ -108,6 +122,7 @@ where
 #[tauri::command]
 async fn open_pdf(
     engine: State<'_, Engine>,
+    positions: State<'_, PositionStore>,
     path: String,
     password: Option<String>,
 ) -> Result<OpenedInfo, CommandError> {
@@ -116,12 +131,47 @@ async fn open_pdf(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.clone());
+    let key = positions::key_for(&path);
     let (doc, pages) = blocking(move || pool.open(&path, password.as_deref())).await?;
+    let position = positions
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key);
     Ok(OpenedInfo {
         doc,
         pages: pages.iter().map(|p| [p.width, p.height]).collect(),
         name,
+        position,
     })
+}
+
+/// Remembers where the reader is in a file. A failure to write the file is not an error for the
+/// reader: the position is kept in the app until it closes.
+#[tauri::command]
+fn set_position(
+    positions: State<'_, PositionStore>,
+    path: String,
+    page: u32,
+    offset: f32,
+    zoom: Option<f32>,
+) {
+    let key = positions::key_for(&path);
+    let _ = positions.0.lock().unwrap_or_else(|e| e.into_inner()).set(
+        &key,
+        Position { page, offset, zoom },
+        now_seconds(),
+    );
+}
+
+/// Forgets every remembered position.
+#[tauri::command]
+fn clear_positions(positions: State<'_, PositionStore>) {
+    let _ = positions
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 /// Draws a page. The answer is the raw bitmap, `width * height * 4` bytes of RGBA, sent as binary
@@ -323,6 +373,12 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(Pending::default())
         .setup(|app| {
+            let positions_file = app
+                .path()
+                .app_data_dir()
+                .ok()
+                .map(|dir| dir.join("positions.json"));
+            app.manage(PositionStore(Mutex::new(Positions::load(positions_file))));
             app.manage(Engine(Arc::new(EnginePool::new(
                 engine_config(app),
                 MAX_DOCUMENTS,
@@ -345,6 +401,8 @@ pub fn run() {
             open_pdf,
             render_page,
             close_pdf,
+            set_position,
+            clear_positions,
             get_outline,
             get_page_text,
             get_page_links,

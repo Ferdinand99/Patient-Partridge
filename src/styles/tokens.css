@@ -1,0 +1,276 @@
+/* Hedgerow look: tokens and base.
+   Copied from the Hedgerow design system (the Vigilant Vole stylesheet), not linked to it: this
+   app has no dependency on any other Hedgerow code, and every asset is local. Dark first, with an
+   equally finished light theme. Colours use light-dark(): the first value is the light theme, the
+   second the dark one. `color-scheme` on <html> picks one: it follows the system by default, and
+   [data-theme="light" | "dark"] forces either. */
+
+@font-face {
+  font-family: "InterVariable";
+  src: url("/fonts/InterVariable.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  color-scheme: light dark;
+
+  /* Surfaces */
+  --bg: light-dark(#f5f5f7, #0b0b0d);
+  --bg-2: light-dark(#ececf0, #111113);
+  --card: light-dark(#ffffff, #161618);
+  --card-raised: light-dark(#ffffff, #1c1c1f);
+  --field: light-dark(#ffffff, #1b1b1e);
+  --fill: light-dark(rgba(118, 118, 128, 0.12), rgba(118, 118, 128, 0.22));
+  --fill-2: light-dark(rgba(118, 118, 128, 0.2), rgba(118, 118, 128, 0.32));
+  --hover: light-dark(rgba(0, 0, 0, 0.035), rgba(255, 255, 255, 0.045));
+  --pressed: light-dark(rgba(0, 0, 0, 0.07), rgba(255, 255, 255, 0.08));
+  --line: light-dark(rgba(0, 0, 0, 0.08), rgba(255, 255, 255, 0.08));
+  --line-strong: light-dark(rgba(0, 0, 0, 0.15), rgba(255, 255, 255, 0.14));
+  --control-border: light-dark(rgba(0, 0, 0, 0.22), rgba(255, 255, 255, 0.26));
+
+  /* Materials (translucent chrome) */
+  --bar: light-dark(rgba(245, 245, 247, 0.76), rgba(11, 11, 13, 0.72));
+  --material: light-dark(rgba(255, 255, 255, 0.84), rgba(34, 34, 37, 0.84));
+  --scrim: light-dark(rgba(0, 0, 0, 0.28), rgba(0, 0, 0, 0.55));
+  --blur-bar: blur(20px) saturate(180%);
+  --blur-material: blur(32px) saturate(180%);
+
+  /* Text */
+  --text: light-dark(#1d1d1f, #f5f5f7);
+  --muted: light-dark(#6e6e73, #a1a1a6);
+  --faint: light-dark(#aeaeb2, #6e6e73);
+  --placeholder: light-dark(#8e8e93, #77777c);
+  --on-inverse: light-dark(#ffffff, #0b0b0d);
+
+  /* Brand: links, focus, selection. Used sparingly. */
+  --brand: light-dark(#6656e8, #8b7dff);
+  --brand-fill: light-dark(rgba(102, 86, 232, 0.1), rgba(139, 125, 255, 0.16));
+  --brand-ring: light-dark(rgba(102, 86, 232, 0.22), rgba(139, 125, 255, 0.32));
+
+  /* Status (Apple system colours): base = dots and bars, -text = readable text, -fill = tint */
+  --ok: light-dark(#34c759, #30d158);
+  --ok-text: light-dark(#1f7a35, #30d158);
+  --ok-fill: light-dark(rgba(52, 199, 89, 0.14), rgba(48, 209, 88, 0.15));
+  --warn: light-dark(#ffcc00, #ffd60a);
+  --warn-text: light-dark(#8f5000, #ffd60a);
+  --warn-fill: light-dark(rgba(255, 204, 0, 0.2), rgba(255, 214, 10, 0.14));
+  --bad: light-dark(#ff3b30, #ff453a);
+  --bad-text: light-dark(#d70015, #ff6961);
+  --bad-fill: light-dark(rgba(255, 59, 48, 0.11), rgba(255, 69, 58, 0.16));
+  --info: light-dark(#007aff, #0a84ff);
+  --info-text: light-dark(#0062cc, #409cff);
+  --info-fill: light-dark(rgba(0, 122, 255, 0.1), rgba(10, 132, 255, 0.18));
+
+  /* Controls */
+  --switch-off: light-dark(#e3e3e8, #39393d);
+  --seg-thumb: light-dark(#ffffff, #5a5a5f);
+  --seg-shadow: light-dark(0 1px 3px rgba(0, 0, 0, 0.12), 0 1px 2px rgba(0, 0, 0, 0.3));
+
+  /* Shadows */
+  --shadow-color: light-dark(rgba(0, 0, 0, 0.08), rgba(0, 0, 0, 0.5));
+  --shadow-pop: 0 10px 30px -6px var(--shadow-color), 0 2px 6px light-dark(rgba(0, 0, 0, 0.06), rgba(0, 0, 0, 0.3));
+  --shadow-sheet: 0 30px 80px -20px light-dark(rgba(0, 0, 0, 0.3), rgba(0, 0, 0, 0.8));
+
+  /* The page itself: PDF pages are paper, white in both themes. */
+  --paper: #ffffff;
+  --paper-shadow: 0 1px 3px light-dark(rgba(0, 0, 0, 0.22), rgba(0, 0, 0, 0.6)), 0 6px 18px -4px light-dark(rgba(0, 0, 0, 0.16), rgba(0, 0, 0, 0.55));
+
+  /* Text selection and search highlights drawn over the pages. */
+  --select: light-dark(rgba(0, 122, 255, 0.28), rgba(10, 132, 255, 0.4));
+  --find: rgba(255, 204, 0, 0.42);
+  --find-current: rgba(255, 149, 0, 0.62);
+
+  /* Type */
+  --font: "InterVariable", "Inter", system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+
+  /* Spacing (4px grid, in rem so it scales with the user's text size) */
+  --sp-1: 0.25rem;
+  --sp-2: 0.5rem;
+  --sp-3: 0.75rem;
+  --sp-4: 1rem;
+  --sp-5: 1.25rem;
+  --sp-6: 1.5rem;
+  --sp-8: 2rem;
+
+  /* Radii */
+  --r-xs: 6px;
+  --r-sm: 10px;
+  --r-md: 14px;
+  --r-lg: 18px;
+  --r-xl: 22px;
+  --r-full: 999px;
+
+  /* Motion */
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
+  --dur-press: 120ms;
+  --dur-ui: 200ms;
+
+  /* Layers */
+  --z-bar: 50;
+  --z-popover: 70;
+  --z-sheet: 90;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  background: var(--bg);
+}
+
+body {
+  margin: 0;
+  height: 100dvh;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 0.9375rem;
+  line-height: 1.5;
+  letter-spacing: -0.009em;
+  font-optical-sizing: auto;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+::selection {
+  background: var(--brand-ring);
+}
+
+:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+  color: var(--text);
+  text-wrap: balance;
+}
+
+h1 {
+  font-size: 2rem;
+  font-weight: 700;
+  line-height: 1.12;
+  letter-spacing: -0.022em;
+}
+
+h2 {
+  font-size: 1.25rem;
+  font-weight: 650;
+  line-height: 1.25;
+  letter-spacing: -0.017em;
+}
+
+h3 {
+  font-size: 1.0625rem;
+  font-weight: 600;
+  line-height: 1.35;
+  letter-spacing: -0.013em;
+}
+
+p {
+  margin: 0;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.num {
+  font-variant-numeric: tabular-nums;
+}
+
+.break {
+  overflow-wrap: anywhere;
+}
+
+.truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Visually hidden, still announced */
+.vh {
+  position: absolute !important;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+kbd {
+  display: inline-block;
+  min-width: 1.6em;
+  padding: 0 0.4em;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-xs);
+  background: var(--fill);
+  font: inherit;
+  font-size: 0.8125em;
+  text-align: center;
+}
+
+/* Icons: an inline sprite in index.html. Drawn on a 24px grid with a 1.5px stroke. */
+.icon {
+  flex: none;
+  width: 1.25em;
+  height: 1.25em;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@media (prefers-contrast: more) {
+  :root {
+    --line: light-dark(rgba(0, 0, 0, 0.3), rgba(255, 255, 255, 0.3));
+    --line-strong: light-dark(rgba(0, 0, 0, 0.5), rgba(255, 255, 255, 0.5));
+    --muted: light-dark(#4a4a4f, #c7c7cc);
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  :root {
+    --bar: var(--bg);
+    --material: var(--card-raised);
+  }
+}

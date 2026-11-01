@@ -3,7 +3,8 @@
 // Every page gets a box of the right size from the start, so the scroll bar is correct at once.
 // Only the pages near the viewport get a canvas, and only those are asked from the engine. Pages
 // that scroll far away lose their canvas again, so memory stays flat however long the document is.
-// One DocumentView is one document; a later tab bar just keeps several of them.
+// One DocumentView is one document; the app keeps one per tab. A view that is not shown frees all
+// its canvases and asks the engine for nothing, and remembers where the reader was.
 
 import { type AppErrorLike, isEngineLost, toAppError } from "../lib/errors";
 import { type Action, pageScrollDistance } from "./keys";
@@ -33,6 +34,21 @@ export interface ViewerEvents {
   onFatal(error: AppErrorLike): void;
   /** The first page has been drawn. */
   onFirstPaint(): void;
+  /** The reading position changed (scrolled or zoomed). Called often: the receiver should wait. */
+  onViewChange?(): void;
+}
+
+/** Where the reader was: a page, how far down it, and the zoom (null means fit width). */
+export interface ViewPosition {
+  page: number;
+  /** 0 at the top of the page, 1 at the bottom. */
+  offset: number;
+  zoom: number | null;
+}
+
+export interface ViewerOptions {
+  /** Where to start. Without it the view starts at the top, fitted to the width. */
+  start?: ViewPosition | null;
 }
 
 export interface DocumentInfo {
@@ -67,11 +83,17 @@ export class DocumentView {
   private painted = false;
   private destroyed = false;
   private fatal = false;
+  private active = true;
+  private started = false;
+  /** Where the reader was when the view was hidden, and how far to the side. */
+  private hiddenAnchor: Anchor = { page: 0, fraction: 0 };
+  private hiddenLeft = 0;
 
   constructor(
     private readonly info: DocumentInfo,
     private readonly api: ViewerApi,
     private readonly events: ViewerEvents,
+    private readonly options: ViewerOptions = {},
   ) {
     this.element = document.createElement("div");
     this.element.className = "viewer";
@@ -115,8 +137,73 @@ export class DocumentView {
 
   /** Call once the element is in the page, so its size is known. */
   start(): void {
+    this.started = true;
+    const start = this.options.start;
+    if (start && this.pageCount > 0) {
+      this.mode = start.zoom === null ? { kind: "fit-width" } : { kind: "custom", zoom: clampZoom(start.zoom) };
+      this.applyMode();
+      const page = Math.min(Math.max(0, Math.floor(start.page)), this.pageCount - 1);
+      const offset = Number.isFinite(start.offset) ? Math.min(Math.max(start.offset, 0), 1) : 0;
+      // The first pages asked from the engine are the ones at the saved place, not page 1.
+      this.relayout({ page, fraction: offset });
+    } else {
+      this.applyMode();
+      this.relayout();
+    }
+    this.element.focus({ preventScroll: true });
+  }
+
+  get isActive(): boolean {
+    return this.active;
+  }
+
+  /** True once the pages have been laid out (a view opened behind another waits until shown). */
+  get hasStarted(): boolean {
+    return this.started;
+  }
+
+  /** The reading position, to be saved and restored later. */
+  getPosition(): ViewPosition {
+    if (!this.started) {
+      return this.options.start ?? { page: 0, offset: 0, zoom: null };
+    }
+    let anchor = this.active ? anchorAt(this.layout, this.element.scrollTop) : this.hiddenAnchor;
+    // The gap between two pages belongs to the page below it.
+    if (anchor.fraction >= 1 && anchor.page + 1 < this.pageCount) {
+      anchor = { page: anchor.page + 1, fraction: 0 };
+    }
+    return {
+      page: anchor.page,
+      offset: Math.min(Math.max(anchor.fraction, 0), 1),
+      zoom: this.mode.kind === "fit-width" ? null : this.zoom,
+    };
+  }
+
+  /**
+   * Shows or hides the view (a tab comes to the front or goes behind). A hidden view gives up its
+   * canvases and asks the engine for nothing; when it is shown again it comes back where it was.
+   */
+  setActive(active: boolean): void {
+    if (this.destroyed || active === this.active) return;
+    this.active = active;
+    if (!active) {
+      if (this.started) {
+        this.hiddenAnchor = anchorAt(this.layout, this.element.scrollTop);
+        this.hiddenLeft = this.element.scrollLeft;
+        this.scheduler.setWanted([]);
+        for (const index of [...this.mounted.keys()]) this.unmount(index);
+      }
+      this.element.hidden = true;
+      return;
+    }
+    this.element.hidden = false;
+    if (!this.started) {
+      this.start();
+      return;
+    }
     this.applyMode();
-    this.relayout();
+    this.relayout(this.hiddenAnchor);
+    this.element.scrollLeft = this.hiddenLeft;
     this.element.focus({ preventScroll: true });
   }
 
@@ -206,9 +293,9 @@ export class DocumentView {
     }
   }
 
-  /** Lays the pages out again at the current zoom, keeping the reading position. */
-  private relayout(): void {
-    const anchor: Anchor = anchorAt(this.layout, this.element.scrollTop);
+  /** Lays the pages out again at the current zoom, keeping the reading position (or going to `place`). */
+  private relayout(place?: Anchor): void {
+    const anchor: Anchor = place ?? anchorAt(this.layout, this.element.scrollTop);
     this.layout = computeLayout(this.info.pages, this.zoom);
     this.sizer.style.height = `${this.layout.totalHeight}px`;
     this.sizer.style.width = `${Math.max(this.layout.contentWidth, this.element.clientWidth)}px`;
@@ -232,7 +319,8 @@ export class DocumentView {
   };
 
   private onResize(): void {
-    if (this.destroyed) return;
+    // A hidden view has no size; fitting to it would shrink the pages to nothing.
+    if (this.destroyed || !this.active) return;
     if (this.mode.kind === "fit-width") {
       const before = this.zoom;
       this.applyMode();
@@ -264,7 +352,7 @@ export class DocumentView {
   // ---- pages ---------------------------------------------------------------
 
   private scheduleRefresh(): void {
-    if (this.frame || this.destroyed) return;
+    if (this.frame || this.destroyed || !this.active) return;
     this.frame = requestAnimationFrame(() => {
       this.frame = 0;
       this.refresh();
@@ -273,7 +361,7 @@ export class DocumentView {
 
   /** Mounts the pages near the viewport, unmounts the others, and queues what needs drawing. */
   private refresh(): void {
-    if (this.destroyed) return;
+    if (this.destroyed || !this.active) return;
     const top = this.element.scrollTop;
     const height = this.element.clientHeight;
     // Keep one viewport of pages above and below ready, so a scroll rarely shows an empty page.
@@ -308,6 +396,7 @@ export class DocumentView {
       this.lastPage = page;
       this.events.onPageChange(page);
     }
+    this.events.onViewChange?.();
   }
 
   private mount(index: number): Mounted {

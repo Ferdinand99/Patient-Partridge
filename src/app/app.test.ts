@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { OpenedDocument } from "../lib/api";
+import type { OpenedDocument, SavedPosition } from "../lib/api";
+import { THEME_KEY } from "../lib/theme";
 import { App } from "./app";
 
 const putImageData = vi.fn();
@@ -10,6 +11,7 @@ function installPage(): void {
   const html = readFileSync("index.html", "utf8");
   const body = /<body>([\s\S]*)<\/body>/.exec(html)?.[1] ?? "";
   document.body.innerHTML = body.replace(/<script[\s\S]*?<\/script>/g, "");
+  document.documentElement.removeAttribute("data-theme");
 }
 
 beforeEach(() => {
@@ -55,31 +57,55 @@ const flush = async () => {
 };
 
 const letter = { width: 612, height: 792 };
-const opened = (doc: number, pages: number, name = "book.pdf"): OpenedDocument => ({
+const opened = (
+  doc: number,
+  pages: number,
+  name = "book.pdf",
+  position: SavedPosition | null = null,
+): OpenedDocument => ({
   doc,
   name,
   pages: Array.from({ length: pages }, () => letter),
+  position,
 });
 
-function make(measureOn = false) {
+class MemoryStorage {
+  readonly data = new Map<string, string>();
+  getItem(key: string): string | null {
+    return this.data.get(key) ?? null;
+  }
+  setItem(key: string, value: string): void {
+    this.data.set(key, value);
+  }
+}
+
+function make(options: { measureOn?: boolean; storage?: MemoryStorage } = {}) {
+  let nextDoc = 1;
   const api = {
-    open: vi.fn((_path: string, _password?: string) => Promise.resolve(opened(1, 3))),
+    open: vi.fn((path: string, _password?: string) =>
+      Promise.resolve(opened(nextDoc++, 3, path.split("/").pop())),
+    ),
     render: vi.fn((_d: number, _p: number, w: number, h: number) =>
       Promise.resolve(new ArrayBuffer(w * h * 4)),
     ),
     close: vi.fn((_doc: number) => Promise.resolve()),
-    measureMode: vi.fn(() => Promise.resolve(measureOn)),
+    setPosition: vi.fn((_path: string, _position: SavedPosition) => Promise.resolve()),
+    clearPositions: vi.fn(() => Promise.resolve()),
+    measureMode: vi.fn(() => Promise.resolve(options.measureOn ?? false)),
     measureReport: vi.fn((_a: number, _b: number, _c: number) => Promise.resolve()),
   };
+  const storage = options.storage ?? new MemoryStorage();
   const deps = {
     api,
-    pickFile: vi.fn(() => Promise.resolve<string | null>(null)),
+    pickFiles: vi.fn(() => Promise.resolve<string[]>([])),
     setWindowTitle: vi.fn(),
     now: vi.fn(() => 0),
+    storage,
+    positionDelayMs: 5,
   };
   const app = new App(document, deps);
   app.init();
-  return { app, api, deps };
+  return { app, api, deps, storage };
 }
 
 const q = <T extends HTMLElement>(selector: string) => document.querySelector(selector) as T;
@@ -87,9 +113,15 @@ const notice = () => document.querySelector<HTMLElement>(".notice");
 const click = (el: Element | null) => (el as HTMLElement).click();
 const button = (label: string) =>
   [...document.querySelectorAll<HTMLButtonElement>(".notice button")].find((b) => b.textContent === label) ?? null;
+const tabTitles = () => [...document.querySelectorAll(".tab-title")].map((t) => t.textContent);
+const selectedTab = () => document.querySelector('.tab-title[aria-selected="true"]')?.textContent;
+const tab = (title: string) =>
+  [...document.querySelectorAll<HTMLElement>(".tab-title")].find((t) => t.textContent === title) as HTMLElement;
+const key = (k: string, init: KeyboardEventInit = {}) =>
+  document.body.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true, cancelable: true, ...init }));
 
 describe("App: opening a file", () => {
-  it("shows the document, the page count and the title", async () => {
+  it("shows the document, the page count, the tab and the title", async () => {
     const { app, deps } = make();
     await app.openPath("/docs/book.pdf");
     await flush();
@@ -100,41 +132,199 @@ describe("App: opening a file", () => {
     expect(deps.setWindowTitle).toHaveBeenLastCalledWith("book.pdf - Patient Partridge");
     expect(q<HTMLInputElement>("#page-input").disabled).toBe(false);
     expect(q("#stage .viewer")).not.toBeNull();
+    expect(tabTitles()).toEqual(["book.pdf"]);
+    expect(selectedTab()).toBe("book.pdf");
   });
 
   it("opens from the file dialog, and does nothing when it is cancelled", async () => {
     const { app, deps, api } = make();
     await app.openDialog();
     expect(api.open).not.toHaveBeenCalled();
-    deps.pickFile.mockResolvedValueOnce("/x/y.pdf");
+    deps.pickFiles.mockResolvedValueOnce(["/x/y.pdf"]);
     await app.openDialog();
     expect(api.open).toHaveBeenCalledWith("/x/y.pdf", undefined);
   });
 
-  it("replaces the open document and closes the old one in the engine", async () => {
-    const { app, api } = make();
-    api.open.mockResolvedValueOnce(opened(1, 3, "a.pdf")).mockResolvedValueOnce(opened(2, 5, "b.pdf"));
+  it("opens every file chosen in the dialog, and shows the first", async () => {
+    const { app, deps, api } = make();
+    deps.pickFiles.mockResolvedValueOnce(["/a.pdf", "/b.pdf", "/c.pdf"]);
+    await app.openDialog();
+    await flush();
+    expect(api.open).toHaveBeenCalledTimes(3);
+    expect(tabTitles()).toEqual(["a.pdf", "b.pdf", "c.pdf"]);
+    expect(selectedTab()).toBe("a.pdf");
+    expect(app.tabCount).toBe(3);
+  });
+
+  it("opens a second file in a second tab and keeps the first open", async () => {
+    const { app, api, deps } = make();
     await app.openPath("/a.pdf");
     await app.openPath("/b.pdf");
     await flush();
-    expect(api.close).toHaveBeenCalledWith(1);
-    expect(q("#page-total").textContent).toBe("/ 5");
+    expect(api.close).not.toHaveBeenCalled();
+    expect(tabTitles()).toEqual(["a.pdf", "b.pdf"]);
+    expect(selectedTab()).toBe("b.pdf");
+    expect(document.querySelectorAll(".viewer").length).toBe(2);
+    expect(deps.setWindowTitle).toHaveBeenLastCalledWith("b.pdf - Patient Partridge");
+  });
+
+  it("shows the tab again instead of opening the same file twice", async () => {
+    const { app, api } = make();
+    await app.openPath("/a.pdf");
+    await app.openPath("/b.pdf");
+    await app.openPath("/a.pdf");
+    await flush();
+    expect(api.open).toHaveBeenCalledTimes(2);
+    expect(app.tabCount).toBe(2);
+    expect(selectedTab()).toBe("a.pdf");
+  });
+
+  it("opens a file once when it is asked for twice at the same moment", async () => {
+    const { app, api } = make();
+    await Promise.all([app.openPath("/a.pdf"), app.openPath("/a.pdf")]);
+    await flush();
+    expect(api.open).toHaveBeenCalledTimes(1);
+    expect(app.tabCount).toBe(1);
+  });
+
+  it("explains it when too many documents are open", async () => {
+    const { app, api } = make();
+    api.open.mockRejectedValueOnce({ code: "invalid_request", message: "16 documents are open already; close one first" });
+    const pending = app.openPath("/more.pdf");
+    await flush();
+    expect(notice()?.textContent).toContain("close one first");
+    click(button("OK"));
+    await pending;
+    expect(app.tabCount).toBe(0);
+  });
+});
+
+describe("App: tabs", () => {
+  it("switches between documents and shows each one's page count", async () => {
+    const { app, api, deps } = make();
+    api.open.mockResolvedValueOnce(opened(1, 3, "a.pdf")).mockResolvedValueOnce(opened(2, 9, "b.pdf"));
+    await app.openPath("/a.pdf");
+    await app.openPath("/b.pdf");
+    await flush();
+    expect(q("#page-total").textContent).toBe("/ 9");
+    click(tab("a.pdf"));
+    await flush();
+    expect(selectedTab()).toBe("a.pdf");
+    expect(q("#page-total").textContent).toBe("/ 3");
+    expect(deps.setWindowTitle).toHaveBeenLastCalledWith("a.pdf - Patient Partridge");
+    const views = [...document.querySelectorAll<HTMLElement>(".viewer")];
+    expect(views.map((v) => v.hidden)).toEqual([false, true]);
+  });
+
+  it("asks the engine for nothing while a document is behind another", async () => {
+    const { app, api } = make();
+    await app.openPath("/a.pdf");
+    await flush();
+    await app.openPath("/b.pdf");
+    await flush();
+    // Only the document in front draws: the one behind gave up its canvases.
+    expect(document.querySelectorAll<HTMLElement>(".viewer")[0].querySelector("canvas")).toBeNull();
+    api.render.mockClear();
+    await flush();
+    expect(api.render).not.toHaveBeenCalled();
+    // Coming back, it draws again.
+    click(tab("a.pdf"));
+    await flush();
+    expect(api.render).toHaveBeenCalled();
+    expect(api.render.mock.calls.every(([doc]) => doc === 1)).toBe(true);
+  });
+
+  it("does not draw a document opened behind another until its tab is selected", async () => {
+    const { app, api, deps } = make();
+    deps.pickFiles.mockResolvedValueOnce(["/a.pdf", "/b.pdf"]);
+    await app.openDialog();
+    await flush();
+    expect(api.render.mock.calls.every(([doc]) => doc === 1)).toBe(true);
+    api.render.mockClear();
+    click(tab("b.pdf"));
+    await flush();
+    expect(api.render).toHaveBeenCalled();
+    expect(api.render.mock.calls.every(([doc]) => doc === 2)).toBe(true);
+  });
+
+  it("closes a tab with its button, closes the document in the engine and shows a neighbour", async () => {
+    const { app, api } = make();
+    await app.openPath("/a.pdf");
+    await app.openPath("/b.pdf");
+    await app.openPath("/c.pdf");
+    await flush();
+    click(document.querySelector('[aria-label="Close b.pdf"]'));
+    await flush();
+    expect(tabTitles()).toEqual(["a.pdf", "c.pdf"]);
+    expect(api.close).toHaveBeenCalledWith(2);
+    expect(selectedTab()).toBe("c.pdf");
+    click(document.querySelector('[aria-label="Close c.pdf"]'));
+    await flush();
+    expect(selectedTab()).toBe("a.pdf");
     expect(document.querySelectorAll(".viewer").length).toBe(1);
   });
 
-  it("closes a file that finished opening after a newer one was asked for", async () => {
-    let finishFirst: (d: OpenedDocument) => void = () => undefined;
-    const { app, api } = make();
-    api.open
-      .mockImplementationOnce(() => new Promise<OpenedDocument>((r) => (finishFirst = r)))
-      .mockResolvedValueOnce(opened(2, 2, "new.pdf"));
-    const first = app.openPath("/slow.pdf");
-    await app.openPath("/new.pdf");
-    finishFirst(opened(1, 9, "slow.pdf"));
-    await first;
+  it("shows the empty state again when the last tab is closed", async () => {
+    const { app, deps } = make();
+    await app.openPath("/a.pdf");
     await flush();
-    expect(api.close).toHaveBeenCalledWith(1);
-    expect(q("#page-total").textContent).toBe("/ 2");
+    key("w", { ctrlKey: true });
+    await flush();
+    expect(app.tabCount).toBe(0);
+    expect(app.currentView).toBeNull();
+    expect(q("#empty").hidden).toBe(false);
+    expect(q<HTMLInputElement>("#page-input").disabled).toBe(true);
+    expect(deps.setWindowTitle).toHaveBeenLastCalledWith("Patient Partridge");
+    // And Ctrl+W with nothing open does nothing.
+    key("w", { ctrlKey: true });
+  });
+
+  it("moves between tabs with Ctrl+Tab, Ctrl+Shift+Tab and the arrow keys", async () => {
+    const { app } = make();
+    await app.openPath("/a.pdf");
+    await app.openPath("/b.pdf");
+    await app.openPath("/c.pdf");
+    await flush();
+    key("Tab", { ctrlKey: true });
+    expect(selectedTab()).toBe("a.pdf");
+    key("Tab", { ctrlKey: true, shiftKey: true });
+    expect(selectedTab()).toBe("c.pdf");
+    key("PageUp", { ctrlKey: true });
+    expect(selectedTab()).toBe("b.pdf");
+    tab("b.pdf").dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true }));
+    expect(selectedTab()).toBe("c.pdf");
+  });
+
+  it("closes a tab with a middle click", async () => {
+    const { app } = make();
+    await app.openPath("/a.pdf");
+    await app.openPath("/b.pdf");
+    await flush();
+    tab("a.pdf").dispatchEvent(new MouseEvent("auxclick", { button: 1, bubbles: true, cancelable: true }));
+    expect(tabTitles()).toEqual(["b.pdf"]);
+  });
+
+  it("keeps working on the other documents when the engine of one stops", async () => {
+    const { app, api } = make();
+    api.render.mockImplementation((doc: number, _p: number, w: number, h: number) =>
+      doc === 2
+        ? Promise.reject({ code: "engine_stopped", message: "it exited" })
+        : Promise.resolve(new ArrayBuffer(w * h * 4)),
+    );
+    await app.openPath("/a.pdf");
+    await flush();
+    await app.openPath("/b.pdf");
+    await flush();
+    expect(notice()?.textContent).toContain("The PDF engine stopped");
+    expect(notice()?.textContent).toContain('"b.pdf"');
+    // The broken document is gone; the good one is back in front and still alive.
+    expect(tabTitles()).toEqual(["a.pdf"]);
+    expect(app.currentView).not.toBeNull();
+    expect(api.close).toHaveBeenCalledWith(2);
+    click(button("Close"));
+    await flush();
+    expect(notice()).toBeNull();
+    expect(api.close).not.toHaveBeenCalledWith(1);
   });
 });
 
@@ -152,6 +342,7 @@ describe("App: files that cannot be opened", () => {
     await pending;
     expect(notice()).toBeNull();
     expect(app.currentView).toBe(before);
+    expect(app.tabCount).toBe(1);
   });
 
   it("explains a file that cannot be read", async () => {
@@ -176,7 +367,7 @@ describe("App: files that cannot be opened", () => {
     const done = app.openPath("/secret.pdf");
     await flush();
     expect(notice()?.textContent).toContain("password protected");
-    const input = q<HTMLInputElement>(".notice-input");
+    const input = q<HTMLInputElement>(".sheet-field");
     expect(input.type).toBe("password");
 
     input.value = "wrong";
@@ -184,7 +375,7 @@ describe("App: files that cannot be opened", () => {
     await flush();
     expect(notice()?.textContent).toContain("not correct");
 
-    q<HTMLInputElement>(".notice-input").value = "right";
+    q<HTMLInputElement>(".sheet-field").value = "right";
     click(button("Open"));
     await done;
     await flush();
@@ -257,9 +448,6 @@ describe("App: the engine stops while a document is open", () => {
 });
 
 describe("App: toolbar and keyboard", () => {
-  const key = (k: string, init: KeyboardEventInit = {}) =>
-    document.body.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true, cancelable: true, ...init }));
-
   it("jumps to the page typed in the page box", async () => {
     const { app } = make();
     await app.openPath("/book.pdf");
@@ -311,7 +499,7 @@ describe("App: toolbar and keyboard", () => {
   it("opens the file dialog with Ctrl+O and focuses the page box with Ctrl+G", async () => {
     const { app, deps } = make();
     key("o", { ctrlKey: true });
-    expect(deps.pickFile).toHaveBeenCalledTimes(1);
+    expect(deps.pickFiles).toHaveBeenCalledTimes(1);
     await app.openPath("/book.pdf");
     await flush();
     key("g", { ctrlKey: true });
@@ -345,10 +533,148 @@ describe("App: toolbar and keyboard", () => {
   });
 });
 
+describe("App: remembering the position", () => {
+  it("opens a file where it was left", async () => {
+    const { app, api } = make();
+    api.open.mockResolvedValueOnce(opened(1, 10, "long.pdf", { page: 4, offset: 0.5, zoom: 2 }));
+    await app.openPath("/long.pdf");
+    await flush();
+    const view = app.currentView!;
+    expect(view.zoomMode).toEqual({ kind: "custom", zoom: 2 });
+    expect(view.currentPageIndex).toBe(4);
+    expect(q<HTMLInputElement>("#page-input").value).toBe("5");
+    // The first pages drawn are the ones at the saved place, not page 1.
+    const firstPages = api.render.mock.calls.slice(0, 2).map(([, page]) => page);
+    expect(firstPages.every((p) => p >= 3)).toBe(true);
+  });
+
+  it("starts at the top, fitted to the width, for a file it has not seen", async () => {
+    const { app } = make();
+    await app.openPath("/new.pdf");
+    await flush();
+    expect(app.currentView?.currentPageIndex).toBe(0);
+    expect(app.currentView?.zoomMode.kind).toBe("fit-width");
+  });
+
+  it("saves the position when the reader rests after scrolling", async () => {
+    const { app, api } = make();
+    await app.openPath("/read.pdf");
+    await flush();
+    api.setPosition.mockClear();
+    app.currentView!.goToPage(2);
+    await flush();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(api.setPosition).toHaveBeenCalled();
+    const [path, position] = api.setPosition.mock.calls.at(-1)!;
+    expect(path).toBe("/read.pdf");
+    expect(position.page).toBe(2);
+    expect(position.zoom).toBeNull();
+    expect(position.offset).toBeGreaterThanOrEqual(0);
+    expect(position.offset).toBeLessThanOrEqual(1);
+  });
+
+  it("saves the position of a tab when another tab is selected and when it is closed", async () => {
+    const { app, api } = make();
+    await app.openPath("/a.pdf");
+    await flush();
+    app.currentView!.setZoom(2);
+    await app.openPath("/b.pdf");
+    await flush();
+    const forA = api.setPosition.mock.calls.filter(([p]) => p === "/a.pdf");
+    expect(forA.at(-1)?.[1].zoom).toBe(2);
+    api.setPosition.mockClear();
+    click(document.querySelector('[aria-label="Close b.pdf"]'));
+    await flush();
+    expect(api.setPosition.mock.calls.some(([p]) => p === "/b.pdf")).toBe(true);
+  });
+
+  it("keeps the place of a tab that is behind another one", async () => {
+    const { app } = make();
+    await app.openPath("/a.pdf");
+    await flush();
+    app.currentView!.goToPage(2);
+    await flush();
+    await app.openPath("/b.pdf");
+    await flush();
+    click(tab("a.pdf"));
+    await flush();
+    expect(app.currentView?.currentPageIndex).toBe(2);
+  });
+
+  it("forgets the remembered positions only after a confirmation", async () => {
+    const { app, api } = make();
+    await app.openPath("/a.pdf");
+    await flush();
+    click(q("#menu-button"));
+    click(q("#forget-positions"));
+    await flush();
+    expect(notice()?.textContent).toContain("Forget remembered positions?");
+    // The safe answer has the focus, so a quick Enter keeps everything.
+    expect(document.activeElement).toBe(button("Keep them"));
+    click(button("Keep them"));
+    await flush();
+    expect(api.clearPositions).not.toHaveBeenCalled();
+
+    click(q("#forget-positions"));
+    await flush();
+    click(button("Forget positions"));
+    await flush();
+    expect(api.clearPositions).toHaveBeenCalledTimes(1);
+    expect(app.tabCount).toBe(1);
+  });
+});
+
+describe("App: the colour theme", () => {
+  const radio = (value: string) => q<HTMLInputElement>(`#theme-choice input[value="${value}"]`);
+
+  it("follows the system when nothing is chosen", () => {
+    make();
+    expect(document.documentElement.hasAttribute("data-theme")).toBe(false);
+    expect(radio("auto").checked).toBe(true);
+  });
+
+  it("forces dark or light when the user chooses, and remembers the choice", () => {
+    const { storage } = make();
+    radio("dark").checked = true;
+    radio("dark").dispatchEvent(new Event("change"));
+    expect(document.documentElement.getAttribute("data-theme")).toBe("dark");
+    expect(storage.data.get(THEME_KEY)).toBe("dark");
+    radio("light").checked = true;
+    radio("light").dispatchEvent(new Event("change"));
+    expect(document.documentElement.getAttribute("data-theme")).toBe("light");
+    radio("auto").checked = true;
+    radio("auto").dispatchEvent(new Event("change"));
+    expect(document.documentElement.hasAttribute("data-theme")).toBe(false);
+    expect(storage.data.get(THEME_KEY)).toBe("auto");
+  });
+
+  it("applies the stored choice at start", () => {
+    const storage = new MemoryStorage();
+    storage.setItem(THEME_KEY, "dark");
+    make({ storage });
+    expect(document.documentElement.getAttribute("data-theme")).toBe("dark");
+    expect(radio("dark").checked).toBe(true);
+  });
+
+  it("opens and closes the settings menu", () => {
+    make();
+    const menu = q("#menu");
+    expect(menu.hidden).toBe(true);
+    click(q("#menu-button"));
+    expect(menu.hidden).toBe(false);
+    expect(q("#menu-button").getAttribute("aria-expanded")).toBe("true");
+    menu.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    expect(menu.hidden).toBe(true);
+    click(q("#menu-button"));
+    document.body.dispatchEvent(new Event("pointerdown", { bubbles: true }));
+    expect(menu.hidden).toBe(true);
+  });
+});
+
 describe("App: measurement mode", () => {
   it("reports the open and first paint times once", async () => {
     let t = 0;
-    const { app, api, deps } = make(true);
+    const { app, api, deps } = make({ measureOn: true });
     deps.now.mockImplementation(() => (t += 10));
     await flush();
     await app.openPath("/book.pdf");

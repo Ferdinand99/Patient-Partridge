@@ -57,8 +57,11 @@
       {
         "ext": ["pdf"],
         "name": "PDF document",
+        "description": "PDF document",
         "mimeType": "application/pdf",
-        "role": "Viewer"
+        "role": "Viewer",
+        "rank": "Alternate",
+        "contentTypes": ["com.adobe.pdf"]
       }
     ]
   }
