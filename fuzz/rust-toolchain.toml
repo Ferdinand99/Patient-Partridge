@@ -1,0 +1,5 @@
+# cargo-fuzz needs a nightly compiler (sanitizers). Pinned to a date so that a run is repeatable;
+# move it by hand, and run the targets once, when you want a newer one.
+[toolchain]
+channel = "nightly-2026-10-29"
+profile = "minimal"
