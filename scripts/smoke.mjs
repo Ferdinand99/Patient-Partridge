@@ -12,6 +12,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { launchEnvironment } from "./smoke-env.mjs";
 
 function parse(argv) {
   const out = { runs: 3, memory: false };
@@ -98,14 +99,8 @@ function killTree(child) {
 async function runOnce({ bin, pdf, memory }) {
   const dir = mkdtempSync(join(tmpdir(), "partridge-smoke-"));
   const report = join(dir, "report.json");
-  const env = { ...process.env, PARTRIDGE_MEASURE_REPORT: report };
-  if (process.platform !== "win32") {
-    // A fresh profile, so each run starts as a first run.
-    env.HOME = join(dir, "home");
-    env.XDG_CONFIG_HOME = join(dir, "home", ".config");
-    env.XDG_DATA_HOME = join(dir, "home", ".local", "share");
-    env.XDG_CACHE_HOME = join(dir, "home", ".cache");
-  }
+  // A fresh profile, so each run starts as a first run (see smoke-env.mjs).
+  const env = launchEnvironment({ ...process.env, PARTRIDGE_MEASURE_REPORT: report }, dir);
   const child = spawn(bin, [pdf], { env: { ...env, RUST_BACKTRACE: "1" }, stdio: ["ignore", "pipe", "pipe"] });
   // Keep the end of what the app wrote, to show it if the run fails.
   let output = "";
@@ -160,32 +155,14 @@ const median = (values) => {
 const options = parse(process.argv.slice(2));
 if (!existsSync(options.bin)) throw new Error(`App binary not found: ${options.bin}`);
 const results = [];
-let retries = 0;
-/**
- * A launch that never reports a drawn page is tried once more. Web views on shared CI machines (the
- * macOS ones in particular) now and then do not start at all. The cause is not known: it may be
- * the machine, or a real hang at startup that the retry hides. Two launches in a row that fail are
- * a failure, and the output of both is shown.
- */
-async function launch() {
-  try {
-    return await runOnce(options);
-  } catch (first) {
-    retries += 1;
-    console.log(`A launch did not report a drawn page; trying once more.
-${first.message}`);
-    return await runOnce(options);
-  }
-}
 for (let i = 0; i < options.runs; i++) {
-  const r = await launch();
+  const r = await runOnce(options);
   results.push(r);
   console.log(`run ${i + 1}: ${JSON.stringify(r)}`);
 }
 const summary = {
   pages: results[0].pages,
   runs: results.length,
-  retries,
   open_ms_median: median(results.map((r) => r.open_ms)),
   first_page_ms_median: median(results.map((r) => r.first_page_ms)),
   since_process_start_ms_median: median(results.map((r) => r.since_process_start_ms)),

@@ -12,6 +12,8 @@
 mod links;
 mod locate;
 mod positions;
+mod session;
+mod updates;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -21,8 +23,10 @@ use links::KnownLinks;
 use partridge_engine_client::{ClientError, EngineConfig, EnginePool, LinkTarget};
 use positions::{Position, Positions};
 use serde::Serialize;
+use session::SessionStore;
 use tauri::webview::PageLoadEvent;
 use tauri::{AppHandle, Emitter, Manager, State};
+use updates::UpdateState;
 
 static START: OnceLock<Instant> = OnceLock::new();
 
@@ -95,6 +99,10 @@ fn page_started<R: tauri::Runtime>(app: &AppHandle<R>) {
     if let (Some(engine), Some(known)) = (app.try_state::<Engine>(), app.try_state::<LinkMemory>())
     {
         release_documents(&engine.0, &known.0, &app.state::<Pending>());
+        // The page that knew the documents is gone, so they are not "open" for an update either.
+        if let Some(update_state) = app.try_state::<UpdateState>() {
+            update_state.forget_all_docs();
+        }
     }
 }
 
@@ -188,16 +196,26 @@ where
 async fn open_pdf(
     engine: State<'_, Engine>,
     positions: State<'_, PositionStore>,
+    update_state: State<'_, UpdateState>,
     path: String,
     password: Option<String>,
 ) -> Result<OpenedInfo, CommandError> {
+    // Not while an update is being installed: an engine started now would keep the installer from
+    // replacing the program. The permit is held until the document is open.
+    let _permit = update_state
+        .gate()
+        .enter()
+        .map_err(|_| updates::updating_error())?;
     let pool = engine.0.clone();
     let name = Path::new(&path)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.clone());
     let key = positions::key_for(&path);
+    let opened_path = path.clone();
     let (doc, pages) = blocking(move || pool.open(&path, password.as_deref())).await?;
+    // The app knows which files are open, so that an update can bring them back.
+    update_state.record_open(doc, &opened_path);
     let position = positions
         .0
         .lock()
@@ -229,14 +247,15 @@ fn set_position(
     );
 }
 
-/// Forgets every remembered position.
+/// Forgets every remembered position, and the list of tabs to reopen with them.
+fn forget_positions(positions: &Mutex<Positions>, session: &SessionStore) {
+    let _ = positions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    session.clear();
+}
+
 #[tauri::command]
-fn clear_positions(positions: State<'_, PositionStore>) {
-    let _ = positions
-        .0
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clear();
+fn clear_positions(positions: State<'_, PositionStore>, session: State<'_, SessionStore>) {
+    forget_positions(&positions.0, &session);
 }
 
 /// Draws a page. The answer is the raw bitmap, `width * height * 4` bytes of RGBA, sent as binary
@@ -258,6 +277,7 @@ async fn render_page(
 async fn close_pdf(
     engine: State<'_, Engine>,
     known: State<'_, LinkMemory>,
+    update_state: State<'_, UpdateState>,
     doc: u64,
 ) -> Result<(), CommandError> {
     known
@@ -265,6 +285,7 @@ async fn close_pdf(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .forget(doc);
+    update_state.forget_doc(doc);
     let pool = engine.0.clone();
     // Closing a document that is gone is fine: the end state is what the caller wants.
     let _ = blocking(move || {
@@ -488,6 +509,18 @@ pub fn run() {
     let _ = START.set(Instant::now());
 
     let app = tauri::Builder::default()
+        // While an update replaces the program, closing the window would leave a half file: the
+        // close is refused for those seconds.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window
+                    .try_state::<UpdateState>()
+                    .is_some_and(|state| state.is_close_blocked())
+                {
+                    api.prevent_close();
+                }
+            }
+        })
         .on_page_load(|webview, payload| {
             if matches!(payload.event(), PageLoadEvent::Started) {
                 page_started(webview.app_handle());
@@ -506,6 +539,7 @@ pub fn run() {
             focus_main(app);
         }))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(Pending::default())
         .setup(|app| {
             let positions_file = app
@@ -519,6 +553,23 @@ pub fn run() {
                 engine_config(app),
                 MAX_DOCUMENTS,
             ))));
+            let update_state = UpdateState::new(app.path().app_data_dir().ok(), updates::detect());
+            // The tabs of the last run, for the window to reopen. Nothing is read, and a list that is
+            // left over is deleted, while the setting is off.
+            app.manage(SessionStore(Mutex::new(session::Session::load(
+                app.path()
+                    .app_data_dir()
+                    .ok()
+                    .map(|dir| dir.join("session.json")),
+                update_state.reopen_tabs(),
+            ))));
+            // After an update the documents that were open come back, once: the window asks for them
+            // (`take_restored_paths`) and opens them without the rules for files named at the start.
+            #[cfg_attr(not(feature = "update-driver"), allow(unused_variables))]
+            let restored = update_state.load_restored();
+            app.manage(update_state);
+            #[cfg(feature = "update-driver")]
+            updates::driver::start(app.handle().clone(), restored);
             let args: Vec<PathBuf> = locate::existing_files(
                 std::env::args().skip(1),
                 std::env::current_dir().ok().as_deref(),
@@ -539,6 +590,10 @@ pub fn run() {
             close_pdf,
             set_position,
             clear_positions,
+            session::get_reopen_tabs,
+            session::set_reopen_tabs,
+            session::save_session,
+            session::take_session,
             get_outline,
             get_page_text,
             get_page_links,
@@ -550,6 +605,14 @@ pub fn run() {
             measure_mode,
             frontend_error,
             measure_report,
+            updates::get_update_settings,
+            updates::set_auto_update,
+            updates::check_update,
+            updates::download_update,
+            updates::install_update,
+            updates::restart_app,
+            updates::open_releases_page,
+            updates::take_restored_paths,
         ])
         .build(tauri::generate_context!())
         .expect("error while building the app");
@@ -580,6 +643,49 @@ pub fn run() {
 mod tests {
     use super::*;
     use partridge_protocol::ErrorCode;
+
+    #[test]
+    fn forgetting_the_positions_forgets_the_list_of_tabs_too() {
+        let dir = std::env::temp_dir().join(format!("partridge-forget-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let positions_file = dir.join("positions.json");
+        let session_file = dir.join("session.json");
+        let mut positions = Positions::load(Some(positions_file.clone()));
+        positions
+            .set(
+                "a.pdf",
+                Position {
+                    page: 2,
+                    offset: 0.5,
+                    zoom: None,
+                },
+                1,
+            )
+            .unwrap();
+        let positions = Mutex::new(positions);
+        let mut session = session::Session::load(Some(session_file.clone()), true);
+        session
+            .save(
+                true,
+                session::TabList {
+                    paths: vec!["a.pdf".into()],
+                    active: Some(0),
+                    failed: Vec::new(),
+                },
+            )
+            .unwrap();
+        let store = SessionStore(Mutex::new(session));
+        assert!(session_file.exists());
+
+        forget_positions(&positions, &store);
+
+        assert!(
+            !session_file.exists(),
+            "the list of tabs must go with the positions"
+        );
+        assert!(positions.lock().unwrap().get("a.pdf").is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn pending_paths_wait_for_the_frontend() {

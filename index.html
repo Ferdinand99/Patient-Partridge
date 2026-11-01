@@ -55,6 +55,12 @@
           <rect x="4" y="4" width="6.5" height="6.5" rx="1.75" /><rect x="13.5" y="4" width="6.5" height="6.5" rx="1.75" />
           <rect x="4" y="13.5" width="6.5" height="6.5" rx="1.75" /><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.75" />
         </symbol>
+        <symbol id="i-refresh" viewBox="0 0 24 24">
+          <path d="M19.25 12a7.25 7.25 0 1 1-2.3-5.3" /><path d="M19.25 4.5v4.25H15" />
+        </symbol>
+        <symbol id="i-download" viewBox="0 0 24 24">
+          <path d="M12 4.5v10.25M7.75 10.5L12 14.75l4.25-4.25M5 19.5h14" />
+        </symbol>
         <symbol id="i-trash" viewBox="0 0 24 24">
           <path d="M5 7h14M9.5 7V4.75h5V7M7 7l.75 12.25a1 1 0 0 0 1 .95h6.5a1 1 0 0 0 1-.95L17 7" />
         </symbol>
@@ -91,6 +97,10 @@
             <svg class="icon" aria-hidden="true"><use href="#i-plus"></use></svg>
           </button>
           <span class="grow"></span>
+          <button class="pill pill-update" id="update-pill" type="button" hidden>
+            <svg class="icon" aria-hidden="true"><use href="#i-download"></use></svg>
+            <span id="update-pill-label">Update</span>
+          </button>
           <button class="btn btn-icon btn-plain" id="print-button" type="button" title="Print (Ctrl+P)" aria-label="Print" disabled>
             <svg class="icon" aria-hidden="true"><use href="#i-printer"></use></svg>
           </button>
@@ -140,7 +150,7 @@
         <div class="empty" id="empty">
           <div class="empty-icon"><svg class="icon" aria-hidden="true"><use href="#i-file"></use></svg></div>
           <h1 class="empty-title">Patient Partridge</h1>
-          <p class="empty-text">Drop a PDF file here, or open one. Nothing leaves this computer.</p>
+          <p class="empty-text">Drop a PDF file here, or open one. Your documents never leave this computer.</p>
           <div class="empty-actions">
             <button class="btn btn-primary btn-lg" id="empty-open" type="button">Open a PDF</button>
           </div>
@@ -160,6 +170,19 @@
           <label><input type="radio" name="theme" value="dark" /><svg class="icon" aria-hidden="true"><use href="#i-moon"></use></svg><span>Dark</span></label>
         </div>
         <hr class="menu-sep" />
+        <button class="menu-item" id="check-updates" type="button" role="menuitem">
+          <svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
+          <span>Check for Updates…</span>
+        </button>
+        <button class="menu-item menu-check" id="auto-update" type="button" role="menuitemcheckbox" aria-checked="true">
+          <svg class="icon" aria-hidden="true"><use href="#i-check"></use></svg>
+          <span>Check for updates automatically</span>
+        </button>
+        <hr class="menu-sep" />
+        <button class="menu-item menu-check" id="reopen-tabs" type="button" role="menuitemcheckbox" aria-checked="true">
+          <svg class="icon" aria-hidden="true"><use href="#i-check"></use></svg>
+          <span>Reopen tabs at start</span>
+        </button>
         <button class="menu-item" id="forget-positions" type="button" role="menuitem">
           <svg class="icon" aria-hidden="true"><use href="#i-trash"></use></svg>
           <span>Forget remembered positions</span>

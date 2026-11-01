@@ -1,0 +1,43 @@
+{
+  "version": "0.3.0",
+  "notes": "## [0.3.0](https://github.com/Ferdinand99/Nimble-Newt/compare/v0.2.2...v0.3.0) (2026-10-28)\n\n\n### ⚠ BREAKING CHANGES\n\n* extension code now runs in a Web Worker, so it has no `window` or `document`. Extensions that used them stop working. The nimble v1 API is unchanged, and setTimeout, Promise and JSON stay available.\n\n### Bug Fixes\n\n* run extensions in a worker so they have no way out (NN-02) ([#30](https://github.com/Ferdinand99/Nimble-Newt/issues/30)) ([cd2449d](https://github.com/Ferdinand99/Nimble-Newt/commit/cd2449defa511192bedfa907fb03b173d8d5ddc5))",
+  "pub_date": "2026-10-28T20:53:49.758Z",
+  "platforms": {
+    "windows-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRclBDNWt0SmdRb1dRbTJidkFJbVZVRGRuVUc0MnBlVWdzS1JkKzVCcHdOUS92MDV6L2F5eVlneWJqdWtITXVLRGNMbTUwTFlXWlJMdkxiM3dZbk5yKzlPdnJCSjYxUFFrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMjIwNTk5CWZpbGU6TmltYmxlIE5ld3RfMC4zLjBfeDY0LXNldHVwLmV4ZQl2ZXJzaW9uOjAuMy4wCkgvc0dwV3pOMXN0WnBycDJQOVUwRUlEWUpSaENnV09HbDFRaDNRR1RXd1FqaUJObGhnSlNUNzNvUXFYVUtSeG9VSXhhSWQ2QUZDNDhXRDdhRTV6ZUNnPT0K",
+      "url": "https://api.github.com/repos/Ferdinand99/Nimble-Newt/releases/assets/686300632"
+    },
+    "windows-x86_64-nsis": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRclBDNWt0SmdRb1dRbTJidkFJbVZVRGRuVUc0MnBlVWdzS1JkKzVCcHdOUS92MDV6L2F5eVlneWJqdWtITXVLRGNMbTUwTFlXWlJMdkxiM3dZbk5yKzlPdnJCSjYxUFFrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMjIwNTk5CWZpbGU6TmltYmxlIE5ld3RfMC4zLjBfeDY0LXNldHVwLmV4ZQl2ZXJzaW9uOjAuMy4wCkgvc0dwV3pOMXN0WnBycDJQOVUwRUlEWUpSaENnV09HbDFRaDNRR1RXd1FqaUJObGhnSlNUNzNvUXFYVUtSeG9VSXhhSWQ2QUZDNDhXRDdhRTV6ZUNnPT0K",
+      "url": "https://api.github.com/repos/Ferdinand99/Nimble-Newt/releases/assets/686300632"
+    },
+    "windows-x86_64-msi": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRclBDNWt0SmdRb1c3YUw4RldXcWFqa0JHMnMyODAxdTVvbmtPNkE4VmJJYWxEODExT0s4VUxHVHR3RnczWDdhSXM1aWpxdkVFeW14eEZSWTZ4L1h3MHVDV091VCtKZmdrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMjIwNTk5CWZpbGU6TmltYmxlIE5ld3RfMC4zLjBfeDY0X2VuLVVTLm1zaQl2ZXJzaW9uOjAuMy4wCmFZNzhyeFBvSEUzcHlZUlB6MDZqeVJBWFgvaTNxTUdWRXBEcTIwZEthbzlSdjdMTUk5VEdVUW5hZ29Sa0ViUkZENFRPK0s4N2NjWjNNNk1xdHhRdkRBPT0K",
+      "url": "https://api.github.com/repos/Ferdinand99/Nimble-Newt/releases/assets/686300543"
+    },
+    "darwin-aarch64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRclBDNWt0SmdRb1p1elBtVWVueDdhb1VDZWZaZWtWcnE3bFJ6aXV1K3A2NTJweXgxeEYvb3JLa01XbUZ3YStzeittYkcxUHppcVhLbVhOTEx4NkVFdm9FckgwQmI1U3dZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMjIwODI0CWZpbGU6TmltYmxlIE5ld3QuYXBwLnRhci5negl2ZXJzaW9uOjAuMy4wCjVSemYxODFVR3o5a0FaOTBQbklHeS83cGNiOVBRbFdJSHl1ZXhjMktNaVAwTkpHV0dqUTlocTdqOUliOGRYeVI2Mk14T3hSM2ZKQ05SSklWbkgvckFBPT0K",
+      "url": "https://api.github.com/repos/Ferdinand99/Nimble-Newt/releases/assets/686310243"
+    },
+    "darwin-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRclBDNWt0SmdRb1p1elBtVWVueDdhb1VDZWZaZWtWcnE3bFJ6aXV1K3A2NTJweXgxeEYvb3JLa01XbUZ3YStzeittYkcxUHppcVhLbVhOTEx4NkVFdm9FckgwQmI1U3dZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMjIwODI0CWZpbGU6TmltYmxlIE5ld3QuYXBwLnRhci5negl2ZXJzaW9uOjAuMy4wCjVSemYxODFVR3o5a0FaOTBQbklHeS83cGNiOVBRbFdJSHl1ZXhjMktNaVAwTkpHV0dqUTlocTdqOUliOGRYeVI2Mk14T3hSM2ZKQ05SSklWbkgvckFBPT0K",
+      "url": "https://api.github.com/repos/Ferdinand99/Nimble-Newt/releases/assets/686310243"
+    },
+    "darwin-universal": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRclBDNWt0SmdRb1p1elBtVWVueDdhb1VDZWZaZWtWcnE3bFJ6aXV1K3A2NTJweXgxeEYvb3JLa01XbUZ3YStzeittYkcxUHppcVhLbVhOTEx4NkVFdm9FckgwQmI1U3dZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMjIwODI0CWZpbGU6TmltYmxlIE5ld3QuYXBwLnRhci5negl2ZXJzaW9uOjAuMy4wCjVSemYxODFVR3o5a0FaOTBQbklHeS83cGNiOVBRbFdJSHl1ZXhjMktNaVAwTkpHV0dqUTlocTdqOUliOGRYeVI2Mk14T3hSM2ZKQ05SSklWbkgvckFBPT0K",
+      "url": "https://api.github.com/repos/Ferdinand99/Nimble-Newt/releases/assets/686310243"
+    },
+    "darwin-aarch64-app": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRclBDNWt0SmdRb1p1elBtVWVueDdhb1VDZWZaZWtWcnE3bFJ6aXV1K3A2NTJweXgxeEYvb3JLa01XbUZ3YStzeittYkcxUHppcVhLbVhOTEx4NkVFdm9FckgwQmI1U3dZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMjIwODI0CWZpbGU6TmltYmxlIE5ld3QuYXBwLnRhci5negl2ZXJzaW9uOjAuMy4wCjVSemYxODFVR3o5a0FaOTBQbklHeS83cGNiOVBRbFdJSHl1ZXhjMktNaVAwTkpHV0dqUTlocTdqOUliOGRYeVI2Mk14T3hSM2ZKQ05SSklWbkgvckFBPT0K",
+      "url": "https://api.github.com/repos/Ferdinand99/Nimble-Newt/releases/assets/686310243"
+    },
+    "darwin-x86_64-app": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRclBDNWt0SmdRb1p1elBtVWVueDdhb1VDZWZaZWtWcnE3bFJ6aXV1K3A2NTJweXgxeEYvb3JLa01XbUZ3YStzeittYkcxUHppcVhLbVhOTEx4NkVFdm9FckgwQmI1U3dZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMjIwODI0CWZpbGU6TmltYmxlIE5ld3QuYXBwLnRhci5negl2ZXJzaW9uOjAuMy4wCjVSemYxODFVR3o5a0FaOTBQbklHeS83cGNiOVBRbFdJSHl1ZXhjMktNaVAwTkpHV0dqUTlocTdqOUliOGRYeVI2Mk14T3hSM2ZKQ05SSklWbkgvckFBPT0K",
+      "url": "https://api.github.com/repos/Ferdinand99/Nimble-Newt/releases/assets/686310243"
+    },
+    "darwin-universal-app": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRclBDNWt0SmdRb1p1elBtVWVueDdhb1VDZWZaZWtWcnE3bFJ6aXV1K3A2NTJweXgxeEYvb3JLa01XbUZ3YStzeittYkcxUHppcVhLbVhOTEx4NkVFdm9FckgwQmI1U3dZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMjIwODI0CWZpbGU6TmltYmxlIE5ld3QuYXBwLnRhci5negl2ZXJzaW9uOjAuMy4wCjVSemYxODFVR3o5a0FaOTBQbklHeS83cGNiOVBRbFdJSHl1ZXhjMktNaVAwTkpHV0dqUTlocTdqOUliOGRYeVI2Mk14T3hSM2ZKQ05SSklWbkgvckFBPT0K",
+      "url": "https://api.github.com/repos/Ferdinand99/Nimble-Newt/releases/assets/686310243"
+    }
+  }
+}

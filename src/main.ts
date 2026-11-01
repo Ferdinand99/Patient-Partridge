@@ -6,6 +6,7 @@ import "./styles/tokens.css";
 import "./styles/components.css";
 import "./styles/app.css";
 import { App } from "./app/app";
+import { Updater } from "./app/updater";
 import { api } from "./lib/api";
 import { blockReload } from "./lib/reload";
 
@@ -56,9 +57,26 @@ const app = new App(document, {
 });
 app.init();
 
+// Updates: the app process checks, downloads and installs; the window only asks and shows.
+new Updater(document, {
+  api,
+  openPaths: () => app.openDocumentPaths(),
+  closeMenu: () => app.closeMenu(),
+}).init();
+
 function openAll(paths: string[]): void {
   void app.openChosen(paths);
 }
+
+// The start: the files that were open before an update (all of them), or else the tabs of the last
+// session; then the files named on the command line, which take the focus. Asking for the named
+// files also tells the app that the window is listening, so it is done last of the three.
+void (async () => {
+  const restored = await api.takeRestoredPaths().catch((): string[] => []);
+  const session = await api.takeSession().catch(() => null);
+  const given = await api.takePendingPaths().catch((): string[] => []);
+  await app.start({ restored, session, given });
+})();
 
 // Files dropped on the window. Tauri hands us real paths; the page never reads the file itself.
 void getCurrentWebview().onDragDropEvent((event) => {
@@ -74,4 +92,3 @@ void getCurrentWebview().onDragDropEvent((event) => {
 // Files named on the command line, or sent by a second copy of the app (also "Open with" from a
 // file manager, once for every file chosen).
 void listen<string[]>("open-paths", (event) => openAll(event.payload));
-void api.takePendingPaths().then(openAll);

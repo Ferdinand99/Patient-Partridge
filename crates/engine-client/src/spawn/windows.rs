@@ -3,7 +3,8 @@
 //! - **Restricted token.** The engine's primary token is a copy of the app's token with every
 //!   privilege removed, every group (and the user) turned into deny-only, and one restricting SID,
 //!   the null SID, which no object grants access to. With such a token almost no securable object
-//!   can be opened: no file, no registry key, no socket device, no named pipe, no other process.
+//!   can be opened: no file, no registry key, no named pipe, no other process. It does not stop the
+//!   network: a process with this token can still make a socket and connect.
 //! - **Untrusted integrity level**, below everything the user owns (set by the engine on its own
 //!   token just before it gives up the start identity).
 //! - **A job object of its own** (so no race with another job): a single process, no child

@@ -16,8 +16,9 @@
 //! read-only handle. Nothing in the sandbox has to allow reading any file.
 //!
 //! A sandbox that did not apply is a failure. Every layer is checked after it is applied (the
-//! engine tries to open a file and a socket and must be refused), and a release build that cannot
-//! show a working sandbox refuses to read documents.
+//! engine tries to open a file and, on Linux and macOS, a socket, and must be refused; on Windows
+//! the network is not blocked, only reported), and a release build that cannot show a working
+//! sandbox refuses to read documents.
 
 #[cfg(target_os = "linux")]
 mod linux;

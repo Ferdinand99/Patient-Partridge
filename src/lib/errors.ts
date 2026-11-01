@@ -86,6 +86,12 @@ export function describeError(error: AppErrorLike, fileName?: string): Described
         detail: `Patient Partridge could not lock its PDF reader into the protective sandbox of this system, so it did not open ${fileName ? file : "this file"}. No part of the file was read.${error.message ? ` (${error.message})` : ""}`,
         action: "none",
       };
+    case "updating":
+      return {
+        title: "An update is being installed",
+        detail: "Patient Partridge cannot open files until it has restarted. Restart the app, then open the file again.",
+        action: "none",
+      };
     default:
       return {
         title: "Something went wrong",

@@ -20,6 +20,10 @@ playwright-report
 src-tauri/gen/schemas
 src-tauri/binaries
 src-tauri/tauri.bundle.generated.conf.json
+src-tauri/tauri.e2e.generated.conf.json
+
+# The update test (scripts/update-e2e.mjs) builds and runs here
+e2e-update
 
 # PDFium binaries are fetched and checked by scripts/fetch-pdfium.mjs
 vendor

@@ -37,8 +37,10 @@ const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
 
 const PROT_EXEC_BIT: u32 = 4;
 const AT_EMPTY_PATH_BIT: u32 = 0x1000;
-/// MAP_SHARED (1) and MAP_SHARED_VALIDATE (3) both have bit 0 set.
-const MAP_SHARED_BITS: u32 = 0x01;
+/// MAP_SHARED (1) and MAP_SHARED_VALIDATE (3) both have bit 0 set. MAP_GROWSDOWN (0x0100, the same
+/// on x86_64 and arm64) is refused too: the kernel does not count such a mapping as data, so it
+/// would also be a way round RLIMIT_DATA.
+const MAP_SHARED_BITS: u32 = 0x01 | 0x0100;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -194,9 +196,9 @@ pub(crate) fn allowlist() -> Vec<Rule> {
             arg: 1,
             values: &[F_GETFD as u32, F_SETFD as u32, F_GETFL as u32],
         },
-        // Memory. Nothing may become executable after the lock-in, and nothing may be shared: a
-        // shared anonymous mapping does not count against RLIMIT_DATA, so it would be a way round
-        // the memory limit.
+        // Memory. Nothing may become executable after the lock-in, and nothing may be shared or
+        // grow down: neither a shared anonymous mapping nor a MAP_GROWSDOWN one counts against
+        // RLIMIT_DATA, so each would be a way round the memory limit.
         Allow(SYS_brk),
         AllowIfClearBoth {
             nr: SYS_mmap,
@@ -429,6 +431,20 @@ struct CapData {
 /// cannot be entered by a process with more.
 pub fn enter_empty_root() -> Result<(), String> {
     use std::ffi::CString;
+    // Ubuntu 24.04 and later let a program make a user namespace but move it to an AppArmor
+    // profile that has no rights in it, and that profile is also applied to the descriptors the
+    // program already holds: the document would stop being readable. The switch that does this is
+    // read first, and the namespace is not tried where it is on.
+    if std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+        .is_ok_and(|v| v.trim() == "1")
+    {
+        return Err("user namespaces are restricted by AppArmor on this system".to_string());
+    }
+    if std::fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone")
+        .is_ok_and(|v| v.trim() == "0")
+    {
+        return Err("user namespaces are switched off on this system".to_string());
+    }
     let path = |p: &str| CString::new(p).expect("no nul in a constant");
     // SAFETY: plain system calls with constant arguments and live C strings.
     unsafe {
@@ -536,10 +552,35 @@ pub fn lock_down() -> Result<Vec<&'static str>, String> {
     apply_seccomp()?;
     layers.insert(0, "seccomp");
     verify()?;
+    // The descriptors the engine was given must still work after all this (an AppArmor profile or
+    // another module could take that away). The input is checked here; the document is taken only
+    // when this has passed.
+    // SAFETY: plain call on descriptor 0 with a live buffer.
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(0, &mut st) != 0 {
+            return Err(errno_text("the standard input stopped working"));
+        }
+    }
     if EMPTY_ROOT.load(std::sync::atomic::Ordering::SeqCst) {
-        // A path lookup must find nothing at all.
-        if std::fs::metadata("/etc").is_ok() || std::fs::metadata("/proc").is_ok() {
-            return Err("the empty root is not empty".to_string());
+        // A path lookup must find nothing at all. `std::fs::metadata` would get EPERM from the
+        // filter whether the root is empty or not, so this uses `newfstatat` with AT_EMPTY_PATH,
+        // the one form of it that the filter lets through.
+        // SAFETY: plain calls with constant arguments and live buffers.
+        unsafe {
+            let mut st: libc::stat = std::mem::zeroed();
+            for name in [c"/etc", c"/proc"] {
+                let r = libc::syscall(
+                    libc::SYS_newfstatat,
+                    libc::AT_FDCWD,
+                    name.as_ptr(),
+                    &mut st as *mut libc::stat,
+                    libc::AT_EMPTY_PATH,
+                );
+                if r == 0 {
+                    return Err("the empty root is not empty".to_string());
+                }
+            }
         }
         layers.push("empty-root");
     }
@@ -637,6 +678,14 @@ mod tests {
         );
         assert_eq!(
             mmap(libc::PROT_READ, libc::MAP_SHARED_VALIDATE),
+            EPERM_ANSWER
+        );
+        // A private mapping that grows down is not counted as data either.
+        assert_eq!(
+            mmap(
+                libc::PROT_READ | libc::PROT_WRITE,
+                private | libc::MAP_GROWSDOWN
+            ),
             EPERM_ANSWER
         );
     }

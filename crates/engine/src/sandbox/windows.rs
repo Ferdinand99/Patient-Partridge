@@ -8,9 +8,11 @@
 //! in that state. This function ends it (`RevertToSelf`), so the thread falls back to the
 //! restricted token, and then checks every layer: the token is restricted, the integrity level is
 //! below medium, the process is in a job, and the mitigation policies are on. Finally it tries to
-//! open a file, to make a socket (Winsock is started first, under the start identity, so that the
-//! refusal is the system's) and to open the network device itself with `NtCreateFile`; all three
-//! must fail.
+//! open a file, which must fail. It also tries to make a socket (Winsock is started first, under
+//! the start identity, so that the answer is the system's) and to open the network device itself
+//! with `NtCreateFile`, but only to find out whether the network is blocked. It is not: the
+//! restricted token does not stop the network on Windows, so those two attempts succeed, the layer
+//! `no-network` is not reported and the engine goes on.
 
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};

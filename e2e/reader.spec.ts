@@ -376,6 +376,70 @@ test("a PDF of thousands of one-point pages cannot fill the memory of the window
   await expect(page.getByRole("alertdialog")).toHaveCount(1);
 });
 
+test("a PDF made to fill the window with elements cannot do it", async ({ page }) => {
+  test.setTimeout(120_000);
+  // A tall window, so that without the limit on mounted pages far more than 120 would be on screen.
+  await page.setViewportSize({ width: 1100, height: 2400 });
+  await page.evaluate(() => (window.__E2E__.dialog = ["/docs/crafted.pdf"]));
+  await page.locator("#empty-open").click();
+  await expect(page.locator('.tab-title[aria-selected="true"]')).toHaveText("crafted.pdf");
+  // Links come with no key press: 500 on every page that is on screen.
+  await expect.poll(async () => (await calls(page, "get_page_links")).length, { timeout: 30_000 }).toBeGreaterThan(20);
+  // The 500 links of every page do not fit, so the reader is told, once. Then the key goes to the page.
+  const notice = page.getByRole("alertdialog");
+  await expect(notice).toContainText("Some pages have a lot of text");
+  await notice.getByRole("button", { name: "OK" }).click();
+  await expect(notice).toHaveCount(0);
+  // Select all: up to 5,000 boxes on every page that is on screen.
+  await page.keyboard.press("Control+a");
+  await expect.poll(async () => (await calls(page, "get_page_text")).length, { timeout: 30_000 }).toBeGreaterThan(60);
+  await page.waitForTimeout(3000);
+  // The heap does not show the elements of the page, so they are counted.
+  const count = await page.evaluate(() => ({
+    pages: document.querySelectorAll(".viewer-page").length,
+    boxes: document.querySelectorAll(".hl-select").length,
+    buttons: document.querySelectorAll(".page-link").length,
+    elements: document.querySelectorAll("*").length,
+  }));
+  process.stderr.write(
+    `elements of the crafted PDF: ${count.elements} in all, ${count.boxes} boxes, ${count.buttons} buttons, ${count.pages} pages on screen
+`,
+  );
+  expect(count.pages).toBeGreaterThan(100);
+  expect(count.pages).toBeLessThanOrEqual(120);
+  expect(count.boxes).toBeGreaterThan(0);
+  expect(count.buttons).toBeGreaterThan(0);
+  // 20,000 boxes and 5,000 buttons at most, and some hundreds of elements for the rest of the window.
+  expect(count.elements).toBeLessThan(30_000);
+  await expect(notice).toHaveCount(0);
+});
+
+test("the right mouse button on a choice in the print dialog does not bring back the menu with Reload", async ({ page }) => {
+  await openBook(page);
+  const seen = await page.evaluate(() => {
+    const log: boolean[] = [];
+    // Listens after the app, in the bubbling phase: what it sees is what the app left of the event.
+    window.addEventListener("contextmenu", (e) => log.push(e.defaultPrevented));
+    (window as unknown as { __menus: boolean[] }).__menus = log;
+    return true;
+  });
+  expect(seen).toBe(true);
+  await page.keyboard.press("Control+p");
+  const dialog = page.getByRole("dialog", { name: "Print" });
+  await expect(dialog).toBeVisible();
+  const radios = dialog.getByRole("radio");
+  expect(await radios.count()).toBeGreaterThan(1);
+  await radios.first().click({ button: "right" });
+  await radios.last().click({ button: "right", force: true });
+  // The Pages box starts greyed out: it is not editable, so its menu is the page menu too.
+  const pagesBox = dialog.getByRole("textbox");
+  await expect(pagesBox).toBeDisabled();
+  await pagesBox.click({ button: "right", force: true });
+  const menus = await page.evaluate(() => (window as unknown as { __menus: boolean[] }).__menus);
+  expect(menus.length).toBe(3);
+  expect(menus.every(Boolean)).toBe(true);
+});
+
 test("the right mouse button on selected text offers Copy", async ({ page, context }) => {
   await context.grantPermissions(["clipboard-read", "clipboard-write"]);
   await openBook(page);

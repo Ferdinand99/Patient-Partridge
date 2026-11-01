@@ -98,8 +98,40 @@ export const DEFAULT_LIMITS: OverlayLimits = {
  */
 export const MAX_LINK_CHARS = 1_000_000;
 
-/** Most boxes drawn for the selection on one page. Copying is not affected. */
+/** Most boxes drawn for the selection, or for the matches of a search, on one page. Copying is not affected. */
 const MAX_SELECTION_BOXES = 5_000;
+
+/**
+ * Most boxes (selection and search matches) drawn for all the pages of a document together, and
+ * most link buttons. The viewer mounts a fixed number of pages at most (`MAX_MOUNTED_PAGES`), but a
+ * crafted file can still give each of them thousands of boxes and 500 links. About 25,000 elements
+ * at the limit, and 5,000 more for the match of a search that is picked out. What does not fit is
+ * not drawn; copying and searching are not affected.
+ */
+export const MAX_OVERLAY_BOXES = 20_000;
+export const MAX_LINK_BUTTONS = 5_000;
+
+/** A count that all the pages of a document share: each page asks for what it wants to draw. */
+class Budget {
+  private readonly used = new Map<string, number>();
+  private sum = 0;
+
+  constructor(private readonly limit: number) {}
+
+  /** How many of `wanted` the owner may draw now. Replaces what the owner was allowed before. */
+  claim(owner: string, wanted: number): number {
+    const had = this.used.get(owner) ?? 0;
+    const allowed = Math.max(0, Math.min(wanted, this.limit - (this.sum - had)));
+    this.sum += allowed - had;
+    if (allowed === 0) this.used.delete(owner);
+    else this.used.set(owner, allowed);
+    return allowed;
+  }
+
+  release(owner: string): void {
+    this.claim(owner, 0);
+  }
+}
 
 /** The engine cuts the text of one page at this many characters (see MAX_PAGE_CHARS there). */
 const ENGINE_PAGE_CHARS = 100_000;
@@ -146,6 +178,9 @@ export class PageOverlays {
   private readonly linkSizes = new Map<number, number>();
   private linkChars = 0;
   private limitReported = false;
+  private readonly boxBudget = new Budget(MAX_OVERLAY_BOXES);
+  private readonly pickedBudget = new Budget(MAX_SELECTION_BOXES);
+  private readonly linkBudget = new Budget(MAX_LINK_BUTTONS);
   /** True while a copy fetches pages: there is one at a time for each document. */
   private copying = false;
   /** Pages of the selection whose text was loaded ahead, within the limit, and is kept. */
@@ -202,6 +237,10 @@ export class PageOverlays {
   unmount(page: number): void {
     this.overlays.get(page)?.remove();
     this.overlays.delete(page);
+    this.boxBudget.release(`${page}:find`);
+    this.boxBudget.release(`${page}:select`);
+    this.pickedBudget.release(String(page));
+    this.linkBudget.release(String(page));
     this.texts.allow(page);
     // The links of a page that is off screen are not kept: they are asked for again when the page
     // is drawn again, so a long document does not pile them up.
@@ -224,7 +263,7 @@ export class PageOverlays {
   /** A page has been drawn: now is the time to ask for its text and its links. */
   pageDrawn(page: number): void {
     if (this.destroyed) return;
-    if (!this.texts.refused(page)) {
+    if (!this.texts.unavailable(page)) {
       void this.texts.load(page).then(() => {
         if (this.texts.refused(page)) this.reportLimit();
         this.paint(page);
@@ -311,38 +350,53 @@ export class PageOverlays {
       return el;
     };
 
-    // Search matches: the one picked out is drawn stronger
+    // Search matches: the one picked out is drawn stronger. Its boxes have a count of their own, so
+    // that it is still drawn when the other matches have used up the boxes of the document.
     const found = this.find.get(page);
     if (found && text) {
       const current = this.findCurrent;
-      const elements: HTMLElement[] = [];
+      const picked: Rect[] = [];
+      const others: Rect[] = [];
       for (const [start, len] of found) {
         const isCurrent = current !== null && current.page === page && current.start === start;
+        const into = isCurrent ? picked : others;
+        if (into.length >= MAX_SELECTION_BOXES) continue;
         for (const r of lineRects(text, start, start + len)) {
-          elements.push(box(r, isCurrent ? "hl hl-find hl-current" : "hl hl-find"));
+          if (into.length >= MAX_SELECTION_BOXES) break;
+          into.push(r);
         }
       }
-      find.replaceChildren(...elements);
+      const pickedAllowed = this.pickedBudget.claim(String(page), picked.length);
+      const othersAllowed = this.claimBoxes(`${page}:find`, others.length);
+      find.replaceChildren(
+        ...picked.slice(0, pickedAllowed).map((r) => box(r, "hl hl-find hl-current")),
+        ...others.slice(0, othersAllowed).map((r) => box(r, "hl hl-find")),
+      );
     } else {
       find.replaceChildren();
-      if (found && !text && !this.texts.refused(page)) void this.texts.load(page).then(() => this.paint(page));
+      this.boxBudget.release(`${page}:find`);
+      this.pickedBudget.release(String(page));
+      if (found && !text && !this.texts.unavailable(page)) void this.texts.load(page).then(() => this.paint(page));
     }
 
     // Selection
     const range = this.selection ? rangeOnPage(this.selection, page) : null;
     if (range && text) {
-      select.replaceChildren(
-        ...lineRects(text, range[0], Math.min(range[1], text.chars.length))
-          .slice(0, MAX_SELECTION_BOXES)
-          .map((r) => box(r, "hl hl-select")),
-      );
+      const wanted = lineRects(text, range[0], Math.min(range[1], text.chars.length)).slice(0, MAX_SELECTION_BOXES);
+      const allowed = this.claimBoxes(`${page}:select`, wanted.length);
+      select.replaceChildren(...wanted.slice(0, allowed).map((r) => box(r, "hl hl-select")));
     } else {
       select.replaceChildren();
-      if (range && !text && !this.texts.refused(page)) void this.texts.load(page).then(() => this.paint(page));
+      this.boxBudget.release(`${page}:select`);
+      // A page that cannot be read is asked for once, not again at every repaint of the selection.
+      if (range && !text && !this.texts.unavailable(page)) void this.texts.load(page).then(() => this.paint(page));
     }
 
     // Links
-    const pageLinks = this.links.get(page) ?? [];
+    const wantedLinks = this.links.get(page) ?? [];
+    const allowedLinks = this.linkBudget.claim(String(page), wantedLinks.length);
+    if (allowedLinks < wantedLinks.length) this.reportLimit();
+    const pageLinks = wantedLinks.slice(0, allowedLinks);
     links.replaceChildren(
       ...pageLinks.map((link) => {
         const b = document.createElement("button");
@@ -366,6 +420,13 @@ export class PageOverlays {
         return b;
       }),
     );
+  }
+
+  /** Asks for room for boxes of one kind on one page. When the document's boxes are used up, says so. */
+  private claimBoxes(owner: string, wanted: number): number {
+    const allowed = this.boxBudget.claim(owner, wanted);
+    if (allowed < wanted) this.reportLimit();
+    return allowed;
   }
 
   private paintAll(): void {
@@ -535,7 +596,7 @@ export class PageOverlays {
     const text = this.texts.get(at.page);
     if (!text) {
       // A page that has no text layer for lack of room cannot be pointed at.
-      if (this.texts.refused(at.page)) return null;
+      if (this.texts.unavailable(at.page)) return null;
       void this.texts.load(at.page).then(() => {
         if (this.dragging && this.pointer) this.extendTo(this.pointer.x, this.pointer.y);
       });

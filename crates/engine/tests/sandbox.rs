@@ -483,21 +483,26 @@ fn a_locked_in_engine_still_reads_draws_and_searches_the_document_it_was_given()
     assert!(run.succeeded(), "the program ended with {}", run.exit);
 }
 
-#[test]
-fn the_memory_limit_ends_an_engine_that_uses_too_much() {
-    // On macOS the engine's own watch is switched off for this test: the app has to end the
-    // engine from outside, which an engine that has been taken over cannot prevent.
-    std::env::set_var("PARTRIDGE_TEST_NO_ENGINE_LIMIT", "1");
+/// Runs the program that takes three times the limit and then holds on to it (see `memory` in
+/// `engine_selftest`). It is not given the chance to finish first: a limit that is a watch looking
+/// every few tens of milliseconds cannot see a program that has taken its memory and ended within
+/// one look, and what it promises is that a program that stays over the limit is ended.
+fn run_memory_hog(extra: &[&str]) -> (Run, Duration) {
     let document = kit::TempFile::new("selftest-mem.pdf", &kit::simple_pdf(1));
     let handle = std::fs::File::open(document.path()).unwrap();
-    // A small limit, so the test does not need gigabytes: the program tries three times as much.
-    let run = run_selftest(
-        &handle,
-        Some(256 * 1024 * 1024),
-        &["memory".to_string(), "256".to_string()],
-    );
+    // A small limit, so the test does not need gigabytes: the program tries three times as much,
+    // and would hold it for 30 seconds.
+    let mut mode = vec!["memory".to_string(), "256".to_string(), "30".to_string()];
+    mode.extend(extra.iter().map(|s| s.to_string()));
+    let started = std::time::Instant::now();
+    let run = run_selftest(&handle, Some(256 * 1024 * 1024), &mode);
+    let took = started.elapsed();
+    println!("{:#?} {} after {took:?}", run.lines, run.exit);
+    (run, took)
+}
+
+fn assert_ended_by_the_limit(run: &Run, took: Duration) {
     let lines = &run.lines;
-    println!("{lines:#?} {}", run.exit);
     assert!(
         !lines.iter().any(|l| l.contains("SURVIVED")),
         "the limit did not hold: {lines:#?}"
@@ -505,7 +510,35 @@ fn the_memory_limit_ends_an_engine_that_uses_too_much() {
     assert!(!lines.iter().any(|l| l == "done"), "{lines:#?}");
     // It was ended: by a signal or an abort, not by finishing.
     assert!(!run.succeeded(), "the program ended with {}", run.exit);
-    std::env::remove_var("PARTRIDGE_TEST_NO_ENGINE_LIMIT");
+    // And well before it would have let go of the memory by itself (it holds it for 30 seconds).
+    assert!(
+        took < Duration::from_secs(20),
+        "it took {took:?} to end the program"
+    );
+}
+
+#[test]
+fn the_memory_limit_ends_an_engine_that_uses_too_much() {
+    // Whatever enforces the limit on this system: the kernel (Windows, Linux) or the watches on
+    // macOS.
+    let (run, took) = run_memory_hog(&[]);
+    assert_ended_by_the_limit(&run, took);
+}
+
+/// macOS: the engine's own watch is switched off, so only the app's watch from outside can end the
+/// program. This is the limit that holds: code that has taken the engine over can stop a thread of
+/// the engine, but not a signal sent from another process.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_app_ends_an_engine_that_stays_over_the_memory_limit_without_any_help_from_it() {
+    let (run, took) = run_memory_hog(&["app-only"]);
+    assert_ended_by_the_limit(&run, took);
+    // The app's watch ends it with SIGKILL; the engine's own would have exited with status 137.
+    assert!(
+        run.exit.contains("signal: 9"),
+        "the program was not killed from outside: {}",
+        run.exit
+    );
 }
 
 // ---- The real engine ----

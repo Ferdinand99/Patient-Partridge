@@ -7,7 +7,7 @@ import { describeError, fileNameOf, toAppError, type AppErrorLike } from "../lib
 import { classifyUri, visibleAddress } from "../lib/linkPolicy";
 import { parsePageInput } from "../lib/pageInput";
 import { describeScripts, scriptsWithoutFont, type TextScript } from "../lib/scripts";
-import { MAX_OPEN_AT_ONCE, wantedPdfPaths } from "../lib/paths";
+import { MAX_OPEN_AT_ONCE, MAX_TABS, pickSessionTabs, wantedPdfPaths, type SessionTabs } from "../lib/paths";
 import {
   THEME_CHOICES,
   applyTheme,
@@ -40,6 +40,9 @@ export interface AppDeps {
     close(doc: number): Promise<void>;
     setPosition(path: string, position: SavedPosition): Promise<void>;
     clearPositions(): Promise<void>;
+    getReopenTabs(): Promise<boolean>;
+    setReopenTabs(enabled: boolean): Promise<void>;
+    saveSession(paths: string[], active: number | null, failed: string[]): Promise<void>;
     getOutline(doc: number): Promise<OutlineEntry[]>;
     getPageText(doc: number, page: number): Promise<{ text: string; rects: number[] }>;
     getPageLinks(doc: number, page: number): Promise<PageLinkInfo[]>;
@@ -69,6 +72,11 @@ export interface AppDeps {
    * milliseconds. Default: LINK_ANSWER_DELAY_MS.
    */
   linkAnswerDelayMs?: number;
+  /**
+   * How long a tab of the last session may take to open at the start, in milliseconds. Default:
+   * SESSION_OPEN_LIMIT_MS.
+   */
+  sessionOpenLimitMs?: number;
   /** Limits on the text kept for each document. For tests; the defaults are meant for the app. */
   viewLimits?: ViewerOptions["limits"];
 }
@@ -89,9 +97,27 @@ interface Tab {
   forgottenAt: ViewPosition | null;
   /** True once the reader was told that some pages have more text than is kept. */
   limitTold: boolean;
+  /**
+   * Where the tab belongs among the tabs of the last session (its index there), so that tabs
+   * reopened one after the other end up in the old order. Infinity for every other tab, which goes
+   * to the end.
+   */
+  rank: number;
   /** Scripts the document uses that this computer has no font for, told once for the tab. */
   fontsTold: boolean;
 }
+
+/**
+ * What happened to one tab of the last session at the start. "unreached" is a file that gave no
+ * answer or could not be read: it may be there again next time (a network drive that was off).
+ */
+type Reopened = "opened" | "locked" | "failed" | "unreached";
+
+/** Errors of opening a file that may go away by themselves. */
+const UNREACHED_CODES = new Set(["io", "engine_unavailable", "engine_stopped", "updating", "internal"]);
+
+/** How long a tab of the last session may take to open at the start, in milliseconds. */
+export const SESSION_OPEN_LIMIT_MS = 10_000;
 
 const ZOOM_CHOICES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
 const DEFAULT_POSITION_DELAY_MS = 600;
@@ -123,6 +149,14 @@ export class App {
   private readonly opening = new Set<string>();
   private measuring = false;
   private reported = false;
+  /** Whether the tabs are remembered for the next start (the setting "Reopen tabs at start"). */
+  private reopenTabs = true;
+  /** True while the tabs of the last session are being reopened: the list is not written yet. */
+  private sessionHeld = false;
+  /** What was last sent to be remembered, so that the same list is not sent twice. */
+  private lastSession: string | null = null;
+  /** Files of the last session that could not be reached at this start: kept in the list once. */
+  private kept: string[] = [];
 
   private readonly stage: HTMLElement;
   private readonly empty: HTMLElement;
@@ -192,6 +226,7 @@ export class App {
     this.root.addEventListener("copy", (e) => this.onCopy(e));
     this.initContextMenu();
     this.initTheme();
+    this.initReopenSetting();
     byId(this.root, "forget-positions").addEventListener("click", () => void this.forgetPositions());
     // The reader's place is saved when they rest, and again when the window goes away.
     this.root.addEventListener("visibilitychange", () => {
@@ -199,7 +234,7 @@ export class App {
     });
     this.root.defaultView?.addEventListener("pagehide", () => this.saveAll());
     this.buildZoomOptions(null);
-    this.syncChrome();
+    this.syncChrome(false);
     void this.deps.api.measureMode().then((on) => (this.measuring = on));
   }
 
@@ -211,6 +246,176 @@ export class App {
   /** How many documents are open. */
   get tabCount(): number {
     return this.tabs.length;
+  }
+
+  /**
+   * The paths of the open documents, the one in view first. The place of the reader in each of them
+   * is written down first, because the app is about to be restarted (after an update).
+   */
+  openDocumentPaths(): string[] {
+    this.saveAll();
+    const active = this.active;
+    const others = this.tabs.filter((t) => t !== active).map((t) => t.path);
+    return active ? [active.path, ...others] : others;
+  }
+
+  /**
+   * Opens the files that were open before an update. They are what the reader had, so the rules
+   * for files that are named at the start do not apply: there is no limit of eight, and a file
+   * without the ending .pdf is opened too. The first one is shown.
+   */
+  async restorePaths(paths: string[]): Promise<void> {
+    if (paths.length > 0) await this.openPaths(paths);
+  }
+
+  /**
+   * The start of the app. Opens, in this order: the files that were open before an update (all of
+   * them, whatever the setting says), or else the tabs of the last session; then the files named
+   * on the command line or sent by the system, which take the focus. The list of tabs is not
+   * written until this is done, so that the tabs still to come back are not forgotten.
+   */
+  async start(from: { restored?: string[]; session?: SessionTabs | null; given?: string[] }): Promise<void> {
+    this.sessionHeld = true;
+    try {
+      const given = from.given ?? [];
+      if ((from.restored ?? []).length > 0) {
+        await this.restorePaths(from.restored ?? []);
+        if (given.length > 0) await this.openChosen(given);
+      } else {
+        await this.reopenSession(from.session, given);
+      }
+    } finally {
+      this.releaseSession();
+    }
+  }
+
+  /** The list of tabs may be written from now on, with the tabs that are open at this moment. */
+  private releaseSession(): void {
+    this.sessionHeld = false;
+    this.saveSession();
+  }
+
+  /**
+   * Reopens the tabs of the last session in their old order. The files named at the start open
+   * first and take the focus, and no tab of the last session can hold them back. The tab that was
+   * in view comes first among the others and is shown when nothing else is; the rest follow one at
+   * a time, so that many tabs do not hold the start back. Nothing asks a question: a file that
+   * cannot be opened is skipped, and one notice at the end says how many. A file that does not
+   * answer within `sessionOpenLimitMs` counts as one that could not be opened.
+   */
+  private async reopenSession(saved: SessionTabs | null | undefined, given: string[]): Promise<void> {
+    const named = wantedPdfPaths(given).slice(0, MAX_OPEN_AT_ONCE);
+    const naming = given.length > 0 ? this.openChosen(given) : Promise.resolve();
+    const pick = pickSessionTabs(saved, MAX_TABS - named.length);
+    if (pick.paths.length === 0) {
+      await naming;
+      return;
+    }
+    // A file that could not be reached gets one more start before it is forgotten: the network
+    // may have been down.
+    const failedBefore = new Set(saved?.failed ?? []);
+    this.kept = [];
+    let failed = pick.left;
+    let locked = 0;
+    const count = (result: Reopened, path: string) => {
+      if (result === "locked") locked++;
+      else if (result !== "opened") {
+        failed++;
+        if (result === "unreached" && !failedBefore.has(path)) this.kept.push(path);
+      }
+    };
+    // The tab that was in view comes first, then the others in their old order.
+    const order = [pick.active, ...pick.paths.keys()].filter((v, i, all) => all.indexOf(v) === i);
+    for (const i of order) {
+      const path = pick.paths[i];
+      if (named.includes(path)) continue;
+      count(await this.reopen(path, i), path);
+    }
+    await naming;
+    this.tellAboutSession(failed, locked, pick.left > 0);
+  }
+
+  /**
+   * Opens a file of the last session without asking anything. It is shown only if nothing else is
+   * shown by then, so a file named at the start or opened by hand keeps the focus.
+   */
+  private async reopen(path: string, rank: number): Promise<Reopened> {
+    if (this.tabs.some((t) => t.path === path) || this.opening.has(path)) return "opened";
+    this.opening.add(path);
+    const started = this.deps.now();
+    try {
+      const opened = await this.openWithin(path);
+      if (opened === null) return "unreached";
+      if (opened.pages.length === 0) {
+        // No dialog per file at the start: it counts in the one notice.
+        void this.deps.api.close(opened.doc).catch(() => undefined);
+        return "failed";
+      }
+      this.addTab(opened, path, started, false, rank);
+      return "opened";
+    } catch (e) {
+      const error = toAppError(e);
+      // A protected file is not asked for its password at the start: it stays closed.
+      if (describeError(error).action === "password") return "locked";
+      return UNREACHED_CODES.has(error.code) ? "unreached" : "failed";
+    } finally {
+      this.opening.delete(path);
+    }
+  }
+
+  /**
+   * Asks the app process to open a file, and gives up on it after `sessionOpenLimitMs`: then the
+   * list of tabs is released and null is given. A document that arrives after that is closed.
+   */
+  private async openWithin(path: string): Promise<OpenedDocument | null> {
+    const limit = this.deps.sessionOpenLimitMs ?? SESSION_OPEN_LIMIT_MS;
+    const pending = this.deps.api.open(path);
+    let late = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const giveUp = new Promise<null>((resolve) => {
+      timer = setTimeout(() => {
+        late = true;
+        this.releaseSession();
+        resolve(null);
+      }, limit);
+    });
+    pending.then(
+      (doc) => {
+        if (late) void this.deps.api.close(doc.doc).catch(() => undefined);
+      },
+      () => undefined,
+    );
+    try {
+      return await Promise.race([pending, giveUp]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** One calm message about the tabs that did not come back, if there are any. */
+  private tellAboutSession(failed: number, locked: number, overLimit: boolean): void {
+    if (failed === 0 && locked === 0) return;
+    const parts: string[] = [];
+    if (failed > 0) {
+      const tabs = failed === 1 ? "1 tab" : `${failed} tabs`;
+      const files = failed === 1 ? "The file may have" : "The files may have";
+      const limit = overLimit ? ` Patient Partridge keeps at most ${MAX_TABS} documents open.` : "";
+      parts.push(`${tabs} from your last session could not be opened. ${files} moved or been deleted.${limit}`);
+    }
+    if (locked > 0) {
+      const files = locked === 1 ? "1 password protected file was" : `${locked} password protected files were`;
+      parts.push(`${files} left closed. Open ${locked === 1 ? "it" : "them"} yourself to enter the password.`);
+    }
+    void showNotice(this.noticeLayer, {
+      title: "Some tabs were not reopened",
+      detail: parts.join(" "),
+      buttons: [{ id: "ok", label: "OK", primary: true }],
+    });
+  }
+
+  /** Closes the settings menu, if it is open. */
+  closeMenu(): void {
+    this.menu.close();
   }
 
   setDropActive(active: boolean): void {
@@ -324,7 +529,13 @@ export class App {
     });
   }
 
-  private addTab(opened: OpenedDocument, path: string, started: number, activate: boolean): void {
+  private addTab(
+    opened: OpenedDocument,
+    path: string,
+    started: number,
+    activate: boolean,
+    rank = Infinity,
+  ): void {
     const openedAfter = this.deps.now() - started;
     const tab: Tab = {
       id: this.nextTabId++,
@@ -336,6 +547,7 @@ export class App {
       saveTimer: undefined,
       forgottenAt: null,
       limitTold: false,
+      rank,
       fontsTold: false,
     };
     tab.view = new DocumentView(
@@ -378,7 +590,10 @@ export class App {
       hasPainted: () => tab.view.hasPainted,
       currentPage: () => tab.view.currentPageIndex,
     };
-    this.tabs.push(tab);
+    // Tabs of the last session go where they were; any other tab goes to the end.
+    const before = this.tabs.findIndex((t) => t.rank > rank);
+    if (before < 0) this.tabs.push(tab);
+    else this.tabs.splice(before, 0, tab);
     this.stage.append(tab.view.element);
 
     const showIt = activate || this.activeId === null;
@@ -535,7 +750,60 @@ export class App {
       tab.saveTimer = undefined;
       tab.forgottenAt = tab.view.getPosition();
     }
+    // The list of tabs goes with the positions, also the files that could not be reached.
+    this.kept = [];
     await this.deps.api.clearPositions().catch(() => undefined);
+  }
+
+  // ---- reopening the tabs ----------------------------------------------------
+
+  /** Remembers which tabs are open, in order, and which one is in view. Paths only. */
+  private saveSession(): void {
+    if (this.sessionHeld || !this.reopenTabs) return;
+    const open = this.tabs.map((t) => t.path);
+    const active = this.tabs.findIndex((t) => t.id === this.activeId);
+    // The files that could not be reached stay at the end of the list for one more start.
+    const failed = this.kept.filter((p) => !open.includes(p));
+    const paths = [...open, ...failed];
+    const key = JSON.stringify([paths, active, failed]);
+    if (key === this.lastSession) return;
+    this.lastSession = key;
+    void this.deps.api.saveSession(paths, active >= 0 ? active : null, failed).catch(() => {
+      this.lastSession = null;
+    });
+  }
+
+  private initReopenSetting(): void {
+    const toggle = byId<HTMLButtonElement>(this.root, "reopen-tabs");
+    const show = () => toggle.setAttribute("aria-checked", String(this.reopenTabs));
+    show();
+    void this.deps.api
+      .getReopenTabs()
+      .then((on) => {
+        this.reopenTabs = on;
+        show();
+      })
+      .catch(() => undefined);
+    toggle.addEventListener("click", () => void this.toggleReopen(show));
+  }
+
+  private async toggleReopen(show: () => void): Promise<void> {
+    const wanted = !this.reopenTabs;
+    this.reopenTabs = wanted;
+    // Turning it off deletes the list, so turning it on again must write the list afresh.
+    this.lastSession = null;
+    show();
+    try {
+      await this.deps.api.setReopenTabs(wanted);
+    } catch {
+      await showNotice(this.noticeLayer, {
+        title: "The setting was not saved",
+        detail:
+          "Patient Partridge could not write the setting to this computer. It holds until the app closes, then it goes back to what it was.",
+        buttons: [{ id: "ok", label: "OK", primary: true }],
+      });
+    }
+    this.saveSession();
   }
 
   // ---- colour theme ----------------------------------------------------------
@@ -563,7 +831,9 @@ export class App {
   // ---- toolbar and tabs ------------------------------------------------------
 
   /** Brings the tab strip, the toolbar, the title and the empty state in step with the tabs. */
-  private syncChrome(): void {
+  private syncChrome(saveTabs = true): void {
+    // Every change of the tabs (opened, closed, brought to the front) ends here.
+    if (saveTabs) this.saveSession();
     const active = this.active;
     this.tabStrip.render(
       this.tabs.map((t) => ({ id: t.id, title: t.name, path: t.path })),

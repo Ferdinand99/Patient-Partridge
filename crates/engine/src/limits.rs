@@ -2,13 +2,16 @@
 //! (which the app survives) instead of slowing down the whole computer.
 //!
 //! - Linux: `RLIMIT_DATA`, which counts the heap and private writable mappings. Shared mappings
-//!   are not counted, so the system call filter refuses them (see `sandbox/linux.rs`).
+//!   and grow-down mappings are not counted, so the system call filter refuses them (see
+//!   `sandbox/linux.rs`).
 //! - Windows: the job object the app puts the engine in has a per-process memory limit, which the
 //!   kernel enforces (the engine only checks that it is in a job).
 //! - macOS: the system does not enforce `RLIMIT_DATA` and `RLIMIT_AS`. The limit that holds is the
 //!   one the app keeps: it reads the memory footprint of the engine from outside and ends it
 //!   (`partridge-engine-client`, `spawn/unix.rs`). A thread of the engine does the same as a first
-//!   line, but code that has taken the engine over can stop that thread.
+//!   line, but code that has taken the engine over can stop that thread. Both are watches that look
+//!   every 20 to 25 ms, not walls: an engine that stays over the limit is ended within a fraction
+//!   of a second, and one that takes memory and lets go of it again within one look is not seen.
 //!
 //! A limit is not a sandbox: it does nothing against code that PDFium is tricked into running.
 

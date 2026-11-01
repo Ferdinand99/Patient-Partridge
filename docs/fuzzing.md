@@ -88,7 +88,7 @@ A 60 second run finds shallow bugs only. Run the targets for much longer by hand
    - Protocol bugs: a `#[test]` in `crates/protocol/src/lib.rs` with the minimized bytes written out in the test.
    - Engine bugs: a test in `crates/engine/tests/` that writes the minimized PDF to a temporary file and runs it through the engine as the target does. A small input can be put in the test as a byte string; a larger one in a new `crates/engine/tests/data/` folder (keep it small).
 4. Also add the minimized input to the matching `fuzz/seeds/<target>/` folder, so that the CI run replays it. The seed generator removes nothing from that folder, but it must be able to write it again: add the file to `make-seeds` if it should survive a full regeneration.
-5. A crash that is only memory use or time from a hostile PDF in PDFium itself (an abort from out-of-memory, `timeout` or `out-of-memory` reports) cannot be fixed here. The engine runs in its own process, with a memory limit on Linux and Windows (none on macOS), so the app survives it. Report it to the PDFium build's upstream and note it in the pull request.
+5. A crash that is only memory use or time from a hostile PDF in PDFium itself (an abort from out-of-memory, `timeout` or `out-of-memory` reports) cannot be fixed here. The engine runs in its own process, with a memory limit (enforced by the system on Linux and Windows, and by a watch of the app on macOS), so the app survives it. Report it to the PDFium build's upstream and note it in the pull request.
 
 ## Adding a target
 

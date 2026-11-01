@@ -35,6 +35,13 @@ impl EngineProcess for UnixProcess {
 /// code it is meant to hold back (Mach calls are not governed by the profile). The app can look at
 /// the footprint of another process with `proc_pid_rusage` and end it with a signal, and nothing
 /// the engine does can stop that.
+///
+/// The watch looks every 25 ms (more when the computer is busy; a look has been seen to come 100 ms
+/// late on a loaded CI machine). It promises that an engine that stays over the limit is ended
+/// within a fraction of a second. It does not promise anything about memory that is taken and
+/// given back within one look: a program can touch several hundred megabytes in 25 ms, so it can
+/// go past the limit by that much before it is seen, and one that ends before the look is never
+/// seen at all.
 #[cfg(target_os = "macos")]
 fn watch_memory(pid: u32, limit: u64) {
     extern "C" {

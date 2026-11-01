@@ -1,0 +1,155 @@
+# Checks macOS code signing and notarisation without publishing anything: builds the universal app
+# with the APPLE_* secrets (the same steps as the release workflow), then checks every program
+# inside it (the app, the engine, the PDFium library), Gatekeeper and the stapled tickets of the app
+# and the disk image, and starts the signed app from the disk image to open a PDF. Run it
+# from the Actions tab after changing certificates or keys. It also runs when the files that make
+# the signed build change, so a change is tested before it is merged.
+name: macOS signing check
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/macos-signing.yml
+      - scripts/macos-import-certificate.sh
+      - scripts/macos-verify.sh
+      - scripts/release-build.mjs
+      - scripts/release-sign.mjs
+      - scripts/smoke.mjs
+      - scripts/prepare-bundle.mjs
+      - scripts/bundle-config.mjs
+      - src-tauri/tauri.conf.json
+
+permissions:
+  contents: read
+
+jobs:
+  sign:
+    name: Sign and notarise (macOS, universal)
+    # Dependabot's branches never get the repository secrets, so the check can't run there; it runs
+    # again on main once the update is merged.
+    if: github.actor != 'dependabot[bot]'
+    runs-on: macos-latest
+    defaults:
+      run:
+        shell: bash
+    # No secret is set for the job. Each is set on the one step that reads it; the steps that run
+    # third-party code (npm, the build scripts of the Rust dependencies, Vite) have none.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: macos-signing
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      - name: Check that the secrets are there
+        env:
+          IN_APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          IN_APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          IN_APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          IN_APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          IN_APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          IN_APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+        run: |
+          missing=""
+          for v in IN_APPLE_CERTIFICATE IN_APPLE_CERTIFICATE_PASSWORD IN_APPLE_SIGNING_IDENTITY \
+                   IN_APPLE_API_ISSUER IN_APPLE_API_KEY IN_APPLE_API_KEY_CONTENT; do
+            [ -n "${!v}" ] || missing="$missing ${v#IN_}"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error title=Missing secrets::Set these repository secrets (see docs/signing.md):$missing"
+            exit 1
+          fi
+
+      # PDFium (both architectures, checked against pinned checksums) and the engine for both,
+      # joined with lipo. No secret.
+      - name: Prepare the bundle (universal)
+        env:
+          PARTRIDGE_UNIVERSAL: "1"
+        run: node scripts/prepare-bundle.mjs
+
+      # Compiles the app and runs the frontend build. No secret.
+      - name: Compile
+        run: npx tauri build --no-bundle --target universal-apple-darwin --config src-tauri/tauri.bundle.generated.conf.json -- --locked
+
+      # The only step with the secrets, the same one the release workflow runs: the certificate goes
+      # into a temporary keychain, the PDFium library is signed, Tauri makes, signs and notarises the
+      # app, and the disk image is notarised and stapled.
+      - name: Sign and notarise
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+        run: node scripts/release-build.mjs build --target universal-apple-darwin --bundles app,dmg --config src-tauri/tauri.bundle.generated.conf.json
+
+      - name: Check the result
+        run: |
+          APP="target/universal-apple-darwin/release/bundle/macos/Patient Partridge.app"
+          DMG=$(find target/universal-apple-darwin/release/bundle/dmg -name '*.dmg' | head -1)
+          scripts/macos-verify.sh "$APP" "$DMG"
+
+      # A signed, notarised app is started and opens a PDF, the way a user's copy does: out of the
+      # disk image, with the "downloaded" mark on it. The hardened runtime, library validation and the
+      # engine's own start-up all have to work for the first page to be drawn.
+      - name: Make a test PDF
+        run: cargo run --release --locked -p partridge-testkit --bin make-pdf -- 30 "$RUNNER_TEMP/launch.pdf"
+      - name: Start the signed app and open the PDF
+        run: |
+          DMG=$(find target/universal-apple-darwin/release/bundle/dmg -name '*.dmg' | head -1)
+          mount="$RUNNER_TEMP/dmg"
+          mkdir -p "$mount" "$RUNNER_TEMP/copy"
+          # The disk image has a licence agreement, which `hdiutil` asks to accept ("attach canceled" otherwise).
+          echo Y | hdiutil attach -nobrowse -readonly -noverify -mountpoint "$mount" "$DMG" > /dev/null
+          cp -R "$mount/Patient Partridge.app" "$RUNNER_TEMP/copy/"
+          hdiutil detach "$mount" > /dev/null
+          APP="$RUNNER_TEMP/copy/Patient Partridge.app"
+          xattr -w com.apple.quarantine "0081;00000000;Safari;" "$APP"
+          spctl --assess --type execute --verbose=4 "$APP"
+          node scripts/smoke.mjs --bin "$APP/Contents/MacOS/patient-partridge" --pdf "$RUNNER_TEMP/launch.pdf" --runs 2 | tee launch.txt
+          {
+            echo "### The signed app opened a PDF"
+            echo
+            echo '```'
+            cat launch.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Only when the launch failed: what the app wrote, its crash reports and the system log.
+      - name: What happened to the signed app
+        if: failure()
+        run: |
+          APP="$RUNNER_TEMP/copy/Patient Partridge.app"
+          ls -la "$APP/Contents/MacOS" "$APP/Contents/Resources" | head -30
+          xattr -l "$APP" | head -5
+          for mode in with-mark without-mark; do
+            [ "$mode" = without-mark ] && xattr -d com.apple.quarantine "$APP" 2>/dev/null
+            echo "=== start ($mode)"
+            "$APP/Contents/MacOS/patient-partridge" "$RUNNER_TEMP/launch.pdf" > app.out 2>&1 &
+            pid=$!
+            sleep 25
+            kill "$pid" 2>/dev/null
+            head -c 3000 app.out
+          done
+          ls -t ~/Library/Logs/DiagnosticReports 2>/dev/null | head -5
+          for f in $(ls -t ~/Library/Logs/DiagnosticReports/*artridge* 2>/dev/null | head -2); do echo "== $f"; head -c 3500 "$f"; done
+          log show --last 5m --style compact --predicate 'process CONTAINS "artridge" OR process == "amfid" OR process == "syspolicyd" OR process == "taskgated"' 2>/dev/null | tail -60
+          true
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: patient-partridge-macos-signed
+          path: target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          retention-days: 3
