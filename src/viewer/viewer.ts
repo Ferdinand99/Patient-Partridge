@@ -19,6 +19,7 @@ import {
   scrollTopForAnchor,
   scrollTopForPage,
   visibleRange,
+  type Range,
 } from "./layout";
 import { PageOverlays, type CopyResult, type OverlayApi, type OverlayLimits, type PageLinkInfo } from "./overlays";
 import { RenderScheduler, type RenderJob } from "./scheduler";
@@ -80,6 +81,14 @@ interface Mounted {
 }
 
 const WHEEL_ZOOM_THRESHOLD = 40;
+
+/**
+ * Most pages that have an element at once. A normal window shows a handful, and even at 10 % zoom on
+ * a large screen it is a few dozen. A file made of thousands of one-point pages would otherwise have
+ * hundreds of canvases and layers, each with the boxes and link buttons of its page. Pages beyond
+ * the limit are left out, those farthest from the middle of the window first.
+ */
+export const MAX_MOUNTED_PAGES = 120;
 
 export class DocumentView {
   readonly element: HTMLElement;
@@ -471,7 +480,8 @@ export class DocumentView {
     const top = this.element.scrollTop;
     const height = this.element.clientHeight;
     // Keep one viewport of pages above and below ready, so a scroll rarely shows an empty page.
-    const range = visibleRange(this.layout, top, height, height);
+    const wide = visibleRange(this.layout, top, height, height);
+    const range = wide ? this.nearestPages(wide, top + height / 2) : null;
 
     for (const index of [...this.mounted.keys()]) {
       if (!range || index < range.first || index > range.last) this.unmount(index);
@@ -503,6 +513,18 @@ export class DocumentView {
       this.events.onPageChange(page);
     }
     this.events.onViewChange?.();
+  }
+
+  /** At most `MAX_MOUNTED_PAGES` of the pages in `range`: the ones nearest to the middle of the window. */
+  private nearestPages(range: Range, middle: number): Range {
+    const count = range.last - range.first + 1;
+    if (count <= MAX_MOUNTED_PAGES) return range;
+    const centre = anchorAt(this.layout, middle).page;
+    const first = Math.min(
+      Math.max(centre - Math.floor(MAX_MOUNTED_PAGES / 2), range.first),
+      range.last - MAX_MOUNTED_PAGES + 1,
+    );
+    return { first, last: first + MAX_MOUNTED_PAGES - 1 };
   }
 
   private mount(index: number): Mounted {

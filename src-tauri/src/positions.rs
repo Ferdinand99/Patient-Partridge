@@ -152,7 +152,7 @@ impl Positions {
 
 /// Makes the folder if it is missing. On Unix it is for the user alone (the file holds the paths of
 /// everything that was read).
-fn create_private_dir(dir: &Path) -> io::Result<()> {
+pub(crate) fn create_private_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -168,7 +168,7 @@ fn create_private_dir(dir: &Path) -> io::Result<()> {
 }
 
 /// Writes a file that, on Unix, only the user can read.
-fn write_private_file(file: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_private_file(file: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);

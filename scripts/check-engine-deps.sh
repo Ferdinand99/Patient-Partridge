@@ -7,7 +7,7 @@
 # Run from the repository root: scripts/check-engine-deps.sh
 set -euo pipefail
 
-forbidden='^(reqwest|hyper|hyper-util|hyper-tls|h2|ureq|curl|curl-sys|isahc|attohttpc|surf|openssl|openssl-sys|native-tls|rustls|tungstenite|tokio|tokio-native-tls|async-std|smol|mio|socket2|tauri|wry|tao|webview2-com)$'
+forbidden='^(reqwest|hyper|hyper-util|hyper-tls|h2|ureq|curl|curl-sys|isahc|attohttpc|surf|openssl|openssl-sys|native-tls|rustls|tungstenite|tokio|tokio-native-tls|async-std|smol|mio|socket2|tauri|tauri-plugin-updater|minisign-verify|wry|tao|webview2-com)$'
 
 fail=0
 

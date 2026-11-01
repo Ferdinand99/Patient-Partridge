@@ -82,6 +82,10 @@ jobs:
       - name: Clippy
         if: matrix.lint
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # The test builds of the update test (scripts/update-e2e.mjs) turn this feature on.
+      - name: Clippy (update driver)
+        if: matrix.lint
+        run: cargo clippy -p patient-partridge --all-targets --features update-driver --locked -- -D warnings
       - name: Test
         run: cargo test --workspace --locked --no-fail-fast
       # What the engine tried after it locked itself in (open a file, connect, start a program,
@@ -205,7 +209,7 @@ jobs:
         include:
           - name: linux
             os: ubuntu-latest
-            bundles: deb
+            bundles: deb,appimage
           - name: windows
             os: windows-latest
             bundles: msi,nsis
@@ -236,6 +240,11 @@ jobs:
       - run: npm ci
       # Fetches PDFium (checksum checked), builds the engine, and builds the installers with the
       # engine and the library inside. This is a build for testing: nothing is signed or released.
+      # The tools that make the AppImage, checked against pinned hashes (the bundler would download
+      # them without a check).
+      - name: Fetch the AppImage tools (pinned)
+        if: runner.os == 'Linux'
+        run: node scripts/linux-tools.mjs
       - name: Build installers
         run: npm run bundle -- --bundles ${{ matrix.bundles }} -- --locked
 
@@ -251,10 +260,20 @@ jobs:
           fi
           echo "ok: no test switches in $bin"
 
+      # The test driver of the update test (a Cargo feature) must not be in a build that is shipped.
+      - name: The release build has no update test driver
+        run: |
+          BIN=target/release/patient-partridge
+          [ "$RUNNER_OS" = "Windows" ] && BIN=target/release/patient-partridge.exe
+          if grep -aq PARTRIDGE_UPDATE_DRIVER "$BIN"; then
+            echo "::error::The app was built with the update-driver feature."
+            exit 1
+          fi
+
       - name: Collect installers
         run: |
           mkdir -p out
-          find target/release/bundle -type f \( -name '*.msi' -o -name '*.exe' -o -name '*.dmg' -o -name '*.deb' \) -exec cp {} out/ \;
+          find target/release/bundle -type f \( -name '*.msi' -o -name '*.exe' -o -name '*.dmg' -o -name '*.deb' -o -name '*.AppImage' \) -exec cp {} out/ \;
           ls -la out
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -304,6 +323,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/deb"
           dpkg-deb -x out/*.deb "$RUNNER_TEMP/deb"
           node scripts/association.mjs linux "$RUNNER_TEMP/deb"
+          # The AppImage has its own desktop file (it is made from the same template).
+          node scripts/association.mjs linux "$RUNNER_TEMP/unpacked/appimage/usr/share/applications"
       - name: Check the file association (macOS)
         if: runner.os == 'macOS'
         run: |

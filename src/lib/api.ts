@@ -1,6 +1,6 @@
 // The commands the app process offers to the window. Everything about PDFs goes through here.
 
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import type { PageSizePt } from "../viewer/layout";
 import type { PageLinkInfo } from "../viewer/overlays";
 
@@ -28,6 +28,44 @@ export interface OutlineEntry {
   page: number | null;
   title: string;
 }
+
+/** What the app process says about updates. */
+export type InstallMethod = "automatic" | "manual";
+
+export interface UpdateSettings {
+  /** Whether the app checks for updates by itself. On unless the user turned it off. */
+  autoUpdate: boolean;
+  /** Whether this copy can install an update by itself, or the user has to do it by hand (deb). */
+  method: InstallMethod;
+  currentVersion: string;
+}
+
+export interface UpdateInfo {
+  version: string;
+  currentVersion: string;
+  /** The release notes. Text from the network: show it as text only. */
+  notes: string;
+  method: InstallMethod;
+}
+
+export type UpdateFailureKind =
+  | "offline"
+  | "invalidSignature"
+  | "notConfigured"
+  | "badManifest"
+  | "disabled"
+  | "busy"
+  | "manual"
+  | "other";
+
+export interface UpdateFailure {
+  kind: UpdateFailureKind;
+  message: string;
+  /** The engines were stopped for the install and it then failed: open documents are gone. */
+  enginesStopped: boolean;
+}
+
+export type UpdateEvent = { event: "progress"; chunk: number; total: number | null };
 
 interface OpenedWire {
   doc: number;
@@ -123,5 +161,55 @@ export const api = {
 
   measureReport(openMs: number, firstPageMs: number, pages: number): Promise<void> {
     return invoke<void>("measure_report", { openMs, firstPageMs, pages });
+  },
+
+  getUpdateSettings(): Promise<UpdateSettings> {
+    return invoke<UpdateSettings>("get_update_settings");
+  },
+
+  async setAutoUpdate(enabled: boolean): Promise<void> {
+    await invoke<void>("set_auto_update", { enabled });
+  },
+
+  /**
+   * Asks the update server whether a newer version exists: null when there is none. The only
+   * network use of the app. An automatic check (`manual` false) is refused while the setting is off.
+   */
+  checkUpdate(manual: boolean): Promise<UpdateInfo | null> {
+    return invoke<UpdateInfo | null>("check_update", { manual });
+  },
+
+  /**
+   * Downloads the update the last check found, with progress, and checks it against the public key.
+   * Nothing about the running app changes: the engines and the open files are not touched.
+   */
+  async downloadUpdate(onEvent: (event: UpdateEvent) => void): Promise<void> {
+    const channel = new Channel<UpdateEvent>();
+    channel.onmessage = onEvent;
+    await invoke<void>("download_update", { onEvent: channel });
+  },
+
+  /**
+   * Installs the downloaded update: the app stops the engines, writes down the files that are open
+   * at that moment (it knows them itself), and replaces the program. `active` is the file in view,
+   * which comes back first. On Windows the app ends when the installer starts.
+   */
+  async installUpdate(active: string | null): Promise<void> {
+    await invoke<void>("install_update", { active });
+  },
+
+  /** The files that were open before the last update, once. They are opened again without any limit of the file dialog. */
+  takeRestoredPaths(): Promise<string[]> {
+    return invoke<string[]>("take_restored_paths");
+  },
+
+  /** Starts the app again (after an update). */
+  async restartApp(): Promise<void> {
+    await invoke<void>("restart_app");
+  },
+
+  /** Opens the page with the releases of the app in the browser. The address is fixed in the app. */
+  async openReleasesPage(): Promise<void> {
+    await invoke<void>("open_releases_page");
   },
 };

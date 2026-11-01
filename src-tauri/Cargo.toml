@@ -14,6 +14,10 @@ crate-type = ["rlib"]
 [features]
 # `tauri build` turns this on: the window then loads the built frontend instead of the dev server.
 custom-protocol = ["tauri/custom-protocol"]
+# Test builds only (see scripts/update-e2e.mjs): when the environment variable
+# PARTRIDGE_UPDATE_DRIVER names a file, the app checks for an update on its own, installs it the
+# way the window would, and writes what happened to that file. Never part of a release build.
+update-driver = []
 
 [build-dependencies]
 tauri-build = { version = "=2.7.4", features = [] }
@@ -26,6 +30,7 @@ partridge-engine-client = { path = "../crates/engine-client" }
 tauri = { version = "=2.12.5", features = [] }
 tauri-plugin-dialog = "=2.8.4"
 tauri-plugin-single-instance = "=2.5.5"
+tauri-plugin-updater = "=2.14.1"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
 url = "=2.5.8"

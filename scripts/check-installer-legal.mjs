@@ -21,7 +21,7 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const normal = (buffer) => buffer.toString("utf8").replace(/\r\n/g, "\n");
 
 /** The format folders that unpack-installer.sh makes, per system. */
-export const FORMATS = { linux: ["deb"], macos: ["dmg"], windows: ["msi", "nsis"] };
+export const FORMATS = { linux: ["deb", "appimage"], macos: ["dmg"], windows: ["msi", "nsis"] };
 
 function walk(folder) {
   return readdirSync(folder, { withFileTypes: true }).flatMap((entry) => {
@@ -36,8 +36,15 @@ function walk(folder) {
  * legal texts. `expected.pdfium` is a Map from file name in pdfium-licenses/ (and "LICENSE" for
  * pdfium-LICENSE) to its text, or null to skip the comparison with the download.
  */
-export function checkLegal(kind, folder, expected) {
-  const files = walk(folder).map((path) => ({ path, rel: relative(folder, path).split(sep).join("/") }));
+export function checkLegal(kind, folder, expected, format = kind === "linux" ? "deb" : "") {
+  const everything = walk(folder).map((path) => ({ path, rel: relative(folder, path).split(sep).join("/") }));
+  // An AppImage carries the libraries of the system it was built on (GTK, WebKit, ...), with their
+  // own files named LICENSE and the like. Only the files in the app's own folder, the one with
+  // pdfium-LICENSE, are the app's legal texts.
+  const appFolder = format === "appimage" ? everything.find((f) => basename(f.path) === "pdfium-LICENSE") : null;
+  const files = appFolder
+    ? everything.filter((f) => dirname(f.path) === dirname(appFolder.path) || f.rel.includes("pdfium-licenses/"))
+    : everything;
   const named = (name) => files.filter((f) => basename(f.path) === name);
   const problems = [];
 
@@ -53,7 +60,9 @@ export function checkLegal(kind, folder, expected) {
     if (normal(readFileSync(f.path)) !== expected.license) problems.push(`${f.rel} is not the LICENSE of the repository`);
   }
 
-  if (kind === "linux") {
+  // The Debian copyright file belongs to the deb. An AppImage has no such file; the AGPL text is
+  // in its app folder, which is checked above.
+  if (kind === "linux" && format === "deb") {
     const copyright = files.filter((f) => f.rel.endsWith("usr/share/doc/patient-partridge/copyright"));
     if (copyright.length !== 1) problems.push("usr/share/doc/patient-partridge/copyright (the AGPL text) is not in the deb");
     else if (normal(readFileSync(copyright[0].path)) !== expected.license) problems.push("the deb copyright file is not the LICENSE of the repository");
@@ -89,7 +98,7 @@ export function checkSystem(kind, unpacked, expected) {
       problems.push(`${format}: the ${format} installer was not unpacked (no folder ${folder})`);
       continue;
     }
-    for (const p of checkLegal(kind, folder, expected)) problems.push(`${format}: ${p}`);
+    for (const p of checkLegal(kind, folder, expected, format)) problems.push(`${format}: ${p}`);
   }
   return problems;
 }

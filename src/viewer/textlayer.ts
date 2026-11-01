@@ -264,6 +264,8 @@ export class TextStore {
   private readonly pages = new Map<number, PageText>();
   private readonly pending = new Map<number, Promise<PageText | null>>();
   private readonly refusedPages = new Set<number>();
+  /** Pages that could not be read: nobody asks for them again until they are allowed to. */
+  private readonly failedPages = new Set<number>();
   private chars = 0;
 
   constructor(
@@ -282,9 +284,20 @@ export class TextStore {
     return this.refusedPages.has(page);
   }
 
-  /** Lets a refused page try again, such as when it comes on screen again. */
+  /** True when the page could not be read the last time it was loaded. */
+  failed(page: number): boolean {
+    return this.failedPages.has(page);
+  }
+
+  /** True when the page has no text and asking again now is no use: it was refused or is unreadable. */
+  unavailable(page: number): boolean {
+    return this.refusedPages.has(page) || this.failedPages.has(page);
+  }
+
+  /** Lets a refused or unreadable page try again, such as when it comes on screen again. */
   allow(page: number): void {
     this.refusedPages.delete(page);
+    this.failedPages.delete(page);
   }
 
   get size(): number {
@@ -309,7 +322,10 @@ export class TextStore {
         if (text) {
           this.pages.set(page, text);
           this.chars += text.chars.length;
+          this.failedPages.delete(page);
           this.trim(page);
+        } else {
+          this.failedPages.add(page);
         }
         return text;
       });
@@ -330,6 +346,7 @@ export class TextStore {
     this.pages.clear();
     this.pending.clear();
     this.refusedPages.clear();
+    this.failedPages.clear();
     this.chars = 0;
   }
 

@@ -1,0 +1,20 @@
+{
+  "comment": "The tools that `tauri build` or `tauri bundle` downloads to make an AppImage, pinned. The bundler of Tauri downloads them without a check and takes whatever is at the address, one of them from a release called 'continuous' that is replaced all the time. scripts/linux-tools.mjs puts these files, checked against the SHA-256 here, into the folder where the bundler looks first, so that it downloads nothing. The files are made for x86_64. To update one: download it, read what changed, compute the SHA-256 yourself, and change it here. 'file' is the name the bundler looks for (tauri-bundler, bundle/linux/appimage/linuxdeploy.rs). The two script plugins of the bundler (gtk and gstreamer) are inside the Tauri CLI and are not downloaded.",
+  "tools": [
+    {
+      "file": "AppRun-x86_64",
+      "url": "https://github.com/tauri-apps/binary-releases/releases/download/apprun-old/AppRun-x86_64",
+      "sha256": "f30140a43a0a59e46db21bdefdf749b9e9f2c6946e92afabbacf98b8ae73fb4f"
+    },
+    {
+      "file": "linuxdeploy-07333c6-x86_64.AppImage",
+      "url": "https://github.com/tauri-apps/binary-releases/releases/download/linuxdeploy-07333c6/linuxdeploy-x86_64.AppImage",
+      "sha256": "36a2d7e274d12e1050d0e9ecfe11d339ed54720b2bec464c286d53f8b07f5c62"
+    },
+    {
+      "file": "linuxdeploy-plugin-appimage.AppImage",
+      "url": "https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous/linuxdeploy-plugin-appimage-x86_64.AppImage",
+      "sha256": "49d6a17160675a6bd1781699aae6bdf7692d98552e02a3671d2183d10547842e"
+    }
+  ]
+}

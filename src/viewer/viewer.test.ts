@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MARGIN, PAGE_GAP } from "./layout";
-import { DocumentView, type ViewerApi, type ViewerEvents, type ViewerOptions } from "./viewer";
+import { DocumentView, MAX_MOUNTED_PAGES, type ViewerApi, type ViewerEvents, type ViewerOptions } from "./viewer";
 
 const VIEWPORT = { width: 900, height: 800 };
 const letter = { width: 612, height: 792 };
@@ -89,6 +89,28 @@ const mountedPages = (view: DocumentView) =>
   [...view.element.querySelectorAll<HTMLElement>(".viewer-page")].map((el) => Number(el.dataset.page));
 
 describe("DocumentView", () => {
+  it("creates elements for a fixed number of pages at most, those nearest the middle of the window", async () => {
+    // Pages one point high: thousands fit in the window.
+    const sliver = { width: 612, height: 1 };
+    const api: ViewerApi = { render: (_d, _p, w, h) => Promise.resolve(new ArrayBuffer(w * h * 4)) };
+    const events = { onPageChange: vi.fn(), onZoomChange: vi.fn(), onFatal: vi.fn(), onFirstPaint: vi.fn() };
+    const view = new DocumentView({ doc: 7, pages: Array.from({ length: 5000 }, () => sliver) }, api, events);
+    document.body.append(view.element);
+    view.start();
+    await flush();
+    const pages = mountedPages(view).sort((a, b) => a - b);
+    expect(pages).toHaveLength(MAX_MOUNTED_PAGES);
+    // They are next to each other, and the window is inside them.
+    expect(pages[pages.length - 1] - pages[0]).toBe(MAX_MOUNTED_PAGES - 1);
+    // Further down, the middle of the window moves and so do the pages.
+    view.element.scrollTop = 40_000;
+    view.element.dispatchEvent(new Event("scroll"));
+    await flush();
+    const later = mountedPages(view).sort((a, b) => a - b);
+    expect(later).toHaveLength(MAX_MOUNTED_PAGES);
+    expect(later[0]).toBeGreaterThan(pages[pages.length - 1]);
+  });
+
   it("creates elements only for the pages near the viewport", async () => {
     const { view, render } = open(500);
     await flush();
