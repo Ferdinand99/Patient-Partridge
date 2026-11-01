@@ -2525,6 +2525,7 @@ version = "0.0.0"
 dependencies = [
  "partridge-engine-client",
  "partridge-protocol",
+ "partridge-testkit",
  "serde",
  "serde_json",
  "tauri",

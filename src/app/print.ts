@@ -106,6 +106,8 @@ export interface PrintProgress {
 }
 
 export class PrintJob {
+  /** The document whose pages are in this job, or null when no pictures are kept. */
+  document: number | null = null;
   private urls: string[] = [];
   private cancelled = false;
   private afterPrint: (() => void) | null = null;
@@ -128,6 +130,7 @@ export class PrintJob {
     }
     for (const url of this.urls) this.deps.revokeUrl(url);
     this.urls = [];
+    this.document = null;
     this.root.replaceChildren();
   }
 
@@ -143,6 +146,7 @@ export class PrintJob {
   ): Promise<PrintOutcome> {
     this.cleanup();
     this.cancelled = false;
+    this.document = doc;
     onProgress({ done: 0, total: indices.length });
     try {
       for (let i = 0; i < indices.length; i++) {
@@ -226,8 +230,16 @@ export function showPrintDialog(
     group.className = "print-choices";
     group.setAttribute("role", "radiogroup");
     group.setAttribute("aria-label", "Pages to print");
+    // A job holds a limited number of pages. A longer document is not offered as "all": the
+    // choice says how many pages it really prints.
+    const tooLong = options.pageCount > MAX_PRINT_PAGES;
     const choices: { value: "all" | "current" | "range"; label: string }[] = [
-      { value: "all", label: `All ${pagesWord(options.pageCount)}` },
+      {
+        value: "all",
+        label: tooLong
+          ? `The first ${MAX_PRINT_PAGES} of ${options.pageCount} pages`
+          : `All ${pagesWord(options.pageCount)}`,
+      },
       { value: "current", label: `This page (page ${options.currentPage + 1})` },
       { value: "range", label: "Pages" },
     ];
@@ -257,6 +269,12 @@ export function showPrintDialog(
     const problem = document.createElement("p");
     problem.className = "sheet-error";
     problem.setAttribute("role", "alert");
+    if (tooLong) {
+      const limit = document.createElement("p");
+      limit.className = "sheet-text";
+      limit.textContent = `A print job holds at most ${MAX_PRINT_PAGES} pages, so the rest of the document is not printed with this choice. Choose Pages to print other parts, one job after the other.`;
+      box.append(limit);
+    }
     box.append(group, range, problem);
 
     const updateRange = () => {

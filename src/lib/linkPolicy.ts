@@ -58,6 +58,45 @@ export function classifyUri(uri: string): LinkVerdict {
   return { kind: "web", url: url.href, host: url.hostname };
 }
 
+/**
+ * An address from a document as it is shown to the reader before it is known to be safe: control
+ * characters and the characters that turn text around (bidirectional marks) are written out as
+ * \u{...}, so they cannot make the address read as something else.
+ */
+export function visibleAddress(text: string): string {
+  let out = "";
+  for (const ch of text) {
+    const n = ch.codePointAt(0) ?? 0;
+    const hidden =
+      n < 0x20 ||
+      (n >= 0x7f && n <= 0x9f) ||
+      n === 0x061c ||
+      n === 0x200e ||
+      n === 0x200f ||
+      (n >= 0x202a && n <= 0x202e) ||
+      (n >= 0x2066 && n <= 0x2069);
+    out += hidden ? `\\u{${n.toString(16).toUpperCase()}}` : ch;
+  }
+  return out;
+}
+
+/** Most characters of a site name shown on a button or in a tooltip. */
+const MAX_SHOWN_HOST = 60;
+
+/**
+ * What to call a link on a button or in a tooltip: the site it would open, as the address parser
+ * reads it, and a plain description when it is not a web address. Only the site is named, because
+ * a long address can be made to start and end like another site. A site name that is too long to
+ * show is cut at the front, since its end tells the site. The question before a link is opened
+ * shows the whole address.
+ */
+export function describeLink(uri: string): string {
+  const verdict = classifyUri(uri);
+  if (verdict.kind !== "web") return "not a web address, not opened";
+  const host = verdict.host;
+  return host.length > MAX_SHOWN_HOST ? `…${host.slice(-MAX_SHOWN_HOST)}` : host;
+}
+
 /** A short form of an address for a button or a tooltip. The full address is always shown in the question. */
 export function shortAddress(url: string, max = 60): string {
   if (url.length <= max) return url;

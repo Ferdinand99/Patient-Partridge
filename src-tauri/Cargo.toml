@@ -29,3 +29,7 @@ tauri-plugin-single-instance = "=2.5.5"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
 url = "=2.5.8"
+
+[dev-dependencies]
+# The test kit makes PDF files for the tests that run real engines.
+partridge-testkit = { path = "../crates/testkit" }

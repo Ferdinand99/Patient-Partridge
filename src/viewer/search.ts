@@ -13,6 +13,19 @@ export interface SearchMatch {
 /** Longest search text, in characters. The engine takes at most 256 bytes. */
 export const MAX_QUERY_CHARS = 64;
 
+/** Most matches the engine gives for one page (the same number as in the engine). */
+export const MAX_MATCHES_PER_PAGE = 2000;
+
+/**
+ * Most matches kept for one search in one document. A search for a common letter in a long file
+ * would otherwise keep millions of matches and make the window slow. The search stops when it gets
+ * here, and the find bar says so.
+ */
+export const MAX_SEARCH_MATCHES = 20_000;
+
+/** What cut a search short: the total above, or a page that has more matches than the engine gives. */
+export type SearchLimit = "total" | "page" | null;
+
 /** Asks the engine for the matches on one page: pairs of start and length. */
 export type PageSearch = (page: number, query: string) => Promise<[number, number][]>;
 
@@ -26,6 +39,8 @@ export interface SearchOptions {
   onUpdate(): void;
   /** The search could not go on (the engine stopped, for example). */
   onError(error: unknown): void;
+  /** Most matches to keep before the search stops. */
+  maxMatches?: number;
 }
 
 /** Trims a search text and cuts it to what is allowed. Returns null when nothing is left. */
@@ -41,6 +56,10 @@ export class SearchSession {
   private cancelled = false;
   private finished = false;
   private failed = false;
+  private stopped = false;
+  private total = 0;
+  private hitTotal = false;
+  private hitPage = false;
   private ordered: SearchMatch[] | null = null;
 
   constructor(private readonly options: SearchOptions) {
@@ -66,7 +85,12 @@ export class SearchSession {
   }
 
   get running(): boolean {
-    return !this.finished && !this.cancelled && !this.failed;
+    return !this.finished && !this.cancelled && !this.failed && !this.stopped;
+  }
+
+  /** Why the result may be incomplete, or null when nothing was cut. */
+  get limit(): SearchLimit {
+    return this.hitTotal ? "total" : this.hitPage ? "page" : null;
   }
 
   /** The matches found so far, in reading order. */
@@ -102,9 +126,16 @@ export class SearchSession {
       try {
         const found = await this.options.search(page, this.query);
         if (this.cancelled) return;
+        if (found.length >= MAX_MATCHES_PER_PAGE) this.hitPage = true;
         if (found.length > 0) {
-          this.found.set(page, found);
-          this.ordered = null;
+          const room = (this.options.maxMatches ?? MAX_SEARCH_MATCHES) - this.total;
+          const kept = found.length > room ? found.slice(0, Math.max(room, 0)) : found;
+          if (kept.length < found.length) this.hitTotal = true;
+          if (kept.length > 0) {
+            this.found.set(page, kept);
+            this.total += kept.length;
+            this.ordered = null;
+          }
         }
       } catch (error) {
         if (this.cancelled) return;
@@ -113,6 +144,15 @@ export class SearchSession {
         return;
       }
       this.searched += 1;
+      // At the total there is no point in going on: more would only be thrown away.
+      if (this.total >= (this.options.maxMatches ?? MAX_SEARCH_MATCHES) && step + 1 < pageCount) {
+        this.hitTotal = true;
+      }
+      if (this.hitTotal) {
+        this.stopped = true;
+        this.options.onUpdate();
+        return;
+      }
       this.options.onUpdate();
     }
     this.finished = true;

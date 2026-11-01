@@ -150,3 +150,32 @@ fn text_requests_go_to_the_right_document() {
         ErrorCode::UnknownDocument
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn letting_go_of_every_document_frees_the_pool_for_new_ones() {
+    // A reload of the window loses the window's list of documents, while the engines go on. The
+    // app then calls `kill_all`; after that all the room is there again.
+    let a = kit::TempFile::new("a.pdf", &kit::simple_pdf(1));
+    let pool = pool(2);
+    let (one, _) = pool.open(&a.path_str(), None).unwrap();
+    let (two, _) = pool.open(&a.path_str(), None).unwrap();
+    let pids = [pool.pid(one).unwrap(), pool.pid(two).unwrap()];
+    assert_eq!(
+        code_of(pool.open(&a.path_str(), None).unwrap_err()),
+        ErrorCode::InvalidRequest
+    );
+
+    pool.kill_all();
+    assert!(pool.is_empty());
+    assert!(pids.iter().all(|pid| !alive(*pid)));
+    // The old handles are dead for good, and new documents get new handles.
+    assert_eq!(
+        code_of(pool.render(one, 0, 30, 40).unwrap_err()),
+        ErrorCode::UnknownDocument
+    );
+    let (three, _) = pool.open(&a.path_str(), None).unwrap();
+    let (four, _) = pool.open(&a.path_str(), None).unwrap();
+    assert!(three > two && four > three);
+    assert!(pool.render(three, 0, 30, 40).is_ok());
+}

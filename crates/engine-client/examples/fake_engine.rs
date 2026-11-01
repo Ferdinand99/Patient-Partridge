@@ -82,6 +82,17 @@ fn main() {
                     let _ = write_frame(&mut output, &vec![0u8; 10 * 1024 * 1024]);
                 }
                 "wrong-id" => reply(&mut output, id + 1, opened()),
+                "bad-page-size" => reply(
+                    &mut output,
+                    id,
+                    ResponseBody::Opened {
+                        doc: 1,
+                        pages: vec![PageSize {
+                            width: f32::NAN,
+                            height: 792.0,
+                        }],
+                    },
+                ),
                 "hang" => std::thread::sleep(std::time::Duration::from_secs(3600)),
                 _ => reply(&mut output, id, opened()),
             },

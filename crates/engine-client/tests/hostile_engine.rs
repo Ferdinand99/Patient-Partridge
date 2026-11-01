@@ -85,6 +85,12 @@ fn an_answer_with_the_wrong_id_is_refused() {
 }
 
 #[test]
+fn a_page_size_that_is_not_a_size_is_refused() {
+    let client = client_with("bad-page-size", &[]);
+    assert_stopped(client.open("a.pdf", None), "not a size");
+}
+
+#[test]
 fn a_bitmap_of_the_wrong_size_is_refused() {
     let client = client_with("wrong-size", &[]);
     let doc = client.open("a.pdf", None).unwrap();
