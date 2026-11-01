@@ -4,13 +4,15 @@ PDFium is the main attack surface of Patient Partridge: it parses files from peo
 
 ## How you find out
 
-The workflow "PDFium update check" (`.github/workflows/pdfium-update.yml`) runs every Monday and can be started by hand from the Actions tab. It reads `build` in `pdfium.lock.json` and compares it with the latest release of bblanchon/pdfium-binaries.
+The workflow "PDFium update check" (`.github/workflows/pdfium-update.yml`) runs on Tuesday and Friday and can be started by hand from the Actions tab. It reads `build` in `pdfium.lock.json` and compares it with the latest release of bblanchon/pdfium-binaries. Upstream publishes about once a week, mostly on Monday, so a release is seen within a few days.
 
-- If the latest release is newer, the workflow opens **one issue** titled `PDFium update available: chromium/NNNN`. It does not open a second one for the same release, also not when the first issue is closed (closing it is how you say "skip this build"). The next release gets a new issue.
+- There is **at most one open issue** about this, titled `PDFium update available: chromium/NNNN`. When a newer release appears and an issue is open, the workflow changes that issue's title and text to the newest build instead of opening another one. It opens a new issue only when none is open.
+- Closing the issue means "skip this build": the workflow does not open an issue again for the same build. The next, newer build gets a new issue.
 - If it can not read the release list, or the latest tag does not look like `chromium/NNNN`, the run fails. A failed scheduled run is visible in the Actions tab and in the notification mail.
 - It also fails when `pdfium.lock.json` and the `pdfium_NNNN` feature in `crates/engine/Cargo.toml` name different builds. The two must always match. A unit test (`scripts/pdfium-update-check.test.mjs`) checks the same.
+- **GitHub switches off scheduled workflows in a public repository after 60 days without repository activity.** A quiet project would then stop getting these warnings without any message. Check the Actions tab now and then, and start the workflow by hand after a long quiet time (this also re-enables it).
 
-The workflow has read-only rights. Only its last job, which opens the issue, has `issues: write`, and nothing else.
+The workflow has read-only rights. Only its last job, which opens or updates the issue, has `issues: write`, and nothing else. The issue text is built only from a release tag that matched `chromium/<digits>`, numbers and a plain version number; everything else from the network is left out and never put into a shell command.
 
 ## Update steps
 
@@ -28,7 +30,7 @@ The workflow has read-only rights. Only its last job, which opens the issue, has
    - The engine tests run against the real library.
    - The build job opens a generated 500-page PDF with the release build.
    - The build job unpacks the real installers and checks that the shipped library has no V8.
-6. **Merge, then close the issue.** The pull request can say `Closes #N`.
+6. **Merge, then close the issue.** The pull request can say `Closes #N`. If you do not update, closing the issue skips that build only.
 
 ## What the V8 check does
 

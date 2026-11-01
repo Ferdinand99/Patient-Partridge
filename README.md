@@ -73,7 +73,7 @@ Please read this before you open files from people you do not trust.
 - **The engine is not sandboxed by the operating system yet.** Being in a separate process protects the app from crashes and hangs, but it is not a security boundary. If an attacker finds a bug in PDFium and builds a PDF that exploits it, the code would run with your user rights: it could read your files and use the network, even though the engine's own code never does. A real sandbox (restricted rights per operating system) is planned and is a requirement for the first release.
 - "No network" means that the engine's code contains none, which CI checks. It does not mean the operating system blocks the engine from the network.
 - What the engine does have today: a limit on the memory it may use (3 GiB on Linux and Windows, none on macOS), it ends when the app ends (even when stuck inside PDFium), the app treats everything it receives from the engine as untrusted, and PDFium is loaded only from the app's own folder after a checksum check at build time.
-- PDFium is the main attack surface. It is pinned to one release and updated by hand ([steps](docs/pdfium-updates.md)); a weekly workflow opens an issue when a newer release exists, and CI checks that the library that ships has no JavaScript engine (V8).
+- PDFium is the main attack surface. It is pinned to one release and updated by hand ([steps](docs/pdfium-updates.md)); a workflow that runs twice a week keeps one issue open while a newer release exists, and CI checks that the library that ships has no JavaScript engine (V8).
 
 ## Building from source
 

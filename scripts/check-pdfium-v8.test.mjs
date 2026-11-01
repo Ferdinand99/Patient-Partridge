@@ -41,10 +41,17 @@ describe("checkPaths", () => {
   });
   it("fails a library with V8", () => {
     const dir = folder();
-    writeFileSync(join(dir, "pdfium.dll"), "?x@v8@@");
+    writeFileSync(join(dir, "pdfium.dll"), "FPDF_InitLibrary?x@v8@@");
     const problems = checkPaths([dir]);
     expect(problems).toHaveLength(1);
     expect(problems[0]).toContain("contains V8");
+  });
+  it("fails an empty or foreign file named like the library", () => {
+    const dir = folder();
+    writeFileSync(join(dir, "pdfium.dll"), "");
+    const problems = checkPaths([dir]);
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("does not look like a PDFium library");
   });
   it("fails when no library is there", () => {
     const dir = folder();
@@ -53,7 +60,7 @@ describe("checkPaths", () => {
   });
   it("only counts the known library names", () => {
     const dir = folder();
-    writeFileSync(join(dir, "libpdfium.so"), "x");
+    writeFileSync(join(dir, "libpdfium.so"), "FPDF_InitLibrary");
     writeFileSync(join(dir, "libother.so"), "x");
     expect(findLibraries(dir)).toHaveLength(1);
   });

@@ -13,6 +13,7 @@
 import { appendFileSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isMain } from "./is-main.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const TAG = /^chromium\/(\d+)$/;
@@ -44,11 +45,19 @@ export function compare(lock, latestTag, cargoToml) {
   };
 }
 
+/** A plain version number such as 0.9.5. Anything else from the network is left out. */
+export function plainVersion(text) {
+  return typeof text === "string" && /^\d{1,4}\.\d{1,4}\.\d{1,4}$/.test(text) ? text : null;
+}
+
 export function issueTitle(latestTag) {
   return `PDFium update available: ${latestTag}`;
 }
 
-/** Text of the issue. Built only from checked values (numbers and a tag that matches TAG). */
+/**
+ * Text of the issue. Built only from checked values: numbers, a tag that matches TAG, and a
+ * crate version that matches plainVersion. Nothing else from the network gets in.
+ */
 export function issueBody(result, lock, crate) {
   const { current, latest, latestTag } = result;
   const lines = [
@@ -57,10 +66,11 @@ export function issueBody(result, lock, crate) {
     `- Pinned in \`pdfium.lock.json\`: build ${current} (\`${lock.release}\`)`,
     `- Latest release: build ${latest} (\`${latestTag}\`), https://github.com/${lock.repository}/releases/tag/${latestTag}`,
   ];
-  if (crate) {
-    const newest = crate.newestFeature;
+  const crateVersion = crate ? plainVersion(crate.version) : null;
+  if (crate && crateVersion) {
+    const newest = Number.isSafeInteger(crate.newestFeature) ? crate.newestFeature : null;
     lines.push(
-      `- pdfium-render ${crate.version} has features up to build ${newest ?? "unknown"}` +
+      `- pdfium-render ${crateVersion} has features up to build ${newest ?? "unknown"}` +
         (newest !== null && newest < latest
           ? `. It has no feature for build ${latest} yet: check that the library still works with the newest feature, or wait for a new pdfium-render.`
           : "."),
@@ -135,7 +145,7 @@ async function main() {
   if (!result.featureMatchesLock) process.exit(1);
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+if (isMain(import.meta.url)) {
   main().catch((error) => {
     console.error(`ERROR: ${error.message}`);
     process.exit(1);

@@ -7,7 +7,8 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { downloadUrl, findV8Markers, libraryFor, platformId, readTgz, sha256Hex, verifyChecksum } from "./pdfium.mjs";
+import { isMain } from "./is-main.mjs";
+import { downloadUrl, findV8Markers, libraryFor, looksLikePdfium, platformId, readTgz, sha256Hex, verifyChecksum } from "./pdfium.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -49,6 +50,7 @@ export async function fetchPdfium(id = platformId()) {
   // The lock pins an asset name only. A V8 build ("pdfium-v8-...") has the checksum of whatever
   // was pinned, so look inside: PDF JavaScript must stay off, and a library without V8 is the
   // way to be sure.
+  if (!looksLikePdfium(files.get(lib.inArchive))) throw new Error(`${entry.asset} has no PDFium library (no FPDF_InitLibrary). Nothing was unpacked.`);
   const v8 = findV8Markers(files.get(lib.inArchive));
   if (v8.length > 0) throw new Error(`${entry.asset} contains the V8 JavaScript engine (${v8.join(", ")}). Nothing was unpacked.`);
   mkdirSync(target, { recursive: true });
@@ -63,7 +65,7 @@ export async function fetchPdfium(id = platformId()) {
   return target;
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+if (isMain(import.meta.url)) {
   fetchPdfium(process.argv[2]).catch((e) => {
     console.error(e.message);
     process.exit(1);

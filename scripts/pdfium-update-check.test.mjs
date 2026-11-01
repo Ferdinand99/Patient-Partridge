@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { buildOfTag, compare, featureOf, issueBody, issueTitle } from "./pdfium-update-check.mjs";
+import { buildOfTag, compare, featureOf, issueBody, issueTitle, plainVersion } from "./pdfium-update-check.mjs";
 
 const lock = JSON.parse(readFileSync(new URL("../pdfium.lock.json", import.meta.url), "utf8"));
 const cargo = readFileSync(new URL("../crates/engine/Cargo.toml", import.meta.url), "utf8");
@@ -44,6 +44,13 @@ describe("compare", () => {
   });
 });
 
+describe("plainVersion", () => {
+  it("accepts a plain version", () => expect(plainVersion("0.9.5")).toBe("0.9.5"));
+  it.each(["0.9.5-beta", "1.2", "@everyone", "1.2.3\n[x](http://evil)", "", null, 5])("drops %s", (v) => {
+    expect(plainVersion(v)).toBeNull();
+  });
+});
+
 describe("the issue", () => {
   const result = compare(lock, `chromium/${lock.build + 50}`, cargo);
   it("has the tag in the title, so a later run can find it", () => {
@@ -53,6 +60,11 @@ describe("the issue", () => {
     const body = issueBody(result, lock, null);
     expect(body).toContain(`releases/tag/chromium/${lock.build + 50}`);
     expect(body).toContain("docs/pdfium-updates.md");
+  });
+  it("leaves out a crate version that is not a plain version", () => {
+    const body = issueBody(result, lock, { version: "9.9.9 @everyone", newestFeature: 1 });
+    expect(body).not.toContain("everyone");
+    expect(body).not.toContain("pdfium-render");
   });
   it("tells when pdfium-render has no feature for the new build yet", () => {
     const body = issueBody(result, lock, { version: "0.9.5", newestFeature: lock.build });

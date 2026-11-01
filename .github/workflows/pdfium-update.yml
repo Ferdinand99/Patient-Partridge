@@ -1,11 +1,12 @@
-# Looks once a week for a newer PDFium build than the one pinned in pdfium.lock.json, and opens
-# one issue when there is one. PDFium is the main attack surface of the app, so a new release
-# must not go unnoticed. The steps to update are in docs/pdfium-updates.md.
+# Looks twice a week for a newer PDFium build than the one pinned in pdfium.lock.json, and keeps
+# ONE open issue about it. PDFium is the main attack surface of the app, so a new release must not
+# go unnoticed, and a reminder that repeats every week would be ignored. The steps to update are in
+# docs/pdfium-updates.md.
 name: PDFium update check
 
 on:
   schedule:
-    - cron: "41 5 * * 1"
+    - cron: "41 8 * * 2,5"
   workflow_dispatch:
 
 # No rights by default. The two jobs below ask for exactly what they need.
@@ -37,7 +38,7 @@ jobs:
         run: node scripts/pdfium-update-check.mjs
 
   report:
-    name: Open an issue
+    name: Open or update the issue
     needs: check
     if: needs.check.outputs.outdated == 'true'
     runs-on: ubuntu-24.04
@@ -45,19 +46,37 @@ jobs:
     permissions:
       issues: write
     steps:
-      # One issue per release: the title names the release, and an issue with that title in any
-      # state (also a closed one: the owner decided to skip it) stops a second one.
-      - name: Open the issue unless it exists
+      # One open issue at a time. The title and body come from the previous job, which builds them
+      # only from a tag that matched chromium/<digits> and from numbers. They are still treated as
+      # data: they reach this script through environment variables only and are never put into the
+      # shell text, and nothing from the release itself is used.
+      #   - An open issue with the prefix exists: its title and body are replaced by the newest
+      #     build. No new issue.
+      #   - None is open, but an issue with exactly this title exists (closed): the owner decided to
+      #     skip this build. Nothing is opened.
+      #   - Otherwise a new issue is opened.
+      - name: Open or update the issue
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TITLE: ${{ needs.check.outputs.title }}
           BODY: ${{ needs.check.outputs.body }}
         run: |
-          existing=$(gh issue list --state all --limit 100 --search "\"$TITLE\" in:title" --json number,title \
-            --jq "[.[] | select(.title == env.TITLE)] | length")
-          if [ "$existing" != "0" ]; then
-            echo "An issue for this release exists already: $TITLE"
+          open_json=$(gh issue list --state open --limit 100 --search '"PDFium update available:" in:title' --json number,title)
+          open_number=$(printf '%s' "$open_json" | jq -r '[.[] | select(.title | startswith("PDFium update available:"))] | sort_by(.number) | reverse | .[0].number // empty')
+          if [ -n "$open_number" ]; then
+            open_title=$(printf '%s' "$open_json" | jq -r --argjson n "$open_number" '.[] | select(.number == $n) | .title')
+            if [ "$open_title" = "$TITLE" ]; then
+              echo "Issue #$open_number is open and already names this build."
+            else
+              gh issue edit "$open_number" --title "$TITLE" --body "$BODY"
+              echo "Updated issue #$open_number to: $TITLE"
+            fi
+            exit 0
+          fi
+          skipped=$(gh issue list --state closed --limit 100 --search '"PDFium update available:" in:title' --json title --jq '[.[] | select(.title == env.TITLE)] | length')
+          if [ "$skipped" != "0" ]; then
+            echo "An issue for this build was closed: it is skipped. $TITLE"
             exit 0
           fi
           gh issue create --title "$TITLE" --body "$BODY"

@@ -84,3 +84,8 @@ export const V8_MARKERS = ["_ZN2v8", "@v8@", "v8::", "V8Flags"];
 export function findV8Markers(library) {
   return V8_MARKERS.filter((marker) => library.includes(marker));
 }
+
+/** A real PDFium library exports FPDF_InitLibrary (the plain builds of all three systems do). */
+export function looksLikePdfium(library) {
+  return library.includes("FPDF_InitLibrary");
+}

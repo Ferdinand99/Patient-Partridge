@@ -10,8 +10,8 @@
 
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
-import { fileURLToPath } from "node:url";
-import { findV8Markers } from "./pdfium.mjs";
+import { isMain } from "./is-main.mjs";
+import { findV8Markers, looksLikePdfium } from "./pdfium.mjs";
 
 const LIBRARY_NAMES = new Set(["libpdfium.so", "libpdfium.dylib", "pdfium.dll"]);
 
@@ -30,14 +30,16 @@ export function checkPaths(paths) {
   if (libraries.length === 0) return [`No PDFium library found in: ${paths.join(", ")}`];
   const problems = [];
   for (const library of libraries) {
-    const found = findV8Markers(readFileSync(library));
-    if (found.length > 0) problems.push(`${library} contains V8 (${found.join(", ")})`);
+    const bytes = readFileSync(library);
+    const found = findV8Markers(bytes);
+    if (!looksLikePdfium(bytes)) problems.push(`${library} does not look like a PDFium library (it has no FPDF_InitLibrary)`);
+    else if (found.length > 0) problems.push(`${library} contains V8 (${found.join(", ")})`);
     else console.log(`${library}: no V8`);
   }
   return problems;
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+if (isMain(import.meta.url)) {
   const paths = process.argv.slice(2);
   if (paths.length === 0) {
     console.error("Usage: node scripts/check-pdfium-v8.mjs <folder or library file>...");
