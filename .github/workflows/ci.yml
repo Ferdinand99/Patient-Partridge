@@ -1,0 +1,197 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Pull requests are checked by the pull_request event only, so a push to a PR branch runs CI
+# once. A newer push cancels the older run.
+concurrency:
+  group: ci-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            os: ubuntu-latest
+            lint: true
+          - name: windows
+            os: windows-latest
+            lint: false
+          - name: macos
+            os: macos-latest
+            lint: false
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install Tauri Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libssl-dev pkg-config
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: ${{ matrix.name }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+      # The engine tests run the real PDFium library. The download is checked against the
+      # checksum pinned in pdfium.lock.json before it is unpacked.
+      - name: Fetch PDFium
+        run: node scripts/fetch-pdfium.mjs
+      # The tauri crate embeds ../dist at compile time; a stub is enough for lint and tests.
+      - name: Create stub dist/
+        run: |
+          mkdir -p dist
+          echo '<!doctype html><title>stub</title>' > dist/index.html
+      - name: Format
+        if: matrix.lint
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        if: matrix.lint
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: The engine has no network code, the app does not link PDFium
+        if: matrix.lint
+        run: scripts/check-engine-deps.sh
+
+  frontend:
+    name: Frontend (typecheck, lint, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+
+  build:
+    name: Build (${{ matrix.name }})
+    needs: [rust, frontend]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            os: ubuntu-latest
+            bundles: deb
+          - name: windows
+            os: windows-latest
+            bundles: msi,nsis
+          - name: macos
+            os: macos-latest
+            bundles: app,dmg
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install Tauri Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libssl-dev pkg-config xvfb
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: build-${{ matrix.name }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # Fetches PDFium (checksum checked), builds the engine, and builds the installers with the
+      # engine and the library inside. This is a build for testing: nothing is signed or released.
+      - name: Build installers
+        run: npm run bundle -- --bundles ${{ matrix.bundles }} -- --locked
+
+      - name: Collect installers
+        run: |
+          mkdir -p out
+          find target/release/bundle -type f \( -name '*.msi' -o -name '*.exe' -o -name '*.dmg' -o -name '*.deb' \) -exec cp {} out/ \;
+          ls -la out
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: installers-${{ matrix.name }}
+          path: out/*
+          if-no-files-found: error
+
+      # Runs the built app on a generated 500-page PDF. It must draw the first page; this proves
+      # that the engine, the PDFium library and the app policy work together in a release build.
+      - name: Make a test PDF
+        run: cargo run --release --locked -p partridge-testkit --bin make-pdf -- 500 "$RUNNER_TEMP/test-500.pdf"
+      - name: Open the PDF in the release build
+        run: |
+          BIN=target/release/patient-partridge
+          [ "$RUNNER_OS" = "Windows" ] && BIN=target/release/patient-partridge.exe
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            xvfb-run -a node scripts/smoke.mjs --bin "$BIN" --pdf "$RUNNER_TEMP/test-500.pdf" --runs 3 --memory | tee smoke.txt
+          else
+            node scripts/smoke.mjs --bin "$BIN" --pdf "$RUNNER_TEMP/test-500.pdf" --runs 3 --memory | tee smoke.txt
+          fi
+          {
+            echo "### Open a 500-page PDF (${{ matrix.name }})"
+            echo
+            echo '```'
+            cat smoke.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The desktop file must pass the file to the app (%F) and end its MimeType list with ';',
+      # or opening a PDF from a file manager starts an empty app.
+      - name: Check the Linux desktop entry
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p "$RUNNER_TEMP/deb"
+          dpkg-deb -x out/*.deb "$RUNNER_TEMP/deb"
+          f=$(find "$RUNNER_TEMP/deb" -name '*.desktop' | head -n1)
+          cat "$f"
+          grep -q '^Exec=.* %F$' "$f"
+          grep -q '^MimeType=application/pdf;$' "$f"
+
+      - name: Installer sizes
+        if: always()
+        run: |
+          {
+            echo "### Installer sizes (${{ matrix.name }})"
+            echo
+            echo "| File | MiB |"
+            echo "|---|---:|"
+            for f in out/*; do
+              [ -f "$f" ] && echo "| $(basename "$f") | $(awk -v b="$(wc -c < "$f")" 'BEGIN{printf "%.2f", b/1048576}') |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"

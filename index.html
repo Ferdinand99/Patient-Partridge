@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light" />
+    <title>Patient Partridge</title>
+  </head>
+  <body>
+    <div class="app" id="app">
+      <header class="toolbar" id="toolbar">
+        <button class="btn" id="open-button" type="button" title="Open a PDF (Ctrl+O)">Open</button>
+        <span class="toolbar-gap"></span>
+        <label class="page-box">
+          <span class="visually-hidden">Page number</span>
+          <input id="page-input" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" size="4" disabled />
+          <span id="page-total" class="page-total"></span>
+        </label>
+        <span class="toolbar-gap"></span>
+        <button class="btn btn-icon" id="zoom-out" type="button" title="Zoom out (Ctrl+-)" aria-label="Zoom out" disabled>&minus;</button>
+        <label class="zoom-box">
+          <span class="visually-hidden">Zoom</span>
+          <select id="zoom-select" disabled></select>
+        </label>
+        <button class="btn btn-icon" id="zoom-in" type="button" title="Zoom in (Ctrl++)" aria-label="Zoom in" disabled>+</button>
+      </header>
+      <main class="stage" id="stage">
+        <div class="empty" id="empty">
+          <h1>Patient Partridge</h1>
+          <p>Drop a PDF file here, or</p>
+          <button class="btn btn-primary" id="empty-open" type="button">Open a PDF</button>
+          <p class="hint">Ctrl+O opens a file. Page Down, Space and the arrow keys scroll.</p>
+        </div>
+        <div class="drop-overlay" id="drop-overlay" hidden><span>Drop a PDF to open it</span></div>
+      </main>
+      <div class="notice-layer" id="notice-layer" hidden></div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

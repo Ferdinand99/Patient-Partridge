@@ -1,0 +1,11 @@
+[package]
+name = "partridge-engine-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Starts and talks to the Patient Partridge PDF engine process and survives its crashes"
+
+[dependencies]
+partridge-protocol = { path = "../protocol" }

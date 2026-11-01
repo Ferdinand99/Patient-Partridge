@@ -1,0 +1,37 @@
+version: 2
+updates:
+  # Rust crates: one grouped PR a week for minor and patch updates;
+  # security updates come on their own as soon as an advisory is out.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types: [minor, patch]
+    commit-message:
+      prefix: "chore(deps)"
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      npm-minor-patch:
+        update-types: [minor, patch]
+    commit-message:
+      prefix: "chore(deps)"
+  - package-ecosystem: github-actions
+    directory: /
+    ignore:
+      # Its tag picks the Rust version (rust-toolchain@1.99); a "newer tag"
+      # is a different toolchain, not an update of the action.
+      - dependency-name: dtolnay/rust-toolchain
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"

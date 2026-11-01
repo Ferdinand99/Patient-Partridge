@@ -1,0 +1,22 @@
+# Cargo
+target
+**/*.rs.bk
+*.pdb
+**/mutants.out*/
+rustc-ice-*.txt
+
+# Node
+node_modules
+dist
+coverage
+*.log
+
+# Tauri
+src-tauri/gen/schemas
+src-tauri/binaries
+src-tauri/tauri.bundle.generated.conf.json
+
+# PDFium binaries are fetched and checked by scripts/fetch-pdfium.mjs
+vendor
+
+.DS_Store
