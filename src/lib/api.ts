@@ -65,9 +65,7 @@ export interface UpdateFailure {
   enginesStopped: boolean;
 }
 
-export type UpdateEvent =
-  | { event: "progress"; chunk: number; total: number | null }
-  | { event: "installing" };
+export type UpdateEvent = { event: "progress"; chunk: number; total: number | null };
 
 interface OpenedWire {
   doc: number;
@@ -182,13 +180,27 @@ export const api = {
   },
 
   /**
-   * Downloads and installs the update the last check found. `paths` are the open documents, to be
-   * opened again after the restart. On Windows the app ends when the installer starts.
+   * Downloads the update the last check found, with progress, and checks it against the public key.
+   * Nothing about the running app changes: the engines and the open files are not touched.
    */
-  async installUpdate(paths: string[], onEvent: (event: UpdateEvent) => void): Promise<void> {
+  async downloadUpdate(onEvent: (event: UpdateEvent) => void): Promise<void> {
     const channel = new Channel<UpdateEvent>();
     channel.onmessage = onEvent;
-    await invoke<void>("install_update", { paths, onEvent: channel });
+    await invoke<void>("download_update", { onEvent: channel });
+  },
+
+  /**
+   * Installs the downloaded update: the app stops the engines, writes down the files that are open
+   * at that moment (it knows them itself), and replaces the program. `active` is the file in view,
+   * which comes back first. On Windows the app ends when the installer starts.
+   */
+  async installUpdate(active: string | null): Promise<void> {
+    await invoke<void>("install_update", { active });
+  },
+
+  /** The files that were open before the last update, once. They are opened again without any limit of the file dialog. */
+  takeRestoredPaths(): Promise<string[]> {
+    return invoke<string[]>("take_restored_paths");
   },
 
   /** Starts the app again (after an update). */

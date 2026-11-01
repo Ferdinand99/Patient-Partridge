@@ -4,10 +4,10 @@ This is separate from [update signing](updates.md). Update signing (Tauri's key 
 
 ## What users see
 
-- **macOS, signed and notarised (every release):** the app opens without a warning from Gatekeeper.
+- **macOS, signed and notarised (every release):** the app should open without a warning from Gatekeeper. The signing check opens the signed app from a copy of the disk image that carries the "downloaded" mark and shows it accepted; nobody has yet tried a real download in a browser on a real Mac, which should be done once before the first release.
 - **macOS, a build that is not signed (a build for testing):** "Patient Partridge cannot be opened because the developer cannot be verified" (or "is damaged"). Right-click the app, Open, Open; or System Settings, Privacy & Security, "Open Anyway". If it says "damaged": `xattr -dr com.apple.quarantine "/Applications/Patient Partridge.app"`.
 - **Windows (not signed):** SmartScreen shows "Windows protected your PC". Click **More info**, then **Run anyway**. Updates inside the app are not affected: they are checked with the update key, not with a certificate.
-- **Linux:** no signature. The AppImage and the deb package come with the update signature and the checksums of the release.
+- **Linux:** no signature. The AppImage and the deb package come with the update signature (`.sig`) of the release, which only the app's updater uses.
 
 ## macOS
 
@@ -60,7 +60,7 @@ The PDFium library is never downloaded as a joined file: each of the two archite
 - The engine loads only the PDFium library that is in the same app, signed by the same team, so the library validation of the hardened runtime is satisfied (`com.apple.security.cs.disable-library-validation` is not needed and must not be added).
 - The app itself starts no code it generates (no JIT): the web view's JIT runs in Apple's own web content process (`allow-jit` and `allow-unsigned-executable-memory` are not needed).
 - The update check is a plain outgoing connection; `com.apple.security.network.client` only matters for apps in the App Sandbox, and this app is distributed outside the store.
-- The engine has its own sandbox profile (Seatbelt; see the sandbox work of this repository). An entitlement that loosens the hardened runtime of the engine would work against it, so an entitlement is added only with a written reason on this page and a review of the sandbox profile.
+- The engine gets a sandbox profile of its own (Seatbelt on macOS; a separate change). An entitlement that loosens the hardened runtime of the engine would work against it, so an entitlement is added only with a written reason on this page and a review of the sandbox profile.
 
 `scripts/macos-verify.sh` fails the build when any program in the app carries entitlements.
 
@@ -79,8 +79,19 @@ spctl --assess --type execute --verbose=4 "/Applications/Patient Partridge.app"
 xcrun stapler validate "/Applications/Patient Partridge.app"
 ```
 
-The disk image is not signed itself (Tauri signs and notarises the app inside it); Gatekeeper accepts the app after it is dragged out.
+The disk image is signed by Tauri, and the release build notarises it and staples the ticket to it (`scripts/release-build.mjs`: `notarytool submit --wait`, then `stapler staple`). A disk image that is signed but not notarised is "Unnotarized Developer ID" to Gatekeeper, so the check fails unless `spctl` accepts the disk image and `stapler validate` passes for both.
 
 ## Windows (not signed yet)
 
 Nothing is set up. Since June 2023 publicly trusted code signing keys must be in hardware or in a cloud service, so a downloadable `.pfx` is rare. When it is time: Azure Trusted Signing or a certificate in a cloud HSM (a `bundle.windows.signCommand` in the Tauri config), or SignPath Foundation (free signing for open source projects, approved per release). None of this is wired up. Until then Windows users see the SmartScreen warning described above; updates inside the app work the same.
+
+## Where the secrets are
+
+The update key and the Apple certificate are the most valuable secrets of the project: the first signs code for every user, the second is the team's Developer ID, shared with the other Hedgerow apps. The workflows keep them away from third-party code as far as Tauri allows:
+
+- No secret is set for a whole job. Each is set only on the step that reads it.
+- The steps that run third-party code have no secret: `npm ci`, the compile (`tauri build --no-bundle`, which runs the build scripts of every Rust dependency and the Vite build), the making of the Windows installers and the Linux packages (`tauri bundle`), and the fetching of the pinned AppImage tools.
+- One step has them, and nothing else: the "tauri script" of `tauri-action` (`scripts/release-build.mjs`). On Windows and Linux it only signs the update files with the update key. On macOS it puts the certificate into a temporary keychain, signs the PDFium library, runs `tauri bundle` (which signs the app, notarises it, and makes and signs the update archive), and notarises and staples the disk image. The Apple secrets are not set on the Windows and Linux jobs at all.
+- The preflight sets the update key only on the step that signs a test file.
+
+What cannot be split: the Tauri CLI (an npm package with a native program) holds the secrets while it signs and notarises, and `tauri-action` (pinned by hash) holds them while it uploads. That is the code that has to have them. The macOS keychain stays unlocked on the runner until the machine is thrown away, which is harmless on a GitHub-hosted runner and would not be on a self-hosted one.

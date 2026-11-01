@@ -25,6 +25,8 @@
       found: null,
       checkError: null,
       installError: null,
+      downloadError: null,
+      restored: [],
       installDelay: 0,
       restarted: 0,
       releasesPageOpened: 0,
@@ -47,6 +49,7 @@
       ["Third page", "The end of the book"],
     ],
     "/docs/second.pdf": [["Other document"], ["Its second page"]],
+    "/docs/no-ending": [["A file whose name does not end in .pdf"]],
     "/docs/rtl.pdf": [[]],
     "/docs/slivers.pdf": Array.from({ length: 5000 }, () => []),
   };
@@ -227,16 +230,23 @@
       case "check_update":
         if (state.update.checkError) throw state.update.checkError;
         return state.update.found;
-      case "install_update": {
+      case "download_update": {
         // Sends the same messages the Rust side does, through the channel the window made.
         const send = (index, message) => callbacks.get(args.onEvent.id)({ index, message });
         send(0, { event: "progress", chunk: 524288, total: 2097152 });
         await new Promise((r) => setTimeout(r, 50));
         send(1, { event: "progress", chunk: 1572864, total: 2097152 });
-        send(2, { event: "installing" });
+        if (state.update.downloadError) throw state.update.downloadError;
+        return null;
+      }
+      case "install_update":
         await new Promise((r) => setTimeout(r, state.update.installDelay));
         if (state.update.installError) throw state.update.installError;
         return null;
+      case "take_restored_paths": {
+        const list = state.update.restored;
+        state.update.restored = [];
+        return list;
       }
       case "restart_app":
         state.update.restarted += 1;

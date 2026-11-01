@@ -202,8 +202,23 @@ jobs:
       - run: npm ci
       # Fetches PDFium (checksum checked), builds the engine, and builds the installers with the
       # engine and the library inside. This is a build for testing: nothing is signed or released.
+      # The tools that make the AppImage, checked against pinned hashes (the bundler would download
+      # them without a check).
+      - name: Fetch the AppImage tools (pinned)
+        if: runner.os == 'Linux'
+        run: node scripts/linux-tools.mjs
       - name: Build installers
         run: npm run bundle -- --bundles ${{ matrix.bundles }} -- --locked
+
+      # The test driver of the update test (a Cargo feature) must not be in a build that is shipped.
+      - name: The release build has no update test driver
+        run: |
+          BIN=target/release/patient-partridge
+          [ "$RUNNER_OS" = "Windows" ] && BIN=target/release/patient-partridge.exe
+          if grep -aq PARTRIDGE_UPDATE_DRIVER "$BIN"; then
+            echo "::error::The app was built with the update-driver feature."
+            exit 1
+          fi
 
       - name: Collect installers
         run: |

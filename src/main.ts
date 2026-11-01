@@ -83,3 +83,8 @@ void getCurrentWebview().onDragDropEvent((event) => {
 // file manager, once for every file chosen).
 void listen<string[]>("open-paths", (event) => openAll(event.payload));
 void api.takePendingPaths().then(openAll);
+// The files that were open before an update come back, all of them.
+void api
+  .takeRestoredPaths()
+  .then((paths) => app.restorePaths(paths))
+  .catch(() => undefined);

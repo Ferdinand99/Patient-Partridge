@@ -41,6 +41,21 @@ describe("signatureMatches", () => {
   });
 });
 
+describe("a real signature (Nimble Newt v0.3.0, made by tauri)", () => {
+  const latest = JSON.parse(readFileSync(new URL("./fixtures/nimble-newt-v0.3.0/latest.json", import.meta.url), "utf8"));
+  it("is read: the form, the key id and the version in its trusted comment", () => {
+    const entry = latest.platforms["windows-x86_64"];
+    const sig = parseSignature(entry.signature);
+    expect(sig.algorithm).toBe("ED");
+    expect(sig.signature.length).toBe(64);
+    expect(Buffer.from(entry.signature, "base64").toString()).toContain("version:0.3.0");
+  });
+  it("is refused for the key of this app, which did not make it", () => {
+    const conf = JSON.parse(readFileSync(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8"));
+    expect(signatureMatches(Buffer.from("anything"), latest.platforms["windows-x86_64"].signature, conf.plugins.updater.pubkey)).toBe(false);
+  });
+});
+
 describe("the public key of the app", () => {
   it("is a minisign public key", () => {
     const conf = JSON.parse(readFileSync(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8"));

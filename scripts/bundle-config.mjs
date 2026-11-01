@@ -9,12 +9,14 @@ export const MAC_TRIPLES = ["aarch64-apple-darwin", "x86_64-apple-darwin"];
 export const UNIVERSAL_TRIPLE = "universal-apple-darwin";
 
 /**
- * Update files (`.sig` next to the installer, and `latest.json` made from them) can only be made
- * with the signing key. A build without it (CI on a pull request, a build for testing) makes
- * installers only, instead of failing.
+ * Whether the bundler itself makes the update file and signs it (`createUpdaterArtifacts`). It is
+ * a plain flag, not a test for the signing key: the key must not be in the environment of the
+ * steps that prepare the build. Only the macOS bundle works this way (its update file is an archive
+ * of the app that must be made after notarisation). For the other systems the update file is the
+ * installer itself, which `scripts/release-sign.mjs` signs in a separate step.
  */
 export function wantsUpdaterArtifacts(env) {
-  return Boolean(env.TAURI_SIGNING_PRIVATE_KEY || env.TAURI_SIGNING_PRIVATE_KEY_PATH);
+  return env.PARTRIDGE_UPDATER_ARTIFACTS === "1";
 }
 
 /**

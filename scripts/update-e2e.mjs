@@ -34,6 +34,7 @@ import {
 import { createServer } from "node:http";
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
+import { signatureMatches } from "./updater-key.mjs";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -142,7 +143,6 @@ function build(version, pubkey) {
   const conf = {
     ...generated,
     version,
-    bundle: { ...generated.bundle, createUpdaterArtifacts: true },
     plugins: {
       updater: {
         pubkey,
@@ -154,9 +154,16 @@ function build(version, pubkey) {
   const confFile = join(root, "src-tauri", "tauri.e2e.generated.conf.json");
   writeFileSync(confFile, JSON.stringify(conf, null, 2));
   rmSync(join(bundleDir), { recursive: true, force: true });
-  sh("npx", ["tauri", "build", "--config", confFile, "--features", "update-driver", "--bundles", bundlesForThisSystem(), "--", "--locked"], {
-    env: { ...buildEnv, TAURI_SIGNING_PRIVATE_KEY: readFileSync(keyFile, "utf8") },
-  });
+  // The same stages as a release, so that this test also proves them. Compile and bundle have no
+  // key (they run the build scripts of the dependencies and the packaging tools); the last stage,
+  // the release's own script, signs the update files with the throwaway key.
+  const noKey = { ...buildEnv };
+  delete noKey.TAURI_SIGNING_PRIVATE_KEY;
+  sh("npx", ["tauri", "build", "--no-bundle", "--config", confFile, "--features", "update-driver", "--", "--locked"], { env: noKey });
+  if (!mac) sh("npx", ["tauri", "bundle", "--bundles", bundlesForThisSystem(), "--config", confFile, "--features", "update-driver"], { env: noKey });
+  const last = ["scripts/release-build.mjs", "build", "--config", confFile, "--features", "update-driver"];
+  if (mac) last.push("--bundles", "app");
+  sh("node", last, { env: { ...buildEnv, TAURI_SIGNING_PRIVATE_KEY: readFileSync(keyFile, "utf8") } });
   artifacts[version] = collect(version);
   rmSync(confFile, { force: true });
 }
@@ -168,7 +175,8 @@ if (!skipBuild) {
   // is also what `plugins.updater.pubkey` takes.
   const pub = readFileSync(`${keyFile}.pub`, "utf8").trim();
   if (pub === realKey) throw new Error("The throwaway key equals the real public key.");
-  sh("node", ["scripts/prepare-bundle.mjs"], { env: { ...buildEnv, TAURI_SIGNING_PRIVATE_KEY: readFileSync(keyFile, "utf8") } });
+  // No key here either. Only macOS has the bundler make the update file (the others are signed after).
+  sh("node", ["scripts/prepare-bundle.mjs"], { env: { ...buildEnv, PARTRIDGE_UPDATER_ARTIFACTS: mac ? "1" : "0" } });
   build(OLD, pub);
   build(NEW, pub);
   writeFileSync(join(work, "artifacts.json"), JSON.stringify(artifacts, null, 2));
@@ -335,6 +343,14 @@ startDisplay();
 const summary = [];
 
 try {
+  // 0. A real signature, made by `tauri signer` in the last stage of the build, goes through the
+  // check that the release's preflight uses, and says which version it was made for.
+  const pubText = readFileSync(`${keyFile}.pub`, "utf8").trim();
+  const otherPub = readFileSync(`${otherKeyFile}.pub`, "utf8").trim();
+  check("a real signature passes scripts/updater-key.mjs, the check of the preflight", signatureMatches(goodPayload(), goodSignature(), pubText));
+  check("scripts/updater-key.mjs refuses it for another key", !signatureMatches(goodPayload(), goodSignature(), otherPub));
+  check("the signature is bound to the version it was made for", Buffer.from(goodSignature(), "base64").toString().includes(`version:${NEW}`));
+
   // 1. A good update.
   publish({ version: NEW, payload: goodPayload(), signature: goodSignature(), label: "good" });
   const good = await runCase("update", null, { finish: (l) => /^up-to-date version=0\.0\.2/.test(l) });
@@ -347,7 +363,8 @@ try {
     has(L, /^documents open before the stop=1, when the install starts=0$/),
   );
   check("the new version started", has(L, /^started version=0\.0\.2/));
-  check("the update started the new version by itself", good.startedByInstaller);
+  // Only Windows hands over to an installer, which has to start the new version. On the other systems the app restarts itself.
+  if (win) check("the installer started the new version by itself", good.startedByInstaller);
   check("the open document came back", has(L, /^started version=0\.0\.2 .* restored=1$/));
   check("the new version is up to date and ends", good.done);
   const order = [/^found/, /^documents open before the stop/, /^started version=0\.0\.2/, /^up-to-date/].map((re) => index(L, re));

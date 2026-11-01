@@ -8,6 +8,8 @@ type UpdateStand = {
   found: unknown;
   checkError: unknown;
   installError: unknown;
+  downloadError: unknown;
+  restored: string[];
   installDelay: number;
   restarted: number;
   releasesPageOpened: number;
@@ -95,10 +97,22 @@ test("an update shows the notes, downloads with progress and asks for the restar
 
   await expect(page.getByRole("alertdialog")).toContainText("Restart to update");
   const [install] = await calls(page, "install_update");
-  expect(install.args.paths).toEqual(["/docs/book.pdf"]);
+  // The app knows which files are open; the window names only the one in view.
+  expect(install.args).toEqual({ active: "/docs/book.pdf" });
   await expect(page.locator("#update-pill")).toContainText("Restart to update");
   await page.getByRole("alertdialog").getByRole("button", { name: "Restart to Update" }).click();
   await expect.poll(() => page.evaluate(() => (window as unknown as { __E2E__: Stand }).__E2E__.update.restarted)).toBe(1);
+});
+
+test("after an update every file comes back, also one that does not end in .pdf", async ({ page }) => {
+  await page.addInitScript(() => {
+    (window as unknown as { __E2E__: Stand }).__E2E__.update.restored = ["/docs/second.pdf", "/docs/no-ending", "/docs/book.pdf"];
+  });
+  await page.goto("/");
+  await expect(page.locator(".tab-title")).toHaveCount(3);
+  await expect(page.locator('.tab-title[aria-selected="true"]')).toHaveText("second.pdf");
+  await expect(page.locator(".tab-title")).toContainText(["second.pdf", "no-ending", "book.pdf"].map((t) => t));
+  await expect(page.getByRole("alertdialog")).toHaveCount(0);
 });
 
 test("Later keeps a small pill that opens the question again", async ({ page }) => {

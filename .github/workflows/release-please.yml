@@ -5,8 +5,8 @@
 # text of the update question in the app.
 #
 # Everything runs in this workflow because tags and releases created with GITHUB_TOKEN do not
-# trigger other workflows. See docs/updates.md (the owner's one-time setup, and how to recover from
-# a release that failed) and docs/signing.md.
+# trigger other workflows. See docs/updates.md (the one-time setup, and how to recover from a
+# release that failed) and docs/signing.md.
 name: Release
 
 on:
@@ -69,20 +69,23 @@ jobs:
           ref: ${{ needs.release-please.outputs.pr_branch }}
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - run: cargo update --workspace
-      - name: Commit if the lockfile changed
+      # The fuzz crate has a lockfile of its own, with the workspace crates in it at their version.
+      - run: cargo update --workspace --manifest-path fuzz/Cargo.toml
+      - name: Commit if a lockfile changed
         run: |
-          if git diff --quiet -- Cargo.lock; then
-            echo "Cargo.lock is already up to date."
+          if git diff --quiet -- Cargo.lock fuzz/Cargo.lock; then
+            echo "The lockfiles are already up to date."
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Cargo.lock
+          git add Cargo.lock fuzz/Cargo.lock
           git commit -m "chore: refresh Cargo.lock for the release"
           git push
 
   # Nothing is built before the keys are known to be right: a release signed with a key that does
   # not belong to the public key in the app could never be installed by an update.
+  # The secrets are set only on the two steps that read them. `npm ci` runs without any.
   preflight:
     name: Preflight (signing keys)
     needs: release-please
@@ -91,14 +94,6 @@ jobs:
     permissions:
       contents: read
     env:
-      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-      IN_APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-      IN_APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-      IN_APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-      IN_APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-      IN_APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-      IN_APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
       TAG: ${{ needs.release-please.outputs.tag_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -109,11 +104,26 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - run: npm ci
+      # Only tests that the secrets are not empty. No tool runs here but the shell.
       - name: Check the secrets and the public key
+        env:
+          IN_TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          IN_TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          IN_APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          IN_APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          IN_APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          IN_APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          IN_APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          IN_APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
         run: |
           fail=0
-          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
-            echo "::error title=Missing secret::TAURI_SIGNING_PRIVATE_KEY is empty. Add it (and TAURI_SIGNING_PRIVATE_KEY_PASSWORD) as repository secrets; see docs/updates.md."
+          missing=""
+          for v in IN_TAURI_SIGNING_PRIVATE_KEY IN_TAURI_SIGNING_PRIVATE_KEY_PASSWORD; do
+            [ -n "${!v}" ] || missing="$missing ${v#IN_}"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error title=Missing secrets::Add these repository secrets; see docs/updates.md:$missing"
             fail=1
           fi
           missing=""
@@ -136,8 +146,11 @@ jobs:
             exit 1
           fi
           echo "The secrets are there."
-      - run: npm ci
+      # The update key signs a small file, and the signature is checked against the public key.
       - name: Check that the signing key belongs to the public key
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           printf 'preflight' > "$RUNNER_TEMP/preflight.txt"
           npx tauri signer sign "$RUNNER_TEMP/preflight.txt" > /dev/null
@@ -173,18 +186,12 @@ jobs:
             os: ubuntu-22.04
             args: ""
             rust_targets: ""
-    env:
-      # Indirection so that `if:` conditions can test whether a secret is set, and so that the
-      # variables the tools read are only set in the steps that need them.
-      IN_APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-      IN_APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-      IN_APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-      IN_APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-      IN_APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-      IN_APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
     defaults:
       run:
         shell: bash
+    # No secret is set for the job. Each is set on the one step that reads it, and the steps that
+    # run third-party code (npm, the build scripts of the Rust dependencies, Vite, the tools that
+    # make the packages) have none. See docs/signing.md ("Where the secrets are").
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -208,40 +215,49 @@ jobs:
           cache: npm
       - run: npm ci
 
-      - name: Import the macOS certificate
-        if: runner.os == 'macOS'
-        env:
-          APPLE_CERTIFICATE: ${{ env.IN_APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ env.IN_APPLE_CERTIFICATE_PASSWORD }}
-        run: scripts/macos-import-certificate.sh
-
-      - name: Set up macOS signing and notarisation
-        if: runner.os == 'macOS'
-        run: |
-          key_path="$RUNNER_TEMP/AuthKey_${IN_APPLE_API_KEY}.p8"
-          printf '%s' "$IN_APPLE_API_KEY_CONTENT" > "$key_path"
-          {
-            echo "APPLE_SIGNING_IDENTITY=$IN_APPLE_SIGNING_IDENTITY"
-            echo "APPLE_API_ISSUER=$IN_APPLE_API_ISSUER"
-            echo "APPLE_API_KEY=$IN_APPLE_API_KEY"
-            echo "APPLE_API_KEY_PATH=$key_path"
-          } >> "$GITHUB_ENV"
+      # The tools that make an AppImage, checked against pinned hashes. The bundler downloads
+      # without any check what is not there.
+      - name: Fetch the AppImage tools (pinned)
+        if: runner.os == 'Linux'
+        run: node scripts/linux-tools.mjs
 
       # Fetches PDFium (checked against the pinned checksum), builds the engine, and writes the
-      # config that puts both into the installer. On macOS both are made for both kinds of Mac, and
-      # the PDFium library is signed. With the signing key set, update files are made too.
+      # config that puts both into the installer. On macOS both are made for both kinds of Mac.
       - name: Prepare the bundle
         env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           PARTRIDGE_UNIVERSAL: ${{ runner.os == 'macOS' && '1' || '0' }}
+          PARTRIDGE_UPDATER_ARTIFACTS: ${{ runner.os == 'macOS' && '1' || '0' }}
         run: node scripts/prepare-bundle.mjs
 
+      # Compiles the app and runs the frontend build. No secret is in this step.
+      - name: Compile
+        run: npx tauri build --no-bundle --config src-tauri/tauri.bundle.generated.conf.json ${{ matrix.args }} -- --locked
+
+      # The installers and packages of Windows and Linux, made without any secret. (The macOS
+      # bundle is made in the last step, because it must be signed while it is made.)
+      - name: Bundle (Windows)
+        if: runner.os == 'Windows'
+        run: npx tauri bundle --bundles nsis,msi --config src-tauri/tauri.bundle.generated.conf.json
+      - name: Bundle (Linux)
+        if: runner.os == 'Linux'
+        run: npx tauri bundle --bundles deb,appimage --config src-tauri/tauri.bundle.generated.conf.json
+
+      # The only step with the secrets. Its "tauri script" signs the update files (Windows, Linux)
+      # or makes, signs and notarises the macOS bundle and the disk image; tauri-action then
+      # uploads what is there and writes latest.json. See scripts/release-build.mjs.
       - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ runner.os == 'macOS' && secrets.APPLE_CERTIFICATE || '' }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ runner.os == 'macOS' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
+          APPLE_SIGNING_IDENTITY: ${{ runner.os == 'macOS' && secrets.APPLE_SIGNING_IDENTITY || '' }}
+          APPLE_API_ISSUER: ${{ runner.os == 'macOS' && secrets.APPLE_API_ISSUER || '' }}
+          APPLE_API_KEY: ${{ runner.os == 'macOS' && secrets.APPLE_API_KEY || '' }}
+          APPLE_API_KEY_CONTENT: ${{ runner.os == 'macOS' && secrets.APPLE_API_KEY_CONTENT || '' }}
         with:
+          tauriScript: node scripts/release-build.mjs
           # The release body (the changelog written by release-please) is used as the `notes` of
           # latest.json by the publish job.
           releaseId: ${{ needs.release-please.outputs.release_id }}
@@ -326,10 +342,10 @@ jobs:
         run: |
           set -euo pipefail
           api="repos/${{ github.repository }}"
-          gh api "$api/releases/$RELEASE_ID" --jq '.assets[].name' > assets.txt
+          gh api "$api/releases/$RELEASE_ID" --jq '[.assets[] | {id, name}]' > assets.json
           id=$(gh api "$api/releases/$RELEASE_ID" --jq '.assets[] | select(.name == "latest.json") | .id')
           gh api "$api/releases/assets/$id" -H "Accept: application/octet-stream" > latest.final.json
-          node scripts/check-latest.mjs latest.final.json assets.txt "${TAG#v}"
+          node scripts/check-latest.mjs latest.final.json assets.json "${TAG#v}"
       - name: Publish release
         run: |
           gh api -X PATCH "repos/${{ github.repository }}/releases/$RELEASE_ID" \

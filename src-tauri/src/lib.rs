@@ -97,6 +97,10 @@ fn page_started<R: tauri::Runtime>(app: &AppHandle<R>) {
     if let (Some(engine), Some(known)) = (app.try_state::<Engine>(), app.try_state::<LinkMemory>())
     {
         release_documents(&engine.0, &known.0, &app.state::<Pending>());
+        // The page that knew the documents is gone, so they are not "open" for an update either.
+        if let Some(update_state) = app.try_state::<UpdateState>() {
+            update_state.forget_all_docs();
+        }
     }
 }
 
@@ -206,7 +210,10 @@ async fn open_pdf(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.clone());
     let key = positions::key_for(&path);
+    let opened_path = path.clone();
     let (doc, pages) = blocking(move || pool.open(&path, password.as_deref())).await?;
+    // The app knows which files are open, so that an update can bring them back.
+    update_state.record_open(doc, &opened_path);
     let position = positions
         .0
         .lock()
@@ -267,6 +274,7 @@ async fn render_page(
 async fn close_pdf(
     engine: State<'_, Engine>,
     known: State<'_, LinkMemory>,
+    update_state: State<'_, UpdateState>,
     doc: u64,
 ) -> Result<(), CommandError> {
     known
@@ -274,6 +282,7 @@ async fn close_pdf(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .forget(doc);
+    update_state.forget_doc(doc);
     let pool = engine.0.clone();
     // Closing a document that is gone is fine: the end state is what the caller wants.
     let _ = blocking(move || {
@@ -486,6 +495,18 @@ pub fn run() {
     let _ = START.set(Instant::now());
 
     let app = tauri::Builder::default()
+        // While an update replaces the program, closing the window would leave a half file: the
+        // close is refused for those seconds.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window
+                    .try_state::<UpdateState>()
+                    .is_some_and(|state| state.is_close_blocked())
+                {
+                    api.prevent_close();
+                }
+            }
+        })
         .on_page_load(|webview, payload| {
             if matches!(payload.event(), PageLoadEvent::Started) {
                 page_started(webview.app_handle());
@@ -519,17 +540,18 @@ pub fn run() {
                 MAX_DOCUMENTS,
             ))));
             let update_state = UpdateState::new(app.path().app_data_dir().ok(), updates::detect());
-            // After an update the documents that were open come back, once.
-            let restored = update_state.take_restored();
+            // After an update the documents that were open come back, once: the window asks for them
+            // (`take_restored_paths`) and opens them without the rules for files named at the start.
+            #[cfg_attr(not(feature = "update-driver"), allow(unused_variables))]
+            let restored = update_state.load_restored();
             app.manage(update_state);
             #[cfg(feature = "update-driver")]
-            updates::driver::start(app.handle().clone(), &restored);
+            updates::driver::start(app.handle().clone(), restored);
             let args: Vec<PathBuf> = locate::existing_files(
                 std::env::args().skip(1),
                 std::env::current_dir().ok().as_deref(),
             )
             .into_iter()
-            .chain(restored)
             .map(PathBuf::from)
             .collect();
             app.state::<Pending>().deliver(
@@ -558,9 +580,11 @@ pub fn run() {
             updates::get_update_settings,
             updates::set_auto_update,
             updates::check_update,
+            updates::download_update,
             updates::install_update,
             updates::restart_app,
             updates::open_releases_page,
+            updates::take_restored_paths,
         ])
         .build(tauri::generate_context!())
         .expect("error while building the app");

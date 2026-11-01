@@ -4,7 +4,7 @@
 #   - every program inside the app (the app, the engine, the PDFium library) is signed by the same
 #     team, with the hardened runtime and a secure timestamp, and carries no entitlements
 #   - each of them runs on both Apple silicon and Intel (a universal app)
-#   - Gatekeeper accepts the app, and the notarisation ticket is stapled to it
+#   - Gatekeeper accepts the app and the disk image, and the notarisation ticket is stapled to both
 #
 #   scripts/macos-verify.sh "<path to the .app>" [path to the .dmg]
 set -uo pipefail
@@ -57,8 +57,11 @@ echo "== Gatekeeper and notarisation =="
 spctl --assess --type execute --verbose=4 "$app" || bad "Gatekeeper does not accept the app"
 xcrun stapler validate "$app" || bad "the notarisation ticket is not stapled to the app"
 if [ -n "$dmg" ]; then
-  spctl --assess --type open --context context:primary-signature --verbose=4 "$dmg" \
-    || echo "::warning::The disk image itself is not signed; the app inside it is."
+  # Tauri signs the disk image, and the release build notarises and staples it too (a signed disk
+  # image that is not notarised is "Unnotarized Developer ID" to Gatekeeper).
+  codesign --verify --verbose=2 "$dmg" || bad "the disk image is not signed"
+  spctl --assess --type open --context context:primary-signature --verbose=4 "$dmg" || bad "Gatekeeper does not accept the disk image"
+  xcrun stapler validate "$dmg" || bad "the notarisation ticket is not stapled to the disk image"
 fi
 
 {

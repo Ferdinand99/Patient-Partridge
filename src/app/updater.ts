@@ -19,16 +19,15 @@ export interface UpdaterDeps {
     getUpdateSettings(): Promise<UpdateSettings>;
     setAutoUpdate(enabled: boolean): Promise<void>;
     checkUpdate(manual: boolean): Promise<UpdateInfo | null>;
-    installUpdate(
-      paths: string[],
-      onEvent: (event: { event: "progress"; chunk: number; total: number | null } | { event: "installing" }) => void,
-    ): Promise<void>;
+    downloadUpdate(onEvent: (event: { event: "progress"; chunk: number; total: number | null }) => void): Promise<void>;
+    installUpdate(active: string | null): Promise<void>;
     restartApp(): Promise<void>;
     openReleasesPage(): Promise<void>;
   };
   /**
-   * The paths of the open documents, active one first. The app saves where the reader is in each
-   * of them before it answers.
+   * The paths of the open documents, the one in view first. The app saves where the reader is in
+   * each of them before it answers. It is asked when the download is finished, just before the
+   * install, and only the first path is used: the app takes the list of open files itself.
    */
   openPaths(): string[];
   /** Closes the settings menu. */
@@ -283,7 +282,13 @@ export class Updater {
     try {
       await this.deps.api.setAutoUpdate(wanted);
     } catch {
-      // Not saved: it holds until the app closes.
+      // Not saved: after the next start the app would check again. Say so, and show the truth.
+      this.autoUpdate = !wanted;
+      this.showToggle();
+      await this.tell(
+        "The setting was not saved",
+        "Patient Partridge could not write the setting to this computer, so it stays as it was.",
+      );
     }
   }
 
@@ -383,7 +388,6 @@ export class Updater {
   private async install(info: UpdateInfo): Promise<void> {
     this.state = { kind: "working" };
     this.showPill();
-    const paths = this.deps.openPaths();
     const sheet = openSheet(this.layer, {
       title: `Downloading version ${info.version}`,
       text: "Starting the download…",
@@ -392,18 +396,25 @@ export class Updater {
     sheet.setProgress(0, null);
     let received = 0;
     try {
-      await this.deps.api.installUpdate(paths, (e) => {
-        if (e.event === "progress") {
-          received += e.chunk;
-          sheet.setProgress(received, e.total);
-          sheet.setText(
-            e.total ? `${Math.min(100, Math.floor((received / e.total) * 100))} % of ${mebibytes(e.total)}` : `${mebibytes(received)} so far`,
-          );
-        } else {
-          sheet.setProgress(0, null);
-          sheet.setText("Installing. The open documents are closed for a moment.");
-        }
+      await this.deps.api.downloadUpdate((e) => {
+        received += e.chunk;
+        sheet.setProgress(received, e.total);
+        sheet.setText(
+          e.total ? `${Math.min(100, Math.floor((received / e.total) * 100))} % of ${mebibytes(e.total)}` : `${mebibytes(received)} so far`,
+        );
       });
+    } catch (e) {
+      sheet.close();
+      await this.installFailed(info, asFailure(e));
+      return;
+    }
+    // The download is done and checked. Only now is the reader's place saved and the file in view
+    // noted: a file opened or closed during the download counts.
+    sheet.setProgress(0, null);
+    sheet.setText("Installing. The open documents are closed for a moment.");
+    const active = this.deps.openPaths()[0] ?? null;
+    try {
+      await this.deps.api.installUpdate(active);
     } catch (e) {
       sheet.close();
       await this.installFailed(info, asFailure(e));

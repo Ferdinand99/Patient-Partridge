@@ -28,6 +28,7 @@ function make(opts: { settings?: Partial<UpdateSettings>; found?: UpdateInfo | n
     getUpdateSettings: vi.fn(async () => settings),
     setAutoUpdate: vi.fn(async () => undefined),
     checkUpdate: vi.fn(async () => (opts.found === undefined ? info() : opts.found)),
+    downloadUpdate: vi.fn(async () => undefined),
     installUpdate: vi.fn(async () => undefined),
     restartApp: vi.fn(async () => undefined),
     openReleasesPage: vi.fn(async () => undefined),
@@ -73,6 +74,20 @@ describe("notesToText", () => {
   it("removes tags and keeps the text", () => {
     expect(notesToText("a <script>alert(1)</script> b <img src=x onerror=alert(1)>")).toBe("a alert(1) b");
     expect(notesToText("")).toBe("");
+  });
+});
+
+describe("notesToText on a real changelog (Nimble Newt v0.3.0, written by release-please)", () => {
+  const real = JSON.parse(readFileSync("scripts/fixtures/nimble-newt-v0.3.0/latest.json", "utf8")) as { notes: string };
+  it("drops the links and the commit and issue marks, and keeps the headings, the warning and the text", () => {
+    const text = notesToText(real.notes);
+    expect(text).toContain("0.3.0 (2026-10-28)");
+    expect(text).toContain("BREAKING CHANGES");
+    expect(text).toContain("• extension code now runs in a Web Worker");
+    expect(text).toContain("run extensions in a worker so they have no way out (NN-02) (#30)");
+    expect(text).not.toContain("https://");
+    expect(text).not.toContain("](");
+    expect(text).not.toContain("cd2449d");
   });
 });
 
@@ -220,23 +235,26 @@ describe("the question", () => {
 });
 
 describe("installing", () => {
-  it("downloads with progress, hands over the open documents, then asks for the restart", async () => {
+  it("downloads with progress, takes the open documents when the download is done, then asks for the restart", async () => {
     const { api, openPaths } = make();
-    let report!: Parameters<UpdaterDeps["api"]["installUpdate"]>[1];
-    let finish!: () => void;
-    api.installUpdate.mockImplementationOnce(
-      (_paths: string[], on: typeof report) =>
+    let report!: Parameters<UpdaterDeps["api"]["downloadUpdate"]>[0];
+    let finishDownload!: () => void;
+    api.downloadUpdate.mockImplementationOnce(
+      (on: typeof report) =>
         new Promise<void>((resolve) => {
           report = on;
-          finish = resolve;
+          finishDownload = resolve;
         }),
     );
+    let finishInstall!: () => void;
+    api.installUpdate.mockImplementationOnce(() => new Promise<void>((resolve) => (finishInstall = resolve)));
     await vi.advanceTimersByTimeAsync(FIRST_CHECK_DELAY_MS);
     await click(pill());
     await click(button("Download and Install"));
 
-    expect(openPaths).toHaveBeenCalled();
-    expect(api.installUpdate.mock.calls[0][0]).toEqual(["/docs/a.pdf", "/docs/b.pdf"]);
+    // During the download nothing is asked of the open files: a file opened now still counts.
+    expect(openPaths).not.toHaveBeenCalled();
+    expect(api.installUpdate).not.toHaveBeenCalled();
     expect(sheetText()).toContain("Downloading version 0.2.0");
     expect(pill().textContent).toContain("Updating");
     const bar = layer().querySelector("progress") as HTMLProgressElement;
@@ -248,10 +266,15 @@ describe("installing", () => {
     expect(sheetText()).toContain("25 % of 4.0 MiB");
     report({ event: "progress", chunk: 3145728, total: 4194304 });
     expect(sheetText()).toContain("100 % of 4.0 MiB");
-    report({ event: "installing" });
+
+    finishDownload();
+    await flush();
+    // Now, right before the install, the reader's place is saved and the file in view is named.
+    expect(openPaths).toHaveBeenCalledTimes(1);
+    expect(api.installUpdate).toHaveBeenCalledWith("/docs/a.pdf");
     expect(sheetText()).toContain("Installing");
 
-    finish();
+    finishInstall();
     await flush();
     expect(layer().querySelector("progress")).toBeNull();
     expect(sheetText()).toContain("Restart to update");
@@ -262,7 +285,15 @@ describe("installing", () => {
     expect(layer().hidden).toBe(true);
   });
 
-  it("a restart sheet cannot be dismissed with Escape, and the pill brings it back", async () => {
+  it("with no document open, the install is told there is none in view", async () => {
+    const { api } = make({ paths: [] });
+    await vi.advanceTimersByTimeAsync(FIRST_CHECK_DELAY_MS);
+    await click(pill());
+    await click(button("Download and Install"));
+    expect(api.installUpdate).toHaveBeenCalledWith(null);
+  });
+
+  it("the restart question cannot be dismissed with Escape", async () => {
     const { api } = make();
     await vi.advanceTimersByTimeAsync(FIRST_CHECK_DELAY_MS);
     await click(pill());
@@ -274,14 +305,16 @@ describe("installing", () => {
   });
 
   it("a download that fails leaves the update available and the documents alone", async () => {
-    const { api } = make();
-    api.installUpdate.mockRejectedValueOnce({ kind: "offline", message: "x", enginesStopped: false });
+    const { api, openPaths } = make();
+    api.downloadUpdate.mockRejectedValueOnce({ kind: "offline", message: "x", enginesStopped: false });
     await vi.advanceTimersByTimeAsync(FIRST_CHECK_DELAY_MS);
     await click(pill());
     await click(button("Download and Install"));
     expect(sheetText()).toContain("The update was not installed");
     expect(sheetText()).toContain("could not reach the update server");
     expect(button("Restart")).toBeUndefined();
+    expect(api.installUpdate).not.toHaveBeenCalled();
+    expect(openPaths).not.toHaveBeenCalled();
     await click(button("OK"));
     expect(pill().hidden).toBe(false);
     expect(pill().textContent).toContain("Update 0.2.0");
@@ -299,6 +332,22 @@ describe("installing", () => {
     expect(sheetText()).toContain("open documents were closed");
     await click(button("Restart"));
     expect(api.restartApp).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("the setting that turns the check off", () => {
+  it("tells the person when it could not be saved, and shows the switch as it was", async () => {
+    const { api } = make();
+    await flush();
+    const toggle = document.getElementById("auto-update") as HTMLButtonElement;
+    api.setAutoUpdate.mockRejectedValueOnce({ code: "internal", message: "disk full" });
+    await click(toggle);
+    expect(sheetText()).toContain("The setting was not saved");
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+    // The automatic check goes on, as the switch says.
+    await click(button("OK"));
+    await vi.advanceTimersByTimeAsync(FIRST_CHECK_DELAY_MS);
+    expect(api.checkUpdate).toHaveBeenCalledTimes(1);
   });
 });
 

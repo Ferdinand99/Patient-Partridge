@@ -2,11 +2,11 @@ import { describe, expect, it } from "vitest";
 import { MAC_TRIPLES, UNIVERSAL_TRIPLE, bundleConfig, codesignArgs, wantsUpdaterArtifacts } from "./bundle-config.mjs";
 
 describe("update files", () => {
-  it("are made only when the signing key is there", () => {
+  it("are made by the bundler only when the flag says so, and the key does not count", () => {
     expect(wantsUpdaterArtifacts({})).toBe(false);
-    expect(wantsUpdaterArtifacts({ TAURI_SIGNING_PRIVATE_KEY: "" })).toBe(false);
-    expect(wantsUpdaterArtifacts({ TAURI_SIGNING_PRIVATE_KEY: "key" })).toBe(true);
-    expect(wantsUpdaterArtifacts({ TAURI_SIGNING_PRIVATE_KEY_PATH: "/k" })).toBe(true);
+    expect(wantsUpdaterArtifacts({ PARTRIDGE_UPDATER_ARTIFACTS: "0" })).toBe(false);
+    expect(wantsUpdaterArtifacts({ PARTRIDGE_UPDATER_ARTIFACTS: "1" })).toBe(true);
+    expect(wantsUpdaterArtifacts({ TAURI_SIGNING_PRIVATE_KEY: "key", TAURI_SIGNING_PRIVATE_KEY_PATH: "/k" })).toBe(false);
   });
 });
 
@@ -20,7 +20,7 @@ describe("bundleConfig", () => {
       "../vendor/pdfium/mac-universal/licenses": "pdfium-licenses",
     });
     expect(c.bundle.createUpdaterArtifacts).toBe(false);
-    expect(bundleConfig({ folder: "win-x64", file: "pdfium.dll", env: { TAURI_SIGNING_PRIVATE_KEY: "k" } }).bundle.createUpdaterArtifacts).toBe(true);
+    expect(bundleConfig({ folder: "win-x64", file: "pdfium.dll", env: { PARTRIDGE_UPDATER_ARTIFACTS: "1" } }).bundle.createUpdaterArtifacts).toBe(true);
   });
 });
 

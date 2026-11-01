@@ -1,6 +1,7 @@
 # Checks macOS code signing and notarisation without publishing anything: builds the universal app
 # with the APPLE_* secrets (the same steps as the release workflow), then checks every program
-# inside it (the app, the engine, the PDFium library), Gatekeeper and the stapled ticket. Run it
+# inside it (the app, the engine, the PDFium library), Gatekeeper and the stapled tickets of the app
+# and the disk image, and starts the signed app from the disk image to open a PDF. Run it
 # from the Actions tab after changing certificates or keys. It also runs when the files that make
 # the signed build change, so a change is tested before it is merged.
 name: macOS signing check
@@ -12,6 +13,9 @@ on:
       - .github/workflows/macos-signing.yml
       - scripts/macos-import-certificate.sh
       - scripts/macos-verify.sh
+      - scripts/release-build.mjs
+      - scripts/release-sign.mjs
+      - scripts/smoke.mjs
       - scripts/prepare-bundle.mjs
       - scripts/bundle-config.mjs
       - src-tauri/tauri.conf.json
@@ -26,16 +30,11 @@ jobs:
     # again on main once the update is merged.
     if: github.actor != 'dependabot[bot]'
     runs-on: macos-latest
-    env:
-      IN_APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-      IN_APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-      IN_APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-      IN_APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-      IN_APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-      IN_APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
     defaults:
       run:
         shell: bash
+    # No secret is set for the job. Each is set on the one step that reads it; the steps that run
+    # third-party code (npm, the build scripts of the Rust dependencies, Vite) have none.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -53,6 +52,13 @@ jobs:
       - run: npm ci
 
       - name: Check that the secrets are there
+        env:
+          IN_APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          IN_APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          IN_APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          IN_APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          IN_APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          IN_APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
         run: |
           missing=""
           for v in IN_APPLE_CERTIFICATE IN_APPLE_CERTIFICATE_PASSWORD IN_APPLE_SIGNING_IDENTITY \
@@ -64,38 +70,60 @@ jobs:
             exit 1
           fi
 
-      - name: Import the certificate
-        env:
-          APPLE_CERTIFICATE: ${{ env.IN_APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ env.IN_APPLE_CERTIFICATE_PASSWORD }}
-        run: scripts/macos-import-certificate.sh
-
-      - name: Write the notarisation key
-        run: |
-          key_path="$RUNNER_TEMP/AuthKey_${IN_APPLE_API_KEY}.p8"
-          printf '%s' "$IN_APPLE_API_KEY_CONTENT" > "$key_path"
-          {
-            echo "APPLE_SIGNING_IDENTITY=$IN_APPLE_SIGNING_IDENTITY"
-            echo "APPLE_API_ISSUER=$IN_APPLE_API_ISSUER"
-            echo "APPLE_API_KEY=$IN_APPLE_API_KEY"
-            echo "APPLE_API_KEY_PATH=$key_path"
-          } >> "$GITHUB_ENV"
-
-      # PDFium (both architectures, checked against pinned checksums), the engine for both, joined
-      # with lipo; the PDFium library is signed here, because Tauri does not sign resources.
+      # PDFium (both architectures, checked against pinned checksums) and the engine for both,
+      # joined with lipo. No secret.
       - name: Prepare the bundle (universal)
         env:
           PARTRIDGE_UNIVERSAL: "1"
         run: node scripts/prepare-bundle.mjs
 
-      - name: Build, sign and notarise
-        run: npx tauri build --target universal-apple-darwin --bundles app,dmg --config src-tauri/tauri.bundle.generated.conf.json -- --locked
+      # Compiles the app and runs the frontend build. No secret.
+      - name: Compile
+        run: npx tauri build --no-bundle --target universal-apple-darwin --config src-tauri/tauri.bundle.generated.conf.json -- --locked
+
+      # The only step with the secrets, the same one the release workflow runs: the certificate goes
+      # into a temporary keychain, the PDFium library is signed, Tauri makes, signs and notarises the
+      # app, and the disk image is notarised and stapled.
+      - name: Sign and notarise
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+        run: node scripts/release-build.mjs build --target universal-apple-darwin --bundles app,dmg --config src-tauri/tauri.bundle.generated.conf.json
 
       - name: Check the result
         run: |
           APP="target/universal-apple-darwin/release/bundle/macos/Patient Partridge.app"
           DMG=$(find target/universal-apple-darwin/release/bundle/dmg -name '*.dmg' | head -1)
           scripts/macos-verify.sh "$APP" "$DMG"
+
+      # A signed, notarised app is started and opens a PDF, the way a user's copy does: out of the
+      # disk image, with the "downloaded" mark on it. The hardened runtime, library validation and the
+      # engine's own start-up all have to work for the first page to be drawn.
+      - name: Make a test PDF
+        run: cargo run --release --locked -p partridge-testkit --bin make-pdf -- 30 "$RUNNER_TEMP/launch.pdf"
+      - name: Start the signed app and open the PDF
+        run: |
+          DMG=$(find target/universal-apple-darwin/release/bundle/dmg -name '*.dmg' | head -1)
+          mount="$RUNNER_TEMP/dmg"
+          mkdir -p "$mount" "$RUNNER_TEMP/copy"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount" "$DMG" > /dev/null
+          cp -R "$mount/Patient Partridge.app" "$RUNNER_TEMP/copy/"
+          hdiutil detach "$mount" > /dev/null
+          APP="$RUNNER_TEMP/copy/Patient Partridge.app"
+          xattr -w com.apple.quarantine "0081;00000000;Safari;" "$APP"
+          spctl --assess --type execute --verbose=4 "$APP"
+          node scripts/smoke.mjs --bin "$APP/Contents/MacOS/patient-partridge" --pdf "$RUNNER_TEMP/launch.pdf" --runs 2 | tee launch.txt
+          {
+            echo "### The signed app opened a PDF"
+            echo
+            echo '```'
+            cat launch.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:

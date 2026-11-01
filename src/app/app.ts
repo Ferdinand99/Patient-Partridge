@@ -219,6 +219,15 @@ export class App {
     return active ? [active.path, ...others] : others;
   }
 
+  /**
+   * Opens the files that were open before an update. They are what the reader had, so the rules
+   * for files that are named at the start do not apply: there is no limit of eight, and a file
+   * without the ending .pdf is opened too. The first one is shown.
+   */
+  async restorePaths(paths: string[]): Promise<void> {
+    if (paths.length > 0) await this.openPaths(paths);
+  }
+
   /** Closes the settings menu, if it is open. */
   closeMenu(): void {
     this.menu.close();

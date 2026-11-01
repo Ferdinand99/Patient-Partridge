@@ -1521,6 +1521,36 @@ describe("App: the menu of the right mouse button", () => {
   });
 });
 
+describe("App: the files that come back after an update", () => {
+  it("are all opened, up to the limit of the app and not the limit of the file dialog, and one without .pdf too", async () => {
+    const { app, api } = make();
+    const paths = [...Array.from({ length: 11 }, (_, i) => `/docs/f${i}.pdf`), "/docs/no-ending", "/docs/other.pdf"];
+    await app.restorePaths(paths);
+    await flush();
+    expect(api.open).toHaveBeenCalledTimes(13);
+    expect(app.tabCount).toBe(13);
+    expect(notice()).toBeNull();
+    // The first one is the one in view.
+    expect(document.querySelector('.tab-title[aria-selected="true"]')?.textContent).toBe("f0.pdf");
+  });
+
+  it("do nothing when there is nothing to restore", async () => {
+    const { app, api } = make();
+    await app.restorePaths([]);
+    expect(api.open).not.toHaveBeenCalled();
+  });
+
+  it("come back through the same open path as every file, so a protected file asks for its password", async () => {
+    const { app, api } = make();
+    api.open.mockRejectedValueOnce({ code: "password_required", message: "locked" });
+    const done = app.restorePaths(["/docs/locked.pdf"]);
+    await flush();
+    expect(notice()?.textContent).toContain("password");
+    click(button("Cancel"));
+    await done;
+  });
+});
+
 describe("App: the file dialog says when it leaves files out", () => {
   it("tells how many of 20 files were not opened", async () => {
     const { app, deps, api } = make();

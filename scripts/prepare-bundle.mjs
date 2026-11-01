@@ -11,15 +11,15 @@
 // PDFium libraries come from the pinned, checksum-checked downloads; the joined library is made
 // here and never downloaded. The result is built with `tauri build --target universal-apple-darwin`.
 //
-// Signing the library (macOS): when APPLE_SIGNING_IDENTITY is set on macOS, the library is signed
-// here with the hardened runtime. Tauri signs the engine (it is a sidecar) and the app itself, but
-// not files in `resources`, and notarisation rejects a library that is not signed.
+// Nothing here needs a secret, and none is wanted: this script runs the build scripts of every
+// dependency of the engine. The macOS signing of the PDFium library (Tauri signs the engine and the
+// app, but not files in `resources`) is done later, in scripts/release-build.mjs.
 
 import { spawnSync } from "node:child_process";
 import { copyFileSync, cpSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { MAC_TRIPLES, UNIVERSAL_TRIPLE, bundleConfig, codesignArgs } from "./bundle-config.mjs";
+import { MAC_TRIPLES, UNIVERSAL_TRIPLE, bundleConfig } from "./bundle-config.mjs";
 import { fetchPdfium } from "./fetch-pdfium.mjs";
 import { libraryFor, platformId } from "./pdfium.mjs";
 
@@ -88,13 +88,8 @@ if (universal) {
   description = `${id} (${triple}); library from ${libraryDir}`;
 }
 
-if (process.platform === "darwin" && process.env.APPLE_SIGNING_IDENTITY) {
-  run("codesign", codesignArgs(process.env.APPLE_SIGNING_IDENTITY, join(root, "vendor", "pdfium", folder, file)));
-  console.log(`Signed ${file} (hardened runtime).`);
-}
-
 const config = bundleConfig({ folder, file, env: process.env });
 writeFileSync(join(root, "src-tauri", "tauri.bundle.generated.conf.json"), JSON.stringify(config, null, 2));
 console.log(
-  `Bundle config written for ${description}; update files ${config.bundle.createUpdaterArtifacts ? "on" : "off (no signing key)"}.`,
+  `Bundle config written for ${description}; the bundler makes the update file: ${config.bundle.createUpdaterArtifacts ? "yes" : "no"}.`,
 );

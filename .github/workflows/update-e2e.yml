@@ -13,6 +13,11 @@ on:
       - scripts/update-e2e.mjs
       - scripts/prepare-bundle.mjs
       - scripts/bundle-config.mjs
+      - scripts/release-build.mjs
+      - scripts/release-sign.mjs
+      - scripts/linux-tools.mjs
+      - scripts/linux-tools.lock.json
+      - scripts/updater-key.mjs
       - Cargo.lock
       - package-lock.json
       - .github/workflows/update-e2e.yml
@@ -24,6 +29,11 @@ on:
       - scripts/update-e2e.mjs
       - scripts/prepare-bundle.mjs
       - scripts/bundle-config.mjs
+      - scripts/release-build.mjs
+      - scripts/release-sign.mjs
+      - scripts/linux-tools.mjs
+      - scripts/linux-tools.lock.json
+      - scripts/updater-key.mjs
       - Cargo.lock
       - package-lock.json
       - .github/workflows/update-e2e.yml
@@ -76,6 +86,10 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # The tools that make the AppImage, checked against pinned hashes.
+      - name: Fetch the AppImage tools (pinned)
+        if: runner.os == 'Linux'
+        run: node scripts/linux-tools.mjs
       # On Linux the AppImage is mounted through FUSE, as a user's would be.
       - name: Update from the old build to the new one
         env:

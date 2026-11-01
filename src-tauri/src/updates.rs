@@ -239,35 +239,78 @@ impl Engines for EnginePool {
     }
 }
 
+/// Why [`install_with_engines_stopped`] did not return the result of `install`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Stopped<X> {
+    /// A document was still being opened when the wait for it ended, so an engine may exist that
+    /// the pool does not know yet. Nothing was installed.
+    OpensStuck,
+    /// `install` ran and failed.
+    Install(X),
+}
+
 /// Runs `install` with no engine alive and no way for one to start.
 ///
-/// 1. `prepare` runs first (the app writes down which documents to bring back).
-/// 2. The gate is closed, so no further document can be opened.
-/// 3. Every engine is stopped.
-/// 4. The opens that were already under way are waited for, and every engine is stopped again:
-///    one of those may have started an engine after the first stop.
-/// 5. `install` runs.
+/// 1. The gate is closed, so no further document can be opened.
+/// 2. Every engine is stopped.
+/// 3. The opens that were already under way are waited for (at most `drain`). When one of them is
+///    still running after that, nothing is installed: its engine would keep the installer from
+///    replacing the program.
+/// 4. Every engine is stopped again: one of those opens may have started an engine after the first
+///    stop.
+/// 5. `prepare` runs (the app writes down which documents to bring back: the list is taken here,
+///    after nothing can be opened or closed by an open any more, and not before the download).
+/// 6. `install` runs.
 ///
-/// When `install` fails the gate is opened again; the documents are gone either way.
+/// When the wait or `install` fails the gate is opened again; the documents are gone either way.
 pub fn install_with_engines_stopped<E, T, X>(
     gate: &OpenGate,
     engines: &E,
+    drain: Duration,
     prepare: impl FnOnce(),
     install: impl FnOnce() -> Result<T, X>,
-) -> Result<T, X>
+) -> Result<T, Stopped<X>>
 where
     E: Engines + ?Sized,
 {
-    prepare();
     gate.close();
     engines.stop_all();
-    gate.wait_idle(Duration::from_secs(OPEN_DRAIN_SECS));
+    if !gate.wait_idle(drain) {
+        gate.reopen();
+        return Err(Stopped::OpensStuck);
+    }
     engines.stop_all();
+    prepare();
     let result = install();
     if result.is_err() {
         gate.reopen();
     }
-    result
+    result.map_err(Stopped::Install)
+}
+
+/// The documents to bring back after an update, in the order they were opened, except that the one
+/// in view (`active`) comes first. A path appears once.
+pub fn restore_list(docs: &[(u64, String)], active: Option<&str>) -> Vec<String> {
+    let mut list: Vec<String> = Vec::new();
+    for (_, path) in docs {
+        if !list.contains(path) {
+            list.push(path.clone());
+        }
+    }
+    if let Some(at) = active.and_then(|a| list.iter().position(|p| p == a)) {
+        let first = list.remove(at);
+        list.insert(0, first);
+    }
+    list
+}
+
+/// True when an update file may be fetched from this address. Only `https`. A test build (the
+/// `update-driver` feature) may also fetch from this computer, for the update test.
+pub fn download_allowed(url: &url::Url) -> bool {
+    url.scheme() == "https"
+        || (cfg!(feature = "update-driver")
+            && url.scheme() == "http"
+            && matches!(url.host_str(), Some("127.0.0.1" | "localhost")))
 }
 
 // ---- settings --------------------------------------------------------------------------------
@@ -472,9 +515,6 @@ pub struct UpdateInfo {
 pub enum UpdateEvent {
     /// Bytes of the download that arrived (`total` when the server said how many there are).
     Progress { chunk: u64, total: Option<u64> },
-    /// The download is checked and stored; the engines are about to be stopped and the update
-    /// installed.
-    Installing,
 }
 
 #[derive(Debug, Serialize)]
@@ -500,8 +540,17 @@ pub struct UpdateState {
     settings: Mutex<Settings>,
     /// The update the last check found, until it is installed.
     pending: Mutex<Option<tauri_plugin_updater::Update>>,
-    /// An install is under way.
+    /// The update that was downloaded and checked, until it is installed.
+    downloaded: Mutex<Option<(tauri_plugin_updater::Update, Vec<u8>)>>,
+    /// A download or an install is under way (or done, and the app is to restart).
     installing: AtomicBool,
+    /// True while the program is being replaced: closing the window then would leave a half file.
+    close_blocked: Arc<AtomicBool>,
+    /// The documents that are open, by handle: kept here so that the list for the restart is taken
+    /// at the moment of the install, from the app's own knowledge, not from the window's.
+    open_docs: Arc<Mutex<Vec<(u64, String)>>>,
+    /// The documents of the last run, to be handed to the window once.
+    restored: Mutex<Vec<String>>,
     restore_file: Option<PathBuf>,
     method: InstallMethod,
 }
@@ -514,7 +563,11 @@ impl UpdateState {
                 data_dir.as_ref().map(|d| d.join("settings.json")),
             )),
             pending: Mutex::new(None),
+            downloaded: Mutex::new(None),
             installing: AtomicBool::new(false),
+            close_blocked: Arc::new(AtomicBool::new(false)),
+            open_docs: Arc::new(Mutex::new(Vec::new())),
+            restored: Mutex::new(Vec::new()),
             restore_file: data_dir.map(|d| d.join("restore-after-update.json")),
             method,
         }
@@ -524,12 +577,52 @@ impl UpdateState {
         &self.gate
     }
 
-    /// The documents that were open before an update, once. Empty if there was no update.
-    pub fn take_restored(&self) -> Vec<String> {
-        self.restore_file
+    /// Reads the documents that were open before an update (the file is deleted by this) and keeps
+    /// them for [`UpdateState::take_restored`]. Returns how many there are. Empty if there was no
+    /// update.
+    pub fn load_restored(&self) -> usize {
+        let list = self
+            .restore_file
             .as_deref()
             .map(|f| take_restore(f, now_seconds()))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let n = list.len();
+        *self.restored.lock().unwrap_or_else(|e| e.into_inner()) = list;
+        n
+    }
+
+    /// The documents to bring back, once: the window asks when it has started.
+    pub fn take_restored(&self) -> Vec<String> {
+        std::mem::take(&mut *self.restored.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// A document was opened.
+    pub fn record_open(&self, doc: u64, path: &str) {
+        self.open_docs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((doc, path.to_string()));
+    }
+
+    /// A document was closed.
+    pub fn forget_doc(&self, doc: u64) {
+        self.open_docs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(d, _)| *d != doc);
+    }
+
+    /// The window that knew the documents is gone (a reload).
+    pub fn forget_all_docs(&self) {
+        self.open_docs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    /// True while an update is being installed and the window must stay open.
+    pub fn is_close_blocked(&self) -> bool {
+        self.close_blocked.load(Ordering::SeqCst)
     }
 
     fn auto_update(&self) -> bool {
@@ -579,12 +672,11 @@ pub async fn check(
     Ok(Some(info))
 }
 
-/// Downloads the update found by the last check, stops the engines, and installs it. Where the
-/// installer replaces the running app (Windows) this does not return: the app ends.
-pub async fn install(
+/// Downloads the update found by the last check and keeps it, checked against the public key, for
+/// [`install`]. Nothing about the running app changes: the engines and the open files are not
+/// touched, so a failure here costs nothing.
+pub async fn download(
     state: &UpdateState,
-    pool: Arc<EnginePool>,
-    paths: Vec<String>,
     report: impl Fn(UpdateEvent) + Send + 'static,
 ) -> Result<(), UpdateFailure> {
     if state.method != InstallMethod::Automatic {
@@ -602,23 +694,33 @@ pub async fn install(
     if state.installing.swap(true, Ordering::SeqCst) {
         return Err(failure(FailureKind::Busy, "an update is being installed"));
     }
-    let result = download_and_install(state, &update, pool, paths, &report).await;
-    if result.is_err() {
-        state.installing.store(false, Ordering::SeqCst);
+    let result = fetch(&update, &report).await;
+    match result {
+        Ok(bytes) => {
+            *state.downloaded.lock().unwrap_or_else(|e| e.into_inner()) = Some((update, bytes));
+            Ok(())
+        }
+        Err(e) => {
+            state.installing.store(false, Ordering::SeqCst);
+            Err(e)
+        }
     }
-    result
 }
 
-async fn download_and_install(
-    state: &UpdateState,
+async fn fetch(
     update: &tauri_plugin_updater::Update,
-    pool: Arc<EnginePool>,
-    paths: Vec<String>,
     report: &(impl Fn(UpdateEvent) + Send + 'static),
-) -> Result<(), UpdateFailure> {
-    // The download is checked against the public key here; nothing else happens to the running
-    // app until it has passed.
-    let bytes = update
+) -> Result<Vec<u8>, UpdateFailure> {
+    // The manifest is not signed, so the address of the file in it is not trusted either: only
+    // https. (The signature protects the bytes; this keeps the download itself private.)
+    if !download_allowed(&update.download_url) {
+        return Err(failure(
+            FailureKind::BadManifest,
+            "the update is not offered over https, so it is not downloaded",
+        ));
+    }
+    // The download is checked against the public key here.
+    update
         .download(
             |chunk, total| {
                 report(UpdateEvent::Progress {
@@ -629,20 +731,44 @@ async fn download_and_install(
             || {},
         )
         .await
-        .map_err(from_updater)?;
-    report(UpdateEvent::Installing);
+        .map_err(from_updater)
+}
 
+/// Stops the engines and installs the update that [`download`] kept. The documents to bring back
+/// are taken here, from what the app has open at this moment (a file opened while the download ran
+/// is in the list, one closed is not); `active` is the one in view, which comes back first. Where
+/// the installer replaces the running app (Windows) this does not return: the app ends.
+pub async fn install(
+    state: &UpdateState,
+    pool: Arc<EnginePool>,
+    active: Option<String>,
+) -> Result<(), UpdateFailure> {
+    let Some((update, bytes)) = state
+        .downloaded
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    else {
+        return Err(failure(FailureKind::Other, "no update has been downloaded"));
+    };
     let gate = state.gate.clone();
     let restore_file = state.restore_file.clone();
-    let update = update.clone();
+    let docs = state.open_docs.clone();
+    let close_blocked = state.close_blocked.clone();
     let outcome = tauri::async_runtime::spawn_blocking(move || {
         #[cfg(feature = "update-driver")]
         let open_before = pool.len();
-        install_with_engines_stopped(
+        close_blocked.store(true, Ordering::SeqCst);
+        let result = install_with_engines_stopped(
             &gate,
             &*pool,
+            Duration::from_secs(OPEN_DRAIN_SECS),
             || {
                 if let Some(file) = &restore_file {
+                    let paths = restore_list(
+                        &docs.lock().unwrap_or_else(|e| e.into_inner()),
+                        active.as_deref(),
+                    );
                     let _ = save_restore(file, &paths, now_seconds());
                 }
             },
@@ -654,22 +780,27 @@ async fn download_and_install(
                 ));
                 update.install(&bytes)
             },
-        )
+        );
+        close_blocked.store(false, Ordering::SeqCst);
+        result
     })
     .await;
-    match outcome {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => {
-            let mut f = from_updater(e);
-            f.engines_stopped = true;
-            Err(f)
-        }
-        Err(e) => {
-            let mut f = failure(FailureKind::Other, e.to_string());
-            f.engines_stopped = true;
-            Err(f)
-        }
-    }
+    let result = match outcome {
+        Ok(Ok(())) => return Ok(()),
+        Ok(Err(Stopped::Install(e))) => from_updater(e),
+        Ok(Err(Stopped::OpensStuck)) => failure(
+            FailureKind::Other,
+            "a file was still being opened, so nothing was installed",
+        ),
+        Err(e) => failure(FailureKind::Other, e.to_string()),
+    };
+    // The engines were stopped, and the program was not replaced: the app can be used again after
+    // a restart (which brings the documents back).
+    state.installing.store(false, Ordering::SeqCst);
+    Err(UpdateFailure {
+        engines_stopped: true,
+        ..result
+    })
 }
 
 fn command_error(error: io::Error) -> CommandError {
@@ -709,20 +840,38 @@ pub async fn check_update(
     check(&app, &state, manual).await
 }
 
-/// Downloads and installs the update that the last check found. `paths` are the documents that are
-/// open: they are opened again after the restart.
+/// The documents that were open before the last update, once: the window opens them again. They
+/// do not go through the rules for files named at the start (no limit of eight, and a file that
+/// does not end in .pdf is kept), because they are what the reader had open.
+#[tauri::command]
+pub fn take_restored_paths(state: State<'_, UpdateState>) -> Vec<String> {
+    state.take_restored()
+}
+
+/// Downloads the update that the last check found, with progress, and checks it against the public
+/// key. Nothing about the running app changes.
+#[tauri::command]
+pub async fn download_update(
+    state: State<'_, UpdateState>,
+    on_event: Channel<UpdateEvent>,
+) -> Result<(), UpdateFailure> {
+    download(&state, move |event| {
+        let _ = on_event.send(event);
+    })
+    .await
+}
+
+/// Installs the update that was downloaded: stops the engines, writes down the documents that are
+/// open at this moment, and replaces the program. `active` is the document in view; it comes back
+/// first.
 #[tauri::command]
 pub async fn install_update(
     state: State<'_, UpdateState>,
     engine: State<'_, Engine>,
-    paths: Vec<String>,
-    on_event: Channel<UpdateEvent>,
+    active: Option<String>,
 ) -> Result<(), UpdateFailure> {
     let pool = engine.0.clone();
-    install(&state, pool, paths, move |event| {
-        let _ = on_event.send(event);
-    })
-    .await
+    install(&state, pool, active).await
 }
 
 /// Starts the app again. The engines are already stopped when this follows an install.
@@ -769,7 +918,7 @@ pub mod driver {
         }
     }
 
-    pub fn start(app: AppHandle, restored: &[String]) {
+    pub fn start(app: AppHandle, restored: usize) {
         // The Windows installer starts the new version without the environment of the old one, so
         // the log can also be named by a file in the app's data folder.
         let named_by_file = || {
@@ -790,7 +939,7 @@ pub mod driver {
                 "started version={} method={:?} restored={}",
                 app.package_info().version,
                 detect(),
-                restored.len()
+                restored
             ),
         );
         tauri::async_runtime::spawn(async move {
@@ -823,17 +972,13 @@ pub mod driver {
                         return;
                     }
                     log(&file, &format!("documents open={}", engine.0.len()));
-                    let paths = locate::existing_files(
-                        std::env::args().skip(1),
-                        std::env::current_dir().ok().as_deref(),
-                    );
-                    let file2 = file.clone();
-                    let result = install(&state, engine.0.clone(), paths, move |event| {
-                        if let UpdateEvent::Installing = event {
-                            log(&file2, "installing: engines are stopped next");
+                    let result = match download(&state, |_| {}).await {
+                        Ok(()) => {
+                            log(&file, "installing: engines are stopped next");
+                            install(&state, engine.0.clone(), None).await
                         }
-                    })
-                    .await;
+                        Err(e) => Err(e),
+                    };
                     match result {
                         Ok(()) => {
                             log(&file, "installed; restarting");
@@ -1062,9 +1207,10 @@ mod tests {
             })
         };
         let seen = RefCell::new(Vec::new());
-        let result: Result<(), ()> = install_with_engines_stopped(
+        let result: Result<(), Stopped<()>> = install_with_engines_stopped(
             &gate,
             &*engines,
+            Duration::from_secs(5),
             || seen.borrow_mut().push("prepare"),
             || {
                 seen.borrow_mut().push("install");
@@ -1088,15 +1234,131 @@ mod tests {
             live: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
         };
-        let result: Result<(), &str> =
-            install_with_engines_stopped(&gate, &engines, || {}, || Err("the installer failed"));
-        assert_eq!(result, Err("the installer failed"));
+        let result: Result<(), Stopped<&str>> = install_with_engines_stopped(
+            &gate,
+            &engines,
+            Duration::from_secs(5),
+            || {},
+            || Err("the installer failed"),
+        );
+        assert_eq!(result, Err(Stopped::Install("the installer failed")));
         assert!(!gate.is_closed());
     }
 
     #[test]
-    fn nothing_is_installed_by_the_function_when_the_engines_cannot_be_asked() {
-        // `install` is only called after the stops; this keeps the order in one place.
+    fn an_open_that_does_not_finish_in_time_stops_the_install() {
+        let gate = Arc::new(OpenGate::default());
+        let engines = Counting {
+            live: AtomicUsize::new(0),
+            stops: AtomicUsize::new(0),
+        };
+        let permit = gate.enter().unwrap();
+        let installed = RefCell::new(false);
+        let result: Result<(), Stopped<()>> = install_with_engines_stopped(
+            &gate,
+            &engines,
+            Duration::from_millis(50),
+            || {},
+            || {
+                *installed.borrow_mut() = true;
+                Ok(())
+            },
+        );
+        assert_eq!(result, Err(Stopped::OpensStuck));
+        assert!(
+            !*installed.borrow(),
+            "nothing may be installed with an open still running"
+        );
+        assert!(!gate.is_closed(), "the app is usable again");
+        drop(permit);
+    }
+
+    #[test]
+    fn the_list_of_documents_is_taken_after_the_stop_and_has_the_one_in_view_first() {
+        let docs = vec![
+            (1, "/a.pdf".to_string()),
+            (2, "/b".to_string()),
+            (3, "/c.pdf".to_string()),
+            (4, "/a.pdf".to_string()),
+        ];
+        assert_eq!(restore_list(&docs, None), vec!["/a.pdf", "/b", "/c.pdf"]);
+        assert_eq!(
+            restore_list(&docs, Some("/c.pdf")),
+            vec!["/c.pdf", "/a.pdf", "/b"]
+        );
+        // A view that is not in the list changes nothing.
+        assert_eq!(
+            restore_list(&docs, Some("/nope")),
+            vec!["/a.pdf", "/b", "/c.pdf"]
+        );
+        assert!(restore_list(&[], Some("/x")).is_empty());
+
+        // The prepare step sees a document that was opened while the download was running.
+        let gate = OpenGate::default();
+        let live = Arc::new(Mutex::new(vec![(1u64, "/first.pdf".to_string())]));
+        let engines = Counting {
+            live: AtomicUsize::new(0),
+            stops: AtomicUsize::new(0),
+        };
+        live.lock()
+            .unwrap()
+            .push((2, "/opened-during-the-download.pdf".to_string()));
+        let written = RefCell::new(Vec::new());
+        let _: Result<(), Stopped<()>> = install_with_engines_stopped(
+            &gate,
+            &engines,
+            Duration::from_secs(1),
+            || *written.borrow_mut() = restore_list(&live.lock().unwrap(), None),
+            || Ok(()),
+        );
+        assert_eq!(
+            *written.borrow(),
+            vec!["/first.pdf", "/opened-during-the-download.pdf"]
+        );
+    }
+
+    #[test]
+    fn documents_are_recorded_when_opened_and_forgotten_when_closed_or_when_the_page_restarts() {
+        let state = UpdateState::new(None, InstallMethod::Manual);
+        state.record_open(1, "/a.pdf");
+        state.record_open(2, "/b.pdf");
+        state.forget_doc(1);
+        let docs = state.open_docs.lock().unwrap().clone();
+        assert_eq!(restore_list(&docs, None), vec!["/b.pdf"]);
+        state.forget_all_docs();
+        assert!(state.open_docs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_update_is_downloaded_only_over_https() {
+        let url = |s: &str| url::Url::parse(s).unwrap();
+        assert!(download_allowed(&url(
+            "https://api.github.com/repos/o/r/releases/assets/1"
+        )));
+        assert!(!download_allowed(&url(
+            "http://api.github.com/repos/o/r/releases/assets/1"
+        )));
+        assert!(!download_allowed(&url("ftp://example.com/file")));
+        // This computer, over http, is for the update test only: it is allowed in a build with the
+        // update-driver feature and refused in every other.
+        assert_eq!(
+            download_allowed(&url("http://127.0.0.1:18099/x")),
+            cfg!(feature = "update-driver")
+        );
+        assert!(!download_allowed(&url("http://example.com/x")));
+    }
+
+    #[test]
+    fn the_window_is_kept_open_only_while_the_program_is_replaced() {
+        let state = UpdateState::new(None, InstallMethod::Manual);
+        assert!(!state.is_close_blocked());
+        state.close_blocked.store(true, Ordering::SeqCst);
+        assert!(state.is_close_blocked());
+    }
+
+    #[test]
+    fn the_steps_of_an_install_come_in_this_order() {
+        // Stop, wait, stop again, write down the documents, install: kept in one place.
         let gate = OpenGate::default();
         let order = RefCell::new(Vec::new());
         struct Log<'a>(&'a RefCell<Vec<&'static str>>);
@@ -1105,16 +1367,17 @@ mod tests {
                 self.0.borrow_mut().push("stop");
             }
         }
-        let _: Result<(), ()> = install_with_engines_stopped(
+        let _: Result<(), Stopped<()>> = install_with_engines_stopped(
             &gate,
             &Log(&order),
+            Duration::from_secs(1),
             || order.borrow_mut().push("prepare"),
             || {
                 order.borrow_mut().push("install");
                 Ok(())
             },
         );
-        assert_eq!(*order.borrow(), vec!["prepare", "stop", "stop", "install"]);
+        assert_eq!(*order.borrow(), vec!["stop", "stop", "prepare", "install"]);
     }
 
     fn fake_engine() -> PathBuf {
@@ -1152,9 +1415,10 @@ mod tests {
         assert!(pids.iter().all(|p| alive(*p)));
 
         let gate = OpenGate::default();
-        let result: Result<(), ()> = install_with_engines_stopped(
+        let result: Result<(), Stopped<()>> = install_with_engines_stopped(
             &gate,
             &pool,
+            Duration::from_secs(5),
             || {},
             || {
                 assert!(pool.is_empty(), "documents are still open");
