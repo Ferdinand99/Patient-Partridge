@@ -12,7 +12,8 @@ import { execFileSync } from "node:child_process";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 
-/** What the Info.plist of the macOS app must say, as parsed JSON. */
+/** What the Info.plist of the macOS app must say, as parsed JSON. macOS names a file type by its
+ * UTI (com.adobe.pdf), not by a MIME type. */
 export function checkMacPlist(plist) {
   const problems = [];
   const types = Array.isArray(plist.CFBundleDocumentTypes) ? plist.CFBundleDocumentTypes : [];
@@ -22,7 +23,6 @@ export function checkMacPlist(plist) {
     return problems;
   }
   if (!(pdf.LSItemContentTypes ?? []).includes("com.adobe.pdf")) problems.push("the PDF type lacks com.adobe.pdf");
-  if (!(pdf.CFBundleTypeMIMETypes ?? []).includes("application/pdf")) problems.push("the PDF type lacks application/pdf");
   if (pdf.CFBundleTypeRole !== "Viewer") problems.push(`the role is ${pdf.CFBundleTypeRole}, not Viewer`);
   if (pdf.LSHandlerRank !== "Alternate") problems.push(`the rank is ${pdf.LSHandlerRank}, not Alternate`);
   return problems;

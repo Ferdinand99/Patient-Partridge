@@ -45,7 +45,6 @@ describe("checking what the build made", () => {
     CFBundleDocumentTypes: [
       {
         CFBundleTypeExtensions: ["pdf"],
-        CFBundleTypeMIMETypes: ["application/pdf"],
         CFBundleTypeRole: "Viewer",
         LSHandlerRank: "Alternate",
         LSItemContentTypes: ["com.adobe.pdf"],
