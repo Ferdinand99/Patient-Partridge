@@ -128,14 +128,21 @@ fn probe(args: &[String], say: &mut dyn FnMut(String)) {
 
     // The network.
     let address: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    // The standard library panics when the system will not even start its network support; for
+    // this test that counts as a refusal.
+    let attempt = |f: fn(std::net::SocketAddr) -> std::io::Result<()>| {
+        std::panic::catch_unwind(|| f(address))
+            .unwrap_or_else(|_| Err(std::io::Error::other("the network support did not start")))
+    };
     report(
         "connect_socket",
-        std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_secs(2))
-            .map(|_| ()),
+        attempt(|a| {
+            std::net::TcpStream::connect_timeout(&a, std::time::Duration::from_secs(2)).map(|_| ())
+        }),
     );
     report(
         "bind_udp_socket",
-        std::net::UdpSocket::bind("127.0.0.1:0").map(|_| ()),
+        attempt(|_| std::net::UdpSocket::bind("127.0.0.1:0").map(|_| ())),
     );
 
     // Processes.
