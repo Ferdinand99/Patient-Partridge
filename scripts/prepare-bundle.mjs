@@ -55,6 +55,9 @@ if (universal) {
   copyFileSync(join(arm, "LICENSE"), join(out, "LICENSE"));
   cpSync(join(arm, "licenses"), join(out, "licenses"), { recursive: true });
 
+  // The repository pins its Rust version (rust-toolchain.toml); the targets belong to that version,
+  // which a plain "install these targets" step of a workflow does not touch.
+  run("rustup", ["target", "add", ...MAC_TRIPLES]);
   for (const triple of MAC_TRIPLES) {
     run("cargo", ["build", "--release", "-p", "partridge-engine", "--locked", "--target", triple]);
     copyFileSync(
