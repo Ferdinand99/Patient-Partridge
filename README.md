@@ -82,7 +82,10 @@ Tests:
 ```
 npm test                          # TypeScript unit tests
 cargo test --workspace --locked   # needs the PDFium download from prepare:dev
+npm run build && npx playwright install chromium && npm run e2e   # the window in a real browser
 ```
+
+The browser tests (`e2e/`) run the real window code in Chromium with the content security policy of the app and a stand-in for the Rust side that serves two made-up documents. They cover tabs, the light and dark look, thumbnails and contents, selecting and copying with the mouse, search, the question before a link is opened, and printing. They do not start the Rust side, the engine or a real web view; the CI job "Build" does that for the release build (it opens a generated 500-page PDF and checks that the first page is drawn).
 
 Installers for testing (not signed): `npm run bundle`.
 

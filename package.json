@@ -9,8 +9,9 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint src scripts vite.config.ts eslint.config.js",
+    "lint": "eslint src scripts e2e vite.config.ts eslint.config.js",
     "test": "vitest run",
+    "e2e": "playwright test --config e2e/playwright.config.ts",
     "tauri": "tauri",
     "fetch:pdfium": "node scripts/fetch-pdfium.mjs",
     "prepare:dev": "node scripts/prepare-dev.mjs",
@@ -23,6 +24,7 @@
   "devDependencies": {
     "@eslint/js": "10.0.1",
     "@tauri-apps/cli": "2.12.4",
+    "@playwright/test": "1.64.1",
     "@types/node": "26.6.6",
     "eslint": "10.14.0",
     "jsdom": "30.1.3",
