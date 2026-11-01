@@ -251,11 +251,60 @@ fn make_tokens() -> io::Result<(Owned, Owned)> {
         )?;
         let own = Owned::new(raw)?;
 
-        // The identity for the start of the engine: the app's own token, as an impersonation token.
+        let user_buffer = token_info(own.raw(), TokenUser)?;
+        let user = &*(user_buffer.as_ptr() as *const TOKEN_USER);
+        let groups_buffer = token_info(own.raw(), TokenGroups)?;
+        let groups = &*(groups_buffer.as_ptr() as *const TOKEN_GROUPS);
+
+        // The identity for the start of the engine: the app's own rights, but as a restricted
+        // token. (The system lets the first thread of a process with a restricted token
+        // impersonate only a restricted token; the restricting SIDs here are all the SIDs the app
+        // has, so nothing is lost.)
+        let mut everyone = simple_sid(1, 0);
+        let mut restricted_code = simple_sid(5, 12);
+        let mut start_sids: Vec<SID_AND_ATTRIBUTES> = vec![
+            SID_AND_ATTRIBUTES {
+                Sid: user.User.Sid,
+                Attributes: 0,
+            },
+            SID_AND_ATTRIBUTES {
+                Sid: everyone.as_mut_ptr().cast(),
+                Attributes: 0,
+            },
+            SID_AND_ATTRIBUTES {
+                Sid: restricted_code.as_mut_ptr().cast(),
+                Attributes: 0,
+            },
+        ];
+        for i in 0..groups.GroupCount as usize {
+            let g = &*groups.Groups.as_ptr().add(i);
+            if g.Attributes & (SE_GROUP_INTEGRITY | SE_GROUP_USE_FOR_DENY_ONLY) == 0 {
+                start_sids.push(SID_AND_ATTRIBUTES {
+                    Sid: g.Sid,
+                    Attributes: 0,
+                });
+            }
+        }
+        let mut start_token: HANDLE = null_mut();
+        check(
+            CreateRestrictedToken(
+                own.raw(),
+                0,
+                0,
+                null(),
+                0,
+                null(),
+                start_sids.len() as u32,
+                start_sids.as_ptr(),
+                &mut start_token,
+            ),
+            "CreateRestrictedToken (start)",
+        )?;
+        let start_token = Owned::new(start_token)?;
         let mut imp: HANDLE = null_mut();
         check(
             DuplicateTokenEx(
-                own.raw(),
+                start_token.raw(),
                 TOKEN_ALL_ACCESS,
                 null(),
                 SecurityImpersonation,
@@ -267,10 +316,6 @@ fn make_tokens() -> io::Result<(Owned, Owned)> {
         let initial = Owned::new(imp)?;
 
         // The user and every group become deny-only, except the integrity entry, which cannot.
-        let user_buffer = token_info(own.raw(), TokenUser)?;
-        let user = &*(user_buffer.as_ptr() as *const TOKEN_USER);
-        let groups_buffer = token_info(own.raw(), TokenGroups)?;
-        let groups = &*(groups_buffer.as_ptr() as *const TOKEN_GROUPS);
         let mut disable: Vec<SID_AND_ATTRIBUTES> = vec![SID_AND_ATTRIBUTES {
             Sid: user.User.Sid,
             Attributes: 0,

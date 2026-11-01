@@ -88,7 +88,7 @@ jobs:
         run: cargo test -p partridge-engine -p partridge-engine-client --locked
       - name: The sandbox log (macOS)
         if: failure() && runner.os == 'macOS'
-        run: log show --last 10m --predicate 'sender == "Sandbox"' --style compact | tail -150 || true
+        run: log show --last 10m --predicate 'sender == "Sandbox"' --style compact | grep -i 'engine|partridge' | tail -100 || true
       # The test switches and the self-test program exist in debug builds only.
       - name: The release engine has no test code
         if: matrix.lint

@@ -47,6 +47,7 @@ The editor side is planned, and none of it exists yet. There are no dates; each 
 - **Text layer.** For each document the window keeps the text of at most 1.5 million characters (about 60 MB) for the pages on screen, and the addresses of their links up to 1 million characters. A page that would go past that is drawn as usual but has no text layer for the moment: its text cannot be selected, searched on the page or pressed as a link, and a message says so once. This only happens with files made to do it, such as thousands of tiny pages that each hold the most text a page can have.
 - **Copying** gathers at most 20 million characters at a time, one copy at a time for each document. When a copy is cut short, or a page cannot be read, or a page has more text than the engine hands over (100,000 characters), a message says what is missing. On some systems the web view allows the text to be put on the clipboard only straight after a key press; if it refuses, a message says so.
 - **Printing** sends pictures of the pages, at 150 dpi, to the system's print dialog. Pages of different sizes are fitted to the paper. One print job holds at most 1,000 pages: for a longer document the dialog offers "The first 1000 of N pages" instead of "All", and a list of pages can be printed in parts.
+- **Fonts that a PDF does not embed.** The engine runs in a sandbox that does not let it open files, so it cannot look at the fonts installed on your system. It uses the fonts built into PDFium, which cover Latin text in the usual faces (Helvetica, Times, Courier and anything named like them). Text in a script that needs a font the file does not carry (Chinese, Japanese, Korean, Arabic, Hebrew, Thai) shows as blanks. Almost every PDF made for print or the web embeds its fonts and is not affected. Fonts put in a `fonts` folder next to the PDFium library are read at start and used; the app does not ship any yet.
 - **Reloading the window** (F5, Ctrl+R, the context menu of the page) is switched off in release builds, because a reload would lose the tabs. The right mouse button on selected text opens a small menu of the app with Copy; text boxes keep the menu of the web view (Cut, Copy, Paste). There is no menu on the page itself, so there is no Paste or Select all by mouse outside the boxes. Whatever else restarts the page, the app ends the engines of the old page and starts clean.
 
 ## How it is built
@@ -55,6 +56,7 @@ The editor side is planned, and none of it exists yet. There are no dates; each 
 - PDF files are read by a separate program, `partridge-engine`, which uses [PDFium](https://pdfium.googlesource.com/pdfium/) (the PDF library of Chrome) through [pdfium-render](https://crates.io/crates/pdfium-render). The app starts it and talks to it over standard input and output with a small binary protocol.
 - A PDF is untrusted input. Every open document is read by an engine process of its own, so a file that crashes or hangs its engine closes only its own tab: you get an error message, the other tabs carry on, and you can open another file. At most 16 documents are open at once.
 - PDF JavaScript is turned off. The PDFium build used has no JavaScript engine at all.
+- The engine runs in an operating system sandbox (see Security below): it cannot open files, use the network or start programs, and it reads the one document the app opens for it through a read-only handle that the app passes on at start.
 - The engine code has no network code, and a check in CI keeps it that way. The app makes no network connections of its own, and the window loads nothing from the internet (strict content security policy). The one thing that leaves the app is a link you say yes to: your normal browser is then started with that address.
 
 - The PDFium library is downloaded from [bblanchon/pdfium-binaries](https://github.com/bblanchon/pdfium-binaries) at a pinned release, and its SHA-256 checksum is checked before it is used (`pdfium.lock.json`).
@@ -69,14 +71,30 @@ src                   the window (TypeScript)
 scripts               PDFium download, bundling, measurements
 ```
 
-## Security: what is protected and what is not yet
+## Security: what is protected and what is not
 
 Please read this before you open files from people you do not trust.
 
-- **The engine is not sandboxed by the operating system yet.** Being in a separate process protects the app from crashes and hangs, but it is not a security boundary. If an attacker finds a bug in PDFium and builds a PDF that exploits it, the code would run with your user rights: it could read your files and use the network, even though the engine's own code never does. A real sandbox (restricted rights per operating system) is planned and is a requirement for the first release.
-- "No network" means that the engine's code contains none, which CI checks. It does not mean the operating system blocks the engine from the network.
-- What the engine does have today: a limit on the memory it may use (3 GiB on Linux and Windows, none on macOS), it ends when the app ends (even when stuck inside PDFium), the app treats everything it receives from the engine as untrusted, and PDFium is loaded only from the app's own folder after a checksum check at build time.
-- PDFium is the main attack surface. It is pinned to one release and updated by hand for now; nothing warns yet when a newer release exists.
+**What the sandbox does.** PDFium is the main attack surface: a large C++ library that parses files nobody has checked. Every open document has an engine process of its own, and that process locks itself into an operating system sandbox before it reads the first byte of the document. If an attacker finds a bug in PDFium and builds a PDF that exploits it, the code runs inside that sandbox:
+
+- **It cannot open any file.** The engine does not open files at all. The app opens the document and hands the engine a read-only handle to that one file when it starts the engine. The engine can read that file and nothing else, cannot write or create files, and cannot see the other open documents (each has its own engine).
+- **It cannot use the network, start programs or touch other processes.** The engine's code contains no network code (a check in CI keeps that), and the sandbox stops the operating system from letting any code in the process do it either.
+- **It cannot use more than 3 GiB of memory.**
+- **How, per system.** Linux: a seccomp filter that allows only the few system calls the engine needs (always applied; nothing that opens files, creates sockets, starts processes, traces other processes or makes memory executable), plus Landlock where the kernel has it (5.13 or newer). macOS: a Seatbelt profile that denies everything by default, the mechanism browsers use for their renderers. Windows: a restricted token with no privileges and no accessible group, the untrusted integrity level, a job object of its own (one process, a memory limit, no child processes, no clipboard, no user interface access), process mitigation policies (no dynamic code, no win32k system calls, no extension points and others), and an explicit list of the four handles the engine inherits.
+- **It checks itself.** After the sandbox is applied the engine tries to open a file and a socket and must be refused. A release build that cannot show a working sandbox does not open the document and tells you so. The app also refuses an engine that does not report a sandbox. A debug build, used for development only, may go on without one.
+
+**What it does not cover.**
+
+- **The app itself is not sandboxed.** The window, the web view and the code that starts the engines run with your user rights. The sandbox protects you from a bad PDF, not from a bug in the app.
+- **The engine can still read the document it was given** and send back whatever it likes. The app treats every answer from the engine as untrusted (sizes are checked, frames are limited, text only reaches the window as text), but a bug in that handling would be reachable from a hostile PDF.
+- **A bug in the operating system kernel** can be used to leave a sandbox. This is true of every sandbox. On Windows the win32k system calls (a large part of that surface) are switched off for the engine; on Linux the system call list is short.
+- **Weaker spots by system.** Windows has no AppContainer (the restricted token is the older mechanism and is what keeps files and sockets away). macOS uses the `sandbox_init` call, which Apple has marked deprecated but still uses itself and which browsers rely on; it is not the App Sandbox. On Linux without Landlock only the seccomp filter protects, and it does that completely for opening files, but not against a kernel bug. On macOS the memory limit is enforced by a watchdog thread inside the engine, which an exploit could stop.
+- **CPU time and speed side channels** are not limited beyond the 60 second answer timeout, and attacks such as Spectre are not mitigated by the sandbox.
+- **The sandbox starts after PDFium and the fonts are loaded**, and loading is not protected. Both come from the app's own folder, and PDFium is checked against a pinned checksum.
+- **Documents the engine opens are untrusted by design; PDFium itself is not tested for correctness.** The sandbox limits the harm of a PDFium bug. It does not fix it.
+- PDFium is pinned to one release and updated by hand for now; nothing warns yet when a newer release exists.
+
+Other protections: the engine ends when the app ends (even when stuck inside PDFium), and PDFium is loaded only from the app's own folder after a checksum check at build time.
 
 ## Building from source
 

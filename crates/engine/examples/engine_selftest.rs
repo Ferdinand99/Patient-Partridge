@@ -154,11 +154,23 @@ fn probe(args: &[String], say: &mut dyn FnMut(String)) {
     ));
 }
 
-/// Tries to get at another process: a debugger attach on Unix, a memory read handle on Windows.
-#[cfg(unix)]
+/// Tries to get at another process: a debugger attach on Linux, a signal on macOS, a memory read
+/// handle on Windows.
+#[cfg(target_os = "linux")]
 fn touch_process(pid: u32) -> std::io::Result<()> {
     // SAFETY: plain system call; a successful attach would be a failure of the sandbox.
     let rc = unsafe { libc::ptrace(libc::PTRACE_ATTACH as _, pid as libc::pid_t, 0, 0) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn touch_process(pid: u32) -> std::io::Result<()> {
+    // SAFETY: signal 0 only checks whether the process can be signalled.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
     if rc == 0 {
         Ok(())
     } else {
