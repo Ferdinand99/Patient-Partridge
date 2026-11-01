@@ -6,6 +6,7 @@ import type { OpenedDocument, OutlineEntry, SavedPosition } from "../lib/api";
 import { describeError, fileNameOf, toAppError, type AppErrorLike } from "../lib/errors";
 import { classifyUri, visibleAddress } from "../lib/linkPolicy";
 import { parsePageInput } from "../lib/pageInput";
+import { describeScripts, scriptsWithoutFont, type TextScript } from "../lib/scripts";
 import { MAX_OPEN_AT_ONCE, wantedPdfPaths } from "../lib/paths";
 import {
   THEME_CHOICES,
@@ -44,6 +45,8 @@ export interface AppDeps {
     getPageLinks(doc: number, page: number): Promise<PageLinkInfo[]>;
     searchPage(doc: number, page: number, query: string): Promise<[number, number][]>;
     openLink(doc: number, url: string): Promise<void>;
+    /** The scripts for which this computer has a system font the engine can use. */
+    systemFonts?(): Promise<string[]>;
     measureMode(): Promise<boolean>;
     measureReport(openMs: number, firstPageMs: number, pages: number): Promise<void>;
   };
@@ -86,6 +89,8 @@ interface Tab {
   forgottenAt: ViewPosition | null;
   /** True once the reader was told that some pages have more text than is kept. */
   limitTold: boolean;
+  /** Scripts the document uses that this computer has no font for, told once for the tab. */
+  fontsTold: boolean;
 }
 
 const ZOOM_CHOICES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
@@ -331,6 +336,7 @@ export class App {
       saveTimer: undefined,
       forgottenAt: null,
       limitTold: false,
+      fontsTold: false,
     };
     tab.view = new DocumentView(
       { doc: opened.doc, pages: opened.pages },
@@ -361,6 +367,7 @@ export class App {
         },
         onSelectionSettled: () => this.updateSelectionProxy(tab),
         onTextLimit: () => void this.textLimitHit(tab),
+        onScripts: (scripts) => void this.scriptsSeen(tab, scripts),
       },
       { start: opened.position ?? null, limits: this.deps.viewLimits },
     );
@@ -389,6 +396,28 @@ export class App {
         buttons: [{ id: "ok", label: "OK", primary: true }],
       });
     }
+  }
+
+  /** The scripts this computer has a system font for; asked once, when a page first needs it. */
+  private fontsAvailable: Promise<string[]> | null = null;
+
+  /**
+   * The text of a page uses some scripts. If this computer has no font for one of them, the PDF
+   * engine cannot draw that text unless the PDF carries its own font. A calm message, once for the
+   * tab, says what that means.
+   */
+  private async scriptsSeen(tab: Tab, scripts: TextScript[]): Promise<void> {
+    if (tab.fontsTold || !this.deps.api.systemFonts) return;
+    this.fontsAvailable ??= this.deps.api.systemFonts().catch(() => []);
+    const fonts = await this.fontsAvailable;
+    const missing = scriptsWithoutFont(scripts, fonts);
+    if (missing.length === 0 || tab.fontsTold || !this.tabs.includes(tab)) return;
+    tab.fontsTold = true;
+    await showNotice(this.noticeLayer, {
+      title: "Some text may not show",
+      detail: `"${tab.name}" has text in ${describeScripts(missing)}. If the PDF does not carry the fonts for it, that text shows as blanks, because this computer has no font installed that the reader can use for it. You can still search, select and copy it. Installing a font for it and opening the file again will show it.`,
+      buttons: [{ id: "ok", label: "OK", primary: true }],
+    });
   }
 
   /** A page of a tab has more text or more links than the window may keep. Told once for the tab. */

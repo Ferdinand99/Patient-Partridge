@@ -65,6 +65,7 @@ fn run_selftest(document: &std::fs::File, memory_limit: Option<u64>, mode_args: 
         // Required: if the restrictions cannot be applied, the test says why instead of
         // quietly running an unrestricted program.
         policy: SandboxPolicy::Required,
+        fonts: &[],
     })
     .expect("the program starts");
     drop(engine.stdin);
@@ -609,6 +610,7 @@ fn talk_unbounded(requests: Vec<RequestBody>, document: Option<&std::fs::File>) 
         document,
         memory_limit: None,
         policy: SandboxPolicy::Required,
+        fonts: &[],
     })
     .unwrap();
     let mut answers = Vec::new();

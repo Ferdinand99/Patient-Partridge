@@ -42,6 +42,7 @@ pub use partridge_protocol::{LinkTarget, OutlineItem, PageLink, TextMatch};
 mod pool;
 pub use pool::EnginePool;
 mod spawn;
+pub mod system_fonts;
 
 /// Largest answer to an open request. An `Opened` answer holds 8 bytes per page, so this allows
 /// more than a million pages.
@@ -68,6 +69,9 @@ pub struct EngineConfig {
     pub memory_limit: Option<u64>,
     /// Whether an engine without a working sandbox is refused. Release builds always insist.
     pub sandbox: SandboxPolicy,
+    /// Whether the app hands the engine system fonts for the scripts that PDFium's own fonts do not
+    /// cover (see `system_fonts`). On by default; a test can turn it off.
+    pub system_fonts: bool,
 }
 
 impl EngineConfig {
@@ -78,6 +82,7 @@ impl EngineConfig {
             timeout: Duration::from_secs(60),
             memory_limit: None,
             sandbox: SandboxPolicy::default_for_build(),
+            system_fonts: true,
         }
     }
 }
@@ -514,12 +519,19 @@ impl EngineClient {
     }
 
     fn start(&self, inner: &mut Inner, document: Option<&File>) -> Result<(), ClientError> {
+        // The fonts are opened for this engine only and closed again when it has them.
+        let fonts = if self.config.system_fonts {
+            system_fonts::open_all()
+        } else {
+            Vec::new()
+        };
         let spawned = spawn_engine(&SpawnRequest {
             program: &self.config.program,
             args: &self.config.args,
             document,
             memory_limit: self.config.memory_limit,
             policy: self.config.sandbox,
+            fonts: &fonts,
         })
         .map_err(|e| {
             ClientError::EngineStopped(format!(

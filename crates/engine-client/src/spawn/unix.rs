@@ -80,15 +80,39 @@ fn watch_memory(pid: u32, limit: u64) {
     });
 }
 
+/// A copy of an open file on a descriptor far above the ones the child gets (3 and up), so that
+/// moving the copies onto their places in the child cannot overwrite one that is still to be moved.
+/// The copy is not inherited by anything unless it is moved.
+fn high_copy(file: &std::fs::File) -> io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: plain call on a descriptor that is open; the result is owned by the new value.
+    let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 64) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the descriptor was just made and nothing else owns it.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
 pub(super) fn spawn(request: &SpawnRequest<'_>) -> io::Result<SpawnedEngine> {
-    // A copy of the handle on a descriptor above 2, so that the standard descriptors the child
-    // gets cannot overwrite it. Copies made this way are not inherited unless asked for.
-    let document = request.document.map(|f| f.try_clone()).transpose()?;
+    // What the child gets, on fixed numbers: the document on 3, the fonts from 4.
+    let document = request.document.map(high_copy).transpose()?;
+    let fonts: Vec<(partridge_protocol::FontScript, std::os::fd::OwnedFd)> = request
+        .fonts
+        .iter()
+        .map(|(script, file)| high_copy(file).map(|fd| (*script, fd)))
+        .collect::<io::Result<_>>()?;
+    let font_numbers: Vec<(partridge_protocol::FontScript, u64)> = fonts
+        .iter()
+        .enumerate()
+        .map(|(i, (script, _))| (*script, (DOCUMENT_DESCRIPTOR + 1 + i as i32) as u64))
+        .collect();
     let mut command = Command::new(request.program);
     command
         .args(engine_args(
             request,
             document.as_ref().map(|_| DOCUMENT_DESCRIPTOR as u64),
+            &font_numbers,
         ))
         // Nothing of the app's environment: tokens, agent sockets, the user's name.
         .env_clear()
@@ -96,20 +120,24 @@ pub(super) fn spawn(request: &SpawnRequest<'_>) -> io::Result<SpawnedEngine> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    // (source, target) pairs for the child.
+    let mut moves: Vec<(i32, i32)> = Vec::new();
     if let Some(document) = &document {
-        let fd = document.as_raw_fd();
-        // SAFETY: the closure runs in the child between fork and exec and only calls `dup2` and
-        // `fcntl`, which are safe to call there. It puts the document on its fixed number; if it
-        // already has that number it just stays open across exec.
+        moves.push((document.as_raw_fd(), DOCUMENT_DESCRIPTOR));
+    }
+    for (i, (_, fd)) in fonts.iter().enumerate() {
+        moves.push((fd.as_raw_fd(), DOCUMENT_DESCRIPTOR + 1 + i as i32));
+    }
+    if !moves.is_empty() {
+        // SAFETY: the closure runs in the child between fork and exec and only calls `dup2`, which
+        // is safe to call there. The sources are all above the targets, so no move overwrites a
+        // source that is still to be used. `dup2` clears the close-on-exec flag of the target.
         unsafe {
             command.pre_exec(move || {
-                if fd == DOCUMENT_DESCRIPTOR {
-                    let flags = libc::fcntl(fd, libc::F_GETFD);
-                    if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                for (source, target) in &moves {
+                    if libc::dup2(*source, *target) < 0 {
                         return Err(io::Error::last_os_error());
                     }
-                } else if libc::dup2(fd, DOCUMENT_DESCRIPTOR) < 0 {
-                    return Err(io::Error::last_os_error());
                 }
                 Ok(())
             });

@@ -203,6 +203,8 @@
         return OUTLINE[docs.get(args.doc)?.path] ?? [];
       case "get_page_text":
         return pageData(docs.get(args.doc)?.path, args.page);
+      case "system_fonts":
+        return [];
       case "get_page_links":
         return LINKS[docs.get(args.doc)?.path]?.[args.page] ?? [];
       case "search_page":

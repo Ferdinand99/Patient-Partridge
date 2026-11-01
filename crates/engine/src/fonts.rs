@@ -17,8 +17,11 @@
 //! `fonts` folder. A PDF that embeds its fonts, which is nearly every PDF made for the web or
 //! print, is not affected.
 
+use std::collections::HashMap;
+use std::fs::File;
 use std::path::Path;
 
+use partridge_protocol::FontScript;
 use pdfium_render::prelude::*;
 
 /// Most font files read at start.
@@ -35,10 +38,145 @@ struct Font {
     data: Vec<u8>,
 }
 
+/// A system font the app handed over as a handle to one file. Its bytes are read when PDFium first
+/// asks for its script, not before: a document without such text never pays for it.
+struct SystemFont {
+    file: File,
+    length: u64,
+    data: Option<Vec<u8>>,
+}
+
+impl SystemFont {
+    fn bytes(&mut self) -> Option<&Vec<u8>> {
+        if self.data.is_none() {
+            let mut buffer = vec![0u8; usize::try_from(self.length).ok()?];
+            read_exact_at(&self.file, &mut buffer, 0).ok()?;
+            self.data = Some(buffer);
+        }
+        self.data.as_ref()
+    }
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buffer, offset)
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buffer.is_empty() {
+        let n = file.seek_read(buffer, offset)?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        buffer = &mut buffer[n..];
+        offset += n as u64;
+    }
+    Ok(())
+}
+
+/// The script a character set that PDFium asks a font for belongs to, if it is one of ours.
+fn script_of(set: &PdfFontCharacterSet) -> Option<FontScript> {
+    Some(match set {
+        PdfFontCharacterSet::JapaneseShiftJis => FontScript::Japanese,
+        PdfFontCharacterSet::KoreanHangul => FontScript::Korean,
+        PdfFontCharacterSet::ChineseGb2312 => FontScript::ChineseSimplified,
+        PdfFontCharacterSet::ChineseBig5 => FontScript::ChineseTraditional,
+        PdfFontCharacterSet::Arabic => FontScript::Arabic,
+        PdfFontCharacterSet::Hebrew => FontScript::Hebrew,
+        PdfFontCharacterSet::Thai => FontScript::Thai,
+        _ => return None,
+    })
+}
+
+/// Fonts of Windows and Macintosh documents that are made for one script, by name. PDFium does
+/// not ask for the character set of these scripts when it draws ordinary text in a font it does
+/// not have: it asks for the font by its name only. A name that is made for one script is enough
+/// to say which of the app's fonts that is. (Names are compared without spaces and style words, by
+/// their beginning, so that `Angsana New` and `AngsanaUPC` both match `angsana`.) A name that
+/// several scripts use, such as Arial or Tahoma, is not in the list.
+const NAMES_BY_SCRIPT: [(FontScript, &[&str]); 3] = [
+    (
+        FontScript::Arabic,
+        &[
+            "traditionalarabic",
+            "simplifiedarabic",
+            "arabictypesetting",
+            "sakkalmajalla",
+            "andalus",
+            "geezapro",
+            "scheherazade",
+            "lateef",
+            "notosansarabic",
+            "notonaskharabic",
+        ],
+    ),
+    (
+        FontScript::Hebrew,
+        &[
+            "david",
+            "narkisim",
+            "miriam",
+            "frankruehl",
+            "frankruhl",
+            "nehama",
+            "arialhebrew",
+            "notosanshebrew",
+        ],
+    ),
+    (
+        FontScript::Thai,
+        &[
+            "angsana",
+            "browallia",
+            "cordia",
+            "dillenia",
+            "eucrosia",
+            "freesia",
+            "iris",
+            "jasmine",
+            "kodchiang",
+            "lilyupc",
+            "thsarabun",
+            "leelawadee",
+            "garuda",
+            "loma",
+            "norasi",
+            "waree",
+            "notosansthai",
+        ],
+    ),
+];
+
+/// The script a font name belongs to, if it is a name made for one script.
+fn script_of_name(face: &str) -> Option<FontScript> {
+    let key = match_key(face);
+    NAMES_BY_SCRIPT
+        .iter()
+        .find(|(_, names)| names.iter().any(|n| key.starts_with(n)))
+        .map(|(script, _)| *script)
+}
+
+/// The character set to report for a font of a script (the one PDFium asked for).
+fn charset_of(script: FontScript) -> PdfFontCharacterSet {
+    match script {
+        FontScript::Japanese => PdfFontCharacterSet::JapaneseShiftJis,
+        FontScript::Korean => PdfFontCharacterSet::KoreanHangul,
+        FontScript::ChineseSimplified => PdfFontCharacterSet::ChineseGb2312,
+        FontScript::ChineseTraditional => PdfFontCharacterSet::ChineseBig5,
+        FontScript::Arabic => PdfFontCharacterSet::Arabic,
+        FontScript::Hebrew => PdfFontCharacterSet::Hebrew,
+        FontScript::Thai => PdfFontCharacterSet::Thai,
+    }
+}
+
 /// The fonts held in memory, and the answer to PDFium's questions about them.
 #[derive(Default)]
 pub struct MemoryFonts {
     fonts: Vec<Font>,
+    system: HashMap<FontScript, SystemFont>,
 }
 
 const STYLE_WORDS: [&str; 7] = [
@@ -116,12 +254,32 @@ impl MemoryFonts {
         });
     }
 
+    /// Adds the system font the app handed over for a script. The length is taken now, while
+    /// files can still be asked about; the bytes are read later through the handle.
+    pub fn add_system(&mut self, script: FontScript, file: File) {
+        let Ok(length) = file.metadata().map(|m| m.len()) else {
+            return;
+        };
+        // A handle that is not a file of a sensible size is not used.
+        if length == 0 || length > 128 * 1024 * 1024 {
+            return;
+        }
+        self.system.insert(
+            script,
+            SystemFont {
+                file,
+                length,
+                data: None,
+            },
+        );
+    }
+
     pub fn len(&self) -> usize {
-        self.fonts.len()
+        self.fonts.len() + self.system.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.fonts.is_empty()
+        self.fonts.is_empty() && self.system.is_empty()
     }
 
     /// The index of the font that fits a request best, if any family matches.
@@ -144,6 +302,21 @@ impl PdfiumCustomFontProvider for MemoryFonts {
         &mut self,
         request: PdfiumCustomFontProviderRequest,
     ) -> Option<PdfiumCustomFontProviderResponse> {
+        // A script the app has a system font for: PDFium asked for the character set, and the
+        // font name only decides nothing here. (The name never chooses a file.)
+        let script =
+            script_of(&request.character_set).or_else(|| script_of_name(&request.font_face));
+        if let Some(script) = script {
+            if let Some(system) = self.system.get_mut(&script) {
+                let data = system.bytes()?.clone();
+                return Some(PdfiumCustomFontProviderResponse {
+                    id: 1000 + script as u64,
+                    font_face: request.font_face,
+                    character_set: charset_of(script),
+                    data,
+                });
+            }
+        }
         let bold = names_bold(&request.font_face);
         let italic = request.is_italic || names_italic(&request.font_face);
         let index = self.find(&request.font_face, bold, italic)?;
@@ -179,6 +352,21 @@ mod tests {
         assert_eq!(set.find("NotoSerif", false, false), Some(2));
         assert_eq!(set.find("Helvetica", false, false), None);
         assert_eq!(set.find("", false, false), None);
+    }
+
+    #[test]
+    fn names_made_for_one_script_find_that_script() {
+        assert_eq!(
+            script_of_name("TraditionalArabic"),
+            Some(FontScript::Arabic)
+        );
+        assert_eq!(script_of_name("David-Bold"), Some(FontScript::Hebrew));
+        assert_eq!(script_of_name("AngsanaUPC"), Some(FontScript::Thai));
+        assert_eq!(script_of_name("Angsana New"), Some(FontScript::Thai));
+        // Names that every script uses are no help.
+        for name in ["Arial", "Tahoma", "Times New Roman", "Helvetica", ""] {
+            assert_eq!(script_of_name(name), None, "{name}");
+        }
     }
 
     #[test]

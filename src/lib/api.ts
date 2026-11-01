@@ -69,6 +69,14 @@ export const api = {
     return invoke<{ text: string; rects: number[] }>("get_page_text", { doc, page });
   },
 
+  /**
+   * The scripts for which this computer has a system font that the app can hand to the PDF engine
+   * (for text whose font the PDF does not carry): "japanese", "korean", "chinese-simplified", ...
+   */
+  systemFonts(): Promise<string[]> {
+    return invoke<string[]>("system_fonts");
+  },
+
   /** The links of a page that lead to a web address or to a page of the document. */
   getPageLinks(doc: number, page: number): Promise<PageLinkInfo[]> {
     return invoke<PageLinkInfo[]>("get_page_links", { doc, page });

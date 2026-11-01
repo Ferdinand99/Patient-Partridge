@@ -10,6 +10,7 @@
 //! `engine_selftest [--pdfium-dir D] [--document N] [--memory-limit B] probe FILE DIR EXE PID PORT TITLE`
 //! `engine_selftest [...] memory MIB`
 //! `engine_selftest [...] document`
+//! `engine_selftest [...] descriptors`
 //! `engine_selftest control FILE DIR EXE PID PORT TITLE` runs the probes of `probe` in a program
 //! that is not locked in, to show that each attempt is one that works without the sandbox.
 
@@ -35,7 +36,7 @@ fn main() {
         let text = word.to_string_lossy().into_owned();
         if matches!(
             text.as_str(),
-            "--pdfium-dir" | "--fonts-dir" | "--document" | "--memory-limit"
+            "--pdfium-dir" | "--fonts-dir" | "--document" | "--memory-limit" | "--font"
         ) {
             engine_options.push(word);
             engine_options.extend(raw.next());
@@ -95,6 +96,17 @@ fn main() {
         "probe" => probe(&mode[1..], &mut say),
         "memory" => memory(mode[1].parse().expect("MiB"), &mut say),
         "document" => document(&mut engine, &mut say),
+        "descriptors" => {
+            // How many descriptors are open: the ones the engine was given and nothing else.
+            #[cfg(unix)]
+            {
+                // SAFETY: asking about a descriptor number only reads the descriptor table.
+                let open = (0..1024)
+                    .filter(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } >= 0)
+                    .count();
+                say(format!("descriptors: {open}"));
+            }
+        }
         _ => unreachable!(),
     }
     say("done".to_string());

@@ -68,6 +68,8 @@ use windows_sys::Win32::System::Threading::{
     LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
 
+use partridge_protocol::FontScript;
+
 use super::{engine_args, EngineProcess, SpawnRequest, SpawnedEngine};
 
 const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x0002_0002;
@@ -615,13 +617,27 @@ pub(super) fn spawn(request: &SpawnRequest<'_>) -> io::Result<SpawnedEngine> {
     let (child_out, parent_out) = make_pipe(false)?;
     let nul = open_nul()?;
     let document = request.document.map(inheritable_copy).transpose()?;
+    let fonts: Vec<(FontScript, Owned)> = request
+        .fonts
+        .iter()
+        .map(|(script, file)| inheritable_copy(file).map(|h| (*script, h)))
+        .collect::<io::Result<_>>()?;
+    let font_numbers: Vec<(FontScript, u64)> = fonts
+        .iter()
+        .map(|(script, h)| (*script, h.raw() as usize as u64))
+        .collect();
 
     // The engine inherits these and nothing else.
     let mut inherited: Vec<HANDLE> = vec![child_in.raw(), child_out.raw(), nul.raw()];
     if let Some(document) = &document {
         inherited.push(document.raw());
     }
-    let args = engine_args(request, document.as_ref().map(|d| d.raw() as usize as u64));
+    inherited.extend(fonts.iter().map(|(_, h)| h.raw()));
+    let args = engine_args(
+        request,
+        document.as_ref().map(|d| d.raw() as usize as u64),
+        &font_numbers,
+    );
     let mut line = command_line(request.program.as_os_str(), &args);
     let program = wide(request.program.as_os_str());
 
@@ -747,7 +763,7 @@ pub(super) fn spawn(request: &SpawnRequest<'_>) -> io::Result<SpawnedEngine> {
     let (process, _thread, id) = result?;
 
     // The engine has its copies now.
-    drop((child_in, child_out, nul, document));
+    drop((child_in, child_out, nul, document, fonts));
     Ok(SpawnedEngine {
         process: Box::new(WindowsProcess {
             process,
@@ -784,11 +800,21 @@ pub(super) fn spawn_plain(request: &SpawnRequest<'_>) -> io::Result<SpawnedEngin
     // document handle is inheritable for the moment of the start and closed again after it.
     let _only_one = START.lock().unwrap_or_else(|e| e.into_inner());
     let document = request.document.map(inheritable_copy).transpose()?;
+    let fonts: Vec<(FontScript, Owned)> = request
+        .fonts
+        .iter()
+        .map(|(script, file)| inheritable_copy(file).map(|h| (*script, h)))
+        .collect::<io::Result<_>>()?;
+    let font_numbers: Vec<(FontScript, u64)> = fonts
+        .iter()
+        .map(|(script, h)| (*script, h.raw() as usize as u64))
+        .collect();
     let mut command = Command::new(request.program);
     command
         .args(engine_args(
             request,
             document.as_ref().map(|d| d.raw() as usize as u64),
+            &font_numbers,
         ))
         .env_clear()
         .envs(super::engine_environment())

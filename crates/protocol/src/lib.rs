@@ -1675,3 +1675,60 @@ mod tests {
         assert!(ErrorCode::from_u8(14).is_none());
     }
 }
+
+/// The scripts for which the app can hand the engine a system font. PDFium asks for a font by
+/// character set, and these are the character sets it can ask for that the fonts built into PDFium
+/// do not cover. The app chooses the files; the PDF only decides which script it needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum FontScript {
+    Japanese,
+    Korean,
+    ChineseSimplified,
+    ChineseTraditional,
+    Arabic,
+    Hebrew,
+    Thai,
+}
+
+impl FontScript {
+    /// Every script, in a fixed order.
+    pub const ALL: [FontScript; 7] = [
+        FontScript::Japanese,
+        FontScript::Korean,
+        FontScript::ChineseSimplified,
+        FontScript::ChineseTraditional,
+        FontScript::Arabic,
+        FontScript::Hebrew,
+        FontScript::Thai,
+    ];
+
+    /// A short stable name, used on the engine's command line and in the window.
+    pub fn name(self) -> &'static str {
+        match self {
+            FontScript::Japanese => "japanese",
+            FontScript::Korean => "korean",
+            FontScript::ChineseSimplified => "chinese-simplified",
+            FontScript::ChineseTraditional => "chinese-traditional",
+            FontScript::Arabic => "arabic",
+            FontScript::Hebrew => "hebrew",
+            FontScript::Thai => "thai",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<FontScript> {
+        FontScript::ALL.into_iter().find(|s| s.name() == name)
+    }
+}
+
+#[cfg(test)]
+mod font_script_tests {
+    use super::*;
+
+    #[test]
+    fn names_round_trip() {
+        for script in FontScript::ALL {
+            assert_eq!(FontScript::from_name(script.name()), Some(script));
+        }
+        assert_eq!(FontScript::from_name("latin"), None);
+    }
+}

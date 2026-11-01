@@ -6,6 +6,7 @@
 // One DocumentView is one document; the app keeps one per tab. A view that is not shown frees all
 // its canvases and asks the engine for nothing, and remembers where the reader was.
 
+import type { TextScript } from "../lib/scripts";
 import { type AppErrorLike, isEngineLost, toAppError } from "../lib/errors";
 import { type Action, pageScrollDistance } from "./keys";
 import {
@@ -47,6 +48,8 @@ export interface ViewerEvents {
   onSelectionSettled?(): void;
   /** A page has more text or more links than the document may keep; it has no text layer for now. */
   onTextLimit?(): void;
+  /** The text of a page uses these scripts (see `scriptsIn`). */
+  onScripts?(scripts: TextScript[]): void;
 }
 
 /** Where the reader was: a page, how far down it, and the zoom (null means fit width). */
@@ -139,6 +142,7 @@ export class DocumentView {
         onSelectionChange: (has) => events.onSelectionChange?.(has),
         onSelectionSettled: () => events.onSelectionSettled?.(),
         onTextLimit: () => events.onTextLimit?.(),
+        onScripts: (scripts) => events.onScripts?.(scripts),
       },
       options.limits,
     );

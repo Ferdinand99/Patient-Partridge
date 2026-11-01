@@ -338,6 +338,17 @@ struct LinkInfo {
     page: Option<u32>,
 }
 
+/// The scripts for which this computer has a system font that the engine can be given (see
+/// `partridge_engine_client::system_fonts`). The window uses it to say when a document has text
+/// in a script that cannot be drawn here.
+#[tauri::command]
+fn system_fonts() -> Vec<String> {
+    partridge_engine_client::system_fonts::available()
+        .into_iter()
+        .map(|s| s.name().to_string())
+        .collect()
+}
+
 #[tauri::command]
 async fn get_page_links(
     engine: State<'_, Engine>,
@@ -531,6 +542,7 @@ pub fn run() {
             get_outline,
             get_page_text,
             get_page_links,
+            system_fonts,
             open_link,
             print_webview,
             search_page,
