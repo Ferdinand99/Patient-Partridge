@@ -52,6 +52,9 @@ fn open_descriptors() -> usize {
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
     let mut count = 0u32;
     // SAFETY: the pseudo handle of this process and a number to write into.
-    assert_ne!(unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) }, 0);
+    assert_ne!(
+        unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) },
+        0
+    );
     count as usize
 }

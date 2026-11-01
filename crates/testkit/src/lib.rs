@@ -467,14 +467,36 @@ pub const SCRIPT_NAMES: [&str; 7] = [
 /// identity encoding with a table of the characters. The text is at the top of the page, at 48
 /// points, from 700 points up from the bottom.
 pub fn script_pdf(script: &str) -> Vec<u8> {
+    script_pdf_with_font(script, default_font_name(script))
+}
+
+/// The font name `script_pdf` gives the text of a script.
+pub fn default_font_name(script: &str) -> &'static str {
+    match script {
+        "japanese" => "MS-Mincho",
+        "korean" => "Batang",
+        "chinese-simplified" => "SimSun",
+        "chinese-traditional" => "MingLiU",
+        "arabic" => "TraditionalArabic",
+        "hebrew" => "David",
+        "thai" => "Angsana",
+        other => panic!("no page for the script {other}"),
+    }
+}
+
+/// As `script_pdf`, with the text in an unembedded font of another name (as documents made on
+/// other systems and by other programs name them). A name with a space is written the way a PDF
+/// writes it (`#20`).
+pub fn script_pdf_with_font(script: &str, name: &str) -> Vec<u8> {
+    let name = &name.replace(' ', "#20");
     let (font, descendant, content) = match script {
-        "japanese" => cid_font("MS-Mincho", "90ms-RKSJ-H", "Japan1", 2, "93FA967B8CEA"),
-        "korean" => cid_font("Batang", "KSCms-UHC-H", "Korea1", 1, "C7D1B1B9BEEE"),
-        "chinese-simplified" => cid_font("SimSun", "GBK-EUC-H", "GB1", 2, "D6D0CEC4"),
-        "chinese-traditional" => cid_font("MingLiU", "ETen-B5-H", "CNS1", 0, "A4A4A4E5"),
-        "arabic" => identity_font("TraditionalArabic", &[0x645, 0x631, 0x62D, 0x628, 0x627]),
-        "hebrew" => identity_font("David", &[0x5E9, 0x5DC, 0x5D5, 0x5DD]),
-        "thai" => identity_font("Angsana", &[0xE2A, 0xE27, 0xE31, 0xE2A, 0xE14, 0xE35]),
+        "japanese" => cid_font(name, "90ms-RKSJ-H", "Japan1", 2, "93FA967B8CEA"),
+        "korean" => cid_font(name, "KSCms-UHC-H", "Korea1", 1, "C7D1B1B9BEEE"),
+        "chinese-simplified" => cid_font(name, "GBK-EUC-H", "GB1", 2, "D6D0CEC4"),
+        "chinese-traditional" => cid_font(name, "ETen-B5-H", "CNS1", 0, "A4A4A4E5"),
+        "arabic" => identity_font(name, &[0x645, 0x631, 0x62D, 0x628, 0x627]),
+        "hebrew" => identity_font(name, &[0x5E9, 0x5DC, 0x5D5, 0x5DD]),
+        "thai" => identity_font(name, &[0xE2A, 0xE27, 0xE31, 0xE2A, 0xE14, 0xE35]),
         other => panic!("no page for the script {other}"),
     };
     let page_content = format!(

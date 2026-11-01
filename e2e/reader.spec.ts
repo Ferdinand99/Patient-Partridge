@@ -10,6 +10,7 @@ type Stand = {
   printed: number;
   violations: string[];
   title: string;
+  fonts: string[];
 };
 
 declare global {
@@ -467,4 +468,24 @@ test("takes screenshots in light and dark (nothing is checked about the look)", 
     await page.waitForTimeout(500);
     await page.screenshot({ path: `e2e/artifacts/reader-${scheme}.png` });
   }
+});
+
+test("a computer without a font for the script of a page gets one calm notice, and still reads the text", async ({
+  page,
+}) => {
+  await page.evaluate(() => {
+    window.__E2E__.fonts = [];
+    window.__E2E__.dialog = ["/docs/rtl.pdf"];
+  });
+  await page.locator("#empty-open").click();
+  await expect(page.locator('.tab-title[aria-selected="true"]')).toHaveText("rtl.pdf");
+  const notice = page.getByRole("alertdialog");
+  await expect(notice).toContainText("Some text may not show");
+  await expect(notice).toContainText("Hebrew");
+  await notice.getByRole("button", { name: "OK" }).click();
+  await expect(notice).toHaveCount(0);
+  // The text is still there to select, and the notice does not come back for the document.
+  await expect.poll(async () => (await calls(page, "get_page_text")).length).toBeGreaterThan(0);
+  await expect(page.locator(".page-overlay").first()).toBeAttached();
+  await expect(notice).toHaveCount(0);
 });

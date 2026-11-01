@@ -34,7 +34,11 @@ fn ink(bitmap: &Bitmap) -> usize {
 }
 
 fn draw(script: &str, system_fonts: bool) -> usize {
-    let file = kit::TempFile::new("script.pdf", &kit::script_pdf(script));
+    draw_named(script, kit::default_font_name(script), system_fonts)
+}
+
+fn draw_named(script: &str, font: &str, system_fonts: bool) -> usize {
+    let file = kit::TempFile::new("script.pdf", &kit::script_pdf_with_font(script, font));
     let client = EngineClient::new(config(system_fonts));
     let doc = client.open(&file.path_str(), None).unwrap();
     let bitmap = client.render(doc.doc, 0, 612, 792).unwrap();
@@ -144,6 +148,93 @@ fn a_page_in_each_script_is_drawn_with_the_font_the_app_found() {
     }
 }
 
+/// Names that documents use for their unembedded fonts, by script. CJK fonts are asked for by
+/// character set, so any name gets the font of the script. The other three are asked for by name
+/// only, and the engine knows the names that were made for one script.
+const NAMED: [(&str, &[&str]); 7] = [
+    (
+        "japanese",
+        &[
+            "MS-Gothic",
+            "MS-PMincho",
+            "HeiseiKakuGo-W5",
+            "KozMinPro-Regular",
+            "Meiryo",
+        ],
+    ),
+    (
+        "korean",
+        &["Gulim", "Malgun Gothic", "HYSMyeongJo-Medium", "Dotum"],
+    ),
+    (
+        "chinese-simplified",
+        &["SimHei", "Microsoft YaHei", "STSong-Light", "FangSong"],
+    ),
+    (
+        "chinese-traditional",
+        &[
+            "PMingLiU",
+            "Microsoft JhengHei",
+            "MSung-Light",
+            "MHei-Medium",
+        ],
+    ),
+    (
+        "arabic",
+        &[
+            "SimplifiedArabic",
+            "ArabicTypesetting",
+            "Sakkal Majalla",
+            "Andalus",
+        ],
+    ),
+    (
+        "hebrew",
+        &["David-Bold", "Miriam", "FrankRuehl", "Narkisim"],
+    ),
+    (
+        "thai",
+        &["AngsanaNew", "Cordia New", "TH SarabunPSK", "BrowalliaUPC"],
+    ),
+];
+
+#[test]
+fn the_names_documents_use_find_the_font_of_their_script() {
+    let found = system_fonts::found();
+    let mut failures = Vec::new();
+    summary("| script | font name in the PDF | dark pixels |");
+    summary("|---|---|---|");
+    for (name, fonts) in NAMED {
+        let script = FontScript::from_name(name).unwrap();
+        if !found.iter().any(|(s, _)| *s == script) {
+            println!("{name}: no font on this system, names not tried");
+            continue;
+        }
+        for font in fonts {
+            let ink = draw_named(name, font, true);
+            println!("{name} as {font}: {ink} dark pixels");
+            summary(&format!("| {name} | {font} | {ink} |"));
+            if ink < 150 {
+                failures.push(format!("{name} as {font}: {ink}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "drawn as blanks: {failures:?}");
+}
+
+/// Names that every script uses are no help to the engine: PDFium asks for "Arial" with no hint of
+/// the script. This only reports what happens (the README says it is not drawn), so that the
+/// claim is checked on each system.
+#[test]
+fn names_that_every_script_uses_are_reported() {
+    for name in ["arabic", "hebrew", "thai"] {
+        for font in ["Arial", "Tahoma", "TimesNewRoman"] {
+            let ink = draw_named(name, font, true);
+            println!("{name} as {font}: {ink} dark pixels (not required)");
+        }
+    }
+}
+
 #[test]
 fn a_page_without_a_font_for_its_script_shows_blanks_and_the_engine_stays_up() {
     for name in kit::SCRIPT_NAMES {
@@ -162,10 +253,12 @@ fn engine_handles(fonts: &[(FontScript, std::fs::File)]) -> usize {
     let handle = std::fs::File::open(document.path()).unwrap();
     let selftest = {
         let exe = std::env::current_exe().unwrap();
-        exe.parent().unwrap().parent().unwrap().join("examples").join(format!(
-            "engine_selftest{}",
-            std::env::consts::EXE_SUFFIX
-        ))
+        exe.parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("examples")
+            .join(format!("engine_selftest{}", std::env::consts::EXE_SUFFIX))
     };
     let args: Vec<std::ffi::OsString> = vec![
         "--pdfium-dir".into(),
