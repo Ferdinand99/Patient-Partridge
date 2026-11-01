@@ -1,16 +1,30 @@
 #![no_main]
 //! Valid requests built from the fuzzer's bytes must come through encode, framing and decode
 //! unchanged. Includes strings of exactly the longest allowed size and multi-byte characters.
+//!
+//! One run in eight builds a request that is one byte over a string cap instead (open path,
+//! password, search text). The encoder cannot write such a request, so the bytes are written by
+//! hand, and the decoder must refuse it.
 
 use std::io::Cursor;
 
 use arbitrary::Unstructured;
 use libfuzzer_sys::fuzz_target;
-use partridge_fuzz::{arb_request, ChunkReader};
+use partridge_fuzz::{arb_request, chance, over_cap_request, ChunkReader};
 use partridge_protocol::{read_frame, write_request, Request};
 
 fuzz_target!(|data: &[u8]| {
     let mut u = Unstructured::new(data);
+    if matches!(chance(&mut u, 8), Ok(true)) {
+        let Ok((name, payload)) = over_cap_request(&mut u) else {
+            return;
+        };
+        assert!(
+            Request::decode(&payload).is_err(),
+            "the decoder accepted: {name}"
+        );
+        return;
+    }
     let Ok(request) = arb_request(&mut u) else {
         return;
     };

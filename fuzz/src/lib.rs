@@ -1,8 +1,13 @@
 //! Helpers shared by the fuzz targets and the seed generator.
 //!
-//! The generators below build valid protocol messages out of fuzzer bytes. They stay inside the
-//! protocol limits on purpose: a message that the encoder would cut is a different message, and
-//! the round-trip targets compare what comes out with what went in.
+//! `arb_request` and `arb_response` build valid protocol messages out of fuzzer bytes. They stay
+//! inside the protocol limits on purpose: a message that the encoder would cut is a different
+//! message, and the round-trip targets compare what comes out with what went in. The messages
+//! that go past a limit on purpose are in `caps`.
+
+mod caps;
+
+pub use caps::*;
 
 use std::io::{self, Read};
 
@@ -13,9 +18,20 @@ use partridge_protocol::{
     MAX_OUTLINE_ITEMS, MAX_OUTLINE_TITLE, MAX_QUERY_LEN, MAX_STRING_LEN, MAX_URI_LEN,
 };
 
-/// A string of at most `max` bytes. Most are short and random; one in ten sits exactly on the limit (or
-/// one byte under it, or end in a two byte character), because that is where decoders slip.
+/// True about one time in `n`, and never when the input has run out: `Unstructured` answers
+/// `true` to every `ratio` once its bytes are used up, which would make the biggest case the
+/// usual one.
+pub fn chance(u: &mut Unstructured, n: u32) -> Result<bool> {
+    Ok(!u.is_empty() && u.ratio(1, n)?)
+}
+
+/// A string of at most `max` bytes. Most are short and random; one in ten sits exactly on the
+/// limit (or one byte under it, or ends in a two byte character), because that is where decoders
+/// slip. When the input has run out the string is empty.
 pub fn string_up_to(u: &mut Unstructured, max: usize) -> Result<String> {
+    if u.is_empty() {
+        return Ok(String::new());
+    }
     Ok(match u.int_in_range(0..=39u8)? {
         0 => "a".repeat(max),
         1 => "a".repeat(max.saturating_sub(1)),
@@ -104,7 +120,7 @@ pub fn arb_request(u: &mut Unstructured) -> Result<Request> {
 
 /// How many entries a list gets: mostly a few, now and then the most the protocol allows.
 fn count_up_to(u: &mut Unstructured, max: usize) -> Result<usize> {
-    if u.ratio(1, 24)? {
+    if chance(u, 24)? {
         Ok(max)
     } else {
         Ok(u.int_in_range(0..=6usize)?.min(max))

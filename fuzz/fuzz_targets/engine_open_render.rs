@@ -1,8 +1,8 @@
 #![no_main]
 //! Arbitrary bytes as a PDF file, through the engine's own request handler: open, outline, then
-//! for a few pages the text, the links, a search and a small render, and close. PDFium is the
-//! pinned build from `pdfium.lock.json`, loaded from `PARTRIDGE_PDFIUM_DIR` or `vendor/pdfium`
-//! (see docs/fuzzing.md).
+//! for the first pages and the last one the text, the links, searches and a small render, and
+//! close. PDFium is the pinned build from `pdfium.lock.json`, loaded from
+//! `PARTRIDGE_PDFIUM_DIR` or `vendor/pdfium` (see docs/fuzzing.md).
 //!
 //! PDFium is a prebuilt library without coverage instrumentation, so the fuzzer only sees which
 //! paths the engine code takes (the result of each step), not the paths inside PDFium. Bugs in
@@ -10,16 +10,32 @@
 //! crash inside the library shows up as a signal. Memory errors inside PDFium are not reported
 //! by AddressSanitizer unless they hit a guard page.
 //!
-//! Beyond "does not crash", every answer must be one the app can decode, and a request for a page
-//! that exists must not fail with an error that means a bug in the engine.
+//! What is checked, on the answer as the engine builds it (before the encoder cuts any list):
+//! - Open: page sizes are finite, positive and not above 14 400 points.
+//! - Outline, Close: the right kind of answer. An outline has at most 5 000 entries, depth at
+//!   most 15, titles at most 512 bytes, and an entry that has a page names a page that exists.
+//!   Close answers `Closed`, and the document is gone afterwards.
+//! - PageText: at most 100 000 characters, one box for each.
+//! - PageLinks: at most 500, addresses not empty and at most 2 048 bytes, and a link to a page
+//!   names a page that exists (the seeds include documents whose link and outline destinations
+//!   are page numbers far past the end or negative).
+//! - Search: matches are not empty, in order, do not overlap, and lie inside the text of the page
+//!   (counted in characters of the `PageText` answer), and the text they cover reads like the
+//!   search text (checked with a second, separate way of folding case and white space). Besides
+//!   fixed words, two searches are for pieces of the page itself, so matches do happen.
+//! - Render: a bitmap of exactly the size asked for.
+//! - Every answer can be encoded and decoded by the app, and the encoder cuts nothing.
+//! - A page that exists fails only with `Corrupt` or `RenderFailed`; a page past the end gives
+//!   `PageOutOfRange`.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
 
 use libfuzzer_sys::fuzz_target;
 use partridge_engine::Engine;
+use partridge_fuzz::check_response_caps;
 use partridge_protocol::{
-    ErrorCode, PageSize, Request, RequestBody, Response, ResponseBody, PROTOCOL_VERSION,
+    ErrorCode, LinkTarget, PageSize, Request, RequestBody, Response, ResponseBody, PROTOCOL_VERSION,
 };
 
 /// Longest side of the bitmaps the target draws. Small, so that an iteration is fast.
@@ -39,6 +55,40 @@ struct State {
 
 thread_local! {
     static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+}
+
+/// The number of entries of a list answer (0 for answers without a list).
+fn list_len(body: &ResponseBody) -> usize {
+    match body {
+        ResponseBody::Opened { pages, .. } => pages.len(),
+        ResponseBody::Outline { items } => items.len(),
+        ResponseBody::PageText { rects, .. } => rects.len(),
+        ResponseBody::PageLinks { links } => links.len(),
+        ResponseBody::Matches { matches } => matches.len(),
+        _ => 0,
+    }
+}
+
+/// Folds text the way a search is meant to read it: lower case, every run of white space is one
+/// space, soft hyphens are dropped, spaces at both ends are cut. Written again here, apart from
+/// the engine, to check what the engine reports as a match.
+fn folded(chars: impl Iterator<Item = char>) -> String {
+    let mut out = String::new();
+    for c in chars {
+        if c == '\u{AD}' {
+            continue;
+        }
+        let f = if c.is_whitespace() {
+            ' '
+        } else {
+            c.to_lowercase().next().unwrap_or(c)
+        };
+        if f == ' ' && out.ends_with(' ') {
+            continue;
+        }
+        out.push(f);
+    }
+    out.trim_matches(' ').to_string()
 }
 
 impl State {
@@ -61,15 +111,22 @@ impl State {
         }
     }
 
+    /// Sends one request and checks what every answer must satisfy.
     fn ask(&mut self, body: RequestBody) -> ResponseBody {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
         let response = self.engine.handle(Request { id, body });
         assert_eq!(response.id, id);
-        // The app must be able to read every answer the engine can give.
-        let bytes = response.encode();
-        let decoded = Response::decode(bytes).expect("the app cannot decode an answer");
+        // The caps, on the answer before the encoder cuts anything.
+        check_response_caps(&response);
+        // The app must be able to read the answer, and the encoder must not have cut a list.
+        let decoded = Response::decode(response.encode()).expect("the app cannot decode an answer");
         assert_eq!(decoded.id, id);
+        assert_eq!(
+            list_len(&decoded.body),
+            list_len(&response.body),
+            "the encoder cut a list of the answer"
+        );
         response.body
     }
 
@@ -109,19 +166,30 @@ impl State {
             }
             other => panic!("unexpected answer to Open: {other:?}"),
         };
+        assert_ne!(doc, 0);
         for size in &pages {
             assert!(size.width.is_finite() && size.width > 0.0 && size.width <= 14_400.0);
             assert!(size.height.is_finite() && size.height > 0.0 && size.height <= 14_400.0);
         }
-
-        self.ask(RequestBody::Outline { doc });
         let count = pages.len() as u32;
+
+        match self.ask(RequestBody::Outline { doc }) {
+            ResponseBody::Outline { items } => {
+                for item in &items {
+                    if let Some(p) = item.page {
+                        assert!(p < count, "outline entry for page {p} of {count}");
+                    }
+                }
+            }
+            other => panic!("unexpected answer to Outline: {other:?}"),
+        }
+
         let mut wanted: Vec<u32> = (0..count.min(PAGES_PER_FILE)).collect();
         if count > PAGES_PER_FILE {
             wanted.push(count - 1);
         }
         for page in wanted {
-            self.page(doc, page, pages[page as usize]);
+            self.page(doc, page, count, pages[page as usize]);
         }
         // Past the end is an error, never a crash.
         self.expect_range_error(RequestBody::PageText { doc, page: count });
@@ -131,7 +199,18 @@ impl State {
             width: 10,
             height: 10,
         });
-        self.ask(RequestBody::Close { doc });
+
+        match self.ask(RequestBody::Close { doc }) {
+            ResponseBody::Closed => {}
+            other => panic!("unexpected answer to Close: {other:?}"),
+        }
+        match self.ask(RequestBody::Outline { doc }) {
+            ResponseBody::Error {
+                code: ErrorCode::UnknownDocument,
+                ..
+            } => {}
+            other => panic!("a closed document answered: {other:?}"),
+        }
     }
 
     fn expect_range_error(&mut self, body: RequestBody) {
@@ -144,28 +223,71 @@ impl State {
         }
     }
 
-    fn page(&mut self, doc: u32, page: u32, size: PageSize) {
-        let text = self.ask(RequestBody::PageText { doc, page });
-        match &text {
-            ResponseBody::PageText { text, rects } => {
-                assert_eq!(text.chars().count(), rects.len());
+    fn page(&mut self, doc: u32, page: u32, count: u32, size: PageSize) {
+        // The text of the page when it could be read, and two pieces of it to search for.
+        let mut text: Option<Vec<char>> = None;
+        let mut from_text: Vec<String> = Vec::new();
+        match self.ask(RequestBody::PageText { doc, page }) {
+            ResponseBody::PageText { text: t, .. } => {
+                let chars: Vec<char> = t.chars().collect();
+                let middle = chars.len() / 2;
+                for start in [0, middle] {
+                    from_text.push(chars.iter().skip(start).take(8).collect());
+                }
+                text = Some(chars);
             }
-            other => self.expect_page_error(other),
+            other => self.expect_page_error(&other),
         }
-        let links = self.ask(RequestBody::PageLinks { doc, page });
-        if !matches!(links, ResponseBody::PageLinks { .. }) {
-            self.expect_page_error(&links);
+
+        match self.ask(RequestBody::PageLinks { doc, page }) {
+            ResponseBody::PageLinks { links } => {
+                for link in &links {
+                    match &link.target {
+                        LinkTarget::Page(p) => {
+                            assert!(*p < count, "link to page {p} of {count}");
+                        }
+                        LinkTarget::Uri(u) => assert!(!u.is_empty()),
+                    }
+                }
+            }
+            other => self.expect_page_error(&other),
         }
-        for query in ["the", "needle", "a b"] {
+
+        let mut queries = vec!["the".to_string(), "needle".to_string(), "a b".to_string()];
+        queries.extend(from_text);
+        for query in queries {
             let found = self.ask(RequestBody::Search {
                 doc,
                 page,
-                query: query.to_string(),
+                query: query.clone(),
             });
-            if !matches!(found, ResponseBody::Matches { .. }) {
-                self.expect_page_error(&found);
+            match found {
+                ResponseBody::Matches { matches } => {
+                    let mut end = 0u64;
+                    for m in &matches {
+                        assert!(m.len > 0, "an empty match");
+                        assert!(m.start as u64 >= end, "matches overlap or are out of order");
+                        end = m.start as u64 + m.len as u64;
+                        if let Some(chars) = &text {
+                            assert!(
+                                end <= chars.len() as u64,
+                                "match up to {end} on a page of {} characters",
+                                chars.len()
+                            );
+                            // What the match covers must read like the search text.
+                            let covered = &chars[m.start as usize..end as usize];
+                            assert_eq!(
+                                folded(covered.iter().copied()),
+                                folded(query.chars()),
+                                "a match that does not read like {query:?}"
+                            );
+                        }
+                    }
+                }
+                other => self.expect_page_error(&other),
             }
         }
+
         let scale = RENDER_SIDE / size.width.max(size.height);
         let width = ((size.width * scale).round() as u32).clamp(1, RENDER_SIDE as u32);
         let height = ((size.height * scale).round() as u32).clamp(1, RENDER_SIDE as u32);

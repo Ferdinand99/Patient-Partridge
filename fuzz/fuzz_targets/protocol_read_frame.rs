@@ -1,16 +1,50 @@
 #![no_main]
 //! Arbitrary bytes as a stream of frames, as the app reads the engine's output and the engine
 //! reads the app's. Checks that:
-//! - `read_frame` and `read_frame_limited` never panic and never allocate by the announced length;
+//! - `read_frame` and `read_frame_limited` never panic;
+//! - they never allocate by the announced length: the biggest single allocation of a run is
+//!   measured and must stay in proportion to the bytes that were really there (a 4 byte header
+//!   that announces 128 MiB must not cost 128 MiB). This needs input longer than the first chunk
+//!   the reader makes room for (64 KiB), so run it with `-max_len` above 65536;
 //! - a stream that arrives in small pieces, with interrupted reads, gives the same frames and the
 //!   same ending as one that arrives whole;
-//! - every frame that comes out can be given to both decoders.
+//! - every frame that comes out can be given to both decoders, and what they return is inside
+//!   the caps.
 
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::{Cursor, Read};
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use libfuzzer_sys::fuzz_target;
-use partridge_fuzz::ChunkReader;
+use partridge_fuzz::{check_request_caps, check_response_caps, ChunkReader};
 use partridge_protocol::{read_frame, read_frame_limited, ProtocolError, Request, Response};
+
+/// The biggest single allocation (or growth of one) since the last reset.
+static BIGGEST: AtomicUsize = AtomicUsize::new(0);
+
+struct Tracking;
+
+// SAFETY: every call is passed on unchanged to the system allocator.
+unsafe impl GlobalAlloc for Tracking {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        BIGGEST.fetch_max(layout.size(), Relaxed);
+        System.alloc(layout)
+    }
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        BIGGEST.fetch_max(layout.size(), Relaxed);
+        System.alloc_zeroed(layout)
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        System.dealloc(ptr, layout)
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        BIGGEST.fetch_max(new_size, Relaxed);
+        System.realloc(ptr, layout, new_size)
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: Tracking = Tracking;
 
 /// Input layout: two bytes of limit (little endian; 0 means use `read_frame`), one byte with the
 /// number of pieces, that many bytes of piece sizes (0 means an interrupted read), then the data.
@@ -63,8 +97,19 @@ fuzz_target!(|raw: &[u8]| {
     let Some(input) = split(raw) else {
         return;
     };
+    BIGGEST.store(0, Relaxed);
     let (whole, whole_end) = drain(&mut Cursor::new(input.data), input.limit);
     let (pieces, pieces_end) = drain(&mut ChunkReader::new(input.data, input.pieces), input.limit);
+
+    // A frame buffer grows by doubling, so twice the data is the most it can take; the list of
+    // frames takes 24 bytes for each frame of at least 4 bytes. Room for 128 MiB would not fit.
+    let biggest = BIGGEST.load(Relaxed);
+    assert!(
+        biggest <= 8 * raw.len() + 256 * 1024,
+        "an allocation of {biggest} bytes for {} bytes of input",
+        raw.len()
+    );
+
     assert_eq!(
         whole, pieces,
         "frames differ when the data arrives in pieces"
@@ -80,7 +125,11 @@ fuzz_target!(|raw: &[u8]| {
         assert!(whole.iter().all(|f| f.len() <= input.limit as usize));
     }
     for frame in whole {
-        let _ = Request::decode(&frame);
-        let _ = Response::decode(frame);
+        if let Ok(request) = Request::decode(&frame) {
+            check_request_caps(&request);
+        }
+        if let Ok(response) = Response::decode(frame) {
+            check_response_caps(&response);
+        }
     }
 });
