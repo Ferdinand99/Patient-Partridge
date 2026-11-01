@@ -39,6 +39,22 @@ pub fn engine_program() -> PathBuf {
     exe_dir().join(format!("partridge-engine{}", std::env::consts::EXE_SUFFIX))
 }
 
+/// The `Contents/Resources` folder of the app bundle that `exe` sits in, when it is the app's
+/// own program (`<name>.app/Contents/MacOS/<program>`). Tauri's `resource_dir` gives up on macOS
+/// when the path of the program goes through a symlink (`/tmp` is one), so the library has to be
+/// found without it. Only the bundle's own folder is returned: the path comes from the program
+/// location, never from the environment, and a program outside an `.app` bundle gets nothing.
+#[cfg(any(target_os = "macos", test))]
+fn bundle_resources(exe: &Path) -> Option<PathBuf> {
+    let macos = exe.parent()?;
+    let contents = macos.parent()?;
+    let app = contents.parent()?;
+    let is_bundle = macos.file_name().is_some_and(|n| n == "MacOS")
+        && contents.file_name().is_some_and(|n| n == "Contents")
+        && app.extension().is_some_and(|e| e == "app");
+    is_bundle.then(|| contents.join("Resources"))
+}
+
 /// Folders that may hold the PDFium library, best first.
 fn pdfium_candidates(resource_dir: Option<&Path>, override_dir: Option<PathBuf>) -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -47,6 +63,14 @@ fn pdfium_candidates(resource_dir: Option<&Path>, override_dir: Option<PathBuf>)
     }
     if let Some(dir) = resource_dir {
         out.push(dir.to_path_buf());
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .as_deref()
+        .and_then(bundle_resources)
+    {
+        out.push(dir);
     }
     out.push(exe_dir());
     // Running from a source checkout (`tauri dev`, `cargo run`).
@@ -133,6 +157,42 @@ mod tests {
         assert_eq!(chosen, full);
         std::fs::remove_dir_all(&empty).unwrap();
         std::fs::remove_dir_all(&full).unwrap();
+    }
+
+    #[test]
+    fn the_resources_folder_is_only_taken_from_inside_an_app_bundle() {
+        assert_eq!(
+            bundle_resources(Path::new(
+                "/a/b/Patient Partridge.app/Contents/MacOS/patient-partridge"
+            )),
+            Some(PathBuf::from(
+                "/a/b/Patient Partridge.app/Contents/Resources"
+            ))
+        );
+        // Not in a bundle: nothing, so a program in some other folder cannot pull in a library
+        // from next to it by this route.
+        for outside in [
+            "/a/b/patient-partridge",
+            "/a/MacOS/patient-partridge",
+            "/a/Contents/MacOS/patient-partridge",
+            "/a/b.app/MacOS/patient-partridge",
+            "/a/b.app/Contents/Other/patient-partridge",
+            "patient-partridge",
+        ] {
+            assert_eq!(bundle_resources(Path::new(outside)), None, "{outside}");
+        }
+    }
+
+    #[test]
+    fn a_library_in_the_bundle_is_found_when_the_resource_folder_is_not_known() {
+        let dir = temp_dir("bundle");
+        let res = dir.join("T.app/Contents/Resources");
+        std::fs::create_dir_all(&res).unwrap();
+        std::fs::write(res.join(library_file()), b"x").unwrap();
+        let exe = dir.join("T.app/Contents/MacOS/t");
+        let found = bundle_resources(&exe).unwrap();
+        assert_eq!(first_with_library(vec![dir.clone(), found.clone()]), found);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
