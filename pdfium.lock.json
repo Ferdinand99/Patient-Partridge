@@ -1,5 +1,5 @@
 {
-  "comment": "The PDFium build the engine is made for. scripts/fetch-pdfium.mjs downloads these files and refuses any whose SHA-256 differs. The 'pdfium_8125' feature of pdfium-render in crates/engine/Cargo.toml must match the release number. To update: pick a release of bblanchon/pdfium-binaries, move the pdfium-render feature, and replace the checksums (compute them yourself from the downloaded files).",
+  "comment": "The PDFium build the engine is made for. scripts/fetch-pdfium.mjs downloads these files and refuses any whose SHA-256 differs. The 'pdfium_8125' feature of pdfium-render in crates/engine/Cargo.toml must match the release number. To update, follow docs/pdfium-updates.md: pick a release of bblanchon/pdfium-binaries, move the pdfium-render feature, and replace the checksums (compute them yourself from the downloaded files).",
   "repository": "bblanchon/pdfium-binaries",
   "release": "chromium/8125",
   "build": 8125,

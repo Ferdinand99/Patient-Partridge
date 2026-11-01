@@ -70,3 +70,17 @@ export function readTgz(tgz, wanted) {
   }
   return files;
 }
+
+/**
+ * Byte strings that only a PDFium build with the V8 JavaScript engine contains. A V8 build
+ * exports the C++ symbols of V8 (`_ZN2v8...` on Linux and macOS, `...@v8@...` on Windows) and
+ * `FPDF_GetRecommendedV8Flags`; the plain build contains none of them (checked on the Linux,
+ * macOS and Windows builds of chromium/8125). The symbol names sit in the library's string
+ * tables in all three file formats, so one byte search covers all three systems.
+ */
+export const V8_MARKERS = ["_ZN2v8", "@v8@", "v8::", "V8Flags"];
+
+/** Returns the V8 markers found in a library file, or an empty list for a plain build. */
+export function findV8Markers(library) {
+  return V8_MARKERS.filter((marker) => library.includes(marker));
+}

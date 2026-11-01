@@ -1,0 +1,63 @@
+# Looks once a week for a newer PDFium build than the one pinned in pdfium.lock.json, and opens
+# one issue when there is one. PDFium is the main attack surface of the app, so a new release
+# must not go unnoticed. The steps to update are in docs/pdfium-updates.md.
+name: PDFium update check
+
+on:
+  schedule:
+    - cron: "41 5 * * 1"
+  workflow_dispatch:
+
+# No rights by default. The two jobs below ask for exactly what they need.
+permissions: {}
+
+jobs:
+  check:
+    name: Compare with the latest release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      outdated: ${{ steps.compare.outputs.outdated }}
+      title: ${{ steps.compare.outputs.title }}
+      body: ${{ steps.compare.outputs.body }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+      # Fails (visibly) when the release list can not be read, when the latest tag has an
+      # unexpected shape, or when pdfium.lock.json and the pdfium-render feature disagree.
+      - name: Compare
+        id: compare
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/pdfium-update-check.mjs
+
+  report:
+    name: Open an issue
+    needs: check
+    if: needs.check.outputs.outdated == 'true'
+    runs-on: ubuntu-24.04
+    # The only job that can write, and the only thing it can write is an issue.
+    permissions:
+      issues: write
+    steps:
+      # One issue per release: the title names the release, and an issue with that title in any
+      # state (also a closed one: the owner decided to skip it) stops a second one.
+      - name: Open the issue unless it exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TITLE: ${{ needs.check.outputs.title }}
+          BODY: ${{ needs.check.outputs.body }}
+        run: |
+          existing=$(gh issue list --state all --limit 100 --search "\"$TITLE\" in:title" --json number,title \
+            --jq "[.[] | select(.title == env.TITLE)] | length")
+          if [ "$existing" != "0" ]; then
+            echo "An issue for this release exists already: $TITLE"
+            exit 0
+          fi
+          gh issue create --title "$TITLE" --body "$BODY"

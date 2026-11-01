@@ -7,7 +7,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { downloadUrl, libraryFor, platformId, readTgz, sha256Hex, verifyChecksum } from "./pdfium.mjs";
+import { downloadUrl, findV8Markers, libraryFor, platformId, readTgz, sha256Hex, verifyChecksum } from "./pdfium.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -46,6 +46,11 @@ export async function fetchPdfium(id = platformId()) {
 
   const files = readTgz(tgz, [lib.inArchive, "VERSION", "LICENSE", "licenses/"]);
   if (!files.has(lib.inArchive)) throw new Error(`${lib.inArchive} is missing from ${entry.asset}.`);
+  // The lock pins an asset name only. A V8 build ("pdfium-v8-...") has the checksum of whatever
+  // was pinned, so look inside: PDF JavaScript must stay off, and a library without V8 is the
+  // way to be sure.
+  const v8 = findV8Markers(files.get(lib.inArchive));
+  if (v8.length > 0) throw new Error(`${entry.asset} contains the V8 JavaScript engine (${v8.join(", ")}). Nothing was unpacked.`);
   mkdirSync(target, { recursive: true });
   for (const [name, data] of files) {
     const out = name === lib.inArchive ? join(target, lib.file) : join(target, name);
