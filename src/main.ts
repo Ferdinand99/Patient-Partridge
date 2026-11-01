@@ -7,7 +7,6 @@ import "./styles/components.css";
 import "./styles/app.css";
 import { App } from "./app/app";
 import { api } from "./lib/api";
-import { pickPdfPaths } from "./lib/paths";
 import { blockReload } from "./lib/reload";
 
 function storage(): Storage | null {
@@ -58,8 +57,7 @@ const app = new App(document, {
 app.init();
 
 function openAll(paths: string[]): void {
-  const chosen = pickPdfPaths(paths);
-  if (chosen.length > 0) void app.openPaths(chosen);
+  void app.openChosen(paths);
 }
 
 // Files dropped on the window. Tauri hands us real paths; the page never reads the file itself.

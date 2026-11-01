@@ -250,21 +250,25 @@ export function selectionText(
 
 // ---- keeping the text of pages -----------------------------------------------
 
-/** Most characters of page text kept at once. About 100 MB of strings and numbers at the limit. */
-export const MAX_KEPT_CHARS = 3_000_000;
+/** Most characters of page text kept at once for one document. About 60 MB at the limit. */
+export const MAX_KEPT_CHARS = 1_500_000;
 
 /**
- * The text of the pages asked for so far. Each page is asked from the engine once; pages that are
- * not needed any more are dropped when the total grows too large, oldest first.
+ * The text of the pages asked for so far. Each page is asked from the engine once. When the total
+ * grows past the limit, pages that are not needed any more are dropped first, oldest first. Pages
+ * that `keep` names (the ones on screen) stay, but the limit is hard: a page that would take the
+ * total past it, with everything that can be dropped gone, is not kept at all. It is `refused`,
+ * the caller gets its text for the moment, and the page has no text layer until it is let in again.
  */
 export class TextStore {
   private readonly pages = new Map<number, PageText>();
   private readonly pending = new Map<number, Promise<PageText | null>>();
+  private readonly refusedPages = new Set<number>();
   private chars = 0;
 
   constructor(
     private readonly fetch: (page: number) => Promise<PageText | null>,
-    /** Pages that must not be dropped, such as those inside the selection. */
+    /** Pages that are dropped last, such as those on screen. */
     private readonly keep: (page: number) => boolean = () => false,
     private readonly limit = MAX_KEPT_CHARS,
   ) {}
@@ -273,8 +277,23 @@ export class TextStore {
     return this.pages.get(page);
   }
 
+  /** True when the page was too much for the limit the last time it was loaded. */
+  refused(page: number): boolean {
+    return this.refusedPages.has(page);
+  }
+
+  /** Lets a refused page try again, such as when it comes on screen again. */
+  allow(page: number): void {
+    this.refusedPages.delete(page);
+  }
+
   get size(): number {
     return this.pages.size;
+  }
+
+  /** Characters of text kept now. */
+  get keptChars(): number {
+    return this.chars;
   }
 
   /** Asks for a page unless it is here or on its way. Resolves with null when it cannot be read. */
@@ -310,6 +329,7 @@ export class TextStore {
   clear(): void {
     this.pages.clear();
     this.pending.clear();
+    this.refusedPages.clear();
     this.chars = 0;
   }
 
@@ -320,6 +340,14 @@ export class TextStore {
       if (page === justLoaded || this.keep(page)) continue;
       this.pages.delete(page);
       this.chars -= text.chars.length;
+    }
+    if (this.chars > this.limit) {
+      const text = this.pages.get(justLoaded);
+      if (text) {
+        this.pages.delete(justLoaded);
+        this.chars -= text.chars.length;
+        this.refusedPages.add(justLoaded);
+      }
     }
   }
 }

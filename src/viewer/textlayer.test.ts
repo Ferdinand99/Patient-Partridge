@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  MAX_KEPT_CHARS,
   TextStore,
   hasBox,
   isEmptySelection,
@@ -329,7 +330,9 @@ describe("offsetAt in right-to-left text", () => {
 
   it("copes with a single letter, and with a left-to-right run inside a right-to-left line", () => {
     const one = mirrored(1);
-    expect(offsetAt(one, 199, 105)).toBeGreaterThanOrEqual(0);
+    // With no neighbour there is nothing to tell the direction from: it reads left to right.
+    expect(offsetAt(one, 199, 105)).toBe(1);
+    expect(offsetAt(one, 195, 105)).toBe(0);
     // "ab" then "12" drawn left to right inside a right-to-left line: digits keep their own order.
     const mixed: PageText = {
       chars: ["א", "ב", "1", "2", "ג"],
@@ -356,5 +359,51 @@ describe("lineRects in right-to-left text", () => {
     expect(lineRects(REAL_RTL, 0, 16)).toHaveLength(2);
     // A part of the line: the middle letters are a box in the middle.
     expect(lineRects(REAL_RTL, 2, 4)).toEqual([{ left: 373, top: 75, right: 400, bottom: 96.0625 }]);
+  });
+});
+
+describe("TextStore: the limit is hard", () => {
+  const page = (n: number): PageText => ({ chars: Array(n).fill("a"), boxes: Array(n * 4).fill(1) });
+
+  it("refuses a page that does not fit, even when everything kept is on screen", async () => {
+    const onScreen = new Set([0, 1]);
+    const store = new TextStore(() => Promise.resolve(page(100)), (p) => onScreen.has(p), 250);
+    await store.load(0);
+    await store.load(1);
+    onScreen.add(2);
+    const text = await store.load(2);
+    // The caller gets the text for the moment, but the store does not keep it.
+    expect(text?.chars).toHaveLength(100);
+    expect(store.get(2)).toBeUndefined();
+    expect(store.refused(2)).toBe(true);
+    expect(store.keptChars).toBe(200);
+    expect(store.get(0)).toBeDefined();
+    expect(store.get(1)).toBeDefined();
+    // It can try again once it is let in again (it came on screen again).
+    store.allow(2);
+    expect(store.refused(2)).toBe(false);
+  });
+
+  it("drops pages that are not on screen before it refuses anything", async () => {
+    const onScreen = new Set([0, 1, 2]);
+    const store = new TextStore(() => Promise.resolve(page(100)), (p) => onScreen.has(p), 250);
+    await store.load(7);
+    await store.load(8);
+    await store.load(0);
+    expect(store.refused(0)).toBe(false);
+    expect(store.get(0)).toBeDefined();
+    expect(store.keptChars).toBeLessThanOrEqual(250);
+  });
+
+  it("never holds more than the limit, whatever the shape of the document", async () => {
+    // 5 000 pages that are all on screen at once, each with the most text a page can have.
+    const store = new TextStore(() => Promise.resolve(page(100_000)), () => true, MAX_KEPT_CHARS);
+    let refused = 0;
+    for (let p = 0; p < 200; p++) {
+      await store.load(p);
+      if (store.refused(p)) refused++;
+      expect(store.keptChars).toBeLessThanOrEqual(MAX_KEPT_CHARS);
+    }
+    expect(refused).toBeGreaterThan(150);
   });
 });

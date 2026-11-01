@@ -166,6 +166,11 @@
         </button>
       </div>
 
+      <!-- The menu of the right mouse button on selected text. The menu of the web view is off, because it also holds Reload. -->
+      <div class="menu context-menu" id="context-menu" role="menu" aria-label="Selected text" hidden>
+        <button class="menu-item" id="context-copy" type="button" role="menuitem"><span>Copy</span></button>
+      </div>
+
       <!-- Holds the selected text so the system's own Copy works. Off screen, but real text. -->
       <div class="sel-proxy" id="sel-proxy" aria-hidden="true"></div>
 

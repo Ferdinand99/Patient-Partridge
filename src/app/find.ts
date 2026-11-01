@@ -220,6 +220,9 @@ export class FindBar {
     const state = this.stateOf(target);
     state.text = this.input.value;
     state.session?.cancel();
+    // An update that the old search was waiting to show must not stand in for the new one.
+    clearTimeout(state.frame);
+    state.frame = undefined;
     state.cursor.clear();
     const query = cleanQuery(this.input.value);
     if (query === null) {

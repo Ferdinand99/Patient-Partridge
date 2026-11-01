@@ -9,6 +9,7 @@ import { describeLink } from "../lib/linkPolicy";
 import type { PageSizePt } from "./layout";
 import type { SearchMatch } from "./search";
 import {
+  MAX_KEPT_CHARS,
   TextStore,
   isEmptySelection,
   lineRange,
@@ -55,6 +56,11 @@ export interface OverlayEvents {
   onSelectionChange?(hasSelection: boolean): void;
   /** The reader let go of the selection (or it was made whole): its text is final for now. */
   onSelectionSettled?(): void;
+  /**
+   * A page has more text or more links than the document may keep (see `MAX_KEPT_CHARS`), so it has
+   * no text layer for now. Called once for the document. The page itself is drawn as usual.
+   */
+  onTextLimit?(): void;
 }
 
 /** Limits on the text a document keeps in the window. */
@@ -67,9 +73,27 @@ export interface OverlayLimits {
   preloadChars: number;
   /** Most characters one Copy gathers. About 40 MB of text at the limit. */
   copyChars: number;
+  /**
+   * Most characters of page text kept for the document, the pages on screen included. A page that
+   * would take the total past it has no text layer until it comes on screen again.
+   */
+  keptChars: number;
 }
 
-export const DEFAULT_LIMITS: OverlayLimits = { preloadChars: 1_000_000, copyChars: 20_000_000 };
+export const DEFAULT_LIMITS: OverlayLimits = {
+  preloadChars: 600_000,
+  copyChars: 20_000_000,
+  keptChars: MAX_KEPT_CHARS,
+};
+
+/**
+ * Most characters of web addresses kept for the links of the pages on screen. A page may hold 500
+ * links of 2,048 characters, and a PDF can make hundreds of pages share a few pixels of screen.
+ */
+export const MAX_LINK_CHARS = 1_000_000;
+
+/** Most boxes drawn for the selection on one page. Copying is not affected. */
+const MAX_SELECTION_BOXES = 5_000;
 
 /** The engine cuts the text of one page at this many characters (see MAX_PAGE_CHARS there). */
 const ENGINE_PAGE_CHARS = 100_000;
@@ -87,6 +111,13 @@ export interface CopyResult {
   truncated: boolean;
   /** Pages as long as the engine allows: the engine cuts such a page, so its end is missing. */
   cut: number;
+  /**
+   * How the copy ended. "busy": another copy of this document is still running, so nothing was
+   * done. "cancelled": the document was closed on the way, so there is nothing to write. "changed":
+   * the selection was changed on the way, so the text is not what is selected now. Only "done"
+   * has text that is meant to be written.
+   */
+  status: "done" | "busy" | "cancelled" | "changed";
 }
 /** How far the pointer must move before a press becomes a drag, in pixels. */
 const DRAG_DISTANCE = 4;
@@ -105,6 +136,12 @@ export class PageOverlays {
   private readonly overlays = new Map<number, HTMLElement>();
   private readonly links = new Map<number, PageLinkInfo[]>();
   private readonly linksPending = new Set<number>();
+  /** Characters of addresses kept for each page in `links`, and their total. */
+  private readonly linkSizes = new Map<number, number>();
+  private linkChars = 0;
+  private limitReported = false;
+  /** True while a copy fetches pages: there is one at a time for each document. */
+  private copying = false;
   /** Pages of the selection whose text was loaded ahead, within the limit, and is kept. */
   private readonly preloaded = new Set<number>();
   private readonly limits: OverlayLimits;
@@ -130,6 +167,7 @@ export class PageOverlays {
     this.texts = new TextStore(
       (page) => this.fetchText(page),
       (page) => this.isKept(page),
+      this.limits.keptChars,
     );
     const el = host.element;
     el.addEventListener("pointerdown", this.onPointerDown);
@@ -151,21 +189,41 @@ export class PageOverlays {
     }
     pageEl.append(layer);
     this.overlays.set(page, layer);
+    this.texts.allow(page);
     this.paint(page);
   }
 
   unmount(page: number): void {
     this.overlays.get(page)?.remove();
     this.overlays.delete(page);
+    this.texts.allow(page);
     // The links of a page that is off screen are not kept: they are asked for again when the page
     // is drawn again, so a long document does not pile them up.
+    this.dropLinks(page);
+  }
+
+  private dropLinks(page: number): void {
     this.links.delete(page);
+    this.linkChars -= this.linkSizes.get(page) ?? 0;
+    this.linkSizes.delete(page);
+  }
+
+  /** The text or the links of a page did not fit: say so, once for the document. */
+  private reportLimit(): void {
+    if (this.limitReported || this.destroyed) return;
+    this.limitReported = true;
+    this.events.onTextLimit?.();
   }
 
   /** A page has been drawn: now is the time to ask for its text and its links. */
   pageDrawn(page: number): void {
     if (this.destroyed) return;
-    void this.texts.load(page).then(() => this.paint(page));
+    if (!this.texts.refused(page)) {
+      void this.texts.load(page).then(() => {
+        if (this.texts.refused(page)) this.reportLimit();
+        this.paint(page);
+      });
+    }
     this.loadLinks(page);
   }
 
@@ -194,7 +252,17 @@ export class PageOverlays {
     this.api
       .getPageLinks(this.doc, page)
       .then((links) => {
-        if (this.overlays.has(page)) this.links.set(page, links);
+        if (!this.overlays.has(page)) return;
+        const size = links.reduce((n, l) => n + (l.uri?.length ?? 0), 0);
+        if (this.linkChars + size > MAX_LINK_CHARS) {
+          // Too many addresses for the document: this page has no link boxes.
+          this.links.set(page, []);
+          this.reportLimit();
+          return;
+        }
+        this.links.set(page, links);
+        this.linkSizes.set(page, size);
+        this.linkChars += size;
       })
       .catch(() => {
         if (this.overlays.has(page)) this.links.set(page, []);
@@ -247,18 +315,20 @@ export class PageOverlays {
       find.replaceChildren(...elements);
     } else {
       find.replaceChildren();
-      if (found && !text) void this.texts.load(page).then(() => this.paint(page));
+      if (found && !text && !this.texts.refused(page)) void this.texts.load(page).then(() => this.paint(page));
     }
 
     // Selection
     const range = this.selection ? rangeOnPage(this.selection, page) : null;
     if (range && text) {
       select.replaceChildren(
-        ...lineRects(text, range[0], Math.min(range[1], text.chars.length)).map((r) => box(r, "hl hl-select")),
+        ...lineRects(text, range[0], Math.min(range[1], text.chars.length))
+          .slice(0, MAX_SELECTION_BOXES)
+          .map((r) => box(r, "hl hl-select")),
       );
     } else {
       select.replaceChildren();
-      if (range && !text) void this.texts.load(page).then(() => this.paint(page));
+      if (range && !text && !this.texts.refused(page)) void this.texts.load(page).then(() => this.paint(page));
     }
 
     // Links
@@ -328,28 +398,55 @@ export class PageOverlays {
   }
 
   /** The selected text from the pages that are loaded, and the pages that are not. */
-  selectedText(): { text: string; missing: number[] } {
-    if (!this.selection || isEmptySelection(this.selection)) return { text: "", missing: [] };
-    return selectionText(this.selection, (page) => this.texts.get(page));
+  selectedText(): { text: string; missing: number[]; cut: number } {
+    const sel = this.selection;
+    if (!sel || isEmptySelection(sel)) return { text: "", missing: [], cut: 0 };
+    const { start, end } = orderSelection(sel);
+    // Pages the engine has cut (it gives 100,000 characters at most): their end is not in the text.
+    let cut = 0;
+    for (let page = start.page; page <= end.page; page++) {
+      if ((this.texts.get(page)?.chars.length ?? 0) >= ENGINE_PAGE_CHARS) cut++;
+    }
+    return { ...selectionText(sel, (page) => this.texts.get(page)), cut };
   }
 
   /**
    * The selected text for a Copy. Pages that are not loaded are fetched one at a time and left to
    * the store to drop, so a selection of a whole book never sits in memory page by page. The copy
    * stops at a fixed size, and the result says how far it got, which pages could not be read, and
-   * whether the engine had cut a page.
+   * whether the engine had cut a page. Only one copy runs for a document at a time, so the limit
+   * is for the document and not for each press of Copy.
    */
   async loadSelectedText(): Promise<CopyResult> {
-    const result: CopyResult = { text: "", pages: 0, total: 0, failed: [], truncated: false, cut: 0 };
+    const result: CopyResult = {
+      text: "",
+      pages: 0,
+      total: 0,
+      failed: [],
+      truncated: false,
+      cut: 0,
+      status: "done",
+    };
     const sel = this.selection;
     if (!sel || isEmptySelection(sel)) return result;
+    if (this.copying) return { ...result, status: "busy" };
+    this.copying = true;
+    try {
+      return await this.gather(sel, result);
+    } finally {
+      this.copying = false;
+    }
+  }
+
+  private async gather(sel: Selection, result: CopyResult): Promise<CopyResult> {
     const { start, end } = orderSelection(sel);
     result.total = end.page - start.page + 1;
     const parts: string[] = [];
     let used = 0;
     for (let page = start.page; page <= end.page; page++) {
-      if (this.destroyed) break;
       const text = this.texts.get(page) ?? (await this.texts.load(page));
+      // A closed document gives nothing: half a text must not reach the clipboard.
+      if (this.destroyed) return { ...result, text: "", pages: 0, status: "cancelled" };
       if (!text) {
         result.failed.push(page);
         continue;
@@ -369,6 +466,8 @@ export class PageOverlays {
       result.pages++;
     }
     result.text = parts.join("\n");
+    if (this.destroyed) return { ...result, text: "", pages: 0, status: "cancelled" };
+    if (this.selection !== sel) result.status = "changed";
     return result;
   }
 
@@ -425,6 +524,8 @@ export class PageOverlays {
     if (!at) return null;
     const text = this.texts.get(at.page);
     if (!text) {
+      // A page that has no text layer for lack of room cannot be pointed at.
+      if (this.texts.refused(at.page)) return null;
       void this.texts.load(at.page).then(() => {
         if (this.dragging && this.pointer) this.extendTo(this.pointer.x, this.pointer.y);
       });
@@ -554,6 +655,11 @@ export class PageOverlays {
   /** Lets go of the text that is not needed now, such as when the view is hidden. */
   releaseText(): void {
     this.texts.retain((page) => this.isKept(page));
+  }
+
+  /** How many characters of page text are kept now. For tests and for diagnostics. */
+  get keptTextChars(): number {
+    return this.texts.keptChars;
   }
 
   /** The text of a page, if it is loaded. For tests and for the receiver of a copy. */

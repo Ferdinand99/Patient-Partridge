@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MAX_KEPT_CHARS } from "./textlayer";
 import { DocumentView, type ViewerApi, type ViewerEvents, type ViewerOptions } from "./viewer";
 import type { PageLinkInfo } from "./overlays";
 
@@ -169,7 +170,7 @@ describe("selecting text with the pointer", () => {
     pointer(view, "pointermove", screen(view, 0, 50 + W * 11 - 1, 105));
     pointer(view, "pointerup", screen(view, 0, 50 + W * 11 - 1, 105));
     expect(view.hasSelection).toBe(true);
-    expect(view.selectedText()).toEqual({ text: "Hello world", missing: [] });
+    expect(view.selectedText()).toEqual({ text: "Hello world", missing: [], cut: 0 });
     const boxes = highlights(view, "hl-select");
     expect(boxes).toHaveLength(1);
     expect(Number.parseFloat(boxes[0].style.left)).toBeCloseTo((50 / 612) * 100, 2);
@@ -340,7 +341,7 @@ describe("links", () => {
     expect(Number.parseFloat(buttons[0].style.left)).toBeCloseTo((72 / 612) * 100, 2);
     expect(Number.parseFloat(buttons[0].style.width)).toBeCloseTo((100 / 612) * 100, 2);
     expect(buttons[0].style.left.endsWith("%")).toBe(true);
-    expect(buttons[0].getAttribute("aria-label")).toBe("Link to https://example.com/a");
+    expect(buttons[0].getAttribute("aria-label")).toBe("Link to example.com");
     expect(buttons[1].getAttribute("aria-label")).toBe("Go to page 3");
   });
 
@@ -376,8 +377,8 @@ describe("links", () => {
     const { view } = open({ 0: [tricky, blocked] });
     await flush();
     const [first, second] = highlights(view, "page-link");
-    expect(first.title).toBe("https://evil.example/@google.com/");
-    expect(first.getAttribute("aria-label")).toBe("Link to https://evil.example/@google.com/");
+    expect(first.title).toBe("evil.example");
+    expect(first.getAttribute("aria-label")).toBe("Link to evil.example");
     expect(second.title).toBe("not a web address, not opened");
     expect(second.getAttribute("aria-label")).not.toContain("passwd");
   });
@@ -521,5 +522,135 @@ describe("limits on what is kept for one document", () => {
     await flush();
     expect(highlights(view, "hl-find")[0]).toBe(before);
     expect(highlights(view, "hl-find").length).toBeGreaterThan(1);
+  });
+});
+
+describe("a PDF made to fill the memory of the window", () => {
+  /** Pages one point high: hundreds of them are on screen at once. Each has the most text a page can. */
+  const sliver = { width: 612, height: 1 };
+  const dense = () => "x".repeat(100_000);
+
+  function openSlivers(pageCount: number, limits?: ViewerOptions["limits"]) {
+    const text = dense();
+    const rects = Array.from({ length: 100_000 * 4 }, (_, i) => (i % 4 < 2 ? 0.5 : 1));
+    const getPageText = vi.fn((_doc: number, _page: number) => Promise.resolve({ text, rects }));
+    const api: ViewerApi = {
+      render: (_d, _p, w, h) => Promise.resolve(new ArrayBuffer(w * h * 4)),
+      getPageText,
+      getPageLinks: () => Promise.resolve([]),
+    };
+    const onTextLimit = vi.fn();
+    const events = {
+      onPageChange: vi.fn(),
+      onZoomChange: vi.fn(),
+      onFatal: vi.fn(),
+      onFirstPaint: vi.fn(),
+      onTextLimit,
+    } satisfies ViewerEvents;
+    const view = new DocumentView({ doc: 5, pages: Array.from({ length: pageCount }, () => sliver) }, api, events, {
+      limits,
+    });
+    document.body.append(view.element);
+    view.start();
+    return { view, getPageText, onTextLimit };
+  }
+
+  it("keeps the text of the pages on screen within the limit, with no key pressed", { timeout: 30_000 }, async () => {
+    const { view, onTextLimit } = openSlivers(5000);
+    await flush();
+    await flush();
+    const mounted = view.element.querySelectorAll(".viewer-page").length;
+    // The shape is what it is meant to be: far more pages are on screen than the limit can hold.
+    expect(mounted * 100_000).toBeGreaterThan(MAX_KEPT_CHARS * 3);
+    expect(view.keptTextChars).toBeLessThanOrEqual(MAX_KEPT_CHARS);
+    expect(view.keptTextChars).toBeGreaterThan(0);
+    // The reader is told once, and the pages are still drawn.
+    expect(onTextLimit).toHaveBeenCalledTimes(1);
+    expect(view.element.querySelectorAll(".viewer-canvas").length).toBe(mounted);
+  });
+
+  it("does not hold more addresses than the limit either", async () => {
+    const link = (n: number): PageLinkInfo => ({
+      rect: [10, 0, 20, 1],
+      uri: `https://example.com/${"a".repeat(1990)}${n}`,
+      page: null,
+    });
+    const many = Array.from({ length: 400 }, (_, i) => link(i));
+    const onTextLimit = vi.fn();
+    const api: ViewerApi = {
+      render: (_d, _p, w, h) => Promise.resolve(new ArrayBuffer(w * h * 4)),
+      getPageLinks: () => Promise.resolve(many),
+    };
+    const view = new DocumentView(
+      { doc: 5, pages: Array.from({ length: 5000 }, () => sliver) },
+      api,
+      { onPageChange: vi.fn(), onZoomChange: vi.fn(), onFatal: vi.fn(), onFirstPaint: vi.fn(), onTextLimit },
+    );
+    document.body.append(view.element);
+    view.start();
+    await flush();
+    await flush();
+    const boxes = highlights(view, "page-link").length;
+    // 1 million characters of addresses: one page of 400 links, not one for every page on screen.
+    expect(boxes).toBe(400);
+    expect(onTextLimit).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("copying one document at a time", () => {
+  const long = (page: number) => `Page ${page} `.padEnd(300, "x");
+
+  it("does not start a second copy while one is running", async () => {
+    const { view } = open({}, 40, { text: long, limits: { preloadChars: 0, copyChars: 100_000 } });
+    await flush();
+    view.selectAll();
+    const first = view.loadSelectedText();
+    const second = await view.loadSelectedText();
+    expect(second.status).toBe("busy");
+    expect(second.text).toBe("");
+    const done = await first;
+    expect(done.status).toBe("done");
+    expect(done.pages).toBe(40);
+    // And when it is over, the next copy works again.
+    expect((await view.loadSelectedText()).status).toBe("done");
+  });
+
+  it("gives nothing when the document is closed on the way, not the first pages", async () => {
+    const { view, getPageText } = open({}, 40, { text: long, limits: { preloadChars: 0, copyChars: 100_000 } });
+    await flush();
+    const original = getPageText.getMockImplementation() as (d: number, p: number) => Promise<ReturnType<typeof wire>>;
+    getPageText.mockImplementation(
+      (d: number, p: number) => new Promise((r) => setTimeout(() => r(original(d, p)), p > 20 ? 3 : 0)),
+    );
+    view.selectAll();
+    const copy = view.loadSelectedText();
+    await wait(10);
+    view.destroy();
+    const result = await copy;
+    expect(result.status).toBe("cancelled");
+    expect(result.text).toBe("");
+  });
+
+  it("says the text is not the selection any more when the selection changed on the way", async () => {
+    const { view, getPageText } = open({}, 40, { text: long, limits: { preloadChars: 0, copyChars: 100_000 } });
+    await flush();
+    const original = getPageText.getMockImplementation() as (d: number, p: number) => Promise<ReturnType<typeof wire>>;
+    getPageText.mockImplementation(
+      (d: number, p: number) => new Promise((r) => setTimeout(() => r(original(d, p)), p > 20 ? 3 : 0)),
+    );
+    view.selectAll();
+    const copy = view.loadSelectedText();
+    await wait(10);
+    view.clearSelection();
+    expect((await copy).status).toBe("changed");
+  });
+
+  it("counts the pages the engine cut, also when all the text is loaded already", async () => {
+    const { view } = open({}, 1, { text: () => "y".repeat(100_000), limits: { copyChars: 1_000_000 } });
+    await flush();
+    view.selectAll();
+    await flush();
+    expect(view.selectedText().cut).toBe(1);
+    expect(view.selectedText().missing).toEqual([]);
   });
 });

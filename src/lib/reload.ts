@@ -5,9 +5,14 @@
 // starts, so whatever reload still gets through starts clean; see `on_page_load` in src-tauri.)
 
 /** The keys that reload a web view: F5 (with or without Ctrl) and Ctrl or Cmd with R. */
-export function isReloadKey(e: Pick<KeyboardEvent, "key" | "ctrlKey" | "metaKey">): boolean {
-  if (e.key === "F5") return true;
-  return (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "r";
+export function isReloadKey(e: Pick<KeyboardEvent, "key" | "code" | "ctrlKey" | "metaKey">): boolean {
+  if (e.key === "F5" || e.key === "BrowserRefresh") return true;
+  if (!(e.ctrlKey || e.metaKey)) return false;
+  if (e.key.toLowerCase() === "r") return true;
+  // On a keyboard layout without Latin letters (Russian, Greek, Hebrew, Arabic) the web view still
+  // reloads on the key where the R is. A Latin layout that has another letter there (Dvorak) keeps
+  // that letter for the app's own shortcuts.
+  return e.code === "KeyR" && !/^[a-z]$/i.test(e.key);
 }
 
 /**
@@ -16,7 +21,17 @@ export function isReloadKey(e: Pick<KeyboardEvent, "key" | "ctrlKey" | "metaKey"
  */
 export function blockReload(doc: Document, enabled: boolean): void {
   if (!enabled) return;
-  doc.addEventListener("contextmenu", (e) => e.preventDefault(), true);
+  // Text boxes keep the menu of the web view (Cut, Copy, Paste). The app has its own menu for
+  // selected text on the pages.
+  doc.addEventListener(
+    "contextmenu",
+    (e) => {
+      const target = e.target;
+      if (target instanceof Element && target.closest("input, textarea")) return;
+      e.preventDefault();
+    },
+    true,
+  );
   doc.addEventListener(
     "keydown",
     (e) => {

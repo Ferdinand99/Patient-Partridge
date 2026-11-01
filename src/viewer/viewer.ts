@@ -45,6 +45,8 @@ export interface ViewerEvents {
   onSelectionChange?(hasSelection: boolean): void;
   /** The selection is final for now (the pointer was released): its text can be taken. */
   onSelectionSettled?(): void;
+  /** A page has more text or more links than the document may keep; it has no text layer for now. */
+  onTextLimit?(): void;
 }
 
 /** Where the reader was: a page, how far down it, and the zoom (null means fit width). */
@@ -136,6 +138,7 @@ export class DocumentView {
         onLink: (link, page) => events.onLink?.(link, page),
         onSelectionChange: (has) => events.onSelectionChange?.(has),
         onSelectionSettled: () => events.onSelectionSettled?.(),
+        onTextLimit: () => events.onTextLimit?.(),
       },
       options.limits,
     );
@@ -327,13 +330,18 @@ export class DocumentView {
   }
 
   /** The selected text from the pages that are loaded, and the pages that are not. */
-  selectedText(): { text: string; missing: number[] } {
+  selectedText(): { text: string; missing: number[]; cut: number } {
     return this.overlays.selectedText();
   }
 
   /** The selected text for a Copy, loading the pages it still lacks, and what it could not do. */
   loadSelectedText(): Promise<CopyResult> {
     return this.overlays.loadSelectedText();
+  }
+
+  /** How many characters of page text the document keeps now. For tests and for diagnostics. */
+  get keptTextChars(): number {
+    return this.overlays.keptTextChars;
   }
 
   /** Marks search matches on the pages. `current` is the one picked out. */

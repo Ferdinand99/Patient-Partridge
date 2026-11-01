@@ -290,3 +290,27 @@ describe("FindBar: the limit and shared timers", () => {
     releaseA();
   });
 });
+
+describe("FindBar: a new search replaces the update that the old one was waiting to show", () => {
+  it("shows the end of a search that finishes within the wait of the one before", async () => {
+    const searchPage = vi.fn(async (_doc: number, page: number, query: string) =>
+      query === "first" ? (page === 0 ? ([[0, 3]] as [number, number][]) : []) : page === 0 ? ([[1, 2]] as [number, number][]) : [],
+    );
+    const bar = new FindBar(document, { searchPage, onEngineLost: vi.fn(), debounceMs: 5 });
+    const view = fakeView(1);
+    bar.setTarget({ doc: 1, view: view as unknown as DocumentView });
+    bar.open();
+    const input = q<HTMLInputElement>("#find-input");
+    input.value = "first";
+    input.dispatchEvent(new Event("input"));
+    await wait(12);
+    // The first search has an update waiting. The reader changes the text at once.
+    input.value = "second";
+    input.dispatchEvent(new Event("input"));
+    await wait(12);
+    await wait(150);
+    expect(q("#find-status").textContent).toBe("1 of 1");
+    const [, current] = view.setFind.mock.calls.at(-1) as [Map<number, number[][]>, unknown];
+    expect(current).toEqual({ page: 0, start: 1, len: 2 });
+  });
+});

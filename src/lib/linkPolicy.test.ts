@@ -86,11 +86,17 @@ describe("visibleAddress and describeLink", () => {
 
   it("describes a web address the way it would be opened, and says nothing else about the rest", () => {
     // A backslash before an @ makes the address read as google.com. The parsed form shows the site.
-    expect(describeLink("https://evil.example\\@google.com/")).toBe("https://evil.example/@google.com/");
-    expect(describeLink("HTTPS://EXAMPLE.COM")).toBe("https://example.com/");
+    expect(describeLink("https://evil.example\\@google.com/")).toBe("evil.example");
+    expect(describeLink("HTTPS://EXAMPLE.COM")).toBe("example.com");
     expect(describeLink("javascript:alert(1)")).toBe("not a web address, not opened");
     expect(describeLink("https://user:pw@example.com/")).toBe("not a web address, not opened");
     // A turn-around character in a web address is shown in its safe, percent-encoded form.
-    expect(describeLink("https://example.com/\u202Egpj.exe")).toBe("https://example.com/%E2%80%AEgpj.exe");
+    expect(describeLink("https://example.com/\u202Egpj.exe")).toBe("example.com");
+  });
+
+  it("names the site alone, so a long address cannot start and end like another site", () => {
+    const fake = "https://accounts.google.com." + "a".repeat(40) + ".evil.example/" + "accounts.google.com/signin/".repeat(8);
+    expect(describeLink(fake)).toBe("…" + ("accounts.google.com." + "a".repeat(40) + ".evil.example").slice(-60));
+    expect(describeLink(fake).endsWith(".evil.example")).toBe(true);
   });
 });

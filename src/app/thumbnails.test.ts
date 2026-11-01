@@ -132,9 +132,10 @@ describe("ThumbnailList", () => {
   });
 
   it("does not ask for the pages it scrolls past, only where it comes to rest", async () => {
-    const { root, list, render } = make(3000);
+    // A settle time well above the pause between scroll events, so a busy machine does not end the fling early.
+    const { root, list, render } = make(3000, 60);
     list.setEnabled(true);
-    await wait(30);
+    await wait(90);
     await flush();
     render.mockClear();
     // A quick fling through the list: many scroll events within the settle time.
@@ -143,7 +144,7 @@ describe("ThumbnailList", () => {
       root.dispatchEvent(new Event("scroll"));
       await wait(1);
     }
-    await wait(60);
+    await wait(150);
     await flush();
     const asked = [...new Set(render.mock.calls.map((c) => c[1] as number))];
     expect(asked.length).toBeGreaterThan(0);
