@@ -104,11 +104,20 @@
       "name": "pdfium-render",
       "version": "0.9.5",
       "license": "MIT",
-      "basis": "authors",
+      "basis": "repository",
       "authors": [
         "Alastair Carey <alastair@alastaircarey.com>"
       ],
-      "holder": "Alastair Carey <alastair@alastaircarey.com>"
+      "notice": [
+        "Copyright 2021, pdfium-sys Developers",
+        "Copyright 2022 - 2024, pdfium-render Developers",
+        "Copyright (c) Alastair Carey <alastair@alastaircarey.com>"
+      ],
+      "source": "The first two lines are the copyright header of build.rs in the crate (lines 2 and 3, followed by the MIT and Apache grant); LICENSE.md of the crate and the repository only name the licences. The third line is the authors field of the crate. The generator checks both header lines against build.rs and the authors against the crate metadata.",
+      "verify": [
+        { "file": "build.rs", "contains": "Copyright 2021, pdfium-sys Developers" },
+        { "file": "build.rs", "contains": "Copyright 2022 - 2024, pdfium-render Developers" }
+      ]
     }
   ],
   "webview2": {

@@ -86,9 +86,11 @@ const clean = (text) => text.replace(/\r\n/g, "\n").trim();
  * A licence template that was never filled in. cargo-about writes the bare SPDX template when it
  * finds no licence file for a crate, and a template is not a copyright notice: MIT and the BSD
  * licences want the copyright notice reproduced. The Apache-2.0 appendix has its own
- * "[yyyy] [name of copyright owner]" boilerplate, which is not matched here.
+ * "[yyyy] [name of copyright owner]" boilerplate, which is not matched here. The templates write
+ * their blanks in angle brackets (SPDX), square brackets (the GitHub MIT template: "[year]
+ * [fullname]") or curly brackets.
  */
-export const PLACEHOLDER = /<year>|<owner>|<copyright holders?>|<name of author>|<organi[sz]ation>/i;
+export const PLACEHOLDER = /[<[{](?:year|fullname|owner|copyright holders?|name of author|organi[sz]ation)[>\]}]/i;
 
 export function hasPlaceholder(text) {
   return PLACEHOLDER.test(text);
@@ -98,7 +100,15 @@ const sha256 = (data) => createHash("sha256").update(data).digest("hex");
 
 /** Puts the copyright holder where the template has its placeholders. */
 export function fillTemplate(text, holder) {
-  return text.replace(/<year>\s+<(?:copyright holders?|owner)>/gi, holder).replace(/<year>\s+<name of author>/gi, holder);
+  return text.replace(/[<[{]year[>\]}]\s+[<[{](?:fullname|copyright holders?|owner|name of author)[>\]}]/gi, () => holder);
+}
+
+/** Replaces the whole line that has a placeholder by the given notice lines. */
+export function fillLines(text, lines) {
+  return text
+    .split("\n")
+    .flatMap((line) => (hasPlaceholder(line) ? lines : [line]))
+    .join("\n");
 }
 
 /**
@@ -139,11 +149,24 @@ export function rustEntries(reports, extra = { copyright: [] }) {
             problems.push(`${key}: the authors in the crate (${have}) are not the ones in notices-extra.json`);
             continue;
           }
-        } else if (entry.basis !== "repository" || !entry.holder || !entry.source) {
-          problems.push(`${key}: an entry of notices-extra.json needs basis "authors", or basis "repository" with holder and source`);
+        } else if (entry.basis !== "repository" || !(entry.holder || entry.notice?.length) || !entry.source) {
+          problems.push(`${key}: an entry of notices-extra.json needs basis "authors", or basis "repository" with holder (or notice lines) and source`);
           continue;
         }
-        const filled = fillTemplate(text, entry.holder);
+        // Lines of the notice that are taken from a file of the crate must be in that file.
+        const missing = (entry.verify ?? []).filter((v) => {
+          const path = join(dirname(crate.manifest_path ?? ""), v.file);
+          return !crate.manifest_path || !existsSync(path) || !readFileSync(path, "utf8").includes(v.contains);
+        });
+        if (missing.length > 0) {
+          problems.push(`${key}: ${missing.map((v) => `"${v.contains}" is not in ${v.file} of the crate`).join(", ")}`);
+          continue;
+        }
+        if (entry.basis === "repository" && entry.authors && JSON.stringify(crate.authors ?? []) !== JSON.stringify(entry.authors)) {
+          problems.push(`${key}: the authors in the crate (${JSON.stringify(crate.authors ?? [])}) are not the ones in notices-extra.json`);
+          continue;
+        }
+        const filled = entry.notice?.length ? fillLines(text, entry.notice) : fillTemplate(text, entry.holder);
         if (hasPlaceholder(filled)) {
           problems.push(`${key}: the licence template has a placeholder that notices-extra.json can not fill`);
           continue;

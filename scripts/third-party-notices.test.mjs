@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   acceptedLicenses,
+  fillLines,
   fillTemplate,
   group,
   hasPlaceholder,
@@ -80,12 +81,24 @@ describe("licenseAllowed", () => {
 });
 
 describe("placeholders", () => {
-  it.each(["Copyright (c) <year> <owner>.", "Copyright (c) <year> <copyright holders>", "<YEAR> <Copyright Holder>", "by <name of author>"])(
-    "finds %s",
-    (text) => expect(hasPlaceholder(text)).toBe(true),
-  );
+  it.each([
+    "Copyright (c) <year> <owner>.",
+    "Copyright (c) <year> <copyright holders>",
+    "<YEAR> <Copyright Holder>",
+    "by <name of author>",
+    "Copyright (c) [year] [fullname]",
+    "Copyright (c) {year} {fullname}",
+    "Copyright (c) {year} {owner}",
+    "Copyright (c) [YEAR] [Copyright Holders]",
+  ])("finds %s", (text) => expect(hasPlaceholder(text)).toBe(true));
   it("does not mind the boilerplate at the end of the Apache licence", () => {
     expect(hasPlaceholder("Copyright [yyyy] [name of copyright owner]\n\nLicensed under the Apache License")).toBe(false);
+    expect(hasPlaceholder("Copyright {yyyy} {name of copyright owner}")).toBe(false);
+  });
+  it("fills the other forms, and a whole line with notice lines", () => {
+    expect(fillTemplate("Copyright (c) [year] [fullname]\n\nx", "A B")).toBe("Copyright (c) A B\n\nx");
+    expect(fillTemplate("Copyright (c) {year} {fullname}", "A B")).toBe("Copyright (c) A B");
+    expect(fillLines("a\nCopyright (c) <year> <owner>\nb", ["L1", "L2"])).toBe("a\nL1\nL2\nb");
   });
   it("is filled with the holder", () => {
     expect(fillTemplate("Copyright (c) <year> <copyright holders>\n\nPermission", "A B")).toBe("Copyright (c) A B\n\nPermission");
@@ -136,6 +149,27 @@ describe("rustEntries and group", () => {
     expect(() => rustEntries([r], { copyright: [repo] })).toThrow(/needs basis/);
     expect(rustEntries([r], { copyright: [{ ...repo, source: "https://x/c" }] })[0].text).toContain("Copyright (c) The C project");
   });
+  it("takes notice lines that are in a file of the crate, and refuses lines that are not", () => {
+    const dir = folder({ "build.rs": "// Copyright 2021, X Developers\n// Copyright 2022, Y Developers\n" });
+    const r = report("MIT", template, [crate("c", "1.0.0", { authors: ["A <a@x>"], manifest_path: join(dir, "Cargo.toml") })]);
+    const notice = {
+      name: "c",
+      version: "1.0.0",
+      license: "MIT",
+      basis: "repository",
+      authors: ["A <a@x>"],
+      notice: ["Copyright 2021, X Developers", "Copyright 2022, Y Developers", "Copyright (c) A <a@x>"],
+      source: "build.rs",
+      verify: [{ file: "build.rs", contains: "Copyright 2021, X Developers" }],
+    };
+    expect(rustEntries([r], { copyright: [notice] })[0].text).toBe(
+      "Copyright 2021, X Developers\nCopyright 2022, Y Developers\nCopyright (c) A <a@x>\n\nPermission is hereby granted",
+    );
+    const wrong = { ...notice, verify: [{ file: "build.rs", contains: "Copyright 1999, Z" }] };
+    expect(() => rustEntries([r], { copyright: [wrong] })).toThrow(/is not in build.rs of the crate/);
+    const otherAuthors = { ...notice, authors: ["B <b@x>"] };
+    expect(() => rustEntries([r], { copyright: [otherAuthors] })).toThrow(/authors in the crate/);
+  });
   it("does not touch the Apache boilerplate and real notices", () => {
     const apache = report("Apache-2.0", "Copyright [yyyy] [name of copyright owner]", [crate("d", "1.0.0")]);
     expect(rustEntries([apache])).toHaveLength(1);
@@ -146,10 +180,20 @@ describe("the real notices-extra.json", () => {
   const extra = JSON.parse(read("notices-extra.json"));
   it("has a holder for every entry, and authors that give the holder", () => {
     for (const c of extra.copyright) {
-      expect(c.holder, c.name).toBeTruthy();
+      expect(c.holder || c.notice?.length, c.name).toBeTruthy();
       if (c.basis === "authors") expect(c.authors.join(", ")).toBe(c.holder);
       else expect(c.source, c.name).toBeTruthy();
     }
+  });
+  it("gives pdfium-render the copyright lines of its build.rs", () => {
+    const c = extra.copyright.find((e) => e.name === "pdfium-render");
+    expect(c.notice).toContain("Copyright 2021, pdfium-sys Developers");
+    expect(c.notice).toContain("Copyright 2022 - 2024, pdfium-render Developers");
+    expect(c.verify.map((v) => v.contains)).toEqual(expect.arrayContaining(["Copyright 2021, pdfium-sys Developers", "Copyright 2022 - 2024, pdfium-render Developers"]));
+  });
+  it("shows those lines in the notices file", () => {
+    const text = read("THIRD-PARTY-NOTICES");
+    expect(text).toContain("Copyright 2021, pdfium-sys Developers\nCopyright 2022 - 2024, pdfium-render Developers\nCopyright (c) Alastair Carey");
   });
 });
 
