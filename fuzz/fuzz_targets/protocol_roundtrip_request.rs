@@ -2,7 +2,7 @@
 //! Valid requests built from the fuzzer's bytes must come through encode, framing and decode
 //! unchanged. Includes strings of exactly the longest allowed size and multi-byte characters.
 //!
-//! One run in eight builds a request that is one byte over a string cap instead (open path,
+//! One run in eight builds a request that is one byte over a string cap instead (open password,
 //! password, search text). The encoder cannot write such a request, so the bytes are written by
 //! hand, and the decoder must refuse it.
 

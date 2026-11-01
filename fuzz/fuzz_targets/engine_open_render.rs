@@ -134,13 +134,18 @@ impl State {
         response.body
     }
 
+    /// Gives the engine a read-only handle to the input file, as the app does when it starts an
+    /// engine.
+    fn hand_over(&mut self) {
+        let file = std::fs::File::open(&self.file).expect("open the input file");
+        self.engine.set_document(file);
+    }
+
     fn run(&mut self, data: &[u8]) {
         std::fs::write(&self.file, data).expect("write the input file");
-        let path = self.file.to_string_lossy().into_owned();
-        let mut opened = self.ask(RequestBody::Open {
-            path: path.clone(),
-            password: None,
-        });
+        // The engine opens only the document it was handed (the app does that in real life).
+        self.hand_over();
+        let mut opened = self.ask(RequestBody::Open { password: None });
         if matches!(
             opened,
             ResponseBody::Error {
@@ -148,8 +153,8 @@ impl State {
                 ..
             }
         ) {
+            self.hand_over();
             opened = self.ask(RequestBody::Open {
-                path,
                 password: Some(PASSWORD.to_string()),
             });
         }

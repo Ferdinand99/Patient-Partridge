@@ -38,10 +38,7 @@ fn requests() -> Vec<(&'static str, Request)> {
             "open",
             b(
                 2,
-                RequestBody::Open {
-                    path: "/home/user/book.pdf".into(),
-                    password: None,
-                },
+                RequestBody::Open { password: None },
             ),
         ),
         (
@@ -49,7 +46,6 @@ fn requests() -> Vec<(&'static str, Request)> {
             b(
                 3,
                 RequestBody::Open {
-                    path: "C:\\Users\\user\\book.pdf".into(),
                     password: Some("secret".into()),
                 },
             ),
@@ -98,6 +94,7 @@ fn responses() -> Vec<(&'static str, Response)> {
                     protocol_version: PROTOCOL_VERSION,
                     engine_version: "0.0.0".into(),
                     pdfium_version: "PDFium 8125".into(),
+                    sandbox: "seccomp+landlock".into(),
                 },
             ),
         ),
