@@ -24,8 +24,8 @@
     // Files that are gone (the stand-in answers "io" for them), and one that needs a password.
     missingFiles: ["/docs/gone.pdf", "/docs/gone2.pdf"],
     protectedFiles: ["/docs/locked.pdf"],
-    // The scripts this stand-in computer has a system font for (all of them, unless a test says not).
-    fonts: ["japanese", "korean", "chinese-simplified", "chinese-traditional", "arabic", "hebrew", "thai"],
+    // The scripts the stand-in engine had no font for when it was asked (empty: it had them all).
+    fonts: [],
     // The update side. `found` is what the next check returns (null: nothing new).
     update: {
       settings: { autoUpdate: true, method: "automatic", currentVersion: "0.1.0" },
@@ -235,7 +235,7 @@
         return OUTLINE[docs.get(args.doc)?.path] ?? [];
       case "get_page_text":
         return pageData(docs.get(args.doc)?.path, args.page);
-      case "system_fonts":
+      case "missed_fonts":
         return state.fonts.slice();
       case "get_page_links":
         if (docs.get(args.doc)?.path === "/docs/crafted.pdf") return CRAFTED_LINKS.slice();

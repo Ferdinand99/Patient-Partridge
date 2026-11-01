@@ -9,7 +9,7 @@
 
 use arbitrary::{Result, Unstructured};
 use partridge_protocol::{
-    LinkTarget, Request, RequestBody, Response, ResponseBody, MAX_LINKS_PER_PAGE,
+    FontScript, LinkTarget, Request, RequestBody, Response, ResponseBody, MAX_LINKS_PER_PAGE,
     MAX_MATCHES_PER_PAGE, MAX_OUTLINE_DEPTH, MAX_OUTLINE_ITEMS, MAX_OUTLINE_TITLE, MAX_PAGE_CHARS,
     MAX_PAGE_TEXT_BYTES, MAX_QUERY_LEN, MAX_RENDER_PIXELS, MAX_RENDER_SIDE, MAX_STRING_LEN,
     MAX_URI_LEN,
@@ -101,6 +101,9 @@ pub fn check_response_caps(response: &Response) {
                 "{} matches",
                 matches.len()
             );
+        }
+        ResponseBody::FontReport { missed } => {
+            assert!(missed.len() <= FontScript::ALL.len(), "{} scripts", missed.len());
         }
         ResponseBody::Error { message, .. } => {
             assert!(message.len() <= MAX_STRING_LEN);

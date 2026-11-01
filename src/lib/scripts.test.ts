@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { describeScripts, scriptsIn, scriptsWithoutFont } from "./scripts";
+import { describeFontScripts, scriptsIn } from "./scripts";
 
 describe("scriptsIn", () => {
   it("finds the scripts that need a font", () => {
@@ -16,24 +16,13 @@ describe("scriptsIn", () => {
   });
 });
 
-describe("scriptsWithoutFont", () => {
-  it("lists what the computer has no font for", () => {
-    const seen = new Set(["han", "thai", "arabic"] as const);
-    expect(scriptsWithoutFont(seen, ["japanese", "arabic"])).toEqual(["thai"]);
-    expect(scriptsWithoutFont(seen, [])).toEqual(["han", "thai", "arabic"]);
-  });
-
-  it("lets any CJK font cover the shared Chinese characters, but not kana or hangul", () => {
-    expect(scriptsWithoutFont(["han"], ["korean"])).toEqual([]);
-    expect(scriptsWithoutFont(["japanese"], ["korean"])).toEqual(["japanese"]);
-    expect(scriptsWithoutFont(["korean"], ["chinese-simplified"])).toEqual(["korean"]);
-  });
-});
-
-describe("describeScripts", () => {
-  it("makes a short phrase", () => {
-    expect(describeScripts(["thai"])).toBe("Thai");
-    expect(describeScripts(["thai", "arabic"])).toBe("Thai and Arabic");
-    expect(describeScripts(["han", "thai", "arabic"])).toBe("Chinese characters, Thai and Arabic");
+describe("describeFontScripts", () => {
+  it("makes a short phrase from the names the engine uses", () => {
+    expect(describeFontScripts(["thai"])).toBe("Thai");
+    expect(describeFontScripts(["thai", "arabic"])).toBe("Thai and Arabic");
+    expect(describeFontScripts(["chinese-simplified", "korean", "hebrew"])).toBe(
+      "Simplified Chinese, Korean and Hebrew",
+    );
+    expect(describeFontScripts([])).toBe("");
   });
 });

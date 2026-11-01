@@ -359,15 +359,14 @@ struct LinkInfo {
     page: Option<u32>,
 }
 
-/// The scripts for which this computer has a system font that the engine can be given (see
-/// `partridge_engine_client::system_fonts`). The window uses it to say when a document has text
-/// in a script that cannot be drawn here.
+/// The scripts for which the engine of a document was asked for a font and had none to give
+/// (`partridge_engine_client::system_fonts` says which fonts it looks for). Text in those scripts,
+/// in a font the PDF does not carry, is drawn as blanks; the window tells the reader.
 #[tauri::command]
-fn system_fonts() -> Vec<String> {
-    partridge_engine_client::system_fonts::available()
-        .into_iter()
-        .map(|s| s.name().to_string())
-        .collect()
+async fn missed_fonts(engine: State<'_, Engine>, doc: u64) -> Result<Vec<String>, CommandError> {
+    let pool = engine.0.clone();
+    let scripts = blocking(move || pool.font_report(doc)).await?;
+    Ok(scripts.into_iter().map(|s| s.name().to_string()).collect())
 }
 
 #[tauri::command]
@@ -597,7 +596,7 @@ pub fn run() {
             get_outline,
             get_page_text,
             get_page_links,
-            system_fonts,
+            missed_fonts,
             open_link,
             print_webview,
             search_page,

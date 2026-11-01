@@ -13,7 +13,8 @@ use std::io::{self, Read};
 
 use arbitrary::{Result, Unstructured};
 use partridge_protocol::{
-    ErrorCode, LinkTarget, OutlineItem, PageLink, PageSize, Request, RequestBody, Response,
+    ErrorCode, FontScript, LinkTarget, OutlineItem, PageLink, PageSize, Request, RequestBody,
+    Response,
     ResponseBody, TextMatch, MAX_LINKS_PER_PAGE, MAX_MATCHES_PER_PAGE, MAX_OUTLINE_DEPTH,
     MAX_OUTLINE_ITEMS, MAX_OUTLINE_TITLE, MAX_QUERY_LEN, MAX_STRING_LEN, MAX_URI_LEN,
 };
@@ -77,7 +78,7 @@ pub fn sanitized(rect: [f32; 4]) -> [f32; 4] {
 /// A request that the encoder writes without cutting anything.
 pub fn arb_request(u: &mut Unstructured) -> Result<Request> {
     let id: u32 = u.arbitrary()?;
-    let body = match u.int_in_range(0..=7u8)? {
+    let body = match u.int_in_range(0..=8u8)? {
         0 => RequestBody::Hello {
             protocol_version: u.arbitrary()?,
         },
@@ -108,6 +109,7 @@ pub fn arb_request(u: &mut Unstructured) -> Result<Request> {
             doc: u.arbitrary()?,
             page: u.arbitrary()?,
         },
+        7 => RequestBody::FontReport,
         _ => RequestBody::Search {
             doc: u.arbitrary()?,
             page: u.arbitrary()?,
@@ -137,7 +139,7 @@ pub struct GeneratedResponse {
 
 pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
     let id: u32 = u.arbitrary()?;
-    let (sent, expected) = match u.int_in_range(0..=8u8)? {
+    let (sent, expected) = match u.int_in_range(0..=9u8)? {
         0 => {
             let b = ResponseBody::Hello {
                 protocol_version: u.arbitrary()?,
@@ -262,6 +264,17 @@ pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
                 });
             }
             let b = ResponseBody::Matches { matches };
+            (b.clone(), b)
+        }
+        8 => {
+            // Any scripts, in the order of the list, as the engine reports them.
+            let mut missed = Vec::new();
+            for script in FontScript::ALL {
+                if u.arbitrary()? {
+                    missed.push(script);
+                }
+            }
+            let b = ResponseBody::FontReport { missed };
             (b.clone(), b)
         }
         _ => {

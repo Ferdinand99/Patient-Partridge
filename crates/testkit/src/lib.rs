@@ -546,7 +546,10 @@ pub fn many_fonts_pdf(fonts: usize) -> Vec<u8> {
             "",
         );
         // The font object is object 5 + 2i and its descendant 6 + 2i.
-        objects.push(font.replace("[6 0 R]", &format!("[{} 0 R]", 6 + 2 * i)).into_bytes());
+        objects.push(
+            font.replace("[6 0 R]", &format!("[{} 0 R]", 6 + 2 * i))
+                .into_bytes(),
+        );
         objects.push(descendant.into_bytes());
     }
     assemble(&objects, "")

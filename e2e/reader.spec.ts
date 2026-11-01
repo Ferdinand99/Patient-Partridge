@@ -474,7 +474,7 @@ test("a computer without a font for the script of a page gets one calm notice, a
   page,
 }) => {
   await page.evaluate(() => {
-    window.__E2E__.fonts = [];
+    window.__E2E__.fonts = ["hebrew"];
     window.__E2E__.dialog = ["/docs/rtl.pdf"];
   });
   await page.locator("#empty-open").click();

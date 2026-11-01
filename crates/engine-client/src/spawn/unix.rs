@@ -107,8 +107,10 @@ pub(super) fn spawn(request: &SpawnRequest<'_>) -> io::Result<SpawnedEngine> {
     let fonts: Vec<(partridge_protocol::FontScript, std::os::fd::OwnedFd)> = request
         .fonts
         .iter()
-        .map(|(script, file)| high_copy(file).map(|fd| (*script, fd)))
-        .collect::<io::Result<_>>()?;
+        // A font that cannot be copied (no descriptor to spare) is left out: the text in its script
+        // shows as blanks, the document still opens.
+        .filter_map(|(script, file)| high_copy(file).ok().map(|fd| (*script, fd)))
+        .collect();
     let font_numbers: Vec<(partridge_protocol::FontScript, u64)> = fonts
         .iter()
         .enumerate()

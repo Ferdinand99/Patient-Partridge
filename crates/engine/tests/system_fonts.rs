@@ -81,7 +81,7 @@ fn what_this_system_has() {
     let found = system_fonts::found();
     println!("system fonts found: {found:#?}");
     // Every file comes from the fixed table: an absolute path to a font file.
-    for (_, path) in found {
+    for (_, path) in &found {
         assert!(path.is_absolute());
     }
     for script in FontScript::ALL {
@@ -120,8 +120,9 @@ fn a_page_in_each_script_is_drawn_with_the_font_the_app_found() {
         };
         let with = draw(name, true);
         let without = draw(name, false);
+        let size = std::fs::metadata(path).map(|m| m.len() / 1024).unwrap_or(0);
         println!(
-            "{name}: {} gives {with} dark pixels, {without} without",
+            "{name}: {} ({size} KiB) gives {with} dark pixels, {without} without",
             path.display()
         );
         summary(&format!(
@@ -291,16 +292,80 @@ fn a_page_with_150_font_names_stays_under_the_memory_limit_and_keeps_working() {
     let text = client.page_text(doc.doc, 0).unwrap();
     assert!(!text.text.trim().is_empty());
     assert_eq!(client.spawn_count(), 1, "the engine restarted");
+    // The names past the budget were refused, and the engine says so: the reader is told.
+    assert_eq!(
+        client.font_report(doc.doc).unwrap(),
+        vec![FontScript::Japanese]
+    );
+}
+
+/// The engine says which scripts it had to refuse a font for, and only those.
+#[test]
+fn the_engine_reports_the_scripts_it_had_no_font_for() {
+    let japanese = kit::TempFile::new("ja.pdf", &kit::script_pdf("japanese"));
+    // No fonts handed over: PDFium asks, the engine has none.
+    let client = EngineClient::new(config(false));
+    let doc = client.open(&japanese.path_str(), None).unwrap();
+    assert!(
+        client.font_report(doc.doc).unwrap().is_empty(),
+        "nothing drawn yet"
+    );
+    client.render(doc.doc, 0, 612, 792).unwrap();
+    assert_eq!(
+        client.font_report(doc.doc).unwrap(),
+        vec![FontScript::Japanese]
+    );
+    // A page that needs no system font is no reason for a message.
+    let plain = kit::TempFile::new("plain.pdf", &kit::fonts_pdf());
+    let client = EngineClient::new(config(true));
+    let doc = client.open(&plain.path_str(), None).unwrap();
+    client.render(doc.doc, 0, 612, 792).unwrap();
+    assert!(client.font_report(doc.doc).unwrap().is_empty());
+    // And with the font of the system the script is not reported either.
+    if system_fonts::available().contains(&FontScript::Japanese) {
+        let client = EngineClient::new(config(true));
+        let doc = client.open(&japanese.path_str(), None).unwrap();
+        client.render(doc.doc, 0, 612, 792).unwrap();
+        assert!(client.font_report(doc.doc).unwrap().is_empty());
+    }
 }
 
 fn ink_anywhere(bitmap: &Bitmap) -> usize {
+    // Anything that is not white: the lines of this page are only a few points high.
     bitmap
         .rgba
         .as_chunks::<4>()
         .0
         .iter()
-        .filter(|p| p[0] < 110 && p[1] < 110 && p[2] < 110)
+        .filter(|p| p[0] < 200 || p[1] < 200 || p[2] < 200)
         .count()
+}
+
+/// A font file cut short (a download that stopped) is not handed to PDFium at all: the page is
+/// blank, the engine does not restart, and it reports the script so that the reader is told.
+#[test]
+fn a_truncated_font_is_refused_before_pdfium_sees_it() {
+    let Some((script, path)) = system_fonts::found().first().cloned() else {
+        println!("no system font here, nothing to cut");
+        return;
+    };
+    let name = script.name();
+    let bytes = std::fs::read(&path).unwrap();
+    let cut = kit::TempFile::new("cut.ttf", &bytes[..bytes.len() * 6 / 10]);
+    let file = kit::TempFile::new("script.pdf", &kit::script_pdf(name));
+    let mut cfg = config(true);
+    cfg.system_font_files = Some(vec![(script, cut.path().to_path_buf())]);
+    let client = EngineClient::new(cfg);
+    let doc = client.open(&file.path_str(), None).unwrap();
+    let bitmap = client.render(doc.doc, 0, 612, 792).unwrap();
+    println!("{name}: font cut at 60%: {} dark pixels", ink(&bitmap));
+    assert_eq!(ink(&bitmap), 0, "a cut font must not be drawn from");
+    assert_eq!(client.spawn_count(), 1);
+    assert_eq!(client.font_report(doc.doc).unwrap(), vec![script]);
+    // The next document goes on.
+    let plain = kit::TempFile::new("plain.pdf", &kit::simple_pdf(1));
+    let doc = client.open(&plain.path_str(), None).unwrap();
+    assert!(ink_anywhere(&client.render(doc.doc, 0, 612, 792).unwrap()) > 0);
 }
 
 /// A font that is damaged inside (the table directory is fine, the tables are not) is read by
@@ -340,14 +405,16 @@ fn a_font_damaged_inside_costs_at_most_one_engine() {
 }
 
 /// Names that every script uses are no help to the engine: PDFium asks for "Arial" with no hint of
-/// the script. This only reports what happens (the README says it is not drawn), so that the
-/// claim is checked on each system.
+/// the script. The README says such text is not drawn, and this checks the claim on each system.
 #[test]
-fn names_that_every_script_uses_are_reported() {
+fn names_that_every_script_uses_stay_blank() {
     for name in ["arabic", "hebrew", "thai"] {
         for font in ["Arial", "Tahoma", "TimesNewRoman"] {
             let ink = draw_named(name, font, true);
-            println!("{name} as {font}: {ink} dark pixels (not required)");
+            println!("{name} as {font}: {ink} dark pixels");
+            // The README says these stay blank. If PDFium or the engine ever draws them, this
+            // fails so that the README is changed with it.
+            assert_eq!(ink, 0, "{name} as {font} is drawn now: update the README");
         }
     }
 }

@@ -136,7 +136,7 @@ function make(
     getPageText: vi.fn((_doc: number, _page: number) =>
       Promise.resolve({ text: "Hello world", rects: layoutRects("Hello world") }),
     ),
-    systemFonts: vi.fn((): Promise<string[]> => Promise.resolve([])),
+    missedFonts: vi.fn((_doc: number): Promise<string[]> => Promise.resolve([])),
     getPageLinks: vi.fn((_doc: number, page: number) =>
       Promise.resolve(
         page === 0
@@ -1400,16 +1400,22 @@ describe("App: pages with more text than the window keeps", () => {
 describe("App: text in a script that needs a font", () => {
   const japanese = "かな日本語";
 
-  it("tells the reader once when this computer has no font for it", async () => {
-    const { app, api } = make();
+  function withJapanese(api: ReturnType<typeof make>["api"]) {
     api.getPageText.mockImplementation(() =>
       Promise.resolve({ text: japanese, rects: layoutRects(japanese) }),
     );
+  }
+
+  it("tells the reader once when the engine had to refuse a font for it", async () => {
+    const { app, api } = make();
+    withJapanese(api);
+    api.missedFonts.mockResolvedValue(["japanese", "thai"]);
     await app.openPath("/a.pdf");
     await flush();
     expect(notice()?.textContent).toContain("Some text may not show");
-    expect(notice()?.textContent).toContain("Japanese");
+    expect(notice()?.textContent).toContain("Japanese and Thai");
     expect(notice()?.textContent).toContain("a.pdf");
+    expect(notice()?.textContent).toContain("open the file again");
     click(button("OK"));
     await flush();
     app.currentView!.goToPage(2);
@@ -1419,23 +1425,42 @@ describe("App: text in a script that needs a font", () => {
     expect(notice()).toBeNull();
   });
 
-  it("says nothing when the computer has a font for it", async () => {
+  it("says nothing when the engine had every font it was asked for", async () => {
     const { app, api } = make();
-    api.systemFonts.mockResolvedValue(["japanese"]);
-    api.getPageText.mockImplementation(() =>
-      Promise.resolve({ text: japanese, rects: layoutRects(japanese) }),
-    );
+    withJapanese(api);
     await app.openPath("/a.pdf");
     await flush();
     expect(notice()).toBeNull();
+    // It did look: text in the script is a reason to ask.
+    expect(api.missedFonts).toHaveBeenCalled();
   });
 
-  it("says nothing for Latin text, and does not ask for the fonts", async () => {
+  it("asks again after a page is drawn, because the fonts are asked for while it is drawn", async () => {
+    const { app, api } = make();
+    withJapanese(api);
+    api.missedFonts.mockResolvedValueOnce([]).mockResolvedValue(["korean"]);
+    await app.openPath("/a.pdf");
+    await flush();
+    app.currentView!.goToPage(1);
+    await flush();
+    expect(notice()?.textContent).toContain("Korean");
+  });
+
+  it("says nothing for Latin text, and does not ask the engine", async () => {
     const { app, api } = make();
     await app.openPath("/a.pdf");
     await flush();
     expect(notice()).toBeNull();
-    expect(api.systemFonts).not.toHaveBeenCalled();
+    expect(api.missedFonts).not.toHaveBeenCalled();
+  });
+
+  it("does not make a message of an engine that cannot say", async () => {
+    const { app, api } = make();
+    withJapanese(api);
+    api.missedFonts.mockRejectedValue(new Error("gone"));
+    await app.openPath("/a.pdf");
+    await flush();
+    expect(notice()).toBeNull();
   });
 });
 

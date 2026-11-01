@@ -51,6 +51,8 @@ export interface ViewerEvents {
   onTextLimit?(): void;
   /** The text of a page uses these scripts (see `scriptsIn`). */
   onScripts?(scripts: TextScript[]): void;
+  /** A page has been drawn (the engine has asked for the fonts it needed for it). */
+  onPageDrawn?(page: number): void;
 }
 
 /** Where the reader was: a page, how far down it, and the zoom (null means fit width). */
@@ -575,6 +577,7 @@ export class DocumentView {
     m.el.classList.remove("viewer-page-failed");
     // Text and links come after the picture, so they never delay the page the reader waits for.
     this.overlays.pageDrawn(job.page);
+    this.events.onPageDrawn?.(job.page);
     if (!this.painted) {
       this.painted = true;
       this.events.onFirstPaint();

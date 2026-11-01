@@ -6,7 +6,7 @@ import type { OpenedDocument, OutlineEntry, SavedPosition } from "../lib/api";
 import { describeError, fileNameOf, toAppError, type AppErrorLike } from "../lib/errors";
 import { classifyUri, visibleAddress } from "../lib/linkPolicy";
 import { parsePageInput } from "../lib/pageInput";
-import { describeScripts, scriptsWithoutFont, type TextScript } from "../lib/scripts";
+import { describeFontScripts } from "../lib/scripts";
 import { MAX_OPEN_AT_ONCE, MAX_TABS, pickSessionTabs, wantedPdfPaths, type SessionTabs } from "../lib/paths";
 import {
   THEME_CHOICES,
@@ -48,8 +48,8 @@ export interface AppDeps {
     getPageLinks(doc: number, page: number): Promise<PageLinkInfo[]>;
     searchPage(doc: number, page: number, query: string): Promise<[number, number][]>;
     openLink(doc: number, url: string): Promise<void>;
-    /** The scripts for which this computer has a system font the engine can use. */
-    systemFonts?(): Promise<string[]>;
+    /** The scripts the engine of a document had no font for when PDFium asked. */
+    missedFonts?(doc: number): Promise<string[]>;
     measureMode(): Promise<boolean>;
     measureReport(openMs: number, firstPageMs: number, pages: number): Promise<void>;
   };
@@ -103,7 +103,11 @@ interface Tab {
    * to the end.
    */
   rank: number;
-  /** Scripts the document uses that this computer has no font for, told once for the tab. */
+  /** True once a page of the document had text in a script that needs a font. */
+  sawScripts: boolean;
+  /** True while the engine is being asked which fonts it had to refuse. */
+  fontsAsking: boolean;
+  /** True once the reader was told about text that cannot be drawn for lack of a font. */
   fontsTold: boolean;
 }
 
@@ -548,6 +552,8 @@ export class App {
       forgottenAt: null,
       limitTold: false,
       rank,
+      sawScripts: false,
+      fontsAsking: false,
       fontsTold: false,
     };
     tab.view = new DocumentView(
@@ -579,7 +585,11 @@ export class App {
         },
         onSelectionSettled: () => this.updateSelectionProxy(tab),
         onTextLimit: () => void this.textLimitHit(tab),
-        onScripts: (scripts) => void this.scriptsSeen(tab, scripts),
+        onScripts: () => {
+          tab.sawScripts = true;
+          void this.fontsMissed(tab);
+        },
+        onPageDrawn: () => void this.fontsMissed(tab),
       },
       { start: opened.position ?? null, limits: this.deps.viewLimits },
     );
@@ -613,24 +623,31 @@ export class App {
     }
   }
 
-  /** The scripts this computer has a system font for; asked once, when a page first needs it. */
-  private fontsAvailable: Promise<string[]> | null = null;
-
   /**
-   * The text of a page uses some scripts. If this computer has no font for one of them, the PDF
-   * engine cannot draw that text unless the PDF carries its own font. A calm message, once for the
-   * tab, says what that means.
+   * A page with text in a script that needs a font was read or drawn. If the PDF carries its fonts
+   * nothing is wrong. If it does not, PDFium asks the engine for one, and when the engine has none
+   * it can use (this computer has none of the fonts it looks for, one is damaged, or the document
+   * names more fonts than the engine hands out) that text is drawn as blanks. The engine remembers
+   * which scripts it had to refuse; one calm message, once for the tab, says what that means.
+   * Asked again after each page drawn until the reader has been told.
    */
-  private async scriptsSeen(tab: Tab, scripts: TextScript[]): Promise<void> {
-    if (tab.fontsTold || !this.deps.api.systemFonts) return;
-    this.fontsAvailable ??= this.deps.api.systemFonts().catch(() => []);
-    const fonts = await this.fontsAvailable;
-    const missing = scriptsWithoutFont(scripts, fonts);
-    if (missing.length === 0 || tab.fontsTold || !this.tabs.includes(tab)) return;
+  private async fontsMissed(tab: Tab): Promise<void> {
+    if (tab.fontsTold || tab.fontsAsking || !tab.sawScripts || !this.deps.api.missedFonts) return;
+    if (!this.tabs.includes(tab)) return;
+    tab.fontsAsking = true;
+    let missed: string[];
+    try {
+      missed = await this.deps.api.missedFonts(tab.doc);
+    } catch {
+      return;
+    } finally {
+      tab.fontsAsking = false;
+    }
+    if (missed.length === 0 || tab.fontsTold || !this.tabs.includes(tab)) return;
     tab.fontsTold = true;
     await showNotice(this.noticeLayer, {
       title: "Some text may not show",
-      detail: `"${tab.name}" has text in ${describeScripts(missing)}. If the PDF does not carry the fonts for it, that text shows as blanks, because this computer has no font installed that the reader can use for it. You can still search, select and copy it. Installing a font for it and opening the file again will show it.`,
+      detail: `"${tab.name}" has text in ${describeFontScripts(missed)} that the file does not carry the fonts for, and the reader could not use a font of this computer for it, so that text shows as blanks. You can still search, select and copy it. The reader only looks for a few fonts that come with the system (the list is in the project's documentation). If you install one of them for all users, open the file again; a font installed for one user only is not used.`,
       buttons: [{ id: "ok", label: "OK", primary: true }],
     });
   }

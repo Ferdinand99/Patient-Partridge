@@ -117,11 +117,12 @@ export const api = {
   },
 
   /**
-   * The scripts for which this computer has a system font that the app can hand to the PDF engine
-   * (for text whose font the PDF does not carry): "japanese", "korean", "chinese-simplified", ...
+   * The scripts for which the engine of a document was asked for a font and had none to give
+   * ("japanese", "korean", "chinese-simplified", ...): text in them that the PDF does not carry a
+   * font for is drawn as blanks.
    */
-  systemFonts(): Promise<string[]> {
-    return invoke<string[]>("system_fonts");
+  missedFonts(doc: number): Promise<string[]> {
+    return invoke<string[]>("missed_fonts", { doc });
   },
 
   /** The links of a page that lead to a web address or to a page of the document. */

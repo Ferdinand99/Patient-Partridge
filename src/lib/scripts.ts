@@ -1,7 +1,6 @@
-// Which writing systems a text uses, so the window can say when a document needs a font that this
-// computer does not have. Pure functions: no DOM. The engine draws text in a script that the PDF
-// does not carry a font for only if the app found a font for that script on the system (see
-// `system_fonts` in the Rust side); this module finds out which scripts a page's text needs.
+// Which writing systems a text uses, so the window knows when to ask the engine whether it had to
+// refuse a font for them (`missed_fonts` on the Rust side), and the words for the message. Pure
+// functions: no DOM.
 
 /** A script as the window tells it apart. "han" is the Chinese characters that Chinese, Japanese
  * and Korean share: any CJK font draws them. */
@@ -48,35 +47,19 @@ export function scriptsIn(text: string): Set<TextScript> {
   return found;
 }
 
-/**
- * The scripts among `seen` that this computer has no font for. `fonts` are the script names the app
- * found a system font for ("japanese", "korean", "chinese-simplified", "chinese-traditional",
- * "arabic", "hebrew", "thai"). The shared Chinese characters are covered by any of the four CJK
- * fonts.
- */
-export function scriptsWithoutFont(seen: Iterable<TextScript>, fonts: readonly string[]): TextScript[] {
-  const has = (name: string): boolean => fonts.includes(name);
-  const anyCjk = ["japanese", "korean", "chinese-simplified", "chinese-traditional"].some(has);
-  const missing: TextScript[] = [];
-  for (const script of seen) {
-    const covered = script === "han" ? anyCjk : has(script);
-    if (!covered) missing.push(script);
-  }
-  return missing;
-}
-
-const LABELS: Record<TextScript, string> = {
-  han: "Chinese characters",
+const FONT_LABELS: Record<string, string> = {
   japanese: "Japanese",
   korean: "Korean",
+  "chinese-simplified": "Simplified Chinese",
+  "chinese-traditional": "Traditional Chinese",
   arabic: "Arabic",
   hebrew: "Hebrew",
   thai: "Thai",
 };
 
-/** The scripts as words for a message: "Japanese and Thai". */
-export function describeScripts(scripts: readonly TextScript[]): string {
-  const names = scripts.map((s) => LABELS[s]);
-  if (names.length <= 1) return names[0] ?? "";
-  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+/** The scripts the engine reports (its names for them) as words for a message: "Japanese and Thai". */
+export function describeFontScripts(names: readonly string[]): string {
+  const labels = names.map((n) => FONT_LABELS[n] ?? n);
+  if (labels.length <= 1) return labels[0] ?? "";
+  return `${labels.slice(0, -1).join(", ")} and ${labels[labels.length - 1]}`;
 }

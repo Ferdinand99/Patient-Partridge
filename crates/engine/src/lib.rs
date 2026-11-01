@@ -12,6 +12,8 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 
 use partridge_protocol::{
     ErrorCode, FontScript, PageSize, Request, RequestBody, Response, ResponseBody,
@@ -26,6 +28,7 @@ pub mod limits;
 pub mod sandbox;
 pub mod startup;
 pub mod stdio;
+mod sysfontinfo;
 pub mod text;
 
 /// Command line of the engine.
@@ -140,6 +143,8 @@ pub struct Engine {
     sandbox: String,
     /// When set, every request fails with this error and the engine reads nothing.
     refusal: Option<Failure>,
+    /// The scripts for which PDFium asked for a font and the engine had none to give.
+    missed_fonts: Arc<AtomicU8>,
 }
 
 impl Engine {
@@ -167,11 +172,16 @@ impl Engine {
             .ok()
             .and_then(|text| parse_pdfium_version(&text))
             .unwrap_or_else(|| "PDFium".to_string());
-        let pdfium = load_pdfium(pdfium_dir, fonts_dir, system_fonts);
-        if let Ok(pdfium) = &pdfium {
-            warm_up(pdfium);
-        }
+        let loaded = load_pdfium(pdfium_dir, fonts_dir, system_fonts);
+        let (pdfium, missed) = match loaded {
+            Ok((pdfium, missed)) => {
+                warm_up(pdfium);
+                (Ok(pdfium), missed)
+            }
+            Err(message) => (Err(message), Arc::new(AtomicU8::new(0))),
+        };
         Engine {
+            missed_fonts: missed,
             pdfium,
             pdfium_version: version,
             docs: HashMap::new(),
@@ -279,6 +289,9 @@ impl Engine {
                     })
                 })
             }
+            RequestBody::FontReport => Ok(ResponseBody::FontReport {
+                missed: fonts::scripts_of_bits(self.missed_fonts.load(Ordering::Relaxed)),
+            }),
             RequestBody::Search { doc, page, query } => self.with_page(doc, page, |p| {
                 let chars = text::page_chars(p, false).map_err(|_| {
                     (
@@ -393,11 +406,14 @@ impl Engine {
     }
 }
 
+/// The loaded library, and the scripts the font source had to refuse (a bit for each).
+type Loaded = (&'static Pdfium, Arc<AtomicU8>);
+
 fn load_pdfium(
     dir: &Path,
     fonts_dir: &Path,
     system_fonts: Vec<(FontScript, File)>,
-) -> Result<&'static Pdfium, String> {
+) -> Result<Loaded, String> {
     let dir = std::fs::canonicalize(dir)
         .map_err(|e| format!("the PDFium folder {} is not usable: {e}", dir.display()))?;
     let library = Pdfium::pdfium_platform_library_name_at_path(&dir);
@@ -407,16 +423,21 @@ fn load_pdfium(
             library.display()
         )
     })?;
-    let mut pdfium = Pdfium::new(bindings);
+    let pdfium = Pdfium::new(bindings);
     // PDFium must not look for fonts on the system: it cannot open files once the sandbox is on.
-    // It gets the fonts of the `fonts` folder from memory, and its built-in ones for the rest.
+    // It gets the fonts of the `fonts` folder and the system fonts the app handed over from
+    // memory, and its built-in ones for the rest.
     let mut provider = fonts::MemoryFonts::load_dir(fonts_dir);
     for (script, file) in system_fonts {
         provider.add_system(script, file);
     }
-    pdfium.set_custom_font_provider(Box::new(provider));
+    let missed = provider.missed_scripts();
+    // The font source lives as long as the process, like the library.
+    let source = Box::leak(sysfontinfo::SysFontInfo::new(provider));
+    // SAFETY: the pointer is to a structure that is never freed, built for this interface.
+    unsafe { pdfium.bindings().FPDF_SetSystemFontInfo(source.as_ptr()) };
     // The engine lives as long as the process: leaking gives every document a 'static library.
-    Ok(Box::leak(Box::new(pdfium)))
+    Ok((Box::leak(Box::new(pdfium)), missed))
 }
 
 /// A small document in the engine itself. Drawing it before the sandbox is applied makes PDFium

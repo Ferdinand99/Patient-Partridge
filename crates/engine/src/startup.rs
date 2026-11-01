@@ -2,7 +2,8 @@
 //!
 //! The order matters, and it is the same for the real engine and for the test-only mode:
 //!
-//! 1. Close every descriptor that is not the standard three and the document.
+//! 1. Close every descriptor that is not the standard three, the document and the system fonts
+//!    the app handed over (one handle each, from 4 up).
 //! 2. Take a private copy of the protocol output.
 //! 3. Set the memory limit.
 //! 4. Load PDFium, the fonts, and warm up the parts of PDFium that start lazily.

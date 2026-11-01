@@ -621,8 +621,9 @@ pub(super) fn spawn(request: &SpawnRequest<'_>) -> io::Result<SpawnedEngine> {
     let fonts: Vec<(FontScript, Owned)> = request
         .fonts
         .iter()
-        .map(|(script, file)| inheritable_copy(file).map(|h| (*script, h)))
-        .collect::<io::Result<_>>()?;
+        // A font that cannot be copied is left out: its script shows as blanks, the document opens.
+        .filter_map(|(script, file)| inheritable_copy(file).ok().map(|h| (*script, h)))
+        .collect();
     let font_numbers: Vec<(FontScript, u64)> = fonts
         .iter()
         .map(|(script, h)| (*script, h.raw() as usize as u64))
@@ -804,8 +805,9 @@ pub(super) fn spawn_plain(request: &SpawnRequest<'_>) -> io::Result<SpawnedEngin
     let fonts: Vec<(FontScript, Owned)> = request
         .fonts
         .iter()
-        .map(|(script, file)| inheritable_copy(file).map(|h| (*script, h)))
-        .collect::<io::Result<_>>()?;
+        // A font that cannot be copied is left out: its script shows as blanks, the document opens.
+        .filter_map(|(script, file)| inheritable_copy(file).ok().map(|h| (*script, h)))
+        .collect();
     let font_numbers: Vec<(FontScript, u64)> = fonts
         .iter()
         .map(|(script, h)| (*script, h.raw() as usize as u64))

@@ -37,7 +37,7 @@ use partridge_protocol::{
 
 pub use spawn::{spawn_engine, EngineProcess, SandboxPolicy, SpawnRequest, SpawnedEngine};
 
-pub use partridge_protocol::{LinkTarget, OutlineItem, PageLink, TextMatch};
+pub use partridge_protocol::{FontScript, LinkTarget, OutlineItem, PageLink, TextMatch};
 
 mod pool;
 pub use pool::EnginePool;
@@ -326,6 +326,21 @@ impl EngineClient {
         )
     }
 
+    /// The scripts for which PDFium asked the engine of this document for a font and the engine had
+    /// none to give: text in them, in a font the PDF does not carry, is drawn as blanks. Empty when
+    /// every font that was asked for was found (or none was asked for).
+    pub fn font_report(&self, doc: u64) -> Result<Vec<FontScript>, ClientError> {
+        self.call(
+            doc,
+            "font report",
+            |_| RequestBody::FontReport,
+            |body| match body {
+                ResponseBody::FontReport { missed } => Ok(missed),
+                other => Err(other),
+            },
+        )
+    }
+
     /// The text of one page with the box of every character.
     pub fn page_text(&self, doc: u64, page: u32) -> Result<PageText, ClientError> {
         self.call(
@@ -524,7 +539,10 @@ impl EngineClient {
 
     fn start(&self, inner: &mut Inner, document: Option<&File>) -> Result<(), ClientError> {
         // The fonts are opened for this engine only and closed again when it has them.
-        let fonts = if let Some(files) = &self.config.system_font_files {
+        let fonts = if document.is_none() {
+            // An engine that only says what it is has no document and needs no fonts.
+            Vec::new()
+        } else if let Some(files) = &self.config.system_font_files {
             files
                 .iter()
                 .filter_map(|(script, path)| Some((*script, File::open(path).ok()?)))
