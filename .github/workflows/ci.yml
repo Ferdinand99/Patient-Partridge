@@ -126,6 +126,9 @@ jobs:
           mkdir -p "$HOME/.local/bin"
           tar -xzf "$RUNNER_TEMP/cargo-about.tar.gz" -C "$HOME/.local/bin" --strip-components=1 "${name}/cargo-about"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      # --fail is what makes an unreadable licence stop the check; this test proves it.
+      - name: cargo-about stops on a crate with an unreadable licence
+        run: scripts/test-notices-fail.sh
       - name: THIRD-PARTY-NOTICES is up to date
         run: scripts/notices.sh --check
 
@@ -262,12 +265,11 @@ jobs:
       # The legal texts must be inside the installers a user gets: THIRD-PARTY-NOTICES, the AGPL
       # text (tauri's licenseFile only reaches the msi and nsis dialogs, so the deb gets a
       # Debian copyright file and every system gets LICENSE in the app's resource folder), and the
-      # PDFium licence texts. The installers are unpacked the way a user's system would, and the
-      # files in them are compared with the repository.
-      - name: Unpack the installers (legal texts)
-        run: scripts/unpack-installer.sh ${{ matrix.name }} out "$RUNNER_TEMP/unpacked-legal"
+      # PDFium licence texts. This uses the folder of the "Unpack the installers" step above (one
+      # folder per format: deb, dmg, or msi and nsis). Each format is checked on its own, and the
+      # files in it are compared with the repository and with the PDFium download.
       - name: The installers carry the licence texts
-        run: node scripts/check-installer-legal.mjs ${{ matrix.name }} "$RUNNER_TEMP/unpacked-legal"
+        run: node scripts/check-installer-legal.mjs ${{ matrix.name }} "$RUNNER_TEMP/unpacked"
 
       - name: Installer sizes
         if: always()

@@ -21,9 +21,9 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 # One report for the app process and one for the engine process: they are separate programs.
-cargo about generate --config about.toml --locked --format json \
+cargo about generate --config about.toml --locked --fail --format json \
   --manifest-path src-tauri/Cargo.toml --output-file "$tmp/app.json"
-cargo about generate --config about.toml --locked --format json \
+cargo about generate --config about.toml --locked --fail --format json \
   --manifest-path crates/engine/Cargo.toml --output-file "$tmp/engine.json"
 
 if [ "${1:-}" = "--check" ]; then

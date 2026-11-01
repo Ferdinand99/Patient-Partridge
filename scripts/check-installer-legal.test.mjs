@@ -2,9 +2,9 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { checkLegal } from "./check-installer-legal.mjs";
+import { checkLegal, checkSystem, pdfiumLicenses } from "./check-installer-legal.mjs";
 
-const expected = { notices: "the notices\n", license: "GNU AFFERO GENERAL PUBLIC LICENSE\n" };
+const expected = { notices: "the notices\n", license: "GNU AFFERO GENERAL PUBLIC LICENSE\n", pdfium: null };
 const dirs = [];
 afterEach(() => dirs.splice(0).forEach((d) => rmSync(d, { recursive: true, force: true })));
 
@@ -18,15 +18,17 @@ function installer(files) {
   return dir;
 }
 
+const pdfiumNames = ["pdfium", "abseil", "icu", "zlib", "freetype"];
 const pdfium = (prefix) => ({
   [`${prefix}/pdfium-LICENSE`]: "BSD",
-  ...Object.fromEntries(["pdfium", "abseil", "icu", "zlib", "freetype"].map((n) => [`${prefix}/pdfium-licenses/${n}.txt`, n])),
+  ...Object.fromEntries(pdfiumNames.map((n) => [`${prefix}/pdfium-licenses/${n}.txt`, n])),
 });
 const full = (prefix) => ({
   [`${prefix}/LICENSE`]: expected.license,
   [`${prefix}/THIRD-PARTY-NOTICES`]: expected.notices,
   ...pdfium(prefix),
 });
+const withDownload = { ...expected, pdfium: new Map([["LICENSE", "BSD"], ...pdfiumNames.map((n) => [`${n}.txt`, n])]) };
 
 describe("checkLegal", () => {
   it("accepts an installer with everything, also with Windows line ends", () => {
@@ -58,5 +60,56 @@ describe("checkLegal", () => {
     const problems = checkLegal("windows", dir, expected);
     expect(problems.join("\n")).toContain("pdfium-LICENSE");
     expect(problems.join("\n")).toContain("pdfium-licenses");
+  });
+  it("compares every PDFium licence file with the download, also an empty or changed one", () => {
+    expect(checkLegal("windows", installer(full("A")), withDownload)).toEqual([]);
+    const lost = installer({ ...full("A") });
+    rmSync(join(lost, "A", "pdfium-licenses", "icu.txt"));
+    expect(checkLegal("windows", lost, withDownload)).toEqual(["pdfium-licenses/icu.txt is not in the installer"]);
+    const changed = installer({ ...full("A"), "A/pdfium-licenses/zlib.txt": "other" });
+    expect(checkLegal("windows", changed, withDownload)).toEqual(["pdfium-licenses/zlib.txt is not the file of the PDFium download"]);
+    const empty = installer({ ...full("A"), "A/pdfium-LICENSE": "" });
+    expect(checkLegal("windows", empty, withDownload).join("\n")).toContain("pdfium-LICENSE is missing or empty");
+  });
+});
+
+describe("checkSystem (each installer format on its own)", () => {
+  const windows = (msi, nsis) => installer({ ...msi, ...nsis });
+  it("passes when msi and nsis both carry everything", () => {
+    expect(checkSystem("windows", windows(full("msi/PFiles/App"), full("nsis")), expected)).toEqual([]);
+  });
+  it("fails when only the msi lacks the notices, although the nsis has them", () => {
+    const msi = full("msi/PFiles/App");
+    delete msi["msi/PFiles/App/THIRD-PARTY-NOTICES"];
+    const problems = checkSystem("windows", windows(msi, full("nsis")), expected);
+    expect(problems).toEqual(["msi: THIRD-PARTY-NOTICES is not in the installer"]);
+  });
+  it("fails when only the nsis lacks the AGPL text, although the msi has it", () => {
+    const nsis = full("nsis");
+    delete nsis["nsis/LICENSE"];
+    const problems = checkSystem("windows", windows(full("msi/PFiles/App"), nsis), expected);
+    expect(problems).toEqual(["nsis: LICENSE (the AGPL text) is not in the installer"]);
+  });
+  it("fails when a format was not unpacked at all", () => {
+    const problems = checkSystem("windows", windows(full("msi/PFiles/App"), {}), expected);
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("nsis: the nsis installer was not unpacked");
+  });
+  it("checks the deb and the dmg as their own formats", () => {
+    expect(checkSystem("macos", installer(full("dmg/App.app/Contents/Resources")), expected)).toEqual([]);
+    expect(checkSystem("macos", installer(full("msi/x")), expected)[0]).toContain("dmg: the dmg installer was not unpacked");
+    expect(checkSystem("linux", installer(full("deb/usr/lib/Patient Partridge")), expected).join("\n")).toContain("deb: usr/share/doc/patient-partridge/copyright");
+  });
+});
+
+describe("pdfiumLicenses", () => {
+  it("reads the licence files of a download", () => {
+    const dir = installer({ LICENSE: "BSD", ...Object.fromEntries(pdfiumNames.map((n) => [`licenses/${n}.txt`, n])) });
+    const map = pdfiumLicenses(dir);
+    expect(map.get("LICENSE")).toBe("BSD");
+    expect(map.size).toBe(6);
+  });
+  it("refuses a folder without them", () => {
+    expect(() => pdfiumLicenses(installer({ other: "x" }))).toThrow(/fetch PDFium first/);
   });
 });

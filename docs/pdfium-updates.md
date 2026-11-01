@@ -25,11 +25,12 @@ The workflow has read-only rights. Only its last job, which opens or updates the
    - `pdfium.lock.json`: `release` (`chromium/NNNN`), `build` (the number), the six `sha256` values, and the build number in the `comment`.
    - `crates/engine/Cargo.toml`: the `pdfium_NNNN` feature, and the version of pdfium-render if you moved it. Keep the `=` pin. Run `cargo update -p pdfium-render --precise <version>` if the version changed, and commit `Cargo.lock`.
    - The `pdfium_NNNN` feature must equal `build`. The check and the unit test fail if it does not.
+   - If `Cargo.lock` changed (a new pdfium-render does that), regenerate the third-party notices and commit them: `npm ci && scripts/notices.sh`. The "Third-party notices" check in CI fails while `THIRD-PARTY-NOTICES` is stale. The same is true for every dependency update.
 5. **Test.** Open a pull request; CI does the rest, on Linux, Windows and macOS:
    - `node scripts/fetch-pdfium.mjs` refuses a download whose checksum differs, and a library that contains V8.
    - The engine tests run against the real library.
    - The build job opens a generated 500-page PDF with the release build.
-   - The build job unpacks the real installers and checks that the shipped library has no V8.
+   - The build job unpacks the real installers and checks that the shipped library has no V8, and that each installer (deb, dmg, msi and NSIS setup, one by one) carries `THIRD-PARTY-NOTICES`, the AGPL text and the PDFium licence texts.
 6. **Merge, then close the issue.** The pull request can say `Closes #N`. If you do not update, closing the issue skips that build only.
 
 ## What the V8 check does
