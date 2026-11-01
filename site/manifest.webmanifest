@@ -1,0 +1,16 @@
+{
+  "name": "Patient Partridge",
+  "short_name": "Partridge",
+  "description": "An open source PDF reader for Windows, macOS and Linux. In development: nothing is released yet.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "browser",
+  "background_color": "#0b0b0d",
+  "theme_color": "#0b0b0d",
+  "icons": [
+    { "src": "favicon.svg", "type": "image/svg+xml", "sizes": "any" },
+    { "src": "favicon.png", "type": "image/png", "sizes": "48x48" },
+    { "src": "apple-touch-icon.png", "type": "image/png", "sizes": "180x180" },
+    { "src": "icon-512.png", "type": "image/png", "sizes": "512x512" }
+  ]
+}

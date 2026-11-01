@@ -1,0 +1,508 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self' 'sha256-WZRJfWvsnNCPcxzZwvyhovnZGqhZaC+8gPGPRbx6wTk='; style-src 'self'; img-src 'self'; font-src 'self'; manifest-src 'self'; base-uri 'self'; form-action 'none'"
+    />
+    <title>Patient Partridge — an open source PDF reader (in development)</title>
+    <meta name="description" content="Patient Partridge is an open source PDF reader for Windows, macOS and Linux from the Hedgerow family. It is meant to be fast and small, with no account, no cloud, no advertising and no tracking. In development: nothing is released yet." />
+    <script>document.documentElement.classList.add("js");</script>
+    <link rel="canonical" href="https://hedgerow.tools/Patient-Partridge/" />
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="icon" href="favicon.png" type="image/png" sizes="48x48" />
+    <link rel="apple-touch-icon" href="apple-touch-icon.png" />
+    <link rel="manifest" href="manifest.webmanifest" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#0b0b0d" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#f5f5f7" media="(prefers-color-scheme: light)" />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://hedgerow.tools/Patient-Partridge/" />
+    <meta property="og:site_name" content="Patient Partridge" />
+    <meta property="og:title" content="Patient Partridge — an open source PDF reader (in development)" />
+    <meta property="og:description" content="A PDF reader that needs no account, no cloud and no tracking. Open source, from the Hedgerow family. In development: nothing is released yet." />
+    <meta property="og:image" content="https://hedgerow.tools/Patient-Partridge/og-image.png" />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="Patient Partridge: an amber partridge on a dark tile, next to the title, the tagline An open source PDF reader, and the note In development." />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Patient Partridge — an open source PDF reader (in development)" />
+    <meta name="twitter:description" content="A PDF reader that needs no account, no cloud and no tracking. Open source, from the Hedgerow family. In development: nothing is released yet." />
+    <meta name="twitter:image" content="https://hedgerow.tools/Patient-Partridge/og-image.png" />
+    <link rel="preload" href="fonts/InterVariable.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="stylesheet" href="styles.css" />
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "Patient Partridge",
+        "description": "An open source PDF reader for Windows, macOS and Linux. In development: nothing is released yet.",
+        "url": "https://hedgerow.tools/Patient-Partridge/",
+        "applicationCategory": "UtilitiesApplication",
+        "operatingSystem": "Windows, macOS, Linux (planned)",
+        "image": "https://hedgerow.tools/Patient-Partridge/og-image.png",
+        "license": "https://github.com/Ferdinand99/Patient-Partridge/blob/main/LICENSE",
+        "sameAs": ["https://github.com/Ferdinand99/Patient-Partridge"]
+      }
+    </script>
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <svg width="0" height="0" class="vh" aria-hidden="true" focusable="false">
+      <symbol id="gh" viewBox="0 0 16 16">
+        <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z" />
+      </symbol>
+    </svg>
+
+    <a class="skip" href="#main">Skip to content</a>
+
+    <header class="topbar" id="top">
+      <div class="wrap topbar-inner">
+        <a class="brand" href="#top">
+          <img src="favicon.svg" alt="" width="28" height="28" />
+          <span>Patient Partridge</span>
+        </a>
+
+        <button class="nav-toggle" type="button" aria-label="Menu" aria-expanded="false" aria-controls="topnav" hidden>
+          <span></span><span></span>
+        </button>
+
+        <nav class="topnav" id="topnav" aria-label="Main">
+          <a class="topnav-link" href="#why">Why</a>
+          <a class="topnav-link" href="#today">Today</a>
+          <a class="topnav-link" href="#planned">Planned</a>
+          <a class="topnav-link" href="#security">Security</a>
+          <a class="topnav-link" href="#roadmap">Roadmap</a>
+          <a class="topnav-link" href="#faq">FAQ</a>
+          <a class="btn btn-ghost btn-sm" href="https://github.com/Ferdinand99/Patient-Partridge" aria-label="Follow Patient Partridge on GitHub">
+            <svg class="gh-mark" aria-hidden="true"><use href="#gh"></use></svg>
+            <span>Follow on GitHub</span>
+          </a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main">
+      <!-- Hero ============================================================ -->
+      <section class="hero" aria-labelledby="hero-title">
+        <div class="wrap">
+          <div class="hero-copy">
+            <div class="hero-icon">
+              <img src="favicon.svg" width="96" height="96" alt="" />
+            </div>
+            <a class="live-pill" href="#roadmap">
+              <span class="dot" aria-hidden="true"></span>
+              <span>In development</span>
+              <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#chevron-right"></use></svg>
+            </a>
+            <h1 class="display" id="hero-title">A PDF reader that<br class="br-wide" /> keeps to itself.</h1>
+            <p class="lead">
+              Patient Partridge is an open source PDF reader for Windows, macOS and Linux. It is meant
+              to be fast and small, and to work without an account, a cloud, advertising or tracking.
+            </p>
+            <p class="hero-fine">Nothing is released yet, so there is nothing to download. Expect rough edges and missing features.</p>
+            <div class="hero-actions">
+              <a class="btn btn-primary btn-lg" href="https://github.com/Ferdinand99/Patient-Partridge">
+                <svg class="gh-mark" aria-hidden="true"><use href="#gh"></use></svg>
+                <span>Follow on GitHub</span>
+              </a>
+              <a class="btn btn-ghost btn-lg" href="#today">
+                <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#check-circle"></use></svg>
+                <span>See what works today</span>
+              </a>
+            </div>
+            <p class="hero-meta"><span>Open source, AGPL-3.0</span><span>Rust and Tauri</span><span>Sibling of Nimble Newt</span></p>
+          </div>
+
+          <figure class="hero-shot">
+            <div
+              class="mock"
+              role="img"
+              aria-label="Concept illustration of the reader: a window titled report.pdf with a page drawn as grey placeholder lines, and a footer reading page 3 of 12 and fit to width. It is not a screenshot."
+            >
+              <div class="mock-bar">
+                <span class="mock-title mono">report.pdf</span>
+                <span class="pill status-accent"><span class="dot"></span>Concept</span>
+              </div>
+              <div class="skel">
+                <i class="skel-h w55"></i>
+                <i class="w90"></i>
+                <i class="w80"></i>
+                <i class="w90"></i>
+                <i class="w60"></i>
+                <i class="skel-gap"></i>
+                <i class="w90"></i>
+                <i class="w70"></i>
+                <i class="w85"></i>
+                <i class="w40"></i>
+              </div>
+              <div class="mock-foot">
+                <span>Page 3 of 12</span>
+                <span>Fit to width</span>
+              </div>
+            </div>
+            <figcaption>Concept illustration with made-up content, not a screenshot. The reader works today; this window is only a sketch.</figcaption>
+          </figure>
+        </div>
+      </section>
+
+      <!-- Why ============================================================= -->
+      <section class="section" id="why" aria-labelledby="why-title">
+        <div class="wrap">
+          <header class="section-head reveal">
+            <p class="eyebrow">Why Partridge</p>
+            <h2 class="headline" id="why-title">A reader, and nothing else.</h2>
+            <p class="sub">
+              A PDF reader needs no account, no cloud and no tracking. Partridge is built on that idea,
+              and the points below are what it is meant to deliver.
+            </p>
+          </header>
+
+          <ul class="grid">
+            <li class="card feature reveal">
+              <span class="list-icon status-accent"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#lock"></use></svg></span>
+              <h3>No account, no cloud</h3>
+              <p>You open a file on your computer and read it. The app makes no network connections, and its window loads nothing from the internet.</p>
+            </li>
+            <li class="card feature reveal d1">
+              <span class="list-icon status-info"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#bolt"></use></svg></span>
+              <h3>Fast and small, by design</h3>
+              <p>Only the pages you can see, and a few around them, are drawn, so opening is quick and memory stays flat as documents get longer. Speed and size are goals: numbers will be published once they are measured.</p>
+            </li>
+            <li class="card feature reveal d2">
+              <span class="list-icon status-none"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#code"></use></svg></span>
+              <h3>Open source</h3>
+              <p>Free software under the GNU AGPL-3.0. PDFs are drawn by PDFium, the PDF library of Chrome, in a separate program from the app.</p>
+            </li>
+          </ul>
+        </div>
+      </section>
+
+      <!-- Today =========================================================== -->
+      <section class="section section-alt" id="today" aria-labelledby="today-title">
+        <div class="wrap">
+          <header class="section-head reveal">
+            <p class="eyebrow">What works today</p>
+            <h2 class="headline" id="today-title">Open a PDF and read it.</h2>
+            <p class="sub">
+              This is everything that works now. It is not released: you can only run it by building
+              it from source.
+            </p>
+          </header>
+
+          <ul class="grid">
+            <li class="card feature reveal">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#folder"></use></svg></span>
+              <h3>Open a file</h3>
+              <p>From the Open button (Ctrl+O), by dropping a file on the window, or from the command line.</p>
+            </li>
+            <li class="card feature reveal d1">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#file"></use></svg></span>
+              <h3>One continuous view</h3>
+              <p>Read in a single scrolling view. Only the pages you can see are drawn.</p>
+            </li>
+            <li class="card feature reveal d2">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#search"></use></svg></span>
+              <h3>Zoom</h3>
+              <p>Zoom in and out, fit the page to the window width, or hold Ctrl and use the mouse wheel.</p>
+            </li>
+            <li class="card feature reveal">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#sort"></use></svg></span>
+              <h3>Move around</h3>
+              <p>Use the mouse wheel, the arrow keys, Page Up and Page Down, Space, Home and End, or jump to a page number with Ctrl+G.</p>
+            </li>
+            <li class="card feature reveal d1">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#key"></use></svg></span>
+              <h3>Password-protected files</h3>
+              <p>A file with a password asks for it before it opens.</p>
+            </li>
+            <li class="card feature reveal d2">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#alert-circle"></use></svg></span>
+              <h3>Clear errors</h3>
+              <p>A damaged file, or a file that is not a PDF, gives a clear message instead of a crash.</p>
+            </li>
+          </ul>
+
+          <p class="later reveal">
+            <strong>Not there yet:</strong> tabs, page thumbnails, the table of contents, selecting and
+            copying text, search, printing, dark mode and remembering where you stopped reading. They
+            are planned and will come step by step.
+          </p>
+        </div>
+      </section>
+
+      <!-- Planned ========================================================= -->
+      <section class="section" id="planned" aria-labelledby="planned-title">
+        <div class="wrap">
+          <header class="section-head reveal">
+            <p class="eyebrow">Planned</p>
+            <h2 class="headline" id="planned-title">What may come next.</h2>
+            <p class="sub">
+              Everything on this list is planned, and none of it exists yet. There are no dates:
+              each step is done when it works.
+            </p>
+          </header>
+
+          <ul class="grid">
+            <li class="card feature reveal">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#pencil"></use></svg></span>
+              <h3>Annotations</h3>
+              <p>Highlights, notes, drawing and stamps.</p>
+            </li>
+            <li class="card feature reveal d1">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#file"></use></svg></span>
+              <h3>Forms</h3>
+              <p>Fill in forms and save them so they still work in other PDF programs.</p>
+            </li>
+            <li class="card feature reveal d2">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#shield-check"></use></svg></span>
+              <h3>Signatures</h3>
+              <p>View and validate digital signatures, and sign documents.</p>
+            </li>
+            <li class="card feature reveal">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#layers"></use></svg></span>
+              <h3>Page tools</h3>
+              <p>Merge, rotate, extract and delete pages.</p>
+            </li>
+            <li class="card feature reveal d1">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#eye"></use></svg></span>
+              <h3>Local OCR</h3>
+              <p>Recognise the text in scanned documents on your own computer.</p>
+            </li>
+            <li class="card feature reveal d2">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#bolt"></use></svg></span>
+              <h3>Apple Intelligence on Mac</h3>
+              <p>Summaries, questions about a document and explanations, using Apple’s on-device model. Mac only, off by default, and the document never leaves the Mac.</p>
+            </li>
+          </ul>
+
+          <div class="steps-notes">
+            <div class="callout status-info reveal">
+              <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#info"></use></svg>
+              <p>
+                <span class="callout-title">About the Apple Intelligence plan</span>
+                It needs a Mac with Apple silicon, macOS 26 or later, and Apple Intelligence turned on.
+                Where that is missing the feature is hidden and the rest of the app works as before.
+                Windows and Linux do not get it.
+              </p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Security ======================================================== -->
+      <section class="section section-alt" id="security" aria-labelledby="security-title">
+        <div class="wrap">
+          <header class="section-head reveal">
+            <p class="eyebrow">Security</p>
+            <h2 class="headline" id="security-title">What is protected, and what is not yet.</h2>
+            <p class="sub">
+              A PDF is untrusted input, so the reader treats every file that way. Please read this
+              before you open files from people you do not trust.
+            </p>
+          </header>
+
+          <ul class="grid">
+            <li class="card feature reveal">
+              <span class="list-icon status-accent"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#server"></use></svg></span>
+              <h3>A separate process</h3>
+              <p>PDF files are read by their own program, <code>partridge-engine</code>. A file that crashes or hangs it cannot take the app down: you get an error message and can open another file.</p>
+            </li>
+            <li class="card feature reveal d1">
+              <span class="list-icon status-accent"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#code"></use></svg></span>
+              <h3>PDF JavaScript is off</h3>
+              <p>The PDFium build used has no JavaScript engine at all.</p>
+            </li>
+            <li class="card feature reveal d2">
+              <span class="list-icon status-accent"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#check-circle"></use></svg></span>
+              <h3>Checked at build time</h3>
+              <p>PDFium is downloaded at a pinned release and its SHA-256 checksum is verified before use. CI checks that the engine’s code contains no network code.</p>
+            </li>
+          </ul>
+
+          <div class="steps-notes">
+            <div class="callout status-warning reveal">
+              <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#alert"></use></svg>
+              <p>
+                <span class="callout-title">No operating-system sandbox yet</span>
+                Being in a separate process protects the app from crashes and hangs. It is not a
+                security boundary. If someone finds a bug in PDFium and builds a PDF that exploits it,
+                the code would run with your user rights. A real sandbox is planned and is a requirement
+                for the first release.
+              </p>
+            </div>
+            <div class="callout status-info reveal d1">
+              <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#info"></use></svg>
+              <p>
+                <span class="callout-title">PDFium is the main attack surface</span>
+                It is pinned to one release and updated by hand for now. Nothing warns yet when a
+                newer release exists. The <a href="https://github.com/Ferdinand99/Patient-Partridge#security-what-is-protected-and-what-is-not-yet">README</a>
+                lists what is and is not protected today.
+              </p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Roadmap ========================================================= -->
+      <section class="section" id="roadmap" aria-labelledby="roadmap-title">
+        <div class="wrap">
+          <header class="section-head reveal">
+            <p class="eyebrow">Status</p>
+            <h2 class="headline" id="roadmap-title">Where it stands.</h2>
+            <p class="sub">
+              Patient Partridge is in development. Nothing is released and there are no dates. The
+              steps show the order the work is planned in, and that order may change.
+            </p>
+          </header>
+
+          <ol class="roadmap">
+            <li class="milestone is-now reveal">
+              <span class="ms-marker" aria-hidden="true"><span class="dot is-live"></span></span>
+              <div class="ms-body">
+                <p class="ms-status"><span class="pill status-accent"><span class="dot"></span>In development</span></p>
+                <h3>The reader</h3>
+                <p>Open a file, read it in one scrolling view, zoom and move around. This works today. Tabs, thumbnails, the table of contents, text selection, search, printing, dark mode and remembering your place are still to come.</p>
+              </div>
+            </li>
+            <li class="milestone reveal">
+              <span class="ms-marker" aria-hidden="true"></span>
+              <div class="ms-body">
+                <p class="ms-status"><span class="pill">Planned</span></p>
+                <h3>Annotations and forms</h3>
+                <p>Highlights, notes, drawing and stamps, and filling in and saving forms.</p>
+              </div>
+            </li>
+            <li class="milestone reveal">
+              <span class="ms-marker" aria-hidden="true"></span>
+              <div class="ms-body">
+                <p class="ms-status"><span class="pill">Planned</span></p>
+                <h3>Signatures and page tools</h3>
+                <p>Viewing, validating and making digital signatures, and merging, rotating, extracting and deleting pages.</p>
+              </div>
+            </li>
+            <li class="milestone reveal">
+              <span class="ms-marker" aria-hidden="true"></span>
+              <div class="ms-body">
+                <p class="ms-status"><span class="pill">Planned</span></p>
+                <h3>Local OCR</h3>
+                <p>Text recognition for scanned documents, on your own computer.</p>
+              </div>
+            </li>
+            <li class="milestone reveal">
+              <span class="ms-marker" aria-hidden="true"></span>
+              <div class="ms-body">
+                <p class="ms-status"><span class="pill">Planned</span></p>
+                <h3>Apple Intelligence on Mac</h3>
+                <p>An optional, on-device feature for summaries and questions, planned after annotations and forms.</p>
+              </div>
+            </li>
+            <li class="milestone reveal">
+              <span class="ms-marker" aria-hidden="true"></span>
+              <div class="ms-body">
+                <p class="ms-status"><span class="pill">Before any release</span></p>
+                <h3>An operating-system sandbox</h3>
+                <p>A sandbox for the engine on each operating system. The first release waits for it.</p>
+              </div>
+            </li>
+          </ol>
+        </div>
+      </section>
+
+      <!-- FAQ ============================================================= -->
+      <section class="section section-alt" id="faq" aria-labelledby="faq-title">
+        <div class="wrap">
+          <header class="section-head reveal">
+            <h2 class="headline" id="faq-title">Questions.</h2>
+          </header>
+          <ul class="faq reveal">
+            <li>
+              <details>
+                <summary>Can I download it?<svg class="icon" aria-hidden="true"><use href="assets/icons.svg#chevron-down"></use></svg></summary>
+                <div class="faq-body">
+                  <p>Not yet. Nothing is released and there is no installer. If you want to try it, you can build it from source: the <a href="https://github.com/Ferdinand99/Patient-Partridge#building-from-source">README</a> explains how. Expect rough edges.</p>
+                </div>
+              </details>
+            </li>
+            <li>
+              <details>
+                <summary>Is it open source?<svg class="icon" aria-hidden="true"><use href="assets/icons.svg#chevron-down"></use></svg></summary>
+                <div class="faq-body">
+                  <p>Yes, under the <a href="https://github.com/Ferdinand99/Patient-Partridge/blob/main/LICENSE">GNU Affero General Public License, version 3</a>. PDFium is under a BSD-style licence, and its licence files ship with the app.</p>
+                </div>
+              </details>
+            </li>
+            <li>
+              <details>
+                <summary>Does it connect to the internet?<svg class="icon" aria-hidden="true"><use href="assets/icons.svg#chevron-down"></use></svg></summary>
+                <div class="faq-body">
+                  <p>No. The app makes no network connections, and its window loads nothing from the internet. The engine’s code has no network code, and CI checks that. That check is about the code: until the sandbox exists, the operating system does not stop the engine from using the network.</p>
+                </div>
+              </details>
+            </li>
+            <li>
+              <details>
+                <summary>Is it safe to open PDFs from strangers?<svg class="icon" aria-hidden="true"><use href="assets/icons.svg#chevron-down"></use></svg></summary>
+                <div class="faq-body">
+                  <p>Not yet. Read the <a href="#security">security section</a> first. The engine is not sandboxed by the operating system, and a real sandbox is a requirement for the first release.</p>
+                </div>
+              </details>
+            </li>
+            <li>
+              <details>
+                <summary>When will it be released?<svg class="icon" aria-hidden="true"><use href="assets/icons.svg#chevron-down"></use></svg></summary>
+                <div class="faq-body">
+                  <p>There is no date. Watch or star the <a href="https://github.com/Ferdinand99/Patient-Partridge">repository</a> to hear about progress.</p>
+                </div>
+              </details>
+            </li>
+            <li>
+              <details>
+                <summary>What is Hedgerow?<svg class="icon" aria-hidden="true"><use href="assets/icons.svg#chevron-down"></use></svg></summary>
+                <div class="faq-body">
+                  <p>Hedgerow is a family of small, open source apps that fit together, like <a href="https://hedgerow.tools/Nimble-Newt/">Nimble Newt</a>, a fast text editor. Patient Partridge is the PDF reader.</p>
+                </div>
+              </details>
+            </li>
+          </ul>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <div class="wrap">
+        <div class="footer-top">
+          <a class="brand" href="#top">
+            <img src="favicon.svg" alt="" width="24" height="24" loading="lazy" />
+            <span>Patient Partridge</span>
+          </a>
+          <span>Made in Norway</span>
+        </div>
+        <nav aria-label="Project links">
+          <ul class="footer-links">
+            <li><a href="https://github.com/Ferdinand99/Patient-Partridge">GitHub</a></li>
+            <li><a href="https://github.com/Ferdinand99/Patient-Partridge#readme">README</a></li>
+            <li><a href="https://github.com/Ferdinand99/Patient-Partridge/issues">Issues</a></li>
+            <li><a href="https://github.com/Ferdinand99/Patient-Partridge/blob/main/LICENSE">AGPL-3.0 license</a></li>
+          </ul>
+        </nav>
+        <p class="sibling">
+          Part of <a href="https://hedgerow.tools/">Hedgerow</a>, small open source apps that live
+          together, with <a href="https://hedgerow.tools/Nimble-Newt/">Nimble Newt</a>, a fast text
+          editor, <a href="https://hedgerow.tools/Vigilant-Vole/">Vigilant Vole</a>, a lightweight
+          uptime monitor, <a href="https://hedgerow.tools/Keen-Kestrel/">Keen Kestrel</a>, error
+          tracking and analytics, <a href="https://hedgerow.tools/Wise-Wren/">Wise Wren</a>, Docker
+          container updates, and <a href="https://hedgerow.tools/Faithful-Ferret/">Faithful Ferret</a>,
+          a planned password manager.
+        </p>
+        <p>
+          Patient Partridge is open source under the GNU AGPL-3.0 and is in development: nothing is
+          released yet. This site uses no cookies and no analytics.
+        </p>
+      </div>
+    </footer>
+  </body>
+</html>

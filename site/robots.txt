@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://hedgerow.tools/Patient-Partridge/sitemap.xml
