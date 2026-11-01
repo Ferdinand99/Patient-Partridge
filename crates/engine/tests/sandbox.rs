@@ -4,11 +4,12 @@
 //! the way the engine starts, locks itself in the same way, and then tries the things the sandbox
 //! must stop. It is started through the same code the app uses to start the engine, so on Windows
 //! it gets the restricted token, the job object and the mitigation policies, and on every system
-//! it gets the document as an inherited handle.
+//! it gets the document as an inherited handle. Each attempt is also made by a copy of the program
+//! that is not locked in (the control), so that a denial is not an attempt that never could work.
 //!
 //! The second half runs the real engine: it must report its sandbox, draw pages inside it
-//! (including a page with fonts that are not embedded), search and read text, and refuse to work
-//! when it has no document.
+//! (including a page with fonts that are not embedded), search and read text, survive being
+//! stopped and continued, and refuse to work when it has no document.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -39,13 +40,20 @@ fn expected_layer() -> &'static str {
     }
 }
 
-/// Runs `engine_selftest` with the document handed over, and returns what it printed and whether
-/// it ended well.
-fn run_selftest(
-    document: &std::fs::File,
-    memory_limit: Option<u64>,
-    mode_args: &[String],
-) -> (Vec<String>, bool) {
+/// What the program printed, and how the process ended.
+struct Run {
+    lines: Vec<String>,
+    exit: String,
+}
+
+impl Run {
+    fn succeeded(&self) -> bool {
+        self.exit.ends_with(": 0")
+    }
+}
+
+/// Runs `engine_selftest` with the document handed over.
+fn run_selftest(document: &std::fs::File, memory_limit: Option<u64>, mode_args: &[String]) -> Run {
     let mut args: Vec<std::ffi::OsString> =
         vec!["--pdfium-dir".into(), kit::pdfium_dir().into_os_string()];
     args.extend(mode_args.iter().map(Into::into));
@@ -83,15 +91,35 @@ fn run_selftest(
         let _ = engine.process.kill();
         let _ = engine.process.wait();
         let so_far = String::from_utf8_lossy(&collected.lock().unwrap()).into_owned();
-        panic!(
-            "the program did not end within 90 seconds. Output so far:
-{so_far}"
-        );
+        panic!("the program did not end within 90 seconds. Output so far:\n{so_far}");
     }
     let _ = engine.process.wait();
-    let ended_well = engine.process.try_wait().ok().flatten().is_some();
+    let exit = engine
+        .process
+        .try_wait()
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "still running".to_string());
     let output = String::from_utf8_lossy(&collected.lock().unwrap()).into_owned();
-    (output.lines().map(str::to_string).collect(), ended_well)
+    Run {
+        lines: output.lines().map(str::to_string).collect(),
+        exit,
+    }
+}
+
+/// Runs the probes in a copy of the program that is not locked in, with the environment of this
+/// test. Everything it is asked to do works there.
+fn run_control(probe_args: &[String]) -> Vec<String> {
+    let output = std::process::Command::new(selftest_program())
+        .arg("control")
+        .args(probe_args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("the control starts");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect()
 }
 
 fn line<'a>(lines: &'a [String], name: &str) -> &'a str {
@@ -101,6 +129,104 @@ fn line<'a>(lines: &'a [String], name: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no line for {name} in {lines:#?}"))
 }
 
+/// True when the line says the attempt was refused with the error this system gives for a refusal.
+fn refused_with_permission_error(l: &str) -> bool {
+    if cfg!(windows) {
+        l.contains("os error 5)")
+    } else {
+        l.contains("os error 1)") || l.contains("os error 13)")
+    }
+}
+
+/// A window and some text on the clipboard of the user's session, made by the test, for the
+/// engine to look for. (Windows only.)
+#[cfg(windows)]
+mod session {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows_sys::Win32::System::Memory::{
+        GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow};
+
+    pub struct Session {
+        window: *mut std::ffi::c_void,
+        pub clipboard_set: bool,
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    pub fn start(title: &str) -> Session {
+        // SAFETY: documented calls with live buffers.
+        unsafe {
+            let class = wide("STATIC");
+            let name = wide(title);
+            let window = CreateWindowExW(
+                0,
+                class.as_ptr(),
+                name.as_ptr(),
+                0x8000_0000, // WS_POPUP
+                0,
+                0,
+                10,
+                10,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            let mut session = Session {
+                window,
+                clipboard_set: false,
+            };
+            session.refill();
+            session
+        }
+    }
+
+    impl Session {
+        pub fn has_window(&self) -> bool {
+            !self.window.is_null()
+        }
+
+        /// Puts the text on the clipboard again (the control empties it).
+        pub fn refill(&mut self) {
+            // SAFETY: documented calls with live buffers.
+            unsafe {
+                self.clipboard_set = false;
+                if OpenClipboard(std::ptr::null_mut()) != 0 {
+                    EmptyClipboard();
+                    let text = wide("a secret on the clipboard");
+                    let memory = GlobalAlloc(GMEM_MOVEABLE, text.len() * 2);
+                    if !memory.is_null() {
+                        let p = GlobalLock(memory) as *mut u16;
+                        std::ptr::copy_nonoverlapping(text.as_ptr(), p, text.len());
+                        GlobalUnlock(memory);
+                        self.clipboard_set = !SetClipboardData(13, memory).is_null();
+                    }
+                    CloseClipboard();
+                }
+            }
+        }
+    }
+
+    impl Drop for Session {
+        fn drop(&mut self) {
+            if !self.window.is_null() {
+                // SAFETY: the window was made by this value.
+                unsafe { DestroyWindow(self.window) };
+            }
+        }
+    }
+}
+
 #[test]
 fn a_locked_in_engine_cannot_open_files_use_the_network_or_start_programs() {
     let document = kit::TempFile::new("selftest.pdf", &kit::fonts_pdf());
@@ -108,36 +234,56 @@ fn a_locked_in_engine_cannot_open_files_use_the_network_or_start_programs() {
     std::fs::create_dir_all(&folder).unwrap();
     let keep = folder.join("keep-me");
     std::fs::write(&keep, b"still here").unwrap();
+    // A folder of its own for the control, which really does what it is asked to.
+    let control_folder = folder.join("control");
+    std::fs::create_dir_all(&control_folder).unwrap();
+    std::fs::write(control_folder.join("keep-me"), b"delete me").unwrap();
+    let control_document = kit::TempFile::new("selftest-control.pdf", &kit::simple_pdf(1));
 
     // Something to connect to. If the engine could connect, this would see it.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
 
-    let handle = std::fs::File::open(document.path()).unwrap();
-    let before = std::fs::read(document.path()).unwrap();
-    let (lines, ended_well) = run_selftest(
-        &handle,
-        None,
-        &[
+    // A secret in the environment of the app, which the engine must not get.
+    std::env::set_var("PARTRIDGE_PLANTED_SECRET", "hunter2");
+
+    let title = format!("Partridge test window {}", std::process::id());
+    #[cfg(windows)]
+    let mut session = session::start(&title);
+
+    let probe_args = |file: String, dir: &std::path::Path| -> Vec<String> {
+        vec![
             "probe".to_string(),
-            document.path_str(),
-            folder.to_string_lossy().into_owned(),
+            file,
+            dir.to_string_lossy().into_owned(),
             std::env::current_exe()
                 .unwrap()
                 .to_string_lossy()
                 .into_owned(),
             std::process::id().to_string(),
             port.to_string(),
-        ],
-    );
+            title.clone(),
+        ]
+    };
+
+    // The control: the same attempts without the sandbox.
+    let control = run_control(&probe_args(control_document.path_str(), &control_folder)[1..]);
+    println!("control: {control:#?}");
+    // The control connected to the listener; that is not what the engine is judged by.
+    while listener.accept().is_ok() {}
+    #[cfg(windows)]
+    session.refill();
+
+    let handle = std::fs::File::open(document.path()).unwrap();
+    let before = std::fs::read(document.path()).unwrap();
+    let run = run_selftest(&handle, None, &probe_args(document.path_str(), &folder));
+    let lines = &run.lines;
     println!("{lines:#?}");
 
-    assert_eq!(line(&lines, "sandbox"), "sandbox: in force", "{lines:#?}");
-    assert!(
-        line(&lines, "layers").contains(expected_layer()),
-        "{lines:#?}"
-    );
+    assert_eq!(line(lines, "sandbox"), "sandbox: in force", "{lines:#?}");
+    let layers = line(lines, "layers").to_string();
+    assert!(layers.contains(expected_layer()), "{lines:#?}");
     for attempt in [
         "open_file_by_path",
         "open_own_executable",
@@ -145,28 +291,139 @@ fn a_locked_in_engine_cannot_open_files_use_the_network_or_start_programs() {
         "create_file",
         "write_existing_file",
         "delete_file",
-        "connect_socket",
-        "bind_udp_socket",
         "start_process",
         "touch_other_process",
     ] {
+        let l = line(lines, attempt);
         assert!(
-            line(&lines, attempt).starts_with(&format!("{attempt}: denied")),
-            "{attempt} was not denied: {}",
-            line(&lines, attempt)
+            l.starts_with(&format!("{attempt}: denied")),
+            "{attempt}: {l}"
+        );
+        assert!(
+            refused_with_permission_error(l),
+            "{attempt} was refused, but not with a permission error: {l}"
+        );
+        // Without the sandbox the same attempt works (the control).
+        let c = line(&control, attempt);
+        assert!(
+            c.starts_with(&format!("{attempt}: ALLOWED")),
+            "{attempt} does not work in the control either: {c}"
+        );
+    }
+    // The network: real attempts. Not "the network support did not start": on Windows the
+    // program starts Winsock before the lock-in, so the refusal is the system's.
+    for attempt in ["connect_socket", "bind_udp_socket"] {
+        let l = line(lines, attempt);
+        assert!(l.starts_with(&format!("{attempt}: denied")), "{l}");
+        assert!(!l.contains("did not start"), "{l}");
+        let c = line(&control, attempt);
+        assert!(
+            c.starts_with(&format!("{attempt}: ALLOWED")),
+            "{attempt} does not work in the control either: {c}"
         );
     }
     // The system call filter on Linux and the dynamic code policy on Windows stop code from being
-    // made at run time. (The macOS profile does not govern memory.)
+    // made at run time. (macOS refuses it on this hardware by its own rule, not by the profile.)
     if !cfg!(target_os = "macos") {
         assert!(
-            line(&lines, "executable_memory").starts_with("executable_memory: denied"),
+            line(lines, "executable_memory").starts_with("executable_memory: denied"),
             "{}",
-            line(&lines, "executable_memory")
+            line(lines, "executable_memory")
         );
     }
+
+    // The environment: nothing of the app's, in particular not the planted secret.
+    let names = line(lines, "environment")
+        .trim_start_matches("environment:")
+        .trim()
+        .to_string();
+    assert!(!names.contains("PARTRIDGE_PLANTED_SECRET"), "{names}");
+    for name in names.split(',').filter(|n| !n.is_empty()) {
+        assert!(
+            name.starts_with("PARTRIDGE_TEST_")
+                || name.eq_ignore_ascii_case("SystemRoot")
+                || name.eq_ignore_ascii_case("windir"),
+            "the engine got the variable {name}"
+        );
+    }
+    assert!(
+        line(&control, "environment").contains("PARTRIDGE_PLANTED_SECRET"),
+        "the control should have the planted variable"
+    );
+
+    // Linux: the ways round the filter that a review found.
+    #[cfg(target_os = "linux")]
+    {
+        for attempt in [
+            "fcntl_setown",
+            "fcntl_setsig",
+            "fcntl_setfl_async",
+            "shared_anonymous_mapping",
+        ] {
+            let l = line(lines, attempt);
+            assert!(l.starts_with(&format!("{attempt}: denied")), "{l}");
+            let c = line(&control, attempt);
+            assert!(
+                c.starts_with(&format!("{attempt}: ALLOWED")),
+                "{attempt} does not work in the control either: {c}"
+            );
+        }
+        assert_eq!(line(lines, "fcntl_getfd_getfl"), "fcntl_getfd_getfl: yes");
+        // A path lookup in an empty root finds nothing; without one (user namespaces switched
+        // off) the metadata of any path can be asked for, which the README says.
+        let found = line(lines, "stat_system_file").contains("FOUND");
+        if layers.contains("empty-root") {
+            assert!(!found, "{lines:#?}");
+            assert!(line(lines, "stat_document_path").contains("not found"));
+        } else {
+            println!("no empty root here: {}", line(lines, "isolation"));
+        }
+        assert!(
+            line(&control, "stat_system_file").contains("FOUND"),
+            "the control cannot see /etc/passwd either"
+        );
+        if std::env::var_os("PARTRIDGE_TEST_REQUIRE_EMPTY_ROOT").is_some() {
+            assert!(layers.contains("empty-root"), "{lines:#?}");
+        }
+    }
+
+    // Windows: the desktop, the other windows, the clipboard and the network below Winsock.
+    #[cfg(windows)]
+    {
+        assert!(layers.contains("own-desktop"), "{lines:#?}");
+        assert!(
+            line(lines, "desktop").starts_with("desktop: PartridgeEngine"),
+            "{}",
+            line(lines, "desktop")
+        );
+        assert_eq!(
+            line(lines, "afd_endpoint"),
+            "afd_endpoint: denied (NTSTATUS 0xC0000022)",
+            "the control got: {}",
+            line(&control, "afd_endpoint")
+        );
+        let l = line(lines, "open_network_path");
+        assert!(l.starts_with("open_network_path: denied"), "{l}");
+        println!("control: {}", line(&control, "open_network_path"));
+        if session.has_window() {
+            assert!(line(lines, "find_window_of_the_user").contains("denied"));
+            assert!(
+                line(&control, "find_window_of_the_user").contains("ALLOWED"),
+                "the control cannot see the window either"
+            );
+        }
+        if session.clipboard_set {
+            assert!(line(lines, "clipboard_read").contains("denied"));
+            assert!(
+                line(&control, "clipboard_read").contains("ALLOWED"),
+                "the control cannot read the clipboard either"
+            );
+        }
+        assert!(line(lines, "clipboard_write").contains("denied"));
+    }
+
     assert!(lines.last().is_some_and(|l| l == "done"), "{lines:#?}");
-    assert!(ended_well);
+    assert!(run.succeeded(), "the program ended with {}", run.exit);
 
     // And nothing happened to the world outside.
     assert!(!folder.join("created-by-the-engine").exists());
@@ -183,34 +440,43 @@ fn a_locked_in_engine_cannot_open_files_use_the_network_or_start_programs() {
 fn a_locked_in_engine_still_reads_draws_and_searches_the_document_it_was_given() {
     let document = kit::TempFile::new("selftest-doc.pdf", &kit::simple_pdf(2));
     let handle = std::fs::File::open(document.path()).unwrap();
-    let (lines, _) = run_selftest(&handle, None, &["document".to_string()]);
+    let run = run_selftest(&handle, None, &["document".to_string()]);
+    let lines = &run.lines;
     println!("{lines:#?}");
-    assert_eq!(line(&lines, "sandbox"), "sandbox: in force", "{lines:#?}");
-    assert_eq!(line(&lines, "open"), "open: ok, 2 pages");
+    assert_eq!(line(lines, "sandbox"), "sandbox: in force", "{lines:#?}");
+    assert_eq!(line(lines, "open"), "open: ok, 2 pages");
     assert!(
-        line(&lines, "render").starts_with("render: ok"),
+        line(lines, "render").starts_with("render: ok"),
         "{}",
-        line(&lines, "render")
+        line(lines, "render")
     );
-    assert_eq!(line(&lines, "search"), "search: 30 matches");
+    assert_eq!(line(lines, "search"), "search: 30 matches");
+    assert!(run.succeeded(), "the program ended with {}", run.exit);
 }
 
 #[test]
 fn the_memory_limit_ends_an_engine_that_uses_too_much() {
+    // On macOS the engine's own watch is switched off for this test: the app has to end the
+    // engine from outside, which an engine that has been taken over cannot prevent.
+    std::env::set_var("PARTRIDGE_TEST_NO_ENGINE_LIMIT", "1");
     let document = kit::TempFile::new("selftest-mem.pdf", &kit::simple_pdf(1));
     let handle = std::fs::File::open(document.path()).unwrap();
     // A small limit, so the test does not need gigabytes: the program tries three times as much.
-    let (lines, _) = run_selftest(
+    let run = run_selftest(
         &handle,
         Some(256 * 1024 * 1024),
         &["memory".to_string(), "256".to_string()],
     );
-    println!("{lines:#?}");
+    let lines = &run.lines;
+    println!("{lines:#?} {}", run.exit);
     assert!(
         !lines.iter().any(|l| l.contains("SURVIVED")),
         "the limit did not hold: {lines:#?}"
     );
     assert!(!lines.iter().any(|l| l == "done"), "{lines:#?}");
+    // It was ended: by a signal or an abort, not by finishing.
+    assert!(!run.succeeded(), "the program ended with {}", run.exit);
+    std::env::remove_var("PARTRIDGE_TEST_NO_ENGINE_LIMIT");
 }
 
 // ---- The real engine ----
@@ -381,4 +647,28 @@ fn a_client_with_a_missing_engine_program_reports_it() {
     let file = kit::TempFile::new("x.pdf", &kit::simple_pdf(1));
     let err = client.open(&file.path_str(), None).unwrap_err();
     assert!(matches!(err, ClientError::EngineStopped(_)), "{err:?}");
+}
+
+/// A laptop that goes to sleep stops every process the same way: the kernel freezes them with a
+/// signal, and a sleep that was cut short is restarted with `restart_syscall`. A filter that does
+/// not allow that call kills the helper thread of the engine, and with it the engine.
+#[cfg(unix)]
+#[test]
+fn an_engine_that_is_stopped_and_continued_keeps_working() {
+    let file = kit::TempFile::new("stop.pdf", &kit::simple_pdf(2));
+    let client = EngineClient::new(real_config());
+    let doc = client.open(&file.path_str(), None).unwrap();
+    let pid = client.pid().unwrap() as libc::pid_t;
+    for _ in 0..3 {
+        // SAFETY: signals to the engine process of this test.
+        unsafe { libc::kill(pid, libc::SIGSTOP) };
+        // Longer than the helper thread sleeps between two looks at its parent (500 ms).
+        std::thread::sleep(Duration::from_millis(1300));
+        // SAFETY: as above.
+        unsafe { libc::kill(pid, libc::SIGCONT) };
+        std::thread::sleep(Duration::from_millis(1300));
+        let bitmap = client.render(doc.doc, 1, 120, 156).unwrap();
+        assert_eq!((bitmap.width, bitmap.height), (120, 156));
+    }
+    assert_eq!(client.spawn_count(), 1, "the engine had to be restarted");
 }

@@ -19,9 +19,6 @@ use partridge_protocol::{
 };
 use pdfium_render::prelude::*;
 
-/// Most documents the engine keeps open at once.
-pub const MAX_OPEN_DOCUMENTS: usize = 64;
-
 #[cfg(unix)]
 pub mod fds;
 pub mod fonts;
@@ -306,9 +303,6 @@ impl Engine {
         pdfium: &'static Pdfium,
         password: Option<&str>,
     ) -> Result<ResponseBody, Failure> {
-        if self.docs.len() >= MAX_OPEN_DOCUMENTS {
-            return fail(ErrorCode::InvalidRequest, "too many documents are open");
-        }
         // The engine does not open files. It reads the one the app handed over, once.
         let Some(file) = self.document.take() else {
             return fail(

@@ -59,6 +59,21 @@ impl Applied {
     }
 }
 
+/// Puts the process in an empty root file system where the system allows it (Linux: a user and a
+/// mount namespace), so that a path lookup finds nothing. An extra layer: an error says why it is
+/// not in force, and the engine goes on. Call it while the process has only one thread, after
+/// everything is loaded and before [`lock_down`].
+pub fn enter_isolation() -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::enter_empty_root()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(())
+    }
+}
+
 /// Locks the process in. Call it once, after PDFium and everything else is loaded and before any
 /// byte of a document is read. On success every layer has been checked to work.
 pub fn lock_down() -> Result<Applied, String> {

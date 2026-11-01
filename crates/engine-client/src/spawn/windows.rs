@@ -30,7 +30,7 @@ use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::ptr::{null, null_mut};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, DuplicateHandle, SetHandleInformation, DUPLICATE_SAME_ACCESS, HANDLE,
@@ -57,6 +57,9 @@ use windows_sys::Win32::System::JobObjects::{
     JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS, JOB_OBJECT_UILIMIT_WRITECLIPBOARD,
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
+use windows_sys::Win32::System::StationsAndDesktops::{
+    CreateDesktopW, GetProcessWindowStation, GetUserObjectInformationW, UOI_NAME,
+};
 use windows_sys::Win32::System::Threading::{
     CreateProcessAsUserW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
     InitializeProcThreadAttributeList, OpenProcessToken, ResumeThread, SetThreadToken,
@@ -103,8 +106,78 @@ const MITIGATIONS: u64 = HEAP_TERMINATE_ALWAYS_ON
 const SE_GROUP_INTEGRITY: u32 = 0x0000_0020;
 const SE_GROUP_USE_FOR_DENY_ONLY: u32 = 0x0000_0010;
 
-/// Memory the engine may use when the caller names no limit: 3 GiB, as on the other systems.
-const DEFAULT_MEMORY_LIMIT: u64 = 3 * 1024 * 1024 * 1024;
+use super::DEFAULT_MEMORY_LIMIT;
+
+/// The name of the desktop the engines run on ("window station\\desktop"), made once and kept until
+/// the app ends. One desktop is shared by all engines: it costs a few MB of the system's desktop
+/// heap, not per engine. `None` when the system would not make one; the engines then run on the
+/// desktop of the app and do not report the layer.
+fn engine_desktop() -> Option<&'static Vec<u16>> {
+    static DESKTOP: OnceLock<Option<Vec<u16>>> = OnceLock::new();
+    DESKTOP
+        .get_or_init(|| {
+            // SAFETY: documented Win32 calls with live buffers. The desktop handle is kept open on
+            // purpose: the desktop goes away when its last handle and its last user are gone.
+            unsafe {
+                let station = GetProcessWindowStation();
+                if station.is_null() {
+                    return None;
+                }
+                let mut name = [0u16; 256];
+                let mut needed = 0u32;
+                if GetUserObjectInformationW(
+                    station,
+                    UOI_NAME,
+                    name.as_mut_ptr().cast(),
+                    (name.len() * 2) as u32,
+                    &mut needed,
+                ) == 0
+                {
+                    return None;
+                }
+                let station: String = String::from_utf16_lossy(
+                    &name[..name.iter().position(|&c| c == 0).unwrap_or(name.len())],
+                );
+                let desktop_name = format!("PartridgeEngine{}", std::process::id());
+                let own = wide(OsStr::new(&desktop_name));
+                let desktop =
+                    CreateDesktopW(own.as_ptr(), null(), null(), 0, GENERIC_ALL_ACCESS, null());
+                if desktop.is_null() {
+                    return None;
+                }
+                Some(wide(OsStr::new(&format!("{station}\\{desktop_name}"))))
+            }
+        })
+        .as_ref()
+}
+
+const GENERIC_ALL_ACCESS: u32 = 0x1000_0000;
+
+/// The environment block of the engine: the variables that are allowed, as UTF-16 text with a zero
+/// after each and one more at the end. (An empty environment is two zeros.)
+fn environment_block() -> Vec<u16> {
+    let mut variables: Vec<(String, Vec<u16>)> = super::engine_environment()
+        .into_iter()
+        .map(|(name, value)| {
+            let mut text: Vec<u16> = name.encode_wide().collect();
+            text.push(b'=' as u16);
+            text.extend(value.encode_wide());
+            (name.to_string_lossy().to_uppercase(), text)
+        })
+        .collect();
+    // The system wants them sorted by name.
+    variables.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut block = Vec::new();
+    for (_, text) in variables {
+        block.extend(text);
+        block.push(0);
+    }
+    block.push(0);
+    if block.len() == 1 {
+        block.push(0);
+    }
+    block
+}
 
 /// A handle that is closed when it goes out of scope.
 struct Owned(HANDLE);
@@ -615,6 +688,13 @@ pub(super) fn spawn(request: &SpawnRequest<'_>) -> io::Result<SpawnedEngine> {
             startup.StartupInfo.hStdOutput = child_out.raw();
             startup.StartupInfo.hStdError = nul.raw();
             startup.lpAttributeList = list;
+            // The engine shows nothing, so it gets a desktop of its own: it cannot see the windows
+            // of the user, read the screen, or put a window of its own over theirs.
+            let mut desktop = engine_desktop().cloned();
+            if let Some(name) = desktop.as_mut() {
+                startup.StartupInfo.lpDesktop = name.as_mut_ptr();
+            }
+            let environment = environment_block();
             let mut info: PROCESS_INFORMATION = zeroed();
             check(
                 CreateProcessAsUserW(
@@ -628,7 +708,7 @@ pub(super) fn spawn(request: &SpawnRequest<'_>) -> io::Result<SpawnedEngine> {
                         | CREATE_SUSPENDED
                         | CREATE_NO_WINDOW
                         | CREATE_UNICODE_ENVIRONMENT,
-                    null(),
+                    environment.as_ptr().cast(),
                     null(),
                     &startup.StartupInfo,
                     &mut info,
@@ -710,6 +790,8 @@ pub(super) fn spawn_plain(request: &SpawnRequest<'_>) -> io::Result<SpawnedEngin
             request,
             document.as_ref().map(|d| d.raw() as usize as u64),
         ))
+        .env_clear()
+        .envs(super::engine_environment())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

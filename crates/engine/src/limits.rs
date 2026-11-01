@@ -1,12 +1,14 @@
 //! A ceiling on the memory the engine may use, so that a PDF built to eat memory ends the engine
 //! (which the app survives) instead of slowing down the whole computer.
 //!
-//! - Linux: `RLIMIT_DATA`, which counts the heap and private writable mappings.
-//! - Windows: the job object the app puts the engine in has a per-process memory limit (the engine
-//!   only checks that it is in a job).
-//! - macOS: the system does not enforce `RLIMIT_DATA` and `RLIMIT_AS`, so a thread of the engine
-//!   watches the memory footprint of the process and ends it above the limit. The limit is also
-//!   set, in case a later system enforces it.
+//! - Linux: `RLIMIT_DATA`, which counts the heap and private writable mappings. Shared mappings
+//!   are not counted, so the system call filter refuses them (see `sandbox/linux.rs`).
+//! - Windows: the job object the app puts the engine in has a per-process memory limit, which the
+//!   kernel enforces (the engine only checks that it is in a job).
+//! - macOS: the system does not enforce `RLIMIT_DATA` and `RLIMIT_AS`. The limit that holds is the
+//!   one the app keeps: it reads the memory footprint of the engine from outside and ends it
+//!   (`partridge-engine-client`, `spawn/unix.rs`). A thread of the engine does the same as a first
+//!   line, but code that has taken the engine over can stop that thread.
 //!
 //! A limit is not a sandbox: it does nothing against code that PDFium is tricked into running.
 
@@ -101,8 +103,14 @@ pub fn limit_memory(bytes: u64) -> bool {
     if footprint().is_none() {
         return false;
     }
-    // A thread that ends the process when it uses more than the limit. It looks every 20 ms, which
-    // is far shorter than the time a PDF needs to fill a few GiB.
+    // The app watches from outside as well (see `partridge-engine-client`); a test can switch this
+    // thread off to show that.
+    #[cfg(debug_assertions)]
+    if std::env::var_os("PARTRIDGE_TEST_NO_ENGINE_LIMIT").is_some() {
+        return true;
+    }
+    // A first line: a thread that ends the process when it uses more than the limit. It looks every
+    // 20 ms. The code inside the engine could stop it, which is why the app does the same.
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_millis(20));
         if footprint().is_some_and(|used| used > bytes) {
@@ -145,14 +153,26 @@ pub fn limit_memory(_bytes: u64) -> bool {
 pub fn exit_with_parent() {
     // SAFETY: getppid has no arguments and no side effects.
     let parent = unsafe { libc::getppid() };
-    std::thread::spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        // SAFETY: as above. When the parent is gone this process is adopted by another one and
-        // the number changes. `_exit` skips the cleanup code that could itself get stuck.
-        if unsafe { libc::getppid() } != parent {
-            unsafe { libc::_exit(0) }
-        }
+    // The thread says when it has started. The system call filter is put on every thread, and a
+    // thread that is still starting up makes calls (to register itself, to set its stack up) that
+    // the filter does not allow; it would be killed halfway, and the engine with it.
+    let (ready, started) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = ready.send(());
+        // If anything in the loop panics (a refused call, say), the engine ends: an engine that
+        // has lost its parent check would outlive the app.
+        let _ = std::panic::catch_unwind(|| loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            // SAFETY: as above. When the parent is gone this process is adopted by another one and
+            // the number changes. `_exit` skips the cleanup code that could itself get stuck.
+            if unsafe { libc::getppid() } != parent {
+                unsafe { libc::_exit(0) }
+            }
+        });
+        // SAFETY: ends the process without cleanup.
+        unsafe { libc::_exit(70) }
     });
+    let _ = started.recv();
 }
 
 #[cfg(not(unix))]

@@ -31,6 +31,8 @@ pub struct Prepared {
     /// Why the sandbox is not in force, if it is not. Always `None` in a release build that is
     /// serving documents.
     pub sandbox_problem: Option<String>,
+    /// Why the empty root (Linux) could not be set up, if it could not. Not an error.
+    pub isolation_problem: Option<String>,
 }
 
 /// The directory of the running program: where the PDFium library is when no folder is given.
@@ -102,8 +104,7 @@ pub fn prepare(args: Args) -> Prepared {
     #[cfg(unix)]
     crate::fds::close_all_above(args.document.map_or(2, |d| (d as i32).max(2)));
     let protocol = stdio::take_protocol_output();
-    limits::limit_memory(args.memory_limit.unwrap_or(limits::MEMORY_LIMIT_BYTES));
-    limits::exit_with_parent();
+    let limit_set = limits::limit_memory(args.memory_limit.unwrap_or(limits::MEMORY_LIMIT_BYTES));
 
     let pdfium_dir = args.pdfium_dir.clone().unwrap_or_else(own_dir);
     let fonts_dir = args
@@ -112,12 +113,29 @@ pub fn prepare(args: Args) -> Prepared {
         .unwrap_or_else(|| pdfium_dir.join("fonts"));
     let mut engine = Engine::with_fonts(&pdfium_dir, &fonts_dir);
 
-    // Everything is loaded. From here on the engine does not open files.
+    // Everything is loaded. The empty root needs a process with one thread, so it comes before the
+    // helper thread that watches the parent.
+    let isolation_problem = if test_switch("PARTRIDGE_TEST_NO_EMPTY_ROOT") {
+        Some("switched off by a test".to_string())
+    } else {
+        sandbox::enter_isolation().err()
+    };
+    limits::exit_with_parent();
+
+    // From here on the engine does not open files.
     let locked = if test_switch("PARTRIDGE_TEST_FAIL_SANDBOX") {
         Err("failure forced by a test".to_string())
     } else {
         sandbox::lock_down()
     };
+    // A memory limit that could not be set is a sandbox that is not complete.
+    let locked = locked.and_then(|applied| {
+        if limit_set {
+            Ok(applied)
+        } else {
+            Err("the memory limit could not be set".to_string())
+        }
+    });
     let sandbox_problem = match locked {
         Ok(applied) => {
             engine.set_sandbox(&applied.describe());
@@ -148,5 +166,6 @@ pub fn prepare(args: Args) -> Prepared {
         protocol,
         args,
         sandbox_problem,
+        isolation_problem,
     }
 }

@@ -64,6 +64,14 @@ jobs:
       - name: Fetch PDFium
         run: node scripts/fetch-pdfium.mjs
       # The tauri crate embeds ../dist at compile time; a stub is enough for lint and tests.
+      # Ubuntu 24.04 lets a program make a user namespace but takes the rights in it away (an
+      # AppArmor rule). The engine's empty root needs those rights, so the rule is switched off for
+      # the run, and the tests then insist that the engine reports the layer.
+      - name: Allow user namespaces (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          echo "PARTRIDGE_TEST_REQUIRE_EMPTY_ROOT=1" >> "$GITHUB_ENV"
       - name: Create stub dist/
         run: |
           mkdir -p dist
@@ -227,6 +235,18 @@ jobs:
       # engine and the library inside. This is a build for testing: nothing is signed or released.
       - name: Build installers
         run: npm run bundle -- --bundles ${{ matrix.bundles }} -- --locked
+
+      # The test switches and the self-test code exist in debug builds only; the engine in the
+      # installers must have none of them, on every system.
+      - name: The engine in the installers has no test code
+        run: |
+          bin=target/release/partridge-engine
+          [ "$RUNNER_OS" = "Windows" ] && bin=target/release/partridge-engine.exe
+          if grep -aq 'PARTRIDGE_TEST_' "$bin"; then
+            echo "The release engine contains test switches." >&2
+            exit 1
+          fi
+          echo "ok: no test switches in $bin"
 
       - name: Collect installers
         run: |

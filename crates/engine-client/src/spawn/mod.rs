@@ -106,3 +106,29 @@ pub(crate) fn engine_args(request: &SpawnRequest<'_>, document: Option<u64>) -> 
     }
     args
 }
+
+/// Memory the engine may use when the caller names no limit: 3 GiB.
+#[cfg(any(windows, target_os = "macos"))]
+pub const DEFAULT_MEMORY_LIMIT: u64 = 3 * 1024 * 1024 * 1024;
+
+/// The variables of the app's environment that the engine gets. Nothing else: not the tokens of the
+/// shell the app was started from, not `SSH_AUTH_SOCK` or `DBUS_SESSION_BUS_ADDRESS`, not `HOME`
+/// or the user name. Windows needs the system folder to find its own libraries.
+#[cfg(windows)]
+const ENGINE_ENVIRONMENT: &[&str] = &["SystemRoot", "windir"];
+#[cfg(not(windows))]
+const ENGINE_ENVIRONMENT: &[&str] = &[];
+
+/// The environment of the engine: the allowed variables of the app's environment, and in debug
+/// builds the switches of the tests (`PARTRIDGE_TEST_*`). A release build passes no switch.
+pub(crate) fn engine_environment() -> Vec<(OsString, OsString)> {
+    std::env::vars_os()
+        .filter(|(name, _)| {
+            let name = name.to_string_lossy();
+            let allowed = ENGINE_ENVIRONMENT
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case(&name));
+            allowed || (cfg!(debug_assertions) && name.starts_with("PARTRIDGE_TEST_"))
+        })
+        .collect()
+}
