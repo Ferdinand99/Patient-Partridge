@@ -2629,7 +2629,7 @@ dependencies = [
 
 [[package]]
 name = "partridge-engine"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "libc",
  "partridge-engine-client",
@@ -2641,7 +2641,7 @@ dependencies = [
 
 [[package]]
 name = "partridge-engine-client"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "libc",
  "partridge-protocol",
@@ -2651,18 +2651,18 @@ dependencies = [
 
 [[package]]
 name = "partridge-protocol"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "partridge-testkit"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "md-5",
 ]
 
 [[package]]
 name = "patient-partridge"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "partridge-engine-client",
  "partridge-protocol",
