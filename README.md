@@ -92,9 +92,10 @@ Please read this before you open files from people you do not trust.
 - **CPU time and speed side channels** are not limited beyond the 60 second answer timeout, and attacks such as Spectre are not mitigated by the sandbox.
 - **The sandbox starts after PDFium and the fonts are loaded**, and loading is not protected. Both come from the app's own folder, and PDFium is checked against a pinned checksum.
 - **Documents the engine opens are untrusted by design; PDFium itself is not tested for correctness.** The sandbox limits the harm of a PDFium bug. It does not fix it.
-- PDFium is pinned to one release and updated by hand for now; nothing warns yet when a newer release exists.
+- PDFium is pinned to one release and updated by hand ([steps](docs/pdfium-updates.md)); a workflow that runs twice a week keeps one issue open while a newer release exists, and CI checks that the library that ships has no JavaScript engine (V8).
 
 Other protections: the engine ends when the app ends (even when stuck inside PDFium), and PDFium is loaded only from the app's own folder after a checksum check at build time.
+
 
 ## Building from source
 
@@ -116,6 +117,8 @@ npm run build && npx playwright install chromium && npm run e2e   # the window i
 
 The browser tests (`e2e/`) run the real window code in Chromium with the content security policy of the app and a stand-in for the Rust side that serves two made-up documents. They cover tabs, the light and dark look, thumbnails and contents, selecting and copying with the mouse, search, the question before a link is opened, and printing. They do not start the Rust side, the engine or a real web view; the CI job "Build" does that for the release build (it opens a generated 500-page PDF and checks that the first page is drawn).
 
+The protocol decoders and the engine (with PDFium) are also fuzzed: see [docs/fuzzing.md](docs/fuzzing.md).
+
 Installers for testing (not signed): `npm run bundle`.
 
 ## Measuring speed and memory
@@ -125,3 +128,5 @@ Installers for testing (not signed): `npm run bundle`.
 ## Licence
 
 Patient Partridge is free software under the [GNU Affero General Public License, version 3](LICENSE). PDFium is under a BSD-style licence; its licence files are shipped with the app.
+
+The licence texts of the Rust crates and npm packages inside the app are in [THIRD-PARTY-NOTICES](THIRD-PARTY-NOTICES), which every installer ships next to the AGPL text. The file is made by `scripts/notices.sh` (cargo-about, pinned) and CI fails when it is out of date or when a dependency has a licence that is not on the allowlist in `about.toml`. After changing a dependency, run `npm ci && scripts/notices.sh` and commit the result.

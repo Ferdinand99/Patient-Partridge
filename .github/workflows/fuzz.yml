@@ -1,0 +1,126 @@
+# Short fuzz runs of the parse boundary: the protocol decoders, the frame reader, and the engine
+# with the pinned PDFium. Each target runs for about a minute from its seed corpus.
+#
+# Not on every push: once a week, on request, and on pull requests that touch the protocol, the
+# engine, PDFium, or the fuzz setup itself. Longer runs are done by hand (see docs/fuzzing.md).
+name: Fuzz
+
+on:
+  pull_request:
+    paths:
+      - "crates/protocol/**"
+      - "crates/engine/**"
+      - "crates/testkit/**"
+      - "pdfium.lock.json"
+      - "fuzz/**"
+      - ".github/workflows/fuzz.yml"
+  schedule:
+    - cron: "41 2 * * 1"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Seconds per target, 1 to 800 (the job stops after 20 minutes, builds included)"
+        default: "60"
+
+concurrency:
+  group: fuzz-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The cargo-fuzz version is pinned like everything else. Change it here and in docs/fuzzing.md.
+  CARGO_FUZZ_VERSION: "0.13.2"
+  SECONDS_PER_TARGET: ${{ inputs.seconds || '60' }}
+
+jobs:
+  fuzz:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: protocol_request_decode
+            dict: protocol
+            args: "-max_len=131072 -timeout=10 -malloc_limit_mb=2"
+          - target: protocol_response_decode
+            dict: protocol
+            args: "-max_len=131072 -timeout=10 -malloc_limit_mb=2"
+          - target: protocol_read_frame
+            dict: protocol
+            args: "-max_len=131072 -timeout=10 -malloc_limit_mb=4"
+          - target: protocol_roundtrip_request
+            dict: protocol
+            args: "-max_len=4096 -timeout=10 -malloc_limit_mb=8"
+          - target: protocol_roundtrip_response
+            dict: protocol
+            args: "-max_len=4096 -timeout=10 -malloc_limit_mb=8"
+          - target: engine_open_render
+            dict: pdf
+            # No more than the engine itself may use (3 GiB on Linux) in one allocation or in all.
+            # Leak reports are turned off through ASAN_OPTIONS and not through libFuzzer's
+            # -detect_leaks=0, which would also remove the check on single big allocations.
+            args: "-max_len=100000 -timeout=30 -rss_limit_mb=3072 -malloc_limit_mb=3072"
+            asan_options: "detect_leaks=0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Check the run time
+        run: |
+          case "$SECONDS_PER_TARGET" in
+            ''|*[!0-9]*) echo "seconds must be a number" >&2; exit 1 ;;
+          esac
+          if [ "$SECONDS_PER_TARGET" -lt 1 ] || [ "$SECONDS_PER_TARGET" -gt 800 ]; then
+            echo "seconds must be from 1 to 800: the job stops after 20 minutes" >&2
+            exit 1
+          fi
+      # The nightly compiler is pinned in fuzz/rust-toolchain.toml; install exactly that one and
+      # use it for every step of this job (the repository's own rust-toolchain.toml names the
+      # stable compiler of the app, which this job does not need).
+      - name: Install the pinned nightly toolchain
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' fuzz/rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal
+          echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: fuzz
+          key: ${{ matrix.target }}
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version "=${CARGO_FUZZ_VERSION}" --locked
+      # cargo-fuzz has no --locked option. This fails when fuzz/Cargo.lock does not cover the
+      # manifests (a changed dependency of the engine or the protocol crate, a new pin).
+      - name: Check that fuzz/Cargo.lock is up to date
+        working-directory: fuzz
+        run: cargo metadata --locked --format-version 1 > /dev/null
+      # The engine target loads the PDFium build pinned in pdfium.lock.json. The download is
+      # checked against the pinned SHA-256 before it is unpacked.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        if: matrix.target == 'engine_open_render'
+        with:
+          node-version: 22
+      - name: Fetch PDFium
+        if: matrix.target == 'engine_open_render'
+        run: node scripts/fetch-pdfium.mjs
+      - name: Fuzz ${{ matrix.target }} for ${{ env.SECONDS_PER_TARGET }} seconds
+        working-directory: fuzz
+        env:
+          ASAN_OPTIONS: ${{ matrix.asan_options }}
+        run: |
+          mkdir -p "corpus/${{ matrix.target }}"
+          cargo fuzz run "${{ matrix.target }}" "corpus/${{ matrix.target }}" "seeds/${{ matrix.target }}" -- \
+            "-dict=dictionaries/${{ matrix.dict }}.dict" \
+            "-max_total_time=${SECONDS_PER_TARGET}" \
+            ${{ matrix.args }} -print_final_stats=1
+      # A crash leaves the input that caused it in fuzz/artifacts. Keep it for reproduction.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: failure()
+        with:
+          name: crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/*
+          if-no-files-found: ignore
