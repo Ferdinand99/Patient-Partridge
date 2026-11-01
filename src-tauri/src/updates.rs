@@ -1407,7 +1407,8 @@ mod tests {
         config.args = vec!["good".into()];
         let pool = EnginePool::new(config, 4);
         // The app opens the file itself and hands it to the engine, so the file has to exist.
-        let dir = std::env::temp_dir().join(format!("partridge-update-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("partridge-update-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let handles: Vec<u64> = (0..3)
             .map(|i| {
