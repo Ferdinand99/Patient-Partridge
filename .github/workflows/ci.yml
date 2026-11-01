@@ -357,3 +357,88 @@ jobs:
               [ -f "$f" ] && echo "| $(basename "$f") | $(awk -v b="$(wc -c < "$f")" 'BEGIN{printf "%.2f", b/1048576}') |"
             done
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # The runners of GitHub run everything as an administrator, and a user of the app usually is not
+  # one. This job makes a local standard user, installs the NSIS installer of the Build job as
+  # that user, opens PDFs with the installed app (one with a space and letters outside ASCII in
+  # its path), and runs the sandbox tests of the engine as that user. Steps and limits are in
+  # scripts/windows-standard-user and docs/windows-standard-user.md.
+  windows-standard-user:
+    name: Windows, as a standard user
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: standard-user
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+
+      # The user and its folders come first, so that everything built later inherits the right
+      # permissions. The password is made here, masked, and kept only in this job.
+      - name: Create the standard user
+        shell: powershell
+        run: ./scripts/windows-standard-user/prepare.ps1
+
+      # The installer is the one the Build job made in this run.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: installers-windows
+          path: installers
+      - name: Fetch PDFium and make a test PDF
+        shell: bash
+        run: |
+          node scripts/fetch-pdfium.mjs
+          cargo run --release --locked -p partridge-testkit --bin make-pdf -- 3 "C:/pp/docs/plain.pdf"
+      - name: Put the installer and PDFium where the user can read them
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem installers -Filter '*-setup.exe' | Select-Object -First 1
+          if (-not $setup) { throw 'The Build job made no NSIS installer.' }
+          Copy-Item $setup.FullName C:\pp\in\
+          $library = Get-ChildItem vendor/pdfium -Recurse -Filter pdfium.dll | Select-Object -First 1
+          Copy-Item "$($library.DirectoryName)\*" C:\pp\pdfium\ -Recurse
+          Get-ChildItem C:\pp\in, C:\pp\pdfium | Format-Table Name, Length
+
+      # Debug builds of the test programs of the engine, in C:\pp\build.
+      - name: Build the engine tests
+        shell: pwsh
+        run: ./scripts/windows-standard-user/build-tests.ps1
+
+      - name: Run the checks as the standard user
+        shell: powershell
+        run: ./scripts/windows-standard-user/run-as-user.ps1
+
+      - name: Summary
+        if: always()
+        shell: pwsh
+        run: |
+          $log = 'C:\pp\out\child.log'
+          if (Test-Path $log) {
+            '### Windows, as a standard user' | Add-Content $env:GITHUB_STEP_SUMMARY
+            '' | Add-Content $env:GITHUB_STEP_SUMMARY
+            '```' | Add-Content $env:GITHUB_STEP_SUMMARY
+            Get-Content $log -Encoding UTF8 |
+              Where-Object { $_ -match '^\[(PASS|FAIL)\]|^(user|process session|window station|desktop|token elevated|SESSIONNAME|FAILED|ALL CHECKS|report:|engine process)' } |
+              Add-Content $env:GITHUB_STEP_SUMMARY
+            '```' | Add-Content $env:GITHUB_STEP_SUMMARY
+          }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: standard-user-logs
+          path: C:\pp\out\*
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Remove the standard user
+        if: always()
+        shell: powershell
+        run: |
+          if ($env:PP_USER) { Remove-LocalUser -Name $env:PP_USER -ErrorAction SilentlyContinue }

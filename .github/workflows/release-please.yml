@@ -36,6 +36,8 @@ jobs:
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5
         id: release
         with:
+          # Pull requests opened with GITHUB_TOKEN wait for a manual approval before their checks run.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
       - name: Look up draft release id
@@ -67,6 +69,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ needs.release-please.outputs.pr_branch }}
+          # A push with GITHUB_TOKEN would start no checks on the new commit.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - run: cargo update --workspace
       # The fuzz crate has a lockfile of its own, with the workspace crates in it at their version.
