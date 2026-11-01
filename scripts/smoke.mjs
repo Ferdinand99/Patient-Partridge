@@ -160,14 +160,31 @@ const median = (values) => {
 const options = parse(process.argv.slice(2));
 if (!existsSync(options.bin)) throw new Error(`App binary not found: ${options.bin}`);
 const results = [];
+let retries = 0;
+/**
+ * A launch that never reports a drawn page is tried once more. Web views on shared CI machines (the
+ * macOS ones in particular) now and then do not start at all, which says nothing about the app.
+ * Two launches in a row that fail are a failure, and the output of both is shown.
+ */
+async function launch() {
+  try {
+    return await runOnce(options);
+  } catch (first) {
+    retries += 1;
+    console.log(`A launch did not report a drawn page; trying once more.
+${first.message}`);
+    return await runOnce(options);
+  }
+}
 for (let i = 0; i < options.runs; i++) {
-  const r = await runOnce(options);
+  const r = await launch();
   results.push(r);
   console.log(`run ${i + 1}: ${JSON.stringify(r)}`);
 }
 const summary = {
   pages: results[0].pages,
   runs: results.length,
+  retries,
   open_ms_median: median(results.map((r) => r.open_ms)),
   first_page_ms_median: median(results.map((r) => r.first_page_ms)),
   since_process_start_ms_median: median(results.map((r) => r.since_process_start_ms)),
