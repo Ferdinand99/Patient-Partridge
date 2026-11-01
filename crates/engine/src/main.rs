@@ -28,6 +28,9 @@ fn quiet_crashes() {}
 
 fn main() -> ExitCode {
     quiet_crashes();
+    // First of all: from here on anything that writes to standard output goes to the null device,
+    // so not even loading PDFium can put stray text into the protocol.
+    let protocol = partridge_engine::stdio::take_protocol_output();
     // Set before anything from a PDF is read. A failure to set it is not fatal.
     partridge_engine::limits::limit_memory();
     partridge_engine::limits::exit_with_parent();
@@ -45,7 +48,7 @@ fn main() -> ExitCode {
 
     let mut engine = Engine::new(&pdfium_dir);
     let mut input = BufReader::new(io::stdin().lock());
-    let mut output = BufWriter::new(partridge_engine::stdio::take_protocol_output());
+    let mut output = BufWriter::new(protocol);
 
     loop {
         let frame = match read_frame(&mut input) {
