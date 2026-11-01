@@ -37,8 +37,7 @@ case "$kind" in
       # A dmg with a software licence agreement makes hdiutil ask for acceptance ("attach
       # canceled" otherwise), so accept it, and report whether the agreement is there.
       hdiutil imageinfo "$f" | grep -i "software license agreement" || echo "NOTE: the dmg has no software licence agreement"
-      printf 'Y
-' | hdiutil attach -nobrowse -readonly -noverify -mountpoint "$mount" "$f" >/dev/null
+      echo Y | hdiutil attach -nobrowse -readonly -noverify -mountpoint "$mount" "$f" >/dev/null
       mkdir -p "$out/dmg"
       cp -R "$mount"/. "$out/dmg"/ || { hdiutil detach "$mount" -force >/dev/null; exit 1; }
       hdiutil detach "$mount" >/dev/null
