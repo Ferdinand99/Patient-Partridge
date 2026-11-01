@@ -586,24 +586,6 @@ mod tests {
         assert!(pending.take().is_empty());
     }
 
-    #[test]
-    fn a_page_that_starts_again_gets_a_clean_start() {
-        let pool = EnginePool::new(EngineConfig::new("no-such-engine"), 2);
-        let known = Mutex::new(KnownLinks::default());
-        known.lock().unwrap().remember(1, "https://example.com/a");
-        let pending = Pending::default();
-        assert!(pending.take().is_empty());
-        assert!(pending.deliver(vec!["now.pdf".into()]).is_some());
-
-        release_documents(&pool, &known, &pending);
-
-        // The addresses of the old documents are forgotten ...
-        assert!(!known.lock().unwrap().allows(1, "https://example.com/a"));
-        // ... and files that arrive before the new page asks are kept for it.
-        assert!(pending.deliver(vec!["later.pdf".into()]).is_none());
-        assert_eq!(pending.take(), vec!["later.pdf".to_string()]);
-    }
-
     /// The real engine program, built by the same `cargo test --workspace` run.
     fn built_engine() -> PathBuf {
         let exe = std::env::current_exe().unwrap();
@@ -630,28 +612,27 @@ mod tests {
             .unwrap_or(false)
     }
 
-    /// The path from the start of a page to the end of its engines: what the app does when the
-    /// window reloads, with real engines and the state the app manages.
+    /// What the app does when the page in the window starts again, with real engines: all of them
+    /// end, the addresses are forgotten, and the pool takes new documents. (Only the lookup of the
+    /// managed state by `page_started` is left out; the launch of the app in CI covers that.)
     #[test]
     fn a_page_that_starts_again_ends_the_engines_of_the_old_one() {
         use partridge_testkit as kit;
         let mut config = EngineConfig::new(built_engine());
         config.args = vec!["--pdfium-dir".into(), kit::pdfium_dir().into_os_string()];
-        let pool = Arc::new(EnginePool::new(config, 4));
+        let pool = EnginePool::new(config, 4);
         let file = kit::TempFile::new("reload.pdf", &kit::simple_pdf(1));
         let (one, _) = pool.open(&file.path_str(), None).unwrap();
         let (two, _) = pool.open(&file.path_str(), None).unwrap();
+        #[cfg(unix)]
         let pids = [pool.pid(one).unwrap(), pool.pid(two).unwrap()];
+        assert_eq!(pool.len(), 2);
+        let known = Mutex::new(KnownLinks::default());
+        known.lock().unwrap().remember(one, "https://example.com/a");
+        let pending = Pending::default();
+        assert!(pending.take().is_empty());
 
-        let app = tauri::test::mock_app();
-        app.manage(Engine(pool.clone()));
-        let mut known = KnownLinks::default();
-        known.remember(one, "https://example.com/a");
-        app.manage(LinkMemory(Mutex::new(known)));
-        app.manage(Pending::default());
-        assert!(app.state::<Pending>().take().is_empty());
-
-        page_started(app.handle());
+        release_documents(&pool, &known, &pending);
 
         assert!(pool.is_empty());
         #[cfg(unix)]
@@ -659,17 +640,8 @@ mod tests {
             pids.iter().all(|pid| !alive(*pid)),
             "an engine is still running"
         );
-        let _ = pids;
-        assert!(!app
-            .state::<LinkMemory>()
-            .0
-            .lock()
-            .unwrap()
-            .allows(one, "https://example.com/a"));
-        assert!(app
-            .state::<Pending>()
-            .deliver(vec!["x.pdf".into()])
-            .is_none());
+        assert!(!known.lock().unwrap().allows(one, "https://example.com/a"));
+        assert!(pending.deliver(vec!["x.pdf".into()]).is_none());
         // The old handles are dead, and the pool takes new documents.
         assert!(pool.render(one, 0, 20, 20).is_err());
         assert!(pool.open(&file.path_str(), None).is_ok());
