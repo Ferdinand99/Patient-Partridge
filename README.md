@@ -121,7 +121,7 @@ npm run build && npx playwright install chromium && npm run e2e   # the window i
 
 The browser tests (`e2e/`) run the real window code in Chromium with the content security policy of the app and a stand-in for the Rust side that serves two made-up documents. They cover tabs, the light and dark look, thumbnails and contents, selecting and copying with the mouse, search, the question before a link is opened, and printing. They do not start the Rust side, the engine or a real web view; the CI job "Build" does that for the release build (it opens a generated 500-page PDF and checks that the first page is drawn).
 
-The protocol decoders and the engine (with PDFium) are also fuzzed: see [docs/fuzzing.md](docs/fuzzing.md).
+The protocol decoders and the engine (with PDFium) are also fuzzed: see [docs/fuzzing.md](docs/fuzzing.md). The app and the engine sandbox are also run on Windows as a standard user, not only as the administrator of the CI runner: see [docs/windows-standard-user.md](docs/windows-standard-user.md).
 
 Installers for testing (not signed, no update files): `npm run bundle`. Releases are made by the release workflow, with the macOS app signed and notarised ([docs/signing.md](docs/signing.md)) and the update files signed ([docs/updates.md](docs/updates.md)). An update can be tried from start to end on one computer with `node scripts/update-e2e.mjs` (it makes a throwaway key, builds two versions and lets the old one update itself; see docs/updates.md).
 
