@@ -225,12 +225,41 @@
               <h3>Clear errors</h3>
               <p>A damaged file, or a file that is not a PDF, gives a clear message instead of a crash.</p>
             </li>
+            <li class="card feature reveal">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#copy"></use></svg></span>
+              <h3>Tabs</h3>
+              <p>Open several documents in tabs. Each one runs in its own engine, so a bad file can’t take the others down.</p>
+            </li>
+            <li class="card feature reveal d1">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#layers"></use></svg></span>
+              <h3>Thumbnails and contents</h3>
+              <p>Side panel with page thumbnails and the document’s table of contents.</p>
+            </li>
+            <li class="card feature reveal d2">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#search"></use></svg></span>
+              <h3>Select, copy and search</h3>
+              <p>Select and copy text, and search the whole document.</p>
+            </li>
+            <li class="card feature reveal">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#file"></use></svg></span>
+              <h3>Print</h3>
+              <p>Print a whole document or a range of pages, up to 1,000 pages at a time.</p>
+            </li>
+            <li class="card feature reveal d1">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#moon"></use></svg></span>
+              <h3>Dark mode and your place</h3>
+              <p>A dark look that follows your system, and Partridge remembers where you stopped reading.</p>
+            </li>
+            <li class="card feature reveal d2">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#link"></use></svg></span>
+              <h3>Links ask first</h3>
+              <p>A link in a PDF never opens by itself. Partridge shows you where it goes and asks.</p>
+            </li>
           </ul>
 
           <p class="later reveal">
-            <strong>Not there yet:</strong> tabs, page thumbnails, the table of contents, selecting and
-            copying text, search, printing, dark mode and remembering where you stopped reading. They
-            are planned and will come step by step.
+            Printing, file association and links have only been tested automatically so far, not on every
+            system by hand. Editing is not there yet: the tools below are planned.
           </p>
         </div>
       </section>
@@ -374,8 +403,8 @@
               <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#info"></use></svg>
               <p>
                 <span class="callout-title">PDFium is the main attack surface</span>
-                It is pinned to one release and updated by hand for now. Nothing warns yet when a
-                newer release exists. The <a href="https://github.com/Ferdinand99/Patient-Partridge#security-what-is-protected-and-what-is-not-yet">README</a>
+                It is pinned to one release and updated by hand. A check now flags a newer release, so
+                updates aren’t missed. The <a href="https://github.com/Ferdinand99/Patient-Partridge#security-what-is-protected-and-what-is-not-yet">README</a>
                 lists what is and is not protected today.
               </p>
             </div>
@@ -401,7 +430,7 @@
               <div class="ms-body">
                 <p class="ms-status"><span class="pill status-accent"><span class="dot"></span>In development</span></p>
                 <h3>The reader</h3>
-                <p>Open a file, read it in one scrolling view, zoom and move around. This works today. Tabs, thumbnails, the table of contents, text selection, search, printing, dark mode and remembering your place are still to come.</p>
+                <p>Tabs, search, selecting and copying text, thumbnails, the table of contents, printing, dark mode and remembering your place all work. Nothing is released yet: the first release waits for the sandbox and automatic updates.</p>
               </div>
             </li>
             <li class="milestone reveal">
