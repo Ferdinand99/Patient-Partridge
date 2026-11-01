@@ -2,7 +2,8 @@
 //! (which the app survives) instead of slowing down the whole computer.
 //!
 //! - Linux: `RLIMIT_DATA`, which counts the heap and private writable mappings. Shared mappings
-//!   are not counted, so the system call filter refuses them (see `sandbox/linux.rs`).
+//!   and grow-down mappings are not counted, so the system call filter refuses them (see
+//!   `sandbox/linux.rs`).
 //! - Windows: the job object the app puts the engine in has a per-process memory limit, which the
 //!   kernel enforces (the engine only checks that it is in a job).
 //! - macOS: the system does not enforce `RLIMIT_DATA` and `RLIMIT_AS`. The limit that holds is the
