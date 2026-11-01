@@ -26,7 +26,7 @@ Patient Partridge is part of the Hedgerow family of apps, next to [Nimble Newt](
 
 ## What is not there yet
 
-The editor side is also planned, and none of it exists yet. There are no dates; each step is done when it works:
+The editor side is planned, and none of it exists yet. There are no dates; each step is done when it works:
 
 - Annotations, filling in forms, creating fillable forms, and digital signatures (viewing, validating and signing).
 - Editing text and images on the page.
