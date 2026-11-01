@@ -74,15 +74,16 @@ jobs:
         if: matrix.lint
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
       # What the engine tried after it locked itself in (open a file, connect, start a program,
       # write a file) and what the system answered, on each system.
       - name: Sandbox proof
+        if: always()
         run: cargo test -p partridge-engine --locked --test sandbox -- --nocapture --test-threads 1
       # The seccomp filter is the base on Linux and Landlock only an extra. Run the engine tests
       # once more with Landlock switched off, so the filter alone is shown to be enough.
       - name: Engine tests with seccomp alone
-        if: runner.os == 'Linux'
+        if: always() && runner.os == 'Linux'
         env:
           PARTRIDGE_TEST_NO_LANDLOCK: "1"
         run: cargo test -p partridge-engine -p partridge-engine-client --locked
