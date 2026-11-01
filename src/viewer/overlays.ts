@@ -62,6 +62,9 @@ export const MAX_SELECT_ALL_PAGES = 600;
 const DRAG_DISTANCE = 4;
 /** How close to the edge of the view the pointer must be to scroll it while dragging, in pixels. */
 const EDGE = 28;
+/** Presses closer together than this, in milliseconds and pixels, count as a double or triple click. */
+const MULTI_CLICK_MS = 500;
+const MULTI_CLICK_PX = 5;
 
 function percent(value: number, of: number): string {
   return `${((of > 0 ? value / of : 0) * 100).toFixed(3)}%`;
@@ -78,6 +81,8 @@ export class PageOverlays {
   private dragging = false;
   private pressed: { x: number; y: number; moved: boolean; detail: number } | null = null;
   private pointer: { x: number; y: number } | null = null;
+  /** The last press, to count double and triple clicks (pointer events carry no click count). */
+  private lastPress: { time: number; x: number; y: number; count: number } | null = null;
   private destroyed = false;
 
   constructor(
@@ -348,16 +353,24 @@ export class PageOverlays {
     if (p.button !== 0 || this.destroyed) return;
     const target = p.target;
     if (target instanceof Element && target.closest(".page-link")) return;
+    const last = this.lastPress;
+    const count =
+      last &&
+      p.timeStamp - last.time < MULTI_CLICK_MS &&
+      Math.hypot(p.clientX - last.x, p.clientY - last.y) < MULTI_CLICK_PX
+        ? Math.min(last.count + 1, 3)
+        : 1;
+    this.lastPress = { time: p.timeStamp, x: p.clientX, y: p.clientY, count };
     const caret = this.caretAt(p.clientX, p.clientY);
-    this.pressed = { x: p.clientX, y: p.clientY, moved: false, detail: p.detail || 1 };
+    this.pressed = { x: p.clientX, y: p.clientY, moved: false, detail: count };
     this.pointer = { x: p.clientX, y: p.clientY };
     if (!caret) {
       this.clearSelection();
       return;
     }
     const text = this.texts.get(caret.page) as PageText;
-    if (p.detail === 2 || p.detail === 3) {
-      const [from, to] = p.detail === 2 ? wordRange(text, caret.offset) : lineRange(text, caret.offset);
+    if (count === 2 || count === 3) {
+      const [from, to] = count === 2 ? wordRange(text, caret.offset) : lineRange(text, caret.offset);
       this.setSelection({ anchor: { page: caret.page, offset: from }, focus: { page: caret.page, offset: to } });
       this.dragging = false;
       this.events.onSelectionSettled?.();

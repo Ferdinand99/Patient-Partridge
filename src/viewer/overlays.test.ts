@@ -193,13 +193,39 @@ describe("selecting text with the pointer", () => {
   it("selects a word on a double click and a line on a triple click", async () => {
     const { view } = open();
     await flush();
-    pointer(view, "pointerdown", screen(view, 0, 70, 105), 2);
+    const press = (at: { clientX: number; clientY: number }) => {
+      pointer(view, "pointerdown", at);
+      pointer(view, "pointerup", at);
+    };
+    const word = screen(view, 0, 70, 105);
+    press(word);
+    expect(view.hasSelection).toBe(false);
+    press(word);
     expect(view.selectedText().text).toBe("Hello");
-    pointer(view, "pointerup", screen(view, 0, 70, 105), 2);
-    expect(view.selectedText().text).toBe("Hello");
-    pointer(view, "pointerdown", screen(view, 0, 70, 119), 3);
-    pointer(view, "pointerup", screen(view, 0, 70, 119), 3);
-    expect(view.selectedText().text).toBe("second line");
+    // A third press at the same place selects the line.
+    press(word);
+    expect(view.selectedText().text).toBe("Hello world");
+    // A press somewhere else starts counting again: it is a single click and clears the selection.
+    press(screen(view, 0, 70, 119));
+    expect(view.hasSelection).toBe(false);
+  });
+
+  it("does not take two slow clicks, or two clicks far apart, for a double click", async () => {
+    const { view } = open();
+    await flush();
+    const press = (at: { clientX: number; clientY: number }) => {
+      pointer(view, "pointerdown", at);
+      pointer(view, "pointerup", at);
+    };
+    press(screen(view, 0, 70, 105));
+    press(screen(view, 0, 200, 105));
+    expect(view.hasSelection).toBe(false);
+    const first = screen(view, 0, 70, 105);
+    view.element.dispatchEvent(new MouseEvent("pointerdown", { ...first, button: 0, bubbles: true }));
+    view.element.dispatchEvent(new MouseEvent("pointerup", { ...first, button: 0, bubbles: true }));
+    await wait(520);
+    press(first);
+    expect(view.hasSelection).toBe(false);
   });
 
   it("clears the selection on a click that does not drag, and with clearSelection", async () => {
