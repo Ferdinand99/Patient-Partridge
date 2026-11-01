@@ -300,6 +300,13 @@ fn engine_handles(fonts: &[(FontScript, std::fs::File)]) -> usize {
         .unwrap_or_else(|_| panic!("no count in {text}"))
 }
 
+/// The smallest of three counts: a handle that the system or a library holds for a moment may be
+/// counted once, and the ones the engine keeps are in every count.
+fn engine_handles_least(fonts: &[(FontScript, std::fs::File)]) -> (usize, Vec<usize>) {
+    let counts: Vec<usize> = (0..3).map(|_| engine_handles(fonts)).collect();
+    (*counts.iter().min().unwrap(), counts)
+}
+
 /// The engine holds one handle for each font it was given, and no other: with all seven scripts it
 /// holds seven more than with none. (On Linux the whole count is known: the standard descriptors,
 /// the document, the fonts and the copy of the output.) Whatever fonts the system has, stand-in
@@ -311,21 +318,25 @@ fn the_engine_holds_only_the_handles_it_was_given() {
         .into_iter()
         .map(|s| (s, std::fs::File::open(stand_in.path()).unwrap()))
         .collect();
-    let none = engine_handles(&[]);
-    let all = engine_handles(&seven);
-    let one = engine_handles(&seven[..1]);
-    println!("handles in the engine: {none} with no font, {one} with one, {all} with seven");
-    assert_eq!(one, none + 1);
-    assert_eq!(all, none + 7);
+    let (none, none_all) = engine_handles_least(&[]);
+    let (all, all_all) = engine_handles_least(&seven);
+    let (one, one_all) = engine_handles_least(&seven[..1]);
+    println!("handles in the engine: {none_all:?} with no font, {one_all:?} with one, {all_all:?} with seven");
+    assert_eq!(one, none + 1, "{none_all:?} {one_all:?} {all_all:?}");
+    assert_eq!(all, none + 7, "{none_all:?} {one_all:?} {all_all:?}");
 
     // The fonts this system really has.
     let real = system_fonts::open_all();
-    let with_real = engine_handles(&real);
+    let (with_real, with_real_all) = engine_handles_least(&real);
     println!(
         "handles in the engine: {with_real} with the {} fonts of this system",
         real.len()
     );
-    assert_eq!(with_real, none + real.len());
+    assert_eq!(
+        with_real,
+        none + real.len(),
+        "{none_all:?} {with_real_all:?}"
+    );
 
     #[cfg(target_os = "linux")]
     {
