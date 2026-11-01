@@ -158,7 +158,9 @@
 
 .select {
   padding-inline-end: 30px;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%238e8e93' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M8 9.5L12 5.5l4 4M8 14.5l4 4 4-4'/%3E%3C/svg%3E");
+  /* A file of the app, not a data: address: the content security policy allows pictures from the
+     app itself and nothing else. */
+  background-image: url("/select-chevron.svg");
   background-repeat: no-repeat;
   background-position: right 8px center;
   background-size: 16px;
