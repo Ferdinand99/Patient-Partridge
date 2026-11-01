@@ -166,7 +166,7 @@
             <li class="card feature reveal">
               <span class="list-icon status-accent"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#lock"></use></svg></span>
               <h3>No account, no cloud</h3>
-              <p>You open a file on your computer and read it. The app makes no network connections, and its window loads nothing from the internet.</p>
+              <p>You open a file on your computer and read it. Your documents never leave it. The only network use is the update check, and you can turn that off.</p>
             </li>
             <li class="card feature reveal d1">
               <span class="list-icon status-info"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#bolt"></use></svg></span>
@@ -391,17 +391,22 @@
               <h3>Checked at build time</h3>
               <p>PDFium is downloaded at a pinned release and its SHA-256 checksum is verified before use. CI checks that the engine’s code contains no network code.</p>
             </li>
+            <li class="card feature reveal">
+              <span class="list-icon status-accent"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#shield-check"></use></svg></span>
+              <h3>An operating-system sandbox</h3>
+              <p>Each open document has its own engine, locked in before it reads the first byte. It cannot open your other files or start programs.</p>
+            </li>
           </ul>
 
           <div class="steps-notes">
             <div class="callout status-warning reveal">
               <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#alert"></use></svg>
               <p>
-                <span class="callout-title">No operating-system sandbox yet</span>
-                Being in a separate process protects the app from crashes and hangs. It is not a
-                security boundary. If someone finds a bug in PDFium and builds a PDF that exploits it,
-                the code would run with your user rights. A real sandbox is planned and is a requirement
-                for the first release.
+                <span class="callout-title">What the sandbox does not cover</span>
+                On Windows the engine is not blocked from the network. If someone finds a bug in PDFium
+                and builds a PDF that exploits it, that code could use the internet, though it still
+                cannot open your other files. Linux and macOS block the network too. This gap will be
+                closed in a later version. The README lists what is and is not protected.
               </p>
             </div>
             <div class="callout status-info reveal d1">
@@ -435,7 +440,7 @@
               <div class="ms-body">
                 <p class="ms-status"><span class="pill status-accent"><span class="dot"></span>In development</span></p>
                 <h3>The reader</h3>
-                <p>Tabs, search, selecting and copying text, thumbnails, the table of contents, printing, dark mode and remembering your place all work. Nothing is released yet: the first release waits for the sandbox and automatic updates.</p>
+                <p>Tabs, search, selecting and copying text, thumbnails, the table of contents, printing, dark mode and remembering your place all work. Nothing is released yet: the first release waits for testing.</p>
               </div>
             </li>
             <li class="milestone reveal">
@@ -498,8 +503,8 @@
               <span class="ms-marker" aria-hidden="true"></span>
               <div class="ms-body">
                 <p class="ms-status"><span class="pill">Before any release</span></p>
-                <h3>An operating-system sandbox</h3>
-                <p>A sandbox for the engine on each operating system. The first release waits for it.</p>
+                <h3>Testing on real computers</h3>
+                <p>The sandbox and automatic updates are built. The first release, 0.1.0, waits for testing on Windows, macOS and Linux.</p>
               </div>
             </li>
           </ol>
@@ -533,7 +538,7 @@
               <details>
                 <summary>Does it connect to the internet?<svg class="icon" aria-hidden="true"><use href="assets/icons.svg#chevron-down"></use></svg></summary>
                 <div class="faq-body">
-                  <p>No. The app makes no network connections, and its window loads nothing from the internet. The engine’s code has no network code, and CI checks that. That check is about the code: until the sandbox exists, the operating system does not stop the engine from using the network.</p>
+                  <p>Only to check for updates. It asks GitHub for a newer version when it starts and every 6 hours, and downloads one when you say so. You can turn the check off. Your documents are never sent anywhere.</p>
                 </div>
               </details>
             </li>
@@ -541,7 +546,7 @@
               <details>
                 <summary>Is it safe to open PDFs from strangers?<svg class="icon" aria-hidden="true"><use href="assets/icons.svg#chevron-down"></use></svg></summary>
                 <div class="faq-body">
-                  <p>Not yet. Read the <a href="#security">security section</a> first. The engine is not sandboxed by the operating system, and a real sandbox is a requirement for the first release.</p>
+                  <p>Safer than before, but no PDF reader is risk-free. The engine runs in a sandbox, but on Windows it can still reach the network, and this is early software. Read the <a href="#security">security section</a> first.</p>
                 </div>
               </details>
             </li>
