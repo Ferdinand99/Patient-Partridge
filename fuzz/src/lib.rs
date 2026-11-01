@@ -82,7 +82,6 @@ pub fn arb_request(u: &mut Unstructured) -> Result<Request> {
             protocol_version: u.arbitrary()?,
         },
         1 => RequestBody::Open {
-            path: string_up_to(u, MAX_STRING_LEN)?,
             password: if u.arbitrary()? {
                 Some(string_up_to(u, MAX_STRING_LEN)?)
             } else {
@@ -144,6 +143,7 @@ pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
                 protocol_version: u.arbitrary()?,
                 engine_version: string_up_to(u, MAX_STRING_LEN)?,
                 pdfium_version: string_up_to(u, MAX_STRING_LEN)?,
+                sandbox: string_up_to(u, MAX_STRING_LEN)?,
             };
             (b.clone(), b)
         }

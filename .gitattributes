@@ -1,6 +1,7 @@
 * text=auto
 *.sh text eol=lf
 *.mjs text eol=lf
+crates/engine/src/warm-up.pdf binary
 *.desktop text eol=lf
 THIRD-PARTY-NOTICES text eol=lf
 legal/* text eol=lf

@@ -365,6 +365,91 @@ pub fn many_links_pdf(count: usize) -> Vec<u8> {
     plain_pdf_with_outline(objects, &format!("/Annots [{refs}]"))
 }
 
+/// The fonts of `fonts_pdf`, one line of text each from the top of the page down: the name the PDF
+/// gives (none of the fonts is embedded) and the kind of font object.
+pub const FONT_LINES: &[(&str, &str)] = &[
+    ("Helvetica", "Type1"),
+    ("Helvetica-Bold", "Type1"),
+    ("Times-Roman", "Type1"),
+    ("Times-BoldItalic", "Type1"),
+    ("Courier", "Type1"),
+    ("Courier-Oblique", "Type1"),
+    ("Arial", "TrueType"),
+    ("Arial-BoldMT", "TrueType"),
+    ("TimesNewRomanPSMT", "TrueType"),
+    ("Calibri", "TrueType"),
+    ("Verdana", "TrueType"),
+    ("Georgia-Italic", "TrueType"),
+    ("NoSuchFontAnywhere", "Type1"),
+];
+
+/// The text of every line of `fonts_pdf`.
+pub const FONT_LINE_TEXT: &str = "Sphinx of black quartz judge my vow";
+
+/// Where the baseline of line `i` of `fonts_pdf` is, in points from the bottom of the page.
+pub fn font_line_baseline(i: usize) -> f32 {
+    740.0 - 44.0 * i as f32
+}
+
+/// One Letter page with a line of text in each of the fonts of `FONT_LINES`. No font is embedded,
+/// so the reader has to find a face for each name itself: the case in which a reader looks at the
+/// fonts of the system, which a sandboxed engine cannot do.
+pub fn fonts_pdf() -> Vec<u8> {
+    let mut content = String::new();
+    for i in 0..FONT_LINES.len() {
+        let _ = writeln!(
+            content,
+            "BT /F{} 20 Tf 40 {} Td ({FONT_LINE_TEXT}) Tj ET",
+            i + 1,
+            font_line_baseline(i)
+        );
+    }
+    let mut fonts = String::new();
+    let mut objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+    ];
+    let mut font_objects: Vec<Vec<u8>> = Vec::new();
+    for (i, (name, kind)) in FONT_LINES.iter().enumerate() {
+        let _ = write!(fonts, "/F{} {} 0 R ", i + 1, 5 + i);
+        let encoding = if *kind == "TrueType" {
+            " /Encoding /WinAnsiEncoding"
+        } else {
+            ""
+        };
+        font_objects.push(
+            format!("<< /Type /Font /Subtype /{kind} /BaseFont /{name}{encoding} >>").into_bytes(),
+        );
+    }
+    objects.push(
+        format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << {fonts}>> >> >>"
+        )
+        .into_bytes(),
+    );
+    objects.push(stream_object("", &content));
+    objects.extend(font_objects);
+    assemble(&objects, "")
+}
+
+/// One page of Japanese text in a font that is not embedded (a Shift-JIS encoded CID font named
+/// MS-Mincho) next to a line of Latin text. Without a CJK font on hand the Japanese shows as
+/// blanks; the engine must neither crash nor hang.
+pub fn cjk_pdf() -> Vec<u8> {
+    let content = "BT /F1 28 Tf 50 700 Td <93FA967B8CEA> Tj ET\n\
+BT /F2 20 Tf 50 640 Td (Latin text next to it) Tj ET\n";
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R /F2 7 0 R >> >> >>".to_vec(),
+        stream_object("", content),
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /MS-Mincho /Encoding /90ms-RKSJ-H /DescendantFonts [6 0 R] >>".to_vec(),
+        b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /MS-Mincho /CIDSystemInfo << /Registry (Adobe) /Ordering (Japan1) /Supplement 2 >> /DW 1000 >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+    ];
+    assemble(&objects, "")
+}
+
 /// Starts like a PDF but is not one: the structure is cut off in the middle of the catalog.
 pub fn corrupt_pdf() -> Vec<u8> {
     b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R\n".to_vec()

@@ -12,6 +12,8 @@ use partridge_testkit as kit;
 fn client() -> EngineClient {
     let mut config = EngineConfig::new(env!("CARGO_BIN_EXE_partridge-engine"));
     config.args = vec!["--pdfium-dir".into(), kit::pdfium_dir().into_os_string()];
+    // The tests insist on the sandbox: an engine that cannot lock itself in fails them.
+    config.sandbox = partridge_engine_client::SandboxPolicy::Required;
     EngineClient::new(config)
 }
 

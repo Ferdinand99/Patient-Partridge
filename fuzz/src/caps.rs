@@ -22,8 +22,7 @@ use crate::chance;
 /// Panics when a request is outside the caps the protocol promises.
 pub fn check_request_caps(request: &Request) {
     match &request.body {
-        RequestBody::Open { path, password } => {
-            assert!(path.len() <= MAX_STRING_LEN, "path of {} bytes", path.len());
+        RequestBody::Open { password } => {
             if let Some(p) = password {
                 assert!(p.len() <= MAX_STRING_LEN, "password of {} bytes", p.len());
             }
@@ -47,10 +46,12 @@ pub fn check_response_caps(response: &Response) {
         ResponseBody::Hello {
             engine_version,
             pdfium_version,
+            sandbox,
             ..
         } => {
             assert!(engine_version.len() <= MAX_STRING_LEN);
             assert!(pdfium_version.len() <= MAX_STRING_LEN);
+            assert!(sandbox.len() <= MAX_STRING_LEN);
         }
         ResponseBody::Opened { .. } | ResponseBody::Closed => {}
         ResponseBody::Rendered {
@@ -132,7 +133,7 @@ fn header(tag: u8, id: u32) -> Vec<u8> {
 }
 
 /// How many cases `over_cap_request_case` has.
-pub const OVER_CAP_REQUESTS: usize = 3;
+pub const OVER_CAP_REQUESTS: usize = 2;
 
 /// A request that is valid except that one string is one byte over its cap. Returns a name and
 /// the payload; the decoder must return an error.
@@ -140,13 +141,6 @@ pub fn over_cap_request_case(case: usize, id: u32) -> (&'static str, Vec<u8>) {
     match case % OVER_CAP_REQUESTS {
         0 => {
             let mut p = header(2, id);
-            push_str(&mut p, MAX_STRING_LEN + 1);
-            p.push(0);
-            ("open path over the cap", p)
-        }
-        1 => {
-            let mut p = header(2, id);
-            push_str(&mut p, 1);
             p.push(1);
             push_str(&mut p, MAX_STRING_LEN + 1);
             ("open password over the cap", p)

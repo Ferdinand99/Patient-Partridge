@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use partridge_engine_client::{ClientError, EngineClient, EngineConfig};
+use partridge_engine_client::{ClientError, EngineClient, EngineConfig, SandboxPolicy};
 use partridge_protocol::ErrorCode;
 
 /// `cargo test` builds the examples too; the fake engine sits next to the test programs.
@@ -13,6 +13,19 @@ fn fake_engine() -> PathBuf {
     let exe = std::env::current_exe().unwrap();
     let dir = exe.parent().unwrap().parent().unwrap().join("examples");
     dir.join(format!("fake_engine{}", std::env::consts::EXE_SUFFIX))
+}
+
+/// A real file for the client to hand to the stand-in engine, which never reads it.
+fn doc_path() -> String {
+    static FILE: std::sync::OnceLock<partridge_testkit::TempFile> = std::sync::OnceLock::new();
+    FILE.get_or_init(|| {
+        partridge_testkit::TempFile::new(
+            "doc.pdf",
+            b"%PDF-1.7
+",
+        )
+    })
+    .path_str()
 }
 
 fn client_with(mode: &str, extra: &[&str]) -> EngineClient {
@@ -35,9 +48,27 @@ fn assert_stopped<T: std::fmt::Debug>(result: Result<T, ClientError>, needle: &s
 }
 
 #[test]
+fn an_engine_that_names_no_sandbox_is_refused_when_one_is_required() {
+    let mut config = EngineConfig::new(fake_engine());
+    config.args = vec!["no-sandbox".into()];
+    config.sandbox = SandboxPolicy::Required;
+    let client = EngineClient::new(config);
+    match client.open(&doc_path(), None) {
+        Err(ClientError::Engine { code, .. }) => assert_eq!(code, ErrorCode::SandboxUnavailable),
+        other => panic!("{other:?}"),
+    }
+    // The same engine is fine for a development build.
+    let mut config = EngineConfig::new(fake_engine());
+    config.args = vec!["no-sandbox".into()];
+    config.sandbox = SandboxPolicy::BestEffort;
+    let client = EngineClient::new(config);
+    assert!(client.open(&doc_path(), None).is_ok());
+}
+
+#[test]
 fn the_good_fake_works() {
     let client = client_with("good", &[]);
-    let doc = client.open("a.pdf", None).unwrap();
+    let doc = client.open(&doc_path(), None).unwrap();
     assert_eq!(doc.pages.len(), 1);
     assert!(client.render(doc.doc, 0, 40, 50).is_ok());
 }
@@ -48,13 +79,13 @@ fn frames_nobody_asked_for_stop_the_engine() {
     // The greeting works; the extra frames come after it.
     client.info().unwrap();
     std::thread::sleep(Duration::from_millis(300));
-    let err = client.open("a.pdf", None);
+    let err = client.open(&doc_path(), None);
     assert!(matches!(err, Err(ClientError::EngineStopped(_))), "{err:?}");
     // The client is not stuck: a request after that starts a new engine (which again misbehaves
-    // after its greeting, but the greeting itself works).
-    assert_eq!(client.spawn_count(), 1);
-    assert!(client.info().is_ok());
+    // after its greeting, but the greeting itself works). The open started one of its own.
     assert_eq!(client.spawn_count(), 2);
+    assert!(client.info().is_ok());
+    assert_eq!(client.spawn_count(), 3);
 }
 
 #[test]
@@ -63,7 +94,7 @@ fn a_flood_of_unasked_data_is_cut_off() {
     client.info().unwrap();
     std::thread::sleep(Duration::from_millis(500));
     let started = Instant::now();
-    let result = client.open("a.pdf", None);
+    let result = client.open(&doc_path(), None);
     assert!(
         matches!(result, Err(ClientError::EngineStopped(_))),
         "{result:?}"
@@ -75,25 +106,25 @@ fn a_flood_of_unasked_data_is_cut_off() {
 fn an_answer_bigger_than_the_request_can_produce_is_refused() {
     let client = client_with("oversized", &[]);
     client.info().unwrap();
-    assert_stopped(client.open("a.pdf", None), "unreadable");
+    assert_stopped(client.open(&doc_path(), None), "unreadable");
 }
 
 #[test]
 fn an_answer_with_the_wrong_id_is_refused() {
     let client = client_with("wrong-id", &[]);
-    assert_stopped(client.open("a.pdf", None), "different request");
+    assert_stopped(client.open(&doc_path(), None), "different request");
 }
 
 #[test]
 fn a_page_size_that_is_not_a_size_is_refused() {
     let client = client_with("bad-page-size", &[]);
-    assert_stopped(client.open("a.pdf", None), "not a size");
+    assert_stopped(client.open(&doc_path(), None), "not a size");
 }
 
 #[test]
 fn a_bitmap_of_the_wrong_size_is_refused() {
     let client = client_with("wrong-size", &[]);
-    let doc = client.open("a.pdf", None).unwrap();
+    let doc = client.open(&doc_path(), None).unwrap();
     assert_stopped(client.render(doc.doc, 0, 40, 50), "unexpected answer");
 }
 
@@ -105,7 +136,7 @@ fn killing_the_engine_frees_a_request_that_waits_for_it() {
         let client = client.clone();
         std::thread::spawn(move || {
             let started = Instant::now();
-            (client.open("a.pdf", None), started.elapsed())
+            (client.open(&doc_path(), None), started.elapsed())
         })
     };
     std::thread::sleep(Duration::from_millis(400));
@@ -129,7 +160,7 @@ fn an_engine_that_exits_while_idle_is_replaced_quietly() {
     client.info().unwrap();
     std::thread::sleep(Duration::from_millis(500));
     // The first engine is gone; the next request gets a new one without an error.
-    let doc = client.open("a.pdf", None).unwrap();
+    let doc = client.open(&doc_path(), None).unwrap();
     assert_eq!(doc.pages.len(), 1);
     assert_eq!(client.spawn_count(), 2);
     let _ = std::fs::remove_file(&marker);
@@ -138,9 +169,9 @@ fn an_engine_that_exits_while_idle_is_replaced_quietly() {
 #[test]
 fn handles_do_not_survive_an_engine_restart() {
     let client = client_with("good", &[]);
-    let old = client.open("a.pdf", None).unwrap();
+    let old = client.open(&doc_path(), None).unwrap();
     client.kill();
-    let new = client.open("a.pdf", None).unwrap();
+    let new = client.open(&doc_path(), None).unwrap();
     // The fake engine hands out document 1 every time, like a real engine after a restart. The
     // handles still differ.
     assert_ne!(old.doc, new.doc);

@@ -23,6 +23,7 @@ jobs:
   rust:
     name: Rust (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -63,6 +64,14 @@ jobs:
       - name: Fetch PDFium
         run: node scripts/fetch-pdfium.mjs
       # The tauri crate embeds ../dist at compile time; a stub is enough for lint and tests.
+      # Ubuntu 24.04 lets a program make a user namespace but takes the rights in it away (an
+      # AppArmor rule). The engine's empty root needs those rights, so the rule is switched off for
+      # the run, and the tests then insist that the engine reports the layer.
+      - name: Allow user namespaces (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          echo "PARTRIDGE_TEST_REQUIRE_EMPTY_ROOT=1" >> "$GITHUB_ENV"
       - name: Create stub dist/
         run: |
           mkdir -p dist
@@ -78,7 +87,36 @@ jobs:
         if: matrix.lint
         run: cargo clippy -p patient-partridge --all-targets --features update-driver --locked -- -D warnings
       - name: Test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
+      # What the engine tried after it locked itself in (open a file, connect, start a program,
+      # write a file) and what the system answered, on each system.
+      - name: Sandbox proof
+        if: always()
+        run: cargo test -p partridge-engine --locked --test sandbox -- --nocapture --test-threads 1
+      # The seccomp filter is the base on Linux and Landlock only an extra. Run the engine tests
+      # once more with Landlock switched off, so the filter alone is shown to be enough.
+      - name: Engine tests with seccomp alone
+        if: always() && runner.os == 'Linux'
+        env:
+          PARTRIDGE_TEST_NO_LANDLOCK: "1"
+        run: cargo test -p partridge-engine -p partridge-engine-client --locked
+      - name: Does an AppContainer stop the network on Windows (diagnosis)
+        if: always() && runner.os == 'Windows'
+        run: cargo test -p partridge-engine --locked --test windows_appcontainer -- --ignored --nocapture
+      - name: The sandbox log (macOS)
+        if: failure() && runner.os == 'macOS'
+        run: log show --last 10m --predicate 'sender == "Sandbox"' --style compact | grep -i 'engine|partridge' | tail -100 || true
+      # The test switches and the self-test program exist in debug builds only.
+      - name: The release engine has no test code
+        if: matrix.lint
+        run: |
+          cargo build --release --locked -p partridge-engine
+          if grep -aq 'PARTRIDGE_TEST_' target/release/partridge-engine; then
+            echo "The release engine contains test switches." >&2
+            exit 1
+          fi
+          ls target/release/examples 2>/dev/null | grep -q selftest && { echo "The self-test program was built in release." >&2; exit 1; }
+          echo "ok: no test switches in the release engine"
       - name: The engine has no network code, the app does not link PDFium
         if: matrix.lint
         run: scripts/check-engine-deps.sh
@@ -210,6 +248,18 @@ jobs:
       - name: Build installers
         run: npm run bundle -- --bundles ${{ matrix.bundles }} -- --locked
 
+      # The test switches and the self-test code exist in debug builds only; the engine in the
+      # installers must have none of them, on every system.
+      - name: The engine in the installers has no test code
+        run: |
+          bin=target/release/partridge-engine
+          [ "$RUNNER_OS" = "Windows" ] && bin=target/release/partridge-engine.exe
+          if grep -aq 'PARTRIDGE_TEST_' "$bin"; then
+            echo "The release engine contains test switches." >&2
+            exit 1
+          fi
+          echo "ok: no test switches in $bin"
+
       # The test driver of the update test (a Cargo feature) must not be in a build that is shipped.
       - name: The release build has no update test driver
         run: |
@@ -243,6 +293,9 @@ jobs:
       # that the engine, the PDFium library and the app policy work together in a release build.
       - name: Make a test PDF
         run: cargo run --release --locked -p partridge-testkit --bin make-pdf -- 500 "$RUNNER_TEMP/test-500.pdf"
+      - name: The release engine on its own (diagnosis)
+        if: always() && runner.os == 'Linux'
+        run: cargo run --release --locked -p partridge-engine --example cold_open -- "$RUNNER_TEMP/test-500.pdf" 1 || true
       - name: Open the PDF in the release build
         run: |
           BIN=target/release/patient-partridge

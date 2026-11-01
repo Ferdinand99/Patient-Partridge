@@ -26,7 +26,8 @@ if [ -n "$bad" ]; then
   fail=1
 fi
 
-if grep -rnE 'std::net|os::unix::net|TcpStream|TcpListener|UdpSocket|UnixStream|UnixListener|ToSocketAddrs|WSAStartup|fn socket|fn connect' crates/engine/src; then
+# The sandbox module makes socket attempts on purpose, to check that they are refused.
+if grep -rnE 'std::net|os::unix::net|TcpStream|TcpListener|UdpSocket|UnixStream|UnixListener|ToSocketAddrs|WSAStartup|fn socket|fn connect' crates/engine/src --exclude-dir=sandbox; then
   echo "The engine source uses sockets." >&2
   fail=1
 fi

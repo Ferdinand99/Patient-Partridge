@@ -7,7 +7,7 @@
 //! string at its cap, so a missing cap check in the decoder shows up here too).
 //!
 //! The seeds include requests that are one byte over a cap, so the cap checks are reached
-//! without luck. That needs a large `-max_len` (a path at the cap is 64 KiB).
+//! without luck. That needs a large `-max_len` (a password at the cap is 64 KiB).
 
 use libfuzzer_sys::fuzz_target;
 use partridge_fuzz::check_request_caps;
