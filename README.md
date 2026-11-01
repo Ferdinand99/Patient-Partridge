@@ -12,6 +12,7 @@ Patient Partridge is part of the Hedgerow family of apps, next to [Nimble Newt](
 
 - Open one or more PDFs from the Open button (Ctrl+O), by dropping files on the window, from the command line, or with "Open with" from a file manager. Each file opens in its own tab (Ctrl+W closes a tab, Ctrl+Tab and Ctrl+Shift+Tab move between tabs). Opening a file that is already open shows its tab.
 - Read in one continuous scrolling view. Only the pages you can see (and a few around them) are drawn, so opening is quick and memory stays flat as documents get longer. A tab you are not looking at gives up its drawn pages.
+- A side panel (Ctrl+B) shows page thumbnails and the table of contents of the PDF (its bookmarks). Thumbnails are drawn only for the part of the list you can see, and only after the page you asked for is on screen, so even a document with thousands of pages opens at the same speed. Entries of the contents that point to a web address or a file are shown but never followed.
 - Zoom in and out, or fit the page to the window width. Ctrl with the mouse wheel zooms too.
 - Move with the mouse wheel, the arrow keys, Page Up and Page Down, Space, Home and End, or jump to a page number (Ctrl+G).
 - Patient Partridge remembers where you stopped in each file and puts you back there when you open it again. The place (page, how far down, zoom) is kept in a small file on your computer, together with the path of the file, for the last 500 files. Nothing is sent anywhere. "Forget remembered positions" in the settings menu (the three dots) empties it.
@@ -21,7 +22,7 @@ Patient Partridge is part of the Hedgerow family of apps, next to [Nimble Newt](
 
 ## What is not there yet
 
-Page thumbnails, the table of contents, selecting and copying text, search and printing.
+Selecting and copying text, search and printing.
 
 The editor side is also planned, and none of it exists yet. There are no dates; each step is done when it works:
 

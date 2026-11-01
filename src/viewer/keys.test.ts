@@ -75,4 +75,10 @@ describe("pageScrollDistance", () => {
     expect(actionForKey(key("Tab"))).toBeNull();
     expect(actionForKey(key("w"))).toBeNull();
   });
+
+  it("shows and hides the side panel with Ctrl+B", () => {
+    expect(actionForKey(key("b", { ctrlKey: true }))).toEqual({ type: "toggle-sidebar" });
+    expect(actionForKey(key("B", { metaKey: true }))).toEqual({ type: "toggle-sidebar" });
+    expect(actionForKey(key("b"))).toBeNull();
+  });
 });

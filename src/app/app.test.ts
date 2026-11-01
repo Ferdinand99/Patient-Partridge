@@ -91,6 +91,12 @@ function make(options: { measureOn?: boolean; storage?: MemoryStorage } = {}) {
     close: vi.fn((_doc: number) => Promise.resolve()),
     setPosition: vi.fn((_path: string, _position: SavedPosition) => Promise.resolve()),
     clearPositions: vi.fn(() => Promise.resolve()),
+    getOutline: vi.fn((_doc: number) =>
+      Promise.resolve([
+        { depth: 0, page: 0, title: "Start" },
+        { depth: 0, page: 2, title: "End" },
+      ]),
+    ),
     measureMode: vi.fn(() => Promise.resolve(options.measureOn ?? false)),
     measureReport: vi.fn((_a: number, _b: number, _c: number) => Promise.resolve()),
   };
@@ -102,6 +108,7 @@ function make(options: { measureOn?: boolean; storage?: MemoryStorage } = {}) {
     now: vi.fn(() => 0),
     storage,
     positionDelayMs: 5,
+    thumbSettleMs: 5,
   };
   const app = new App(document, deps);
   app.init();
@@ -621,6 +628,87 @@ describe("App: remembering the position", () => {
     await flush();
     expect(api.clearPositions).toHaveBeenCalledTimes(1);
     expect(app.tabCount).toBe(1);
+  });
+});
+
+describe("App: the side panel", () => {
+  it("is closed at start and costs nothing", async () => {
+    const { app, api } = make();
+    await app.openPath("/a.pdf");
+    await flush();
+    expect(q("#sidebar").hidden).toBe(true);
+    expect(document.querySelectorAll(".thumb").length).toBe(0);
+    expect(api.getOutline).not.toHaveBeenCalled();
+    // Only the main view drew pages.
+    expect(api.render.mock.calls.every(([, , w]) => w > 300)).toBe(true);
+  });
+
+  it("shows thumbnails of the document in front, after the first page is drawn", async () => {
+    const { app, api } = make();
+    await app.openPath("/a.pdf");
+    await flush();
+    key("b", { ctrlKey: true });
+    expect(q("#sidebar").hidden).toBe(false);
+    await new Promise((r) => setTimeout(r, 30));
+    await flush();
+    const thumbCalls = api.render.mock.calls.filter(([, , w]) => w <= 300);
+    expect(thumbCalls.length).toBeGreaterThan(0);
+    expect(thumbCalls.every(([doc]) => doc === 1)).toBe(true);
+    expect(document.querySelectorAll(".thumb").length).toBe(3);
+    key("b", { ctrlKey: true });
+    expect(q("#sidebar").hidden).toBe(true);
+  });
+
+  it("goes to the page of a thumbnail and follows the page in view", async () => {
+    const { app } = make();
+    await app.openPath("/a.pdf");
+    await flush();
+    click(q("#sidebar-toggle"));
+    q('.thumb[data-page="2"]').click();
+    await flush();
+    expect(app.currentView?.currentPageIndex).toBe(2);
+    expect(q('.thumb[aria-current="page"]').dataset.page).toBe("2");
+  });
+
+  it("shows the table of contents and goes to an entry", async () => {
+    const { app, api } = make();
+    await app.openPath("/a.pdf");
+    await flush();
+    click(q("#sidebar-toggle"));
+    click(q("#side-tab-contents"));
+    await flush();
+    expect(api.getOutline).toHaveBeenCalledWith(1);
+    [...document.querySelectorAll<HTMLElement>(".outline-link")].find((l) => l.textContent === "End")?.click();
+    await flush();
+    expect(app.currentView?.currentPageIndex).toBe(2);
+  });
+
+  it("follows the tab in front", async () => {
+    const { app, api } = make();
+    await app.openPath("/a.pdf");
+    await app.openPath("/b.pdf");
+    await flush();
+    click(q("#sidebar-toggle"));
+    click(q("#side-tab-contents"));
+    await flush();
+    expect(api.getOutline).toHaveBeenLastCalledWith(2);
+    click(tab("a.pdf"));
+    await flush();
+    expect(api.getOutline).toHaveBeenLastCalledWith(1);
+    // A closed tab's contents are forgotten, and nothing is asked for a closed document.
+    key("w", { ctrlKey: true });
+    await flush();
+    expect(api.getOutline).toHaveBeenCalledTimes(2);
+  });
+
+  it("is empty when no document is open", async () => {
+    const { app } = make();
+    await app.openPath("/a.pdf");
+    click(q("#sidebar-toggle"));
+    await flush();
+    key("w", { ctrlKey: true });
+    await flush();
+    expect(document.querySelectorAll(".thumb").length).toBe(0);
   });
 });
 

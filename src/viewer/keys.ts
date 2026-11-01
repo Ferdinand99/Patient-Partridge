@@ -21,7 +21,8 @@ export type Action =
   | { type: "open-file" }
   | { type: "close-tab" }
   | { type: "next-tab" }
-  | { type: "previous-tab" };
+  | { type: "previous-tab" }
+  | { type: "toggle-sidebar" };
 
 /** CSS pixels one arrow key press scrolls. */
 export const LINE_SCROLL = 48;
@@ -55,6 +56,9 @@ export function actionForKey(e: KeyInfo): Action | null {
       case "w":
       case "W":
         return { type: "close-tab" };
+      case "b":
+      case "B":
+        return { type: "toggle-sidebar" };
       case "Tab":
         return { type: e.shiftKey ? "previous-tab" : "next-tab" };
       case "PageDown":
