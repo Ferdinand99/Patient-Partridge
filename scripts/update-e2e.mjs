@@ -304,12 +304,27 @@ async function runCase(name, setup, expectations, { seconds = 150 } = {}) {
   const before = existsSync(installed.file) && !mac ? sha256(installed.file) : null;
   const child = spawn(installed.command, [pdf], { env: appEnv(home, log), stdio: "ignore", detached: !win });
   child.unref();
-  const done = await waitFor(log, expectations.finish, seconds);
+  let done = await waitFor(log, expectations.finish, seconds);
+  const startedByInstaller = done;
+  if (win && !done && has(readLog(log), /^documents open before the stop/)) {
+    // The app handed over to the installer. Say what the computer looks like, and, if the new
+    // version is there but was not started, start it, so that the rest can still be checked.
+    const ps = (command) => spawnSync("powershell", ["-NoProfile", "-Command", command], { encoding: "utf8" }).stdout.trim();
+    console.log(`    [windows] processes:\n${ps("Get-Process | Where-Object { $_.Name -match 'partridge|setup|msiexec|nsis' } | Select-Object Name,Id | Out-String")}`);
+    const version = ps(`(Get-Item '${installed.file}').VersionInfo.ProductVersion`);
+    console.log(`    [windows] version of the installed program: ${version}`);
+    console.log(`    [windows] install folder:\n${ps(`Get-ChildItem '${dirname(installed.file)}' | Select-Object Name,Length,LastWriteTime | Out-String`)}`);
+    if (version.startsWith(NEW)) {
+      const again = spawn(installed.command, [pdf], { env: appEnv(home, log), stdio: "ignore" });
+      again.unref();
+      done = await waitFor(log, expectations.finish, 90);
+    }
+  }
   await sleep(1500);
   const lines = readLog(log);
   console.log(lines.map((l) => `    ${l}`).join("\n"));
   killApps();
-  return { lines, done, installed, before, dir };
+  return { lines, done, installed, before, dir, startedByInstaller };
 }
 
 const has = (lines, re) => lines.some((l) => re.test(l));
@@ -334,6 +349,7 @@ try {
     has(L, /^documents open before the stop=1, when the install starts=0$/),
   );
   check("the new version started", has(L, /^started version=0\.0\.2/));
+  check("the update started the new version by itself", good.startedByInstaller);
   check("the open document came back", has(L, /^started version=0\.0\.2 .* restored=1$/));
   check("the new version is up to date and ends", good.done);
   const order = [/^found/, /^documents open before the stop/, /^started version=0\.0\.2/, /^up-to-date/].map((re) => index(L, re));

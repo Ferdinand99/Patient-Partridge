@@ -97,9 +97,9 @@ pub fn install_method(facts: &Facts) -> InstallMethod {
         Os::Mac => facts.exe.as_deref().is_some_and(inside_app_bundle),
         Os::Linux => match (&facts.exe, &facts.appimage, &facts.appdir) {
             (Some(exe), Some(appimage), Some(appdir)) => {
-                appimage.is_absolute()
+                appimage.has_root()
                     && facts.appimage_is_file
-                    && appdir.is_absolute()
+                    && appdir.has_root()
                     && appdir.parent().is_some()
                     && exe.starts_with(appdir)
             }
