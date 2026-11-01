@@ -131,3 +131,7 @@ If only one build job failed (a flaky runner) and the preflight passed, use "Re-
 | "update information could not be read, or has nothing for this computer" | `latest.json` is missing, is not valid, or has no entry for this system (also while no published release exists) | Check that the latest published release has a `latest.json` with all four systems |
 | "is up to date" | Nothing newer is published | None |
 | "An update is being installed" when opening a file | The engines were stopped for an update | Restart the app |
+
+## The release token
+
+`RELEASE_PLEASE_TOKEN` is a fine-grained personal access token for this repository only, with read and write access to contents, pull requests and issues. The release workflow uses it to open the release PR and to refresh the lockfile on it, so the checks on that PR start without a manual approval. It expires after a year. When it does, the Release workflow fails on the release-please step: create a new one with the same rights and replace the secret.
