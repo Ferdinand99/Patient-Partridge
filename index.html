@@ -91,6 +91,9 @@
             <svg class="icon" aria-hidden="true"><use href="#i-plus"></use></svg>
           </button>
           <span class="grow"></span>
+          <button class="btn btn-icon btn-plain" id="print-button" type="button" title="Print (Ctrl+P)" aria-label="Print" disabled>
+            <svg class="icon" aria-hidden="true"><use href="#i-printer"></use></svg>
+          </button>
           <button class="btn btn-icon btn-plain" id="find-button" type="button" title="Find in this document (Ctrl+F)" aria-label="Find" aria-pressed="false" aria-controls="findbar" disabled>
             <svg class="icon" aria-hidden="true"><use href="#i-search"></use></svg>
           </button>
@@ -168,6 +171,8 @@
 
       <div class="sheet-layer" id="notice-layer" hidden></div>
     </div>
+    <!-- The pages being printed. Hidden on screen; the only thing shown when printing. -->
+    <div class="print-root" id="print-root" aria-hidden="true"></div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

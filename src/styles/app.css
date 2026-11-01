@@ -401,6 +401,71 @@ button.outline-toggle {
   outline-offset: 0;
 }
 
+/* Printing: the pages are pictures in a hidden element, shown only when printing */
+.print-root {
+  display: none;
+}
+
+.print-progress {
+  width: 100%;
+  height: 6px;
+  margin-top: var(--sp-2);
+  accent-color: var(--brand);
+}
+
+.print-choices {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+}
+
+.print-choices .check {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: 0.875rem;
+}
+
+.sheet-error {
+  min-height: 1.25em;
+  color: var(--bad-text);
+  font-size: 0.8125rem;
+}
+
+@media print {
+  @page {
+    margin: 0;
+  }
+
+  html,
+  body {
+    height: auto;
+    overflow: visible;
+    background: #fff;
+  }
+
+  .app,
+  .sel-proxy {
+    display: none !important;
+  }
+
+  .print-root {
+    display: block;
+  }
+
+  .print-page {
+    display: block;
+    width: 100%;
+    height: auto;
+    max-height: 100vh;
+    margin: 0 auto;
+    object-fit: contain;
+    break-after: page;
+    page-break-after: always;
+  }
+}
+
 /* The selected text, kept as real text off screen so the system's Copy works */
 .sel-proxy {
   position: fixed;

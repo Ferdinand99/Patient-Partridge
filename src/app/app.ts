@@ -20,6 +20,13 @@ import { DocumentView } from "../viewer/viewer";
 import { zoomLabel, type ZoomMode } from "../viewer/zoom";
 import { FindBar } from "./find";
 import { MenuController } from "./menu";
+import {
+  PrintJob,
+  encodeJpeg,
+  showPrintDialog,
+  showPrintProgress,
+  type PrintDeps,
+} from "./print";
 import { showNotice } from "./notice";
 import { Sidebar, type SidebarDocument } from "./sidebar";
 import { TabStrip } from "./tabs";
@@ -51,6 +58,8 @@ export interface AppDeps {
   thumbSettleMs?: number;
   /** How long typing in the find box must rest before the search starts, in milliseconds. */
   findDebounceMs?: number;
+  /** What printing needs besides the engine. Without it the browser's own functions are used. */
+  print?: Partial<Omit<PrintDeps, "render">>;
 }
 
 interface Tab {
@@ -97,6 +106,9 @@ export class App {
   private readonly sidebar: Sidebar;
   private readonly find: FindBar;
   private readonly selectionProxy: HTMLElement;
+  private readonly printRoot: HTMLElement;
+  private printJob: PrintJob | null = null;
+  private printing = false;
   private readonly positionDelay: number;
 
   constructor(
@@ -119,6 +131,7 @@ export class App {
     });
     this.menu = new MenuController(byId(root, "menu-button"), byId(root, "menu"));
     this.selectionProxy = byId(root, "sel-proxy");
+    this.printRoot = byId(root, "print-root");
     this.find = new FindBar(root, {
       searchPage: (doc, page, query) => deps.api.searchPage(doc, page, query),
       onEngineLost: (target, error) => {
@@ -136,6 +149,7 @@ export class App {
 
   init(): void {
     byId(this.root, "open-button").addEventListener("click", () => void this.openDialog());
+    byId(this.root, "print-button").addEventListener("click", () => void this.printActive());
     byId(this.root, "empty-open").addEventListener("click", () => void this.openDialog());
     this.zoomIn.addEventListener("click", () => this.active?.view.stepZoom(1));
     this.zoomOut.addEventListener("click", () => this.active?.view.stepZoom(-1));
@@ -353,6 +367,7 @@ export class App {
     const [tab] = this.tabs.splice(index, 1);
     this.saveNow(tab);
     clearTimeout(tab.saveTimer);
+    if (this.tabs.length === 0) this.printJob?.cleanup();
     this.find.forget(tab.view);
     tab.view.destroy();
     this.sidebar.forget(tab.doc);
@@ -470,6 +485,7 @@ export class App {
 
   private setControlsEnabled(on: boolean): void {
     for (const el of [this.pageInput, this.zoomSelect, this.zoomIn, this.zoomOut]) el.disabled = !on;
+    byId<HTMLButtonElement>(this.root, "print-button").disabled = !on;
   }
 
   private showCurrentPage(page?: number): void {
@@ -572,6 +588,9 @@ export class App {
         this.pageInput.focus();
         this.pageInput.select();
       }
+    } else if (action.type === "print") {
+      e.preventDefault();
+      void this.printActive();
     } else if (action.type === "find") {
       e.preventDefault();
       this.find.open();
@@ -594,6 +613,53 @@ export class App {
       this.stepTab(action.type === "next-tab" ? 1 : -1);
     } else if (this.active?.view.handleAction(action)) {
       e.preventDefault();
+    }
+  }
+
+  // ---- printing --------------------------------------------------------------
+
+  /** Asks which pages, prepares them, and opens the print dialog of the system. */
+  async printActive(): Promise<void> {
+    const tab = this.active;
+    if (!tab || this.printing || tab.view.pageCount === 0) return;
+    this.printing = true;
+    try {
+      const choice = await showPrintDialog(this.noticeLayer, {
+        name: tab.name,
+        pageCount: tab.view.pageCount,
+        currentPage: tab.view.currentPageIndex,
+      });
+      if (!choice || choice.pages.length === 0) return;
+      const job = (this.printJob ??= new PrintJob(this.printRoot, {
+        render: (doc, page, width, height) => this.deps.api.render(doc, page, width, height),
+        encode: this.deps.print?.encode ?? encodeJpeg,
+        createUrl: this.deps.print?.createUrl ?? ((blob) => URL.createObjectURL(blob)),
+        revokeUrl: this.deps.print?.revokeUrl ?? ((url) => URL.revokeObjectURL(url)),
+        print:
+          this.deps.print?.print ??
+          (() => {
+            this.root.defaultView?.print();
+            return Promise.resolve();
+          }),
+      }));
+      const progress = showPrintProgress(this.noticeLayer, () => job.cancel());
+      try {
+        await job.run(tab.doc, tab.sidebarDoc.pages, choice.pages, (p) => progress.update(p));
+      } finally {
+        progress.close();
+      }
+    } catch (e) {
+      const text = describeError(toAppError(e), tab.name);
+      await showNotice(this.noticeLayer, {
+        title: "The document could not be printed",
+        detail:
+          text.title === "Something went wrong"
+            ? `${text.detail} Nothing was sent to the printer.`
+            : `${text.title}. Nothing was sent to the printer.`,
+        buttons: [{ id: "ok", label: "OK", primary: true }],
+      });
+    } finally {
+      this.printing = false;
     }
   }
 

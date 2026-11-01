@@ -86,6 +86,12 @@ describe("pageScrollDistance", () => {
     expect(actionForKey(key("a"))).toBeNull();
   });
 
+  it("prints with Ctrl+P", () => {
+    expect(actionForKey(key("p", { ctrlKey: true }))).toEqual({ type: "print" });
+    expect(actionForKey(key("P", { metaKey: true }))).toEqual({ type: "print" });
+    expect(actionForKey(key("p"))).toBeNull();
+  });
+
   it("shows and hides the side panel with Ctrl+B", () => {
     expect(actionForKey(key("b", { ctrlKey: true }))).toEqual({ type: "toggle-sidebar" });
     expect(actionForKey(key("B", { metaKey: true }))).toEqual({ type: "toggle-sidebar" });

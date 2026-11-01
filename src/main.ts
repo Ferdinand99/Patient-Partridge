@@ -42,6 +42,14 @@ const app = new App(document, {
   },
   now: () => performance.now(),
   storage: storage(),
+  print: {
+    // The web view of macOS ignores window.print(); the Rust side opens its print dialog instead.
+    print: () => {
+      if (/Mac/i.test(navigator.userAgent)) return api.printWebview();
+      window.print();
+      return Promise.resolve();
+    },
+  },
 });
 app.init();
 

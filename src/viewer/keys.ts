@@ -26,7 +26,8 @@ export type Action =
   | { type: "find" }
   | { type: "find-next" }
   | { type: "find-previous" }
-  | { type: "select-all" };
+  | { type: "select-all" }
+  | { type: "print" };
 
 /** CSS pixels one arrow key press scrolls. */
 export const LINE_SCROLL = 48;
@@ -69,6 +70,9 @@ export function actionForKey(e: KeyInfo): Action | null {
       case "a":
       case "A":
         return { type: "select-all" };
+      case "p":
+      case "P":
+        return { type: "print" };
       case "Tab":
         return { type: e.shiftKey ? "previous-tab" : "next-tab" };
       case "PageDown":
