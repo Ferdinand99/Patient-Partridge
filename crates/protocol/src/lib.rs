@@ -889,14 +889,25 @@ pub fn read_frame_limited<R: Read>(
     if len > limit().min(MAX_FRAME_LEN) {
         return Err(ProtocolError::FrameTooLarge(len as u64));
     }
-    // Do not trust the announced length for the allocation: grow while data actually arrives.
-    let mut payload = Vec::with_capacity(len.min(64 * 1024));
-    let read = r.take(len as u64).read_to_end(&mut payload)?;
-    if read != len {
-        return Err(ProtocolError::Truncated);
+    // Do not trust the announced length for the allocation. Room is made for one chunk at a time,
+    // and only after the chunk before it has arrived in full, so a peer that announces 128 MiB
+    // and sends nothing costs one chunk, and memory use follows the bytes that really came.
+    let mut payload: Vec<u8> = Vec::new();
+    let mut left = len;
+    while left > 0 {
+        let chunk = left.min(READ_CHUNK);
+        payload.reserve(chunk);
+        let read = r.by_ref().take(chunk as u64).read_to_end(&mut payload)?;
+        if read != chunk {
+            return Err(ProtocolError::Truncated);
+        }
+        left -= chunk;
     }
     Ok(Some(payload))
 }
+
+/// How much room `read_frame` makes at a time while a frame arrives.
+const READ_CHUNK: usize = 64 * 1024;
 
 #[cfg(test)]
 mod tests {
@@ -1155,6 +1166,104 @@ mod tests {
         wire.truncate(wire.len() - 1);
         let err = read_frame(&mut Cursor::new(wire)).unwrap_err();
         assert!(matches!(err, ProtocolError::Truncated), "{err:?}");
+    }
+
+    /// Counts the biggest single allocation (or growth) of the thread that asks, to show how much
+    /// room a read makes.
+    mod tracking {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static BIGGEST: Cell<usize> = const { Cell::new(0) };
+        }
+
+        fn note(size: usize) {
+            let _ = BIGGEST.try_with(|b| {
+                if size > b.get() {
+                    b.set(size)
+                }
+            });
+        }
+
+        pub struct Tracking;
+
+        // SAFETY: every call is passed on unchanged to the system allocator.
+        unsafe impl GlobalAlloc for Tracking {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                note(layout.size());
+                System.alloc(layout)
+            }
+            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                note(layout.size());
+                System.alloc_zeroed(layout)
+            }
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                System.dealloc(ptr, layout)
+            }
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                note(new_size);
+                System.realloc(ptr, layout, new_size)
+            }
+        }
+
+        pub fn biggest_allocation_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
+            BIGGEST.with(|b| b.set(0));
+            let result = f();
+            (result, BIGGEST.with(|b| b.get()))
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: tracking::Tracking = tracking::Tracking;
+
+    #[test]
+    fn a_frame_that_announces_much_and_sends_little_costs_one_chunk() {
+        // Announces the largest frame there is and sends three bytes.
+        let mut wire = (MAX_FRAME_LEN as u32).to_le_bytes().to_vec();
+        wire.extend_from_slice(&[1, 2, 3]);
+        let (result, biggest) =
+            tracking::biggest_allocation_during(|| read_frame(&mut Cursor::new(wire)));
+        assert!(
+            matches!(result, Err(ProtocolError::Truncated)),
+            "{result:?}"
+        );
+        assert!(
+            biggest <= 2 * READ_CHUNK,
+            "a 128 MiB announcement made an allocation of {biggest} bytes"
+        );
+    }
+
+    #[test]
+    fn a_frame_grows_the_buffer_as_data_arrives() {
+        for len in [
+            0,
+            1,
+            READ_CHUNK - 1,
+            READ_CHUNK,
+            READ_CHUNK + 1,
+            2 * READ_CHUNK,
+            300_000,
+        ] {
+            let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let mut wire = (len as u32).to_le_bytes().to_vec();
+            wire.extend_from_slice(&payload);
+            // A second frame behind it must be left alone.
+            wire.extend_from_slice(&[7, 0, 0, 0, 9, 9, 9, 9, 9, 9, 9]);
+            let mut cursor = Cursor::new(wire);
+            let (frame, biggest) =
+                tracking::biggest_allocation_during(|| read_frame(&mut cursor).unwrap().unwrap());
+            assert_eq!(frame, payload, "length {len}");
+            assert!(
+                biggest <= 2 * len.max(READ_CHUNK),
+                "length {len}: allocation of {biggest} bytes"
+            );
+            assert_eq!(
+                read_frame(&mut cursor).unwrap().unwrap(),
+                vec![9u8; 7],
+                "length {len}"
+            );
+        }
     }
 
     #[test]
