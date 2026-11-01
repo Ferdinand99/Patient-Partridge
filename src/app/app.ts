@@ -4,6 +4,7 @@
 
 import type { OpenedDocument, OutlineEntry, SavedPosition } from "../lib/api";
 import { describeError, fileNameOf, toAppError, type AppErrorLike } from "../lib/errors";
+import { classifyUri } from "../lib/linkPolicy";
 import { parsePageInput } from "../lib/pageInput";
 import {
   THEME_CHOICES,
@@ -14,8 +15,10 @@ import {
   type StorageLike,
 } from "../lib/theme";
 import { actionForKey } from "../viewer/keys";
+import type { PageLinkInfo } from "../viewer/overlays";
 import { DocumentView } from "../viewer/viewer";
 import { zoomLabel, type ZoomMode } from "../viewer/zoom";
+import { FindBar } from "./find";
 import { MenuController } from "./menu";
 import { showNotice } from "./notice";
 import { Sidebar, type SidebarDocument } from "./sidebar";
@@ -29,6 +32,10 @@ export interface AppDeps {
     setPosition(path: string, position: SavedPosition): Promise<void>;
     clearPositions(): Promise<void>;
     getOutline(doc: number): Promise<OutlineEntry[]>;
+    getPageText(doc: number, page: number): Promise<{ text: string; rects: number[] }>;
+    getPageLinks(doc: number, page: number): Promise<PageLinkInfo[]>;
+    searchPage(doc: number, page: number, query: string): Promise<[number, number][]>;
+    openLink(doc: number, url: string): Promise<void>;
     measureMode(): Promise<boolean>;
     measureReport(openMs: number, firstPageMs: number, pages: number): Promise<void>;
   };
@@ -42,6 +49,8 @@ export interface AppDeps {
   positionDelayMs?: number;
   /** How long the thumbnail list must rest before thumbnails are asked for, in milliseconds. */
   thumbSettleMs?: number;
+  /** How long typing in the find box must rest before the search starts, in milliseconds. */
+  findDebounceMs?: number;
 }
 
 interface Tab {
@@ -86,6 +95,8 @@ export class App {
   private readonly tabStrip: TabStrip;
   private readonly menu: MenuController;
   private readonly sidebar: Sidebar;
+  private readonly find: FindBar;
+  private readonly selectionProxy: HTMLElement;
   private readonly positionDelay: number;
 
   constructor(
@@ -107,6 +118,15 @@ export class App {
       close: (id) => this.closeTab(id),
     });
     this.menu = new MenuController(byId(root, "menu-button"), byId(root, "menu"));
+    this.selectionProxy = byId(root, "sel-proxy");
+    this.find = new FindBar(root, {
+      searchPage: (doc, page, query) => deps.api.searchPage(doc, page, query),
+      onEngineLost: (target, error) => {
+        const lost = this.tabs.find((t) => t.view === target.view);
+        if (lost) void this.documentLost(lost, error);
+      },
+      debounceMs: deps.findDebounceMs,
+    });
     this.sidebar = new Sidebar(root, {
       api: deps.api,
       storage: deps.storage ?? null,
@@ -123,6 +143,7 @@ export class App {
     this.pageInput.addEventListener("keydown", (e) => this.onPageInputKey(e));
     this.pageInput.addEventListener("blur", () => this.showCurrentPage());
     this.root.addEventListener("keydown", (e) => this.onKeyDown(e));
+    this.root.addEventListener("copy", (e) => this.onCopy(e));
     this.initTheme();
     byId(this.root, "forget-positions").addEventListener("click", () => void this.forgetPositions());
     // The reader's place is saved when they rest, and again when the window goes away.
@@ -270,6 +291,11 @@ export class App {
           void this.deps.api.measureReport(openedAfter, paintedAfter, opened.pages.length);
         },
         onViewChange: () => this.scheduleSave(tab),
+        onLink: (link, page) => void this.onLink(tab, link, page),
+        onSelectionChange: (has) => {
+          if (!has && this.active === tab) this.selectionProxy.textContent = "";
+        },
+        onSelectionSettled: () => this.updateSelectionProxy(tab),
       },
       { start: opened.position ?? null },
     );
@@ -327,6 +353,7 @@ export class App {
     const [tab] = this.tabs.splice(index, 1);
     this.saveNow(tab);
     clearTimeout(tab.saveTimer);
+    this.find.forget(tab.view);
     tab.view.destroy();
     this.sidebar.forget(tab.doc);
     void this.deps.api.close(tab.doc).catch(() => undefined);
@@ -426,6 +453,8 @@ export class App {
     this.empty.hidden = this.tabs.length > 0;
     this.setControlsEnabled(active !== null);
     this.sidebar.setDocument(active?.sidebarDoc ?? null);
+    this.find.setTarget(active ? { doc: active.doc, view: active.view } : null);
+    this.selectionProxy.textContent = "";
     if (!active) {
       this.pageInput.value = "";
       this.pageTotal.textContent = "";
@@ -514,6 +543,14 @@ export class App {
   // ---- keyboard --------------------------------------------------------------
 
   private onKeyDown(e: KeyboardEvent): void {
+    if (e.key === "Escape" && this.noticeLayer.childElementCount === 0) {
+      const view = this.active?.view;
+      if (view?.hasSelection && !(e.target instanceof HTMLInputElement)) {
+        e.preventDefault();
+        view.clearSelection();
+        return;
+      }
+    }
     const action = actionForKey(e);
     if (!action) return;
     const target = e.target as HTMLElement | null;
@@ -535,6 +572,17 @@ export class App {
         this.pageInput.focus();
         this.pageInput.select();
       }
+    } else if (action.type === "find") {
+      e.preventDefault();
+      this.find.open();
+    } else if (action.type === "find-next" || action.type === "find-previous") {
+      e.preventDefault();
+      this.find.step(action.type === "find-next" ? 1 : -1);
+    } else if (action.type === "select-all") {
+      // In a text box, Ctrl+A belongs to the box.
+      if (typing) return;
+      e.preventDefault();
+      this.active?.view.selectAll();
     } else if (action.type === "toggle-sidebar") {
       e.preventDefault();
       this.sidebar.setOpen(!this.sidebar.isOpen);
@@ -546,6 +594,83 @@ export class App {
       this.stepTab(action.type === "next-tab" ? 1 : -1);
     } else if (this.active?.view.handleAction(action)) {
       e.preventDefault();
+    }
+  }
+
+  // ---- copying, and links ----------------------------------------------------
+
+  /**
+   * Keeps the selected text in a hidden element that is really selected, so that the Copy of the
+   * system (the menu, the keyboard, a context menu) has something to copy and is not greyed out.
+   * A very long selection is not put in the page; Copy then uses the loaded text directly.
+   */
+  private updateSelectionProxy(tab: Tab): void {
+    if (this.active !== tab) return;
+    const { text, missing } = tab.view.selectedText();
+    if (missing.length > 0 || text.length === 0) {
+      this.selectionProxy.textContent = "";
+      return;
+    }
+    this.selectionProxy.textContent = text.length <= 200_000 ? text : " ";
+    const selection = this.root.getSelection?.() ?? null;
+    selection?.removeAllRanges();
+    const range = this.root.createRange();
+    range.selectNodeContents(this.selectionProxy);
+    selection?.addRange(range);
+  }
+
+  private onCopy(e: ClipboardEvent): void {
+    const target = e.target;
+    // A text box copies its own text.
+    if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) return;
+    const view = this.active?.view;
+    if (!view?.hasSelection) return;
+    const { text, missing } = view.selectedText();
+    if (missing.length === 0 && e.clipboardData) {
+      e.clipboardData.setData("text/plain", text);
+      e.preventDefault();
+      return;
+    }
+    // Some pages are not loaded yet: fetch them, then write the text to the clipboard.
+    e.preventDefault();
+    void view.loadSelectedText().then((all) => this.root.defaultView?.navigator.clipboard?.writeText(all));
+  }
+
+  /** A link on a page was pressed. A page link just goes there; a web address is asked about first. */
+  private async onLink(tab: Tab, link: PageLinkInfo, _page: number): Promise<void> {
+    if (link.page !== null) {
+      tab.view.goToPage(link.page);
+      return;
+    }
+    const uri = link.uri ?? "";
+    const verdict = classifyUri(uri);
+    if (verdict.kind === "blocked") {
+      await showNotice(this.noticeLayer, {
+        title: "This link is not opened",
+        detail: verdict.reason,
+        quote: uri.length > 300 ? `${uri.slice(0, 300)}…` : uri,
+        buttons: [{ id: "ok", label: "OK", primary: true }],
+      });
+      return;
+    }
+    const answer = await showNotice(this.noticeLayer, {
+      title: "Open this link in your browser?",
+      detail: `This document wants to open a web address on the site ${verdict.host}. Only open it if you trust the document.`,
+      quote: verdict.url,
+      buttons: [
+        { id: "cancel", label: "Cancel", safe: true },
+        { id: "open", label: "Open in browser", primary: true },
+      ],
+    });
+    if (answer.button !== "open") return;
+    try {
+      await this.deps.api.openLink(tab.doc, uri);
+    } catch {
+      await showNotice(this.noticeLayer, {
+        title: "The link could not be opened",
+        detail: "Patient Partridge could not start your web browser. Copy the address from the document instead.",
+        buttons: [{ id: "ok", label: "OK", primary: true }],
+      });
     }
   }
 

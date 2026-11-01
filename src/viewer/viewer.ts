@@ -20,10 +20,13 @@ import {
   scrollTopForPage,
   visibleRange,
 } from "./layout";
+import { PageOverlays, type OverlayApi, type PageLinkInfo } from "./overlays";
 import { RenderScheduler, type RenderJob } from "./scheduler";
+import type { SearchMatch } from "./search";
+import type { Rect } from "./textlayer";
 import { type ZoomMode, clampZoom, fitWidthZoom, stepZoom } from "./zoom";
 
-export interface ViewerApi {
+export interface ViewerApi extends OverlayApi {
   render(doc: number, page: number, width: number, height: number): Promise<ArrayBuffer>;
 }
 
@@ -36,6 +39,12 @@ export interface ViewerEvents {
   onFirstPaint(): void;
   /** The reading position changed (scrolled or zoomed). Called often: the receiver should wait. */
   onViewChange?(): void;
+  /** A link on a page was pressed. Nothing has been opened: the receiver decides what to do. */
+  onLink?(link: PageLinkInfo, page: number): void;
+  /** Text was selected, or the selection was cleared. */
+  onSelectionChange?(hasSelection: boolean): void;
+  /** The selection is final for now (the pointer was released): its text can be taken. */
+  onSelectionSettled?(): void;
 }
 
 /** Where the reader was: a page, how far down it, and the zoom (null means fit width). */
@@ -73,6 +82,7 @@ export class DocumentView {
   private readonly sizer: HTMLElement;
   private readonly mounted = new Map<number, Mounted>();
   private readonly scheduler: RenderScheduler;
+  private readonly overlays: PageOverlays;
   private readonly resizeObserver?: ResizeObserver;
   private layout: Layout;
   private zoom = 1;
@@ -109,6 +119,23 @@ export class DocumentView {
       run: (job) => this.renderJob(job),
       onError: (job, error) => this.renderFailed(job, error),
     });
+
+    this.overlays = new PageOverlays(
+      info.doc,
+      info.pages,
+      api,
+      {
+        element: this.element,
+        pageElement: (page) => this.mounted.get(page)?.el ?? null,
+        mountedPages: () => [...this.mounted.keys()],
+        scrollToRect: (page, rect) => this.scrollToRect(page, rect),
+      },
+      {
+        onLink: (link, page) => events.onLink?.(link, page),
+        onSelectionChange: (has) => events.onSelectionChange?.(has),
+        onSelectionSettled: () => events.onSelectionSettled?.(),
+      },
+    );
 
     this.element.addEventListener("scroll", this.onScroll, { passive: true });
     this.element.addEventListener("wheel", this.onWheel, { passive: false });
@@ -197,6 +224,7 @@ export class DocumentView {
         this.hiddenLeft = this.element.scrollLeft;
         this.scheduler.setWanted([]);
         for (const index of [...this.mounted.keys()]) this.unmount(index);
+        this.overlays.releaseText();
       }
       this.element.hidden = true;
       return;
@@ -219,6 +247,7 @@ export class DocumentView {
     this.resizeObserver?.disconnect();
     window.removeEventListener("resize", this.onWindowResize);
     for (const index of [...this.mounted.keys()]) this.unmount(index);
+    this.overlays.destroy();
     this.element.remove();
   }
 
@@ -278,6 +307,67 @@ export class DocumentView {
       default:
         return false;
     }
+  }
+
+  // ---- selection, search and links -------------------------------------------
+
+  get hasSelection(): boolean {
+    return this.overlays.hasSelection;
+  }
+
+  selectAll(): void {
+    this.overlays.selectAll();
+  }
+
+  clearSelection(): void {
+    this.overlays.clearSelection();
+  }
+
+  /** The selected text from the pages that are loaded, and the pages that are not. */
+  selectedText(): { text: string; missing: number[] } {
+    return this.overlays.selectedText();
+  }
+
+  /** The selected text, loading the pages it still lacks. */
+  loadSelectedText(): Promise<string> {
+    return this.overlays.loadSelectedText();
+  }
+
+  /** Marks search matches on the pages. `current` is the one picked out. */
+  setFind(matches: ReadonlyMap<number, readonly [number, number][]>, current: SearchMatch | null): void {
+    this.overlays.setFind(matches, current);
+  }
+
+  clearFind(): void {
+    this.overlays.clearFind();
+  }
+
+  /** Scrolls so that a match is in view. */
+  revealMatch(match: SearchMatch): Promise<void> {
+    return this.overlays.revealMatch(match);
+  }
+
+  /** Scrolls so that a box of a page (in points from its top left) is in view. */
+  private scrollToRect(page: number, rect: Rect): void {
+    if (!this.active || page < 0 || page >= this.pageCount) return;
+    const size = this.info.pages[page];
+    const w = size.width || 1;
+    const h = size.height || 1;
+    const top = this.layout.tops[page] + (rect.top / h) * this.layout.heights[page];
+    const bottom = this.layout.tops[page] + (rect.bottom / h) * this.layout.heights[page];
+    const containerWidth = Math.max(this.layout.contentWidth, this.element.clientWidth);
+    const pageLeft = Math.round((containerWidth - this.layout.widths[page]) / 2);
+    const left = pageLeft + (rect.left / w) * this.layout.widths[page];
+    const right = pageLeft + (rect.right / w) * this.layout.widths[page];
+    const el = this.element;
+    const edge = 48;
+    if (top < el.scrollTop + edge || bottom > el.scrollTop + el.clientHeight - edge) {
+      el.scrollTop = Math.max(0, Math.round(top - el.clientHeight / 3));
+    }
+    if (left < el.scrollLeft + edge || right > el.scrollLeft + el.clientWidth - edge) {
+      el.scrollLeft = Math.max(0, Math.round(left - el.clientWidth / 3));
+    }
+    this.refresh();
   }
 
   // ---- layout --------------------------------------------------------------
@@ -415,6 +505,7 @@ export class DocumentView {
     const m: Mounted = { el, canvas, wantKey: "", drawnKey: null, failedKey: null };
     this.mounted.set(index, m);
     this.placePage(index, m);
+    this.overlays.mount(index, el);
     return m;
   }
 
@@ -424,6 +515,7 @@ export class DocumentView {
     // Shrinking the canvas frees its bitmap right away instead of when the garbage collector runs.
     m.canvas.width = 0;
     m.canvas.height = 0;
+    this.overlays.unmount(index);
     m.el.remove();
     this.mounted.delete(index);
   }
@@ -444,6 +536,8 @@ export class DocumentView {
     ctx.putImageData(new ImageData(new Uint8ClampedArray(buffer), job.width, job.height), 0, 0);
     m.drawnKey = job.key;
     m.el.classList.remove("viewer-page-failed");
+    // Text and links come after the picture, so they never delay the page the reader waits for.
+    this.overlays.pageDrawn(job.page);
     if (!this.painted) {
       this.painted = true;
       this.events.onFirstPaint();

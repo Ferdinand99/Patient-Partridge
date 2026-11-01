@@ -8,6 +8,7 @@
 //! Every open document has its own engine process (see `EnginePool`), so a file that crashes its
 //! engine closes only its own tab.
 
+mod links;
 mod locate;
 mod positions;
 
@@ -15,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use links::KnownLinks;
 use partridge_engine_client::{ClientError, EngineConfig, EnginePool, LinkTarget};
 use positions::{Position, Positions};
 use serde::Serialize;
@@ -59,6 +61,9 @@ const MAX_DOCUMENTS: usize = 16;
 
 /// The supervised engine processes, one per open document.
 struct Engine(Arc<EnginePool>);
+
+/// The web addresses the engine has reported for each open document. Only these can be opened.
+struct LinkMemory(Mutex<KnownLinks>);
 
 /// Where the reader was in each file, kept in a file in the app's data folder.
 struct PositionStore(Mutex<Positions>);
@@ -190,7 +195,16 @@ async fn render_page(
 }
 
 #[tauri::command]
-async fn close_pdf(engine: State<'_, Engine>, doc: u64) -> Result<(), CommandError> {
+async fn close_pdf(
+    engine: State<'_, Engine>,
+    known: State<'_, LinkMemory>,
+    doc: u64,
+) -> Result<(), CommandError> {
+    known
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .forget(doc);
     let pool = engine.0.clone();
     // Closing a document that is gone is fine: the end state is what the caller wants.
     let _ = blocking(move || {
@@ -267,11 +281,20 @@ struct LinkInfo {
 #[tauri::command]
 async fn get_page_links(
     engine: State<'_, Engine>,
+    known: State<'_, LinkMemory>,
     doc: u64,
     page: u32,
 ) -> Result<Vec<LinkInfo>, CommandError> {
     let pool = engine.0.clone();
     let links = blocking(move || pool.page_links(doc, page)).await?;
+    {
+        let mut memory = known.0.lock().unwrap_or_else(|e| e.into_inner());
+        for link in &links {
+            if let LinkTarget::Uri(uri) = &link.target {
+                memory.remember(doc, uri);
+            }
+        }
+    }
     Ok(links
         .into_iter()
         .map(|l| {
@@ -286,6 +309,28 @@ async fn get_page_links(
             }
         })
         .collect())
+}
+
+/// Opens a web address from a document in the user's browser. The window has asked the user first;
+/// this is the second check. Only `http` and `https` addresses are opened, and only ones that the
+/// engine reported for this document.
+#[tauri::command]
+fn open_link(known: State<'_, LinkMemory>, doc: u64, url: String) -> Result<(), CommandError> {
+    let refuse = |message: &str| CommandError {
+        code: "link_refused".into(),
+        message: message.into(),
+    };
+    if !known
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .allows(doc, &url)
+    {
+        return Err(refuse("this address is not a link of the document"));
+    }
+    let address = links::check_web_address(&url)
+        .map_err(|_| refuse("only web addresses (http and https) are opened"))?;
+    links::open_in_browser(&address).map_err(|_| refuse("the web browser could not be started"))
 }
 
 /// Finds a text on one page. Each match is `[start, length]` in characters of the page text.
@@ -387,6 +432,7 @@ pub fn run() {
                 .app_data_dir()
                 .ok()
                 .map(|dir| dir.join("positions.json"));
+            app.manage(LinkMemory(Mutex::new(KnownLinks::default())));
             app.manage(PositionStore(Mutex::new(Positions::load(positions_file))));
             app.manage(Engine(Arc::new(EnginePool::new(
                 engine_config(app),
@@ -415,6 +461,7 @@ pub fn run() {
             get_outline,
             get_page_text,
             get_page_links,
+            open_link,
             search_page,
             take_pending_paths,
             measure_mode,

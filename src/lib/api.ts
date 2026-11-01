@@ -2,6 +2,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import type { PageSizePt } from "../viewer/layout";
+import type { PageLinkInfo } from "../viewer/overlays";
 
 /** Where the reader was in a file, as remembered on this computer. */
 export interface SavedPosition {
@@ -58,6 +59,32 @@ export const api = {
   /** The table of contents of a document. Empty when it has none. */
   getOutline(doc: number): Promise<OutlineEntry[]> {
     return invoke<OutlineEntry[]>("get_outline", { doc });
+  },
+
+  /**
+   * The text of a page. `rects` holds four numbers for every character of `text`, in order: left,
+   * top, right and bottom in points from the top left of the page as it is drawn.
+   */
+  getPageText(doc: number, page: number): Promise<{ text: string; rects: number[] }> {
+    return invoke<{ text: string; rects: number[] }>("get_page_text", { doc, page });
+  },
+
+  /** The links of a page that lead to a web address or to a page of the document. */
+  getPageLinks(doc: number, page: number): Promise<PageLinkInfo[]> {
+    return invoke<PageLinkInfo[]>("get_page_links", { doc, page });
+  },
+
+  /** Finds a text on one page. Each match is `[start, length]` in characters of the page text. */
+  searchPage(doc: number, page: number, query: string): Promise<[number, number][]> {
+    return invoke<[number, number][]>("search_page", { doc, page, query });
+  },
+
+  /**
+   * Opens a web address of a document in the user's browser. Call this only after the user said
+   * yes. The Rust side checks it again: http and https only, and only an address of that document.
+   */
+  async openLink(doc: number, url: string): Promise<void> {
+    await invoke<void>("open_link", { doc, url });
   },
 
   /** Remembers where the reader is in a file. Kept in a file on this computer, nowhere else. */

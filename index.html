@@ -91,8 +91,28 @@
             <svg class="icon" aria-hidden="true"><use href="#i-plus"></use></svg>
           </button>
           <span class="grow"></span>
+          <button class="btn btn-icon btn-plain" id="find-button" type="button" title="Find in this document (Ctrl+F)" aria-label="Find" aria-pressed="false" aria-controls="findbar" disabled>
+            <svg class="icon" aria-hidden="true"><use href="#i-search"></use></svg>
+          </button>
           <button class="btn btn-icon btn-plain" id="menu-button" type="button" title="Settings" aria-label="Settings" aria-haspopup="true" aria-expanded="false" aria-controls="menu">
             <svg class="icon" aria-hidden="true"><use href="#i-more"></use></svg>
+          </button>
+        </div>
+        <div class="findbar" id="findbar" role="search" hidden>
+          <label class="search">
+            <span class="vh">Find in this document</span>
+            <svg class="icon" aria-hidden="true"><use href="#i-search"></use></svg>
+            <input id="find-input" type="search" placeholder="Find in this document" autocomplete="off" spellcheck="false" maxlength="256" />
+          </label>
+          <span class="find-status muted num" id="find-status" role="status" aria-live="polite"></span>
+          <button class="btn btn-icon btn-plain" id="find-prev" type="button" title="Previous match (Shift+Enter)" aria-label="Previous match">
+            <svg class="icon" aria-hidden="true"><use href="#i-chevron-up"></use></svg>
+          </button>
+          <button class="btn btn-icon btn-plain" id="find-next" type="button" title="Next match (Enter)" aria-label="Next match">
+            <svg class="icon" aria-hidden="true"><use href="#i-chevron-down"></use></svg>
+          </button>
+          <button class="btn btn-icon btn-plain" id="find-close" type="button" title="Close (Esc)" aria-label="Close search">
+            <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
           </button>
         </div>
       </header>
@@ -142,6 +162,9 @@
           <span>Forget remembered positions</span>
         </button>
       </div>
+
+      <!-- Holds the selected text so the system's own Copy works. Off screen, but real text. -->
+      <div class="sel-proxy" id="sel-proxy" aria-hidden="true"></div>
 
       <div class="sheet-layer" id="notice-layer" hidden></div>
     </div>

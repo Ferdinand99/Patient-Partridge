@@ -13,6 +13,9 @@ Patient Partridge is part of the Hedgerow family of apps, next to [Nimble Newt](
 - Open one or more PDFs from the Open button (Ctrl+O), by dropping files on the window, from the command line, or with "Open with" from a file manager. Each file opens in its own tab (Ctrl+W closes a tab, Ctrl+Tab and Ctrl+Shift+Tab move between tabs). Opening a file that is already open shows its tab.
 - Read in one continuous scrolling view. Only the pages you can see (and a few around them) are drawn, so opening is quick and memory stays flat as documents get longer. A tab you are not looking at gives up its drawn pages.
 - A side panel (Ctrl+B) shows page thumbnails and the table of contents of the PDF (its bookmarks). Thumbnails are drawn only for the part of the list you can see, and only after the page you asked for is on screen, so even a document with thousands of pages opens at the same speed. Entries of the contents that point to a web address or a file are shown but never followed.
+- Select text with the mouse (double click for a word, triple click for a line, Ctrl+A for everything) and copy it with Ctrl+C or the system's Copy. The text and the place of every character come from PDFium through the engine; nothing is read from the file by the window.
+- Search in the document (Ctrl+F). The matches are highlighted on the pages, Enter and Shift+Enter (or F3) move between them, and the count is shown. Search ignores upper and lower case and line breaks, and runs page by page in the background, so you can stop it at any time. Words that a PDF writes with a ligature such as "fi" in one character may not be found.
+- Links inside a PDF are never opened by themselves. Pressing one shows the whole address and asks first. Only web addresses (http and https) can be opened, in your normal browser; anything else (a file, a program, a script, a mail address) is refused with an explanation. Links to another page of the same document just go there. Attachments in a PDF are never opened or even listed.
 - Zoom in and out, or fit the page to the window width. Ctrl with the mouse wheel zooms too.
 - Move with the mouse wheel, the arrow keys, Page Up and Page Down, Space, Home and End, or jump to a page number (Ctrl+G).
 - Patient Partridge remembers where you stopped in each file and puts you back there when you open it again. The place (page, how far down, zoom) is kept in a small file on your computer, together with the path of the file, for the last 500 files. Nothing is sent anywhere. "Forget remembered positions" in the settings menu (the three dots) empties it.
@@ -22,7 +25,7 @@ Patient Partridge is part of the Hedgerow family of apps, next to [Nimble Newt](
 
 ## What is not there yet
 
-Selecting and copying text, search and printing.
+Printing.
 
 The editor side is also planned, and none of it exists yet. There are no dates; each step is done when it works:
 
