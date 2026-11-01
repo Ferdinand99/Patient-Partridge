@@ -3,8 +3,8 @@ name: CI
 on:
   push:
     branches: [main]
+  # Every pull request is checked, also one that is based on another branch of a series.
   pull_request:
-    branches: [main]
   workflow_dispatch:
 
 # Pull requests are checked by the pull_request event only, so a push to a PR branch runs CI

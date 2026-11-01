@@ -45,7 +45,7 @@ fn main() -> ExitCode {
 
     let mut engine = Engine::new(&pdfium_dir);
     let mut input = BufReader::new(io::stdin().lock());
-    let mut output = BufWriter::new(io::stdout().lock());
+    let mut output = BufWriter::new(partridge_engine::stdio::take_protocol_output());
 
     loop {
         let frame = match read_frame(&mut input) {

@@ -23,6 +23,8 @@ use pdfium_render::prelude::*;
 pub const MAX_OPEN_DOCUMENTS: usize = 64;
 
 pub mod limits;
+pub mod stdio;
+pub mod text;
 
 /// Command line of the engine.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -163,7 +165,69 @@ impl Engine {
                 self.docs.remove(&doc);
                 Ok(ResponseBody::Closed)
             }
+            RequestBody::Outline { doc } => {
+                let document = self.document(doc)?;
+                Ok(ResponseBody::Outline {
+                    items: text::outline(document),
+                })
+            }
+            RequestBody::PageText { doc, page } => self.with_page(doc, page, |p| {
+                let chars = text::page_chars(p, true).map_err(|_| {
+                    (
+                        ErrorCode::Corrupt,
+                        "the text of the page could not be read".to_string(),
+                    )
+                })?;
+                Ok(ResponseBody::PageText {
+                    text: chars.iter().map(|c| c.ch).collect(),
+                    rects: chars.iter().map(|c| c.rect).collect(),
+                })
+            }),
+            RequestBody::PageLinks { doc, page } => {
+                let count = self.document(doc)?.pages().len() as usize;
+                self.with_page(doc, page, |p| {
+                    Ok(ResponseBody::PageLinks {
+                        links: text::page_links(p, count),
+                    })
+                })
+            }
+            RequestBody::Search { doc, page, query } => self.with_page(doc, page, |p| {
+                let chars = text::page_chars(p, false).map_err(|_| {
+                    (
+                        ErrorCode::Corrupt,
+                        "the text of the page could not be read".to_string(),
+                    )
+                })?;
+                let plain: Vec<char> = chars.iter().map(|c| c.ch).collect();
+                Ok(ResponseBody::Matches {
+                    matches: text::find_matches(&plain, &query),
+                })
+            }),
         }
+    }
+
+    fn document(&self, doc: u32) -> Result<&PdfDocument<'static>, Failure> {
+        self.docs
+            .get(&doc)
+            .ok_or((ErrorCode::UnknownDocument, "no such document".to_string()))
+    }
+
+    /// Loads one page of an open document and runs `f` on it.
+    fn with_page<T>(
+        &self,
+        doc: u32,
+        page: u32,
+        f: impl FnOnce(&PdfPage) -> Result<T, Failure>,
+    ) -> Result<T, Failure> {
+        let document = self.document(doc)?;
+        let pages = document.pages();
+        if page as i64 >= pages.len() as i64 {
+            return fail(ErrorCode::PageOutOfRange, "the page does not exist");
+        }
+        let page = pages
+            .get(page as PdfPageIndex)
+            .map_err(|_| (ErrorCode::Corrupt, "the page could not be read".to_string()))?;
+        f(&page)
     }
 
     fn open(

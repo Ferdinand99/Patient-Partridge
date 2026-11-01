@@ -31,6 +31,13 @@ if grep -rnE 'std::net|os::unix::net|TcpStream|TcpListener|UdpSocket|UnixStream|
   fail=1
 fi
 
+# Attachments are never opened and links are only reported, never followed: the engine must have
+# no code that reads an attachment, launches a file, or follows a remote or embedded destination.
+if grep -rnE 'attachments\(|\.attachment|FPDFAttachment|FPDFDoc_(Get|Add|Delete)Attachment|as_launch_action|as_remote_destination_action|as_embedded_destination_action|PdfActionLaunch|PdfAttachment|Command::new' crates/engine/src; then
+  echo "The engine source touches attachments, launches something, or follows links." >&2
+  fail=1
+fi
+
 app_crates=$(tree_of patient-partridge)
 if echo "$app_crates" | grep -qx 'pdfium-render'; then
   echo "The app process links pdfium-render. PDF parsing must stay in the engine." >&2

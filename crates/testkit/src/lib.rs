@@ -13,6 +13,8 @@ pub struct PageSpec {
     pub height: u32,
     /// Page content stream. `None` gives a blank page without a content stream.
     pub content: Option<String>,
+    /// More entries for the page dictionary, such as `/Annots [..]` or `/Rotate 90`.
+    pub extra: String,
 }
 
 /// Content of a page that has a title, a block of text and a coloured bar at the bottom.
@@ -96,8 +98,8 @@ fn build(
         };
         body_objects.push(
             format!(
-                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {} {}] {contents_ref}/Resources << /Font << /F1 3 0 R >> >> >>",
-                spec.width, spec.height
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {} {}] {contents_ref}/Resources << /Font << /F1 3 0 R >> >> {} >>",
+                spec.width, spec.height, spec.extra
             )
             .into_bytes(),
         );
@@ -124,6 +126,7 @@ pub fn simple_pdf(pages: usize) -> Vec<u8> {
             width: 612,
             height: 792,
             content: Some(demo_content(n, 612, 792)),
+            extra: String::new(),
         })
         .collect();
     build(&specs, "", "", Vec::new())
@@ -139,6 +142,7 @@ pub fn mixed_size_pdf() -> Vec<u8> {
             width: w,
             height: h,
             content: Some(demo_content(i + 1, w, h)),
+            extra: String::new(),
         })
         .collect();
     build(&specs, "", "", Vec::new())
@@ -151,6 +155,7 @@ pub fn javascript_pdf() -> Vec<u8> {
         width: 612,
         height: 792,
         content: Some(demo_content(1, 612, 792)),
+        extra: String::new(),
     }];
     build(
         &specs,
@@ -159,6 +164,169 @@ pub fn javascript_pdf() -> Vec<u8> {
         "",
         Vec::new(),
     )
+}
+
+/// Wraps a stream body into an object.
+fn stream_object(dict: &str, data: &str) -> Vec<u8> {
+    let mut out = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+    out.extend_from_slice(data.as_bytes());
+    out.extend_from_slice(b"\nendstream");
+    out
+}
+
+/// A document with three pages that has everything the reader looks at: text to search and copy
+/// (page 1), a rotated page (page 2), an outline, links of several kinds, and an attachment.
+///
+/// Page 1 holds "Hello Partridge" as a title and three lines: "A needle in a haystack.",
+/// "Another NEEDLE here and quick" and "brown fox". Page 2 is turned a quarter turn. The outline
+/// is "Chapter 1" (page 1) with "Section 1.1" (page 2) inside, "External" (a web address, no page)
+/// and "Chapter 3" (page 3, reached with a GoTo action). The links on page 1 are, from the top:
+/// a web link, a `javascript:` link, a link to page 3, and a link that launches a program. The
+/// file has an embedded file and a file attachment annotation, which no code may ever open.
+pub fn features_pdf() -> Vec<u8> {
+    let page1 = "BT /F1 24 Tf 72 740 Td (Hello Partridge) Tj ET\n\
+BT /F1 12 Tf 72 400 Td 16 TL (A needle in a haystack.) Tj T* (Another NEEDLE here and quick) Tj T* (brown fox) Tj ET\n"
+        .to_string();
+    let specs = [
+        PageSpec {
+            width: 612,
+            height: 792,
+            content: Some(page1),
+            extra: "/Annots [15 0 R 16 0 R 17 0 R 18 0 R 19 0 R]".into(),
+        },
+        PageSpec {
+            width: 612,
+            height: 792,
+            content: Some("BT /F1 24 Tf 72 740 Td (Rotated page) Tj ET\n".to_string()),
+            extra: "/Rotate 90".into(),
+        },
+        PageSpec {
+            width: 612,
+            height: 792,
+            content: Some(demo_content(3, 612, 792)),
+            extra: String::new(),
+        },
+    ];
+    // Object numbers: 1 catalog, 2 tree, 3 font, 4..9 the pages and their content.
+    let extras: Vec<Vec<u8>> = vec![
+        // 10: outline root
+        b"<< /Type /Outlines /First 11 0 R /Last 14 0 R /Count 4 >>".to_vec(),
+        // 11: Chapter 1, with a child
+        b"<< /Title (Chapter 1) /Parent 10 0 R /Next 13 0 R /First 12 0 R /Last 12 0 R /Count 1 /Dest [4 0 R /Fit] >>".to_vec(),
+        // 12: Section 1.1 on page 2
+        b"<< /Title (Section 1.1) /Parent 11 0 R /Dest [6 0 R /Fit] >>".to_vec(),
+        // 13: an outline entry that opens a web address: it must not get a page
+        b"<< /Title (External) /Parent 10 0 R /Prev 11 0 R /Next 14 0 R /A << /S /URI /URI (https://example.com/outline) >> >>".to_vec(),
+        // 14: Chapter 3, reached with a GoTo action
+        b"<< /Title (Chapter 3) /Parent 10 0 R /Prev 13 0 R /A << /S /GoTo /D [8 0 R /Fit] >> >>".to_vec(),
+        // 15..18: links
+        b"<< /Type /Annot /Subtype /Link /Rect [72 700 172 720] /Border [0 0 0] /A << /S /URI /URI (https://example.com/page) >> >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Link /Rect [72 650 172 670] /Border [0 0 0] /A << /S /URI /URI (javascript:alert\\(1\\)) >> >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Link /Rect [72 600 172 620] /Border [0 0 0] /A << /S /GoTo /D [8 0 R /Fit] >> >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Link /Rect [72 550 172 570] /Border [0 0 0] /A << /S /Launch /F (calc.exe) >> >>".to_vec(),
+        // 19: a file attachment annotation
+        b"<< /Type /Annot /Subtype /FileAttachment /Rect [300 700 320 720] /FS 20 0 R /Name /Paperclip >>".to_vec(),
+        // 20: the file specification, 21: the embedded file
+        b"<< /Type /Filespec /F (evil.exe) /UF (evil.exe) /EF << /F 21 0 R >> >>".to_vec(),
+        stream_object("/Type /EmbeddedFile", "MZ not really a program"),
+    ];
+    build(
+        &specs,
+        "/Outlines 10 0 R /Names << /EmbeddedFiles << /Names [(evil.exe) 20 0 R] >> >>",
+        "",
+        extras,
+    )
+}
+
+/// A page-free helper: three plain pages and an outline built by `outline_objects`, which returns
+/// the objects from number 10 (the outline root) on. Page 1 is object 4, page 2 is 6, page 3 is 8.
+fn plain_pdf_with_outline(outline_objects: Vec<Vec<u8>>, annots: &str) -> Vec<u8> {
+    let specs: Vec<PageSpec> = (1..=3)
+        .map(|n| PageSpec {
+            width: 612,
+            height: 792,
+            content: Some(demo_content(n, 612, 792)),
+            extra: if n == 1 {
+                annots.to_string()
+            } else {
+                String::new()
+            },
+        })
+        .collect();
+    build(&specs, "/Outlines 10 0 R", "", outline_objects)
+}
+
+/// An outline that loops: entry 11 is its own next sibling and its own first child. A reader that
+/// walks it without keeping track of what it has seen never finishes.
+pub fn outline_loop_pdf() -> Vec<u8> {
+    plain_pdf_with_outline(
+        vec![
+            b"<< /Type /Outlines /First 11 0 R /Last 11 0 R /Count 1 >>".to_vec(),
+            b"<< /Title (Loop) /Parent 10 0 R /Next 11 0 R /First 11 0 R /Last 11 0 R /Count 1 /Dest [4 0 R /Fit] >>".to_vec(),
+        ],
+        "",
+    )
+}
+
+/// An outline with `count` entries on the top level.
+pub fn outline_wide_pdf(count: usize) -> Vec<u8> {
+    let mut objects = vec![format!(
+        "<< /Type /Outlines /First 11 0 R /Last {} 0 R /Count {count} >>",
+        10 + count
+    )
+    .into_bytes()];
+    for i in 0..count {
+        let id = 11 + i;
+        let mut dict = format!(
+            "<< /Title (Item {i}) /Parent 10 0 R /Dest [{} 0 R /Fit]",
+            4 + 2 * (i % 3)
+        );
+        if i > 0 {
+            let _ = write!(dict, " /Prev {} 0 R", id - 1);
+        }
+        if i + 1 < count {
+            let _ = write!(dict, " /Next {} 0 R", id + 1);
+        }
+        dict.push_str(" >>");
+        objects.push(dict.into_bytes());
+    }
+    plain_pdf_with_outline(objects, "")
+}
+
+/// An outline where every entry is the only child of the one before, `depth` levels deep.
+pub fn outline_deep_pdf(depth: usize) -> Vec<u8> {
+    let mut objects =
+        vec![
+            format!("<< /Type /Outlines /First 11 0 R /Last 11 0 R /Count {depth} >>").into_bytes(),
+        ];
+    for i in 0..depth {
+        let id = 11 + i;
+        let parent = if i == 0 { 10 } else { id - 1 };
+        let mut dict = format!("<< /Title (Level {i}) /Parent {parent} 0 R /Dest [4 0 R /Fit]");
+        if i + 1 < depth {
+            let _ = write!(dict, " /First {0} 0 R /Last {0} 0 R", id + 1);
+        }
+        dict.push_str(" >>");
+        objects.push(dict.into_bytes());
+    }
+    plain_pdf_with_outline(objects, "")
+}
+
+/// A first page with `count` web links, to test the limit on links per page.
+pub fn many_links_pdf(count: usize) -> Vec<u8> {
+    // Object 10 is a placeholder outline root; the link annotations follow from 11.
+    let mut objects = vec![b"<< /Type /Outlines /Count 0 >>".to_vec()];
+    let mut refs = String::new();
+    for i in 0..count {
+        let _ = write!(refs, "{} 0 R ", 11 + i);
+        objects.push(
+            format!(
+                "<< /Type /Annot /Subtype /Link /Rect [10 10 20 20] /Border [0 0 0] /A << /S /URI /URI (https://example.com/{i}) >> >>"
+            )
+            .into_bytes(),
+        );
+    }
+    plain_pdf_with_outline(objects, &format!("/Annots [{refs}]"))
 }
 
 /// Starts like a PDF but is not one: the structure is cut off in the middle of the catalog.
@@ -241,6 +409,7 @@ pub fn encrypted_pdf(user_password: &str, pages: usize) -> Vec<u8> {
             width: 612,
             height: 792,
             content: None,
+            extra: String::new(),
         })
         .collect();
     build(
@@ -364,6 +533,39 @@ mod tests {
         assert!(!text(&corrupt_pdf()).contains("%%EOF"));
         assert!(!text(&not_a_pdf()).starts_with("%PDF"));
         assert!(truncated_pdf().len() < simple_pdf(5).len());
+    }
+
+    #[test]
+    fn the_feature_documents_have_the_right_structure() {
+        for pdf in [
+            features_pdf(),
+            outline_loop_pdf(),
+            outline_wide_pdf(30),
+            outline_deep_pdf(30),
+            many_links_pdf(30),
+        ] {
+            let t = text(&pdf);
+            assert!(t.starts_with("%PDF-1.4"));
+            assert!(t.trim_end().ends_with("%%EOF"));
+            let start: usize = t
+                .rsplit("startxref\n")
+                .next()
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(pdf[start..].starts_with(b"xref"));
+        }
+        let t = text(&features_pdf());
+        assert!(t.contains("/Outlines 10 0 R"));
+        assert!(t.contains("/Subtype /FileAttachment"));
+        assert!(t.contains("/Rotate 90"));
+        assert_eq!(
+            text(&many_links_pdf(7)).matches("/Subtype /Link").count(),
+            7
+        );
     }
 
     #[test]
