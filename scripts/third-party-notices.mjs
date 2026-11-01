@@ -12,9 +12,11 @@
 // The npm packages are the production dependencies in package-lock.json (what Vite bundles into
 // dist/); their licence files are read from node_modules, so run `npm ci` first.
 
+import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isMain } from "./is-main.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -80,29 +82,116 @@ function splitTopLevel(text, operator) {
 
 const clean = (text) => text.replace(/\r\n/g, "\n").trim();
 
-/** Reads the `licenses` of cargo-about JSON files into [{ licenseId, text, packages: [label] }]. */
-export function rustEntries(reports) {
+/**
+ * A licence template that was never filled in. cargo-about writes the bare SPDX template when it
+ * finds no licence file for a crate, and a template is not a copyright notice: MIT and the BSD
+ * licences want the copyright notice reproduced. The Apache-2.0 appendix has its own
+ * "[yyyy] [name of copyright owner]" boilerplate, which is not matched here.
+ */
+export const PLACEHOLDER = /<year>|<owner>|<copyright holders?>|<name of author>|<organi[sz]ation>/i;
+
+export function hasPlaceholder(text) {
+  return PLACEHOLDER.test(text);
+}
+
+const sha256 = (data) => createHash("sha256").update(data).digest("hex");
+
+/** Puts the copyright holder where the template has its placeholders. */
+export function fillTemplate(text, holder) {
+  return text.replace(/<year>\s+<(?:copyright holders?|owner)>/gi, holder).replace(/<year>\s+<name of author>/gi, holder);
+}
+
+/**
+ * Reads the `licenses` of cargo-about JSON files into [{ licenseId, text, packages: [label] }].
+ *
+ * A licence text that still has a placeholder is filled only from `extra.copyright` (notices-extra.json),
+ * for the exact crate name and version. A crate without such an entry, an entry whose crate
+ * authors differ from the recorded ones, and an entry that no crate needs are all errors.
+ */
+export function rustEntries(reports, extra = { copyright: [] }) {
   const entries = [];
+  const problems = [];
+  const wanted = new Map((extra.copyright ?? []).map((c) => [`${c.name} ${c.version}`, c]));
+  const used = new Set();
+  const asPackage = (crate) => ({ label: `${crate.name} ${crate.version}`, url: crate.repository ?? "" });
   for (const report of reports) {
     for (const license of report.licenses) {
-      entries.push({
-        licenseId: license.id,
-        text: clean(license.text),
-        packages: license.used_by.map(({ crate }) => ({
-          label: `${crate.name} ${crate.version}`,
-          url: crate.repository ?? "",
-        })),
-      });
+      const text = clean(license.text);
+      if (!hasPlaceholder(text)) {
+        entries.push({ licenseId: license.id, text, packages: license.used_by.map(({ crate }) => asPackage(crate)) });
+        continue;
+      }
+      for (const { crate } of license.used_by) {
+        const key = `${crate.name} ${crate.version}`;
+        const entry = wanted.get(key);
+        if (!entry) {
+          problems.push(`${key} (${license.id}) has no copyright notice, only a licence template. Clarify it in about.toml or add it to notices-extra.json.`);
+          continue;
+        }
+        used.add(key);
+        if (entry.license !== license.id) {
+          problems.push(`${key}: notices-extra.json says ${entry.license} but the licence is ${license.id}`);
+          continue;
+        }
+        if (entry.basis === "authors") {
+          const have = JSON.stringify(crate.authors ?? []);
+          if (have !== JSON.stringify(entry.authors) || entry.holder !== entry.authors.join(", ") || entry.authors.length === 0) {
+            problems.push(`${key}: the authors in the crate (${have}) are not the ones in notices-extra.json`);
+            continue;
+          }
+        } else if (entry.basis !== "repository" || !entry.holder || !entry.source) {
+          problems.push(`${key}: an entry of notices-extra.json needs basis "authors", or basis "repository" with holder and source`);
+          continue;
+        }
+        const filled = fillTemplate(text, entry.holder);
+        if (hasPlaceholder(filled)) {
+          problems.push(`${key}: the licence template has a placeholder that notices-extra.json can not fill`);
+          continue;
+        }
+        entries.push({ licenseId: license.id, text: filled, packages: [asPackage(crate)] });
+      }
     }
   }
+  for (const key of wanted.keys()) {
+    if (!used.has(key)) problems.push(`notices-extra.json has an entry for ${key} that no crate needs (the version changed, or it is clarified now). Remove or update it.`);
+  }
+  if (problems.length > 0) throw new Error(problems.join("\n"));
   return entries;
+}
+
+/**
+ * The WebView2 loader that the Windows build links. The crate webview2-com-sys carries Microsoft's
+ * WebView2LoaderStatic.lib; its licence is not in the crate. The text is committed from the
+ * NuGet package of the exact version that these files come from, and the files are pinned by hash:
+ * a new crate version with a new SDK fails here until the licence is looked at again.
+ */
+export function webview2Section(extra, reports, readLicense = (file) => readFileSync(join(root, file), "utf8")) {
+  const w = extra.webview2;
+  if (!w) throw new Error("notices-extra.json has no webview2 entry.");
+  const crates = reports.flatMap((r) => r.licenses.flatMap((l) => l.used_by.map((u) => u.crate))).filter((c) => c.name === w.vendoredBy);
+  if (crates.length === 0) throw new Error(`${w.vendoredBy} is not in the dependencies, so the webview2 entry in notices-extra.json is not needed. Remove it.`);
+  const problems = [];
+  for (const crate of crates) {
+    for (const [file, hash] of Object.entries(w.vendoredFiles)) {
+      const path = join(dirname(crate.manifest_path), file);
+      if (!existsSync(path)) problems.push(`${crate.name} ${crate.version}: ${file} is not there`);
+      else if (sha256(readFileSync(path)) !== hash) {
+        problems.push(`${crate.name} ${crate.version}: ${file} is not the file of ${w.package} ${w.version}. Take the licence from the package this crate uses now.`);
+      }
+    }
+  }
+  const raw = readLicense(w.licenseFile).replace(/\r\n/g, "\n");
+  if (sha256(raw) !== w.licenseSha256) problems.push(`${w.licenseFile} does not have the hash in notices-extra.json`);
+  const text = clean(raw);
+  if (problems.length > 0) throw new Error(problems.join("\n"));
+  return { title: "WebView2 loader (Windows only)", package: w.package, version: w.version, crate: `${crates[0].name} ${crates[0].version}`, text };
 }
 
 /**
  * The production npm packages of a package-lock.json, with licence files read from node_modules.
  * Throws for a licence that is not allowed and for a package without a licence text.
  */
-export function npmEntries(lock, accepted, nodeModules) {
+export function npmEntries(lock, accepted, projectRoot) {
   const entries = [];
   const problems = [];
   for (const [path, info] of Object.entries(lock.packages ?? {})) {
@@ -114,7 +203,8 @@ export function npmEntries(lock, accepted, nodeModules) {
       problems.push(`${label} has the licence "${expression || "(none)"}", which is not on the allowlist in about.toml`);
       continue;
     }
-    const folder = join(nodeModules, name);
+    // The lock path itself, so a package nested below another one reads its own files.
+    const folder = join(projectRoot, path);
     const files = existsSync(folder)
       ? readdirSync(folder).filter((f) => /^(licen[cs]e|copying|notice)([-._].*)?$/i.test(f)).sort()
       : [];
@@ -165,7 +255,7 @@ function section(title, groups) {
 }
 
 /** The whole file. Same input, same text: no dates, no paths. */
-export function render({ rust, npm, fontLicense }) {
+export function render({ rust, npm, fontLicense, webview2 }) {
   const head = [
     "THIRD-PARTY NOTICES",
     "",
@@ -196,7 +286,22 @@ export function render({ rust, npm, fontLicense }) {
     "",
     "",
   ].join("\n");
-  return `${head}${section("Rust crates", group(rust))}${section("npm packages", group(npm))}${font}`.replace(/\n+$/, "\n");
+  const loader = [
+    RULE,
+    webview2.title,
+    RULE,
+    "",
+    `The Windows program links Microsoft's WebView2 loader (WebView2LoaderStatic.lib), which the`,
+    `crate ${webview2.crate} carries. The files are those of ${webview2.package} ${webview2.version}; this is the`,
+    "LICENSE.txt of that package:",
+    "",
+    webview2.text,
+    "",
+    "",
+  ].join("\n");
+  const text = `${head}${section("Rust crates", group(rust))}${section("npm packages", group(npm))}${loader}${font}`.replace(/\n+$/, "\n");
+  if (hasPlaceholder(text)) throw new Error("THIRD-PARTY-NOTICES would contain an unfilled licence template (<year>, <owner> or <copyright holders>).");
+  return text;
 }
 
 function parseArgs(argv) {
@@ -215,11 +320,13 @@ function parseArgs(argv) {
 function main() {
   const options = parseArgs(process.argv.slice(2));
   const accepted = acceptedLicenses(readFileSync(join(root, "about.toml"), "utf8"));
+  const extra = JSON.parse(readFileSync(join(root, "notices-extra.json"), "utf8"));
   const reports = options.rust.map((file) => JSON.parse(readFileSync(file, "utf8")));
   const lock = JSON.parse(readFileSync(join(root, "package-lock.json"), "utf8"));
   const text = render({
-    rust: rustEntries(reports),
-    npm: npmEntries(lock, accepted, join(root, "node_modules")),
+    rust: rustEntries(reports, extra),
+    npm: npmEntries(lock, accepted, root),
+    webview2: webview2Section(extra, reports),
     fontLicense: readFileSync(join(root, "public", "fonts", "Inter-LICENSE.txt"), "utf8"),
   });
   const target = join(root, options.out ?? "THIRD-PARTY-NOTICES");
@@ -236,7 +343,7 @@ function main() {
   }
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+if (isMain(import.meta.url)) {
   try {
     main();
   } catch (error) {
