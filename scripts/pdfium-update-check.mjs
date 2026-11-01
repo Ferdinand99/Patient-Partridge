@@ -78,7 +78,7 @@ export function issueBody(result, lock, crate) {
   }
   lines.push(
     "",
-    "To update, follow docs/pdfium-updates.md. Close this issue when the update is merged, or when you decide to skip this build; the workflow opens one issue per release and does not repeat it.",
+    "To update, follow docs/pdfium-updates.md. This is the only open issue about PDFium updates: when an even newer build appears, the workflow changes this issue and adds a comment. Close it as completed when the update is merged. To skip this build, close it as 'not planned'; a newer build then gets a new issue.",
   );
   return lines.join("\n");
 }

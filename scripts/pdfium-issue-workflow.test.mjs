@@ -30,19 +30,27 @@ afterEach(() => dirs.splice(0).forEach((d) => rmSync(d, { recursive: true, force
 const FAKE_GH = `#!/usr/bin/env bash
 echo "$*" >> "$GH_LOG"
 if [ "$1 $2" = "issue list" ]; then
-  state=open; jq=""
+  state=open; jq=""; author=""
   while [ $# -gt 0 ]; do
-    case "$1" in --state) state="$2";; --jq) jq="$2";; esac
+    case "$1" in --state) state="$2";; --jq) jq="$2";; --author) author="$2";; esac
     shift
   done
   if [ "$state" = open ]; then data="$FAKE_OPEN"; else data="$FAKE_CLOSED"; fi
+  # Like the real gh: with --author only that author's issues come back, without it all of them.
+  if [ -n "$author" ]; then data=$(printf '%s' "$data" | jq -c --arg a "$author" '[.[] | select(.author == $a)]'); fi
   if [ -n "$jq" ]; then printf '%s' "$data" | jq -r "$jq"; else printf '%s' "$data"; fi
+elif [ "$1 $2" = "issue comment" ]; then
+  printf 'COMMENT %s: %s\\n' "$3" "$5" >> "$GH_LOG"
 elif [ "$1 $2" = "issue edit" ] || [ "$1 $2" = "issue create" ]; then
   # Log the title and body arguments exactly as they arrive, one per line.
   if [ "$2" = edit ]; then shift 3; else shift 2; fi
   while [ $# -ge 2 ]; do printf 'ARG %s=%s\\n' "$1" "$2" >> "$GH_LOG"; shift 2; done
 fi
 `;
+
+/** An issue as the fake gh holds it: written by the workflow, closed as "not planned" unless told otherwise. */
+const BOT = "app/github-actions";
+const issue = (i) => ({ author: BOT, stateReason: "NOT_PLANNED", ...i });
 
 function run({ open = [], closed = [], title = "PDFium update available: chromium/8200", body = "body" }) {
   const dir = mkdtempSync(join(tmpdir(), "pdfium-issue-"));
@@ -59,8 +67,8 @@ function run({ open = [], closed = [], title = "PDFium update available: chromiu
     env: {
       PATH: `${dir}:${process.env.PATH}`,
       GH_LOG: log,
-      FAKE_OPEN: JSON.stringify(open),
-      FAKE_CLOSED: JSON.stringify(closed),
+      FAKE_OPEN: JSON.stringify(open.map(issue)),
+      FAKE_CLOSED: JSON.stringify(closed.map(issue)),
       TITLE: title,
       BODY: body,
     },
@@ -107,6 +115,45 @@ describe.skipIf(!tools)("the issue step", () => {
   it("opens an issue for a newer build after an older one was closed", () => {
     const r = run({ closed: [{ title: "PDFium update available: chromium/8150" }] });
     expect(r.log).toContain("issue create");
+  });
+  it("comments when it moves the open issue to a newer build, because a new title sends no notice", () => {
+    const r = run({ open: [{ number: 7, title: "PDFium update available: chromium/8150" }] });
+    expect(r.log).toContain("COMMENT 7: A newer PDFium build is out. This issue now names: PDFium update available: chromium/8200");
+  });
+  it("does not skip a build whose issue was closed as completed (a merged update with Closes #N)", () => {
+    // The issue may have been renamed to this build after the work on an older one began.
+    const r = run({ closed: [{ title: "PDFium update available: chromium/8200", stateReason: "COMPLETED" }] });
+    expect(r.log).toContain("issue create");
+  });
+
+  describe("only issues of the workflow count", () => {
+    it("asks for the workflow's own issues in every list it makes", () => {
+      const r = run({});
+      const lists = r.log.split("\n").filter((l) => l.startsWith("issue list"));
+      expect(lists).toHaveLength(2);
+      for (const l of lists) expect(l).toContain("--author app/github-actions");
+    });
+    it("is not switched off by a stranger who opened and closed an issue with the same title", () => {
+      const stranger = { author: "mallory", title: "PDFium update available: chromium/8200" };
+      const r = run({ closed: [stranger] });
+      expect(r.status).toBe(0);
+      expect(r.log).toContain("issue create");
+    });
+    it("does not edit or reopen a stranger's open issue with the prefix; it opens its own", () => {
+      const r = run({ open: [{ author: "mallory", number: 3, title: "PDFium update available: chromium/8100" }] });
+      expect(r.log).not.toContain("issue edit");
+      expect(r.log).toContain("issue create");
+    });
+    it("still updates its own open issue when a stranger's one is there too", () => {
+      const r = run({
+        open: [
+          { author: "mallory", number: 30, title: "PDFium update available: chromium/8199" },
+          { number: 7, title: "PDFium update available: chromium/8150" },
+        ],
+      });
+      expect(r.log).toContain("issue edit 7");
+      expect(r.log).not.toContain("issue edit 30");
+    });
   });
   it("treats a hostile title and body as data", () => {
     const evil = "x'; touch pwned; echo '$(touch pwned2) `touch pwned3` \"; @everyone";

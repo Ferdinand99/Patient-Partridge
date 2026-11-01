@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { isMain } from "./is-main.mjs";
 
@@ -11,7 +11,7 @@ afterEach(() => dirs.splice(0).forEach((d) => rmSync(d, { recursive: true, force
 describe("isMain", () => {
   it("is true for the same file", () => {
     const here = new URL("./is-main.mjs", import.meta.url);
-    expect(isMain(here.href, new URL(here).pathname.replace(/^\/([A-Za-z]:)/, "$1"))).toBe(true);
+    expect(isMain(here.href, fileURLToPath(here))).toBe(true);
   });
   it("is false for another file, no argument and a missing file", () => {
     const dir = mkdtempSync(join(tmpdir(), "ismain-"));

@@ -47,13 +47,20 @@ jobs:
       issues: write
     steps:
       # One open issue at a time. The title and body come from the previous job, which builds them
-      # only from a tag that matched chromium/<digits> and from numbers. They are still treated as
-      # data: they reach this script through environment variables only and are never put into the
-      # shell text, and nothing from the release itself is used.
-      #   - An open issue with the prefix exists: its title and body are replaced by the newest
-      #     build. No new issue.
-      #   - None is open, but an issue with exactly this title exists (closed): the owner decided to
-      #     skip this build. Nothing is opened.
+      # only from a tag that matched chromium/<digits>, from numbers and from a plain version
+      # number. They are still treated as data: they reach this script through environment
+      # variables only and are never put into the shell text, and nothing from the release itself
+      # is used.
+      # Only issues that this workflow wrote count (--author app/github-actions): the repository is
+      # public, anyone can open an issue with any title and close it, and that must not be able to
+      # switch off the alert for a build or to take over the issue.
+      #   - An open issue of the workflow with the prefix exists: its title and body are replaced by
+      #     the newest build, and a comment says so (a changed title sends no notification, a
+      #     comment does). No new issue.
+      #   - None is open, but an issue of the workflow with exactly this title was closed as "not
+      #     planned": the owner decided to skip this build. Nothing is opened. An issue that was
+      #     closed as completed (a merged update that says "Closes #N") does not skip anything:
+      #     the issue may have been renamed to a newer build after the work started.
       #   - Otherwise a new issue is opened.
       - name: Open or update the issue
         env:
@@ -62,7 +69,7 @@ jobs:
           TITLE: ${{ needs.check.outputs.title }}
           BODY: ${{ needs.check.outputs.body }}
         run: |
-          open_json=$(gh issue list --state open --limit 100 --search '"PDFium update available:" in:title' --json number,title)
+          open_json=$(gh issue list --state open --author app/github-actions --limit 100 --search '"PDFium update available:" in:title' --json number,title)
           open_number=$(printf '%s' "$open_json" | jq -r '[.[] | select(.title | startswith("PDFium update available:"))] | sort_by(.number) | reverse | .[0].number // empty')
           if [ -n "$open_number" ]; then
             open_title=$(printf '%s' "$open_json" | jq -r --argjson n "$open_number" '.[] | select(.number == $n) | .title')
@@ -70,11 +77,12 @@ jobs:
               echo "Issue #$open_number is open and already names this build."
             else
               gh issue edit "$open_number" --title "$TITLE" --body "$BODY"
+              gh issue comment "$open_number" --body "A newer PDFium build is out. This issue now names: $TITLE"
               echo "Updated issue #$open_number to: $TITLE"
             fi
             exit 0
           fi
-          skipped=$(gh issue list --state closed --limit 100 --search '"PDFium update available:" in:title' --json title --jq '[.[] | select(.title == env.TITLE)] | length')
+          skipped=$(gh issue list --state closed --author app/github-actions --limit 100 --search '"PDFium update available:" in:title' --json title,stateReason --jq '[.[] | select(.title == env.TITLE and .stateReason == "NOT_PLANNED")] | length')
           if [ "$skipped" != "0" ]; then
             echo "An issue for this build was closed: it is skipped. $TITLE"
             exit 0
