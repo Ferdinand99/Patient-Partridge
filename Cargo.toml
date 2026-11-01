@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/protocol",
+    "crates/engine",
+    "crates/engine-client",
+    "crates/testkit",
+    "src-tauri",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+repository = "https://github.com/Ferdinand99/Patient-Partridge"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "s"
+panic = "abort"
+strip = true

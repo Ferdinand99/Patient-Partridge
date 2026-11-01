@@ -1,0 +1,10 @@
+[package]
+name = "partridge-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Length-prefixed binary protocol between the Patient Partridge app and its PDF engine process"
+
+[dependencies]

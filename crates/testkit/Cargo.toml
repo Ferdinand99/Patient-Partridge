@@ -1,0 +1,15 @@
+[package]
+name = "partridge-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Test support for Patient Partridge: generates small PDF files and finds the PDFium folder"
+
+[dependencies]
+md-5 = "=0.11.0"
+
+[[bin]]
+name = "make-pdf"
+path = "src/bin/make-pdf.rs"

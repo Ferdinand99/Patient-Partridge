@@ -1,0 +1,32 @@
+{
+  "comment": "The PDFium build the engine is made for. scripts/fetch-pdfium.mjs downloads these files and refuses any whose SHA-256 differs. The 'pdfium_8125' feature of pdfium-render in crates/engine/Cargo.toml must match the release number. To update: pick a release of bblanchon/pdfium-binaries, move the pdfium-render feature, and replace the checksums (compute them yourself from the downloaded files).",
+  "repository": "bblanchon/pdfium-binaries",
+  "release": "chromium/8125",
+  "build": 8125,
+  "platforms": {
+    "linux-x64": {
+      "asset": "pdfium-linux-x64.tgz",
+      "sha256": "e1c3ce6e270cb5e0c20816b379ad9f2c1309972697c505f508de92bf5e7d6659"
+    },
+    "linux-arm64": {
+      "asset": "pdfium-linux-arm64.tgz",
+      "sha256": "8b8818f2ec57d1b213d952ca6d7f0ffeca9d0110487d0e20ad83ba918bc92efa"
+    },
+    "mac-arm64": {
+      "asset": "pdfium-mac-arm64.tgz",
+      "sha256": "4939bd935ac83ddc09a3a4f038bc43a19cea1660316a3667f26cb07a070e139d"
+    },
+    "mac-x64": {
+      "asset": "pdfium-mac-x64.tgz",
+      "sha256": "8a5193535b80c7215d8932f6647ae5097465b6dba2811602c21e120c2af112b0"
+    },
+    "win-x64": {
+      "asset": "pdfium-win-x64.tgz",
+      "sha256": "9a964261760cff52570aabf038ab346d3a5034dd8b30d0d5fe8861235d356b8b"
+    },
+    "win-arm64": {
+      "asset": "pdfium-win-arm64.tgz",
+      "sha256": "d394ba61991fb53f4d87f70988035f337d9e73f2bd2c3c1b966df8c43fcabb05"
+    }
+  }
+}
