@@ -21,7 +21,9 @@
     printed: 0,
     violations: [],
     title: "",
-    missingFiles: [],
+    // Files that are gone (the stand-in answers "io" for them), and one that needs a password.
+    missingFiles: ["/docs/gone.pdf", "/docs/gone2.pdf"],
+    protectedFiles: ["/docs/locked.pdf"],
     // The update side. `found` is what the next check returns (null: nothing new).
     update: {
       settings: { autoUpdate: true, method: "automatic", currentVersion: "0.1.0" },
@@ -124,6 +126,7 @@
 
   function openDoc(path) {
     if (state.missingFiles.includes(path)) throw { code: "io", message: "no such file" };
+    if (state.protectedFiles.includes(path)) throw { code: "password_required", message: "locked" };
     const pages = LINES[path];
     if (!pages) throw { code: "corrupt", message: "not a pdf" };
     const doc = nextDoc++;
@@ -269,6 +272,26 @@
       case "open_releases_page":
         state.update.releasesPageOpened += 1;
         return null;
+      // The list of tabs and its setting live in the session storage of the page, so that they
+      // outlive a reload the way the files of the real app outlive a restart. "e2e-reopen" is
+      // "off" when the setting is off.
+      case "get_reopen_tabs":
+        return sessionStorage.getItem("e2e-reopen") !== "off";
+      case "set_reopen_tabs":
+        sessionStorage.setItem("e2e-reopen", args.enabled ? "on" : "off");
+        if (!args.enabled) sessionStorage.removeItem("e2e-session");
+        return null;
+      case "save_session":
+        if (sessionStorage.getItem("e2e-reopen") !== "off") {
+          sessionStorage.setItem("e2e-session", JSON.stringify({ paths: args.paths, active: args.active, failed: args.failed }));
+        }
+        return null;
+      case "take_session": {
+        const stored = sessionStorage.getItem("e2e-session");
+        return sessionStorage.getItem("e2e-reopen") === "off" || !stored
+          ? { paths: [], active: null }
+          : JSON.parse(stored);
+      }
       case "set_position":
       case "clear_positions":
       case "frontend_error":

@@ -13,6 +13,15 @@ export interface SavedPosition {
   zoom: number | null;
 }
 
+/** The tabs of the last run: the paths in tab order, and which one was in view. */
+export interface SavedTabs {
+  paths: string[];
+  /** Index into `paths` of the tab that was in view, or null. */
+  active: number | null;
+  /** The paths (a part of `paths`) that could not be reached at the last start. */
+  failed?: string[];
+}
+
 export interface OpenedDocument {
   doc: number;
   pages: PageSizePt[];
@@ -140,7 +149,27 @@ export const api = {
     });
   },
 
-  /** Forgets every remembered position. */
+  /** Whether the tabs of the last run are reopened at the start. */
+  getReopenTabs(): Promise<boolean> {
+    return invoke<boolean>("get_reopen_tabs");
+  },
+
+  /** Turns "Reopen tabs at start" on or off. Off deletes the list of tabs at once. */
+  async setReopenTabs(enabled: boolean): Promise<void> {
+    await invoke<void>("set_reopen_tabs", { enabled });
+  },
+
+  /** Remembers which tabs are open (paths only), for the next start. Does nothing while the setting is off. */
+  async saveSession(paths: string[], active: number | null, failed: string[]): Promise<void> {
+    await invoke<void>("save_session", { paths, active, failed });
+  },
+
+  /** The tabs the last run left, once. Empty while the setting is off. */
+  takeSession(): Promise<SavedTabs> {
+    return invoke<SavedTabs>("take_session");
+  },
+
+  /** Forgets every remembered position, and the list of tabs with them. */
   async clearPositions(): Promise<void> {
     await invoke<void>("clear_positions");
   },

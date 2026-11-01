@@ -101,6 +101,11 @@ try {
     Log "--- case '$tag': $pdf ---"
     $report = Join-Path $reportFolder "report-$tag.json"
     Remove-Item -LiteralPath $report -Force -ErrorAction SilentlyContinue
+    # Every case starts as a first run: the app reopens the tabs of the last session, and the file of
+    # the case before would be drawn instead of the file of this case.
+    foreach ($base in @($env:APPDATA, $env:LOCALAPPDATA)) {
+      Remove-Item -LiteralPath (Join-Path $base "com.ferdinand99.patientpartridge\session.json") -Force -ErrorAction SilentlyContinue
+    }
     $env:PARTRIDGE_MEASURE_REPORT = $report
     $clock = [Diagnostics.Stopwatch]::StartNew()
     $app = Start-Process -FilePath $exe -ArgumentList ('"' + $pdf + '"') -PassThru

@@ -322,34 +322,60 @@ struct StoredSettings {
     version: u32,
     #[serde(rename = "autoUpdate")]
     auto_update: bool,
+    /// Whether the tabs of the last run are reopened at the start. Files from before this setting
+    /// existed do not have it, and mean "on".
+    #[serde(rename = "reopenTabs", default = "on")]
+    reopen_tabs: bool,
 }
 
-/// The one setting: whether the app checks for updates by itself. On unless the user turned it
-/// off. Kept in a small file in the app's data folder. A missing or damaged file means "on".
+fn on() -> bool {
+    true
+}
+
+/// The settings: whether the app checks for updates by itself, and whether it reopens the tabs of
+/// the last run. Both are on unless the user turned them off. Kept in a small file in the app's data
+/// folder. A missing or damaged file means "on".
 pub struct Settings {
     file: Option<PathBuf>,
     auto_update: bool,
+    reopen_tabs: bool,
 }
 
 impl Settings {
     pub fn load(file: Option<PathBuf>) -> Settings {
-        let auto_update = file
+        let stored = file
             .as_deref()
             .and_then(read_small_file)
             .and_then(|bytes| serde_json::from_slice::<StoredSettings>(&bytes).ok())
-            .filter(|s| s.version == 1)
-            .map(|s| s.auto_update)
-            .unwrap_or(true);
-        Settings { file, auto_update }
+            .filter(|s| s.version == 1);
+        Settings {
+            file,
+            auto_update: stored.as_ref().map(|s| s.auto_update).unwrap_or(true),
+            reopen_tabs: stored.as_ref().map(|s| s.reopen_tabs).unwrap_or(true),
+        }
     }
 
     pub fn auto_update(&self) -> bool {
         self.auto_update
     }
 
+    pub fn reopen_tabs(&self) -> bool {
+        self.reopen_tabs
+    }
+
     /// Changes the setting. The change holds for this run even when the file cannot be written.
     pub fn set_auto_update(&mut self, on: bool) -> io::Result<()> {
         self.auto_update = on;
+        self.write()
+    }
+
+    /// Changes the setting. The change holds for this run even when the file cannot be written.
+    pub fn set_reopen_tabs(&mut self, on: bool) -> io::Result<()> {
+        self.reopen_tabs = on;
+        self.write()
+    }
+
+    fn write(&self) -> io::Result<()> {
         let Some(file) = &self.file else {
             return Ok(());
         };
@@ -357,13 +383,14 @@ impl Settings {
             file,
             &StoredSettings {
                 version: 1,
-                auto_update: on,
+                auto_update: self.auto_update,
+                reopen_tabs: self.reopen_tabs,
             },
         )
     }
 }
 
-fn read_small_file(file: &Path) -> Option<Vec<u8>> {
+pub(crate) fn read_small_file(file: &Path) -> Option<Vec<u8>> {
     let meta = std::fs::metadata(file).ok()?;
     if meta.len() > MAX_SMALL_FILE {
         return None;
@@ -371,7 +398,7 @@ fn read_small_file(file: &Path) -> Option<Vec<u8>> {
     std::fs::read(file).ok()
 }
 
-fn write_json<T: Serialize>(file: &Path, value: &T) -> io::Result<()> {
+pub(crate) fn write_json<T: Serialize>(file: &Path, value: &T) -> io::Result<()> {
     if let Some(dir) = file.parent() {
         create_private_dir(dir)?;
     }
@@ -630,6 +657,21 @@ impl UpdateState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .auto_update()
+    }
+
+    /// Whether the tabs of this run are reopened at the next start.
+    pub fn reopen_tabs(&self) -> bool {
+        self.settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reopen_tabs()
+    }
+
+    pub fn set_reopen_tabs(&self, on: bool) -> io::Result<()> {
+        self.settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_reopen_tabs(on)
     }
 }
 
@@ -1448,6 +1490,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn reopening_tabs_is_on_until_turned_off_and_the_settings_keep_apart() {
+        let dir = temp_dir("settings-tabs");
+        let file = dir.join("settings.json");
+        assert!(
+            Settings::load(Some(file.clone())).reopen_tabs(),
+            "default is on"
+        );
+        assert!(Settings::load(None).reopen_tabs());
+
+        let mut s = Settings::load(Some(file.clone()));
+        s.set_reopen_tabs(false).unwrap();
+        s.set_auto_update(false).unwrap();
+        let back = Settings::load(Some(file.clone()));
+        assert!(!back.reopen_tabs() && !back.auto_update(), "kept on disk");
+        s.set_auto_update(true).unwrap();
+        let back = Settings::load(Some(file.clone()));
+        assert!(!back.reopen_tabs() && back.auto_update());
+        s.set_reopen_tabs(true).unwrap();
+        assert!(Settings::load(Some(file.clone())).reopen_tabs());
+
+        // A file from before the setting existed means "on" for it and keeps the other choice.
+        std::fs::write(&file, br#"{"version":1,"autoUpdate":false}"#).unwrap();
+        let old = Settings::load(Some(file));
+        assert!(old.reopen_tabs() && !old.auto_update());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

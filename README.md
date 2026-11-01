@@ -20,6 +20,7 @@ Patient Partridge is part of the Hedgerow family of apps, next to [Nimble Newt](
 - Zoom in and out, or fit the page to the window width. Ctrl with the mouse wheel zooms too.
 - Move with the mouse wheel, the arrow keys, Page Up and Page Down, Space, Home and End, or jump to a page number (Ctrl+G).
 - Patient Partridge remembers where you stopped in each file and puts you back there when you open it again. The place (page, how far down, zoom) is kept in a small file on your computer, together with the path of the file, for the last 500 files. Nothing is sent anywhere. "Forget remembered positions" in the settings menu (the three dots) empties it.
+- The tabs you had open come back the next time you start the app, in the same order with the same tab in front, each at its remembered place. Only the file paths are kept, in the same folder as the positions. A file that has gone is skipped with one short notice, and a password-protected file stays closed until you open it. "Reopen tabs at start" in the settings menu turns this off; that, and "Forget remembered positions", delete the list.
 - The look follows the system's light or dark setting. The settings menu has Auto, Light and Dark. The pages themselves stay white, like paper.
 - Password-protected files ask for the password. A damaged file, or a file that is not a PDF, gives a clear message instead of a crash.
 - The installers register Patient Partridge as a viewer for PDF files, so it appears under "Open with". It does not take over as the default reader by itself.

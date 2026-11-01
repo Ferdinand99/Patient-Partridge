@@ -106,6 +106,10 @@ function make(
     /** Keeps the real delay before a link question can be answered. Tests wait for it otherwise. */
     realLinkDelay?: boolean;
     viewLimits?: { preloadChars?: number; copyChars?: number; keptChars?: number };
+    /** What the app process says about the setting "Reopen tabs at start". On by default. */
+    reopenTabs?: boolean;
+    /** How long a tab of the last session may take to open at the start. */
+    sessionOpenLimitMs?: number;
   } = {},
 ) {
   let nextDoc = 1;
@@ -120,6 +124,9 @@ function make(
     close: vi.fn((_doc: number) => Promise.resolve()),
     setPosition: vi.fn((_path: string, _position: SavedPosition) => Promise.resolve()),
     clearPositions: vi.fn(() => Promise.resolve()),
+    getReopenTabs: vi.fn(() => Promise.resolve(options.reopenTabs ?? true)),
+    setReopenTabs: vi.fn((_enabled: boolean) => Promise.resolve()),
+    saveSession: vi.fn((_paths: string[], _active: number | null, _failed: string[]) => Promise.resolve()),
     getOutline: vi.fn((_doc: number) =>
       Promise.resolve([
         { depth: 0, page: 0, title: "Start" },
@@ -158,6 +165,7 @@ function make(
     thumbSettleMs: 5,
     findDebounceMs: 5,
     linkAnswerDelayMs: options.realLinkDelay ? undefined : 0,
+    sessionOpenLimitMs: options.sessionOpenLimitMs,
     viewLimits: options.viewLimits,
     print: {
       encode: vi.fn(() => Promise.resolve(new Blob(["jpeg"]))),
@@ -1576,5 +1584,355 @@ describe("App: the file dialog says when it leaves files out", () => {
     await app.openDialog();
     await flush();
     expect(notice()).toBeNull();
+  });
+});
+
+describe("App: reopening the tabs of the last session", () => {
+  const saved = { paths: ["/docs/a.pdf", "/docs/b.pdf", "/docs/c.pdf"], active: 1 };
+
+  it("opens the tabs in their old order with the same one in view, each at its remembered place", async () => {
+    const { app, api } = make();
+    const places: Record<string, SavedPosition> = {
+      "/docs/a.pdf": { page: 1, offset: 0.25, zoom: null },
+      "/docs/b.pdf": { page: 2, offset: 0, zoom: null },
+      "/docs/c.pdf": { page: 0, offset: 0.5, zoom: 2 },
+    };
+    api.open.mockImplementation((path: string) =>
+      // The slowest file is the first one: the order of the tabs must not follow the order of arrival.
+      new Promise((resolve) =>
+        setTimeout(() => resolve(opened(path.charCodeAt(6), 3, path.split("/").pop(), places[path])), path === "/docs/a.pdf" ? 20 : 0),
+      ),
+    );
+    await app.start({ session: saved });
+    await flush();
+    expect(tabTitles()).toEqual(["a.pdf", "b.pdf", "c.pdf"]);
+    expect(selectedTab()).toBe("b.pdf");
+    expect(app.currentView?.currentPageIndex).toBe(2);
+    click(tab("a.pdf"));
+    await flush();
+    expect(app.currentView?.currentPageIndex).toBe(1);
+    expect(notice()).toBeNull();
+  });
+
+  it("opens the tab that was in view first and the others one after the other behind it", async () => {
+    const { app, api } = make();
+    let running = 0;
+    let mostAtOnce = 0;
+    api.open.mockImplementation(async (path: string) => {
+      running++;
+      mostAtOnce = Math.max(mostAtOnce, running);
+      await new Promise((r) => setTimeout(r, 2));
+      running--;
+      return opened(path.charCodeAt(6), 3, path.split("/").pop());
+    });
+    await app.start({ session: saved });
+    expect(api.open.mock.calls.map(([path]) => path)).toEqual(["/docs/b.pdf", "/docs/a.pdf", "/docs/c.pdf"]);
+    expect(mostAtOnce).toBe(1);
+  });
+
+  it("opens the files named at the start too and gives them the focus", async () => {
+    const { app } = make();
+    await app.start({ session: saved, given: ["/docs/new.pdf"] });
+    await flush();
+    expect(tabTitles()).toEqual(["a.pdf", "b.pdf", "c.pdf", "new.pdf"]);
+    expect(selectedTab()).toBe("new.pdf");
+  });
+
+  it("shows a named file that is also in the list instead of opening it twice", async () => {
+    const { app, api } = make();
+    await app.start({ session: saved, given: ["/docs/c.pdf"] });
+    await flush();
+    expect(tabTitles()).toEqual(["a.pdf", "b.pdf", "c.pdf"]);
+    expect(selectedTab()).toBe("c.pdf");
+    expect(api.open.mock.calls.filter(([path]) => path === "/docs/c.pdf")).toHaveLength(1);
+  });
+
+  it("opens nothing, and says nothing, when there is nothing to reopen", async () => {
+    const { app, api } = make();
+    await app.start({ session: { paths: [], active: null } });
+    await app.start({});
+    expect(api.open).not.toHaveBeenCalled();
+    expect(notice()).toBeNull();
+    expect(q("#empty").hidden).toBe(false);
+  });
+
+  it("skips files that are gone with one calm notice that counts them, and the start is not held back", async () => {
+    const { app, api } = make();
+    api.open.mockImplementation((path: string) =>
+      path === "/docs/b.pdf" || path === "/docs/c.pdf"
+        ? Promise.reject({ code: "io", message: "no such file" })
+        : Promise.resolve(opened(1, 3, path.split("/").pop())),
+    );
+    await app.start({ session: { paths: ["/docs/a.pdf", "/docs/b.pdf", "/docs/c.pdf"], active: 0 } });
+    await flush();
+    expect(tabTitles()).toEqual(["a.pdf"]);
+    expect(document.querySelectorAll(".notice")).toHaveLength(1);
+    expect(notice()?.textContent).toContain("2 tabs from your last session could not be opened");
+    // One OK is the only thing to press: no question per file.
+    expect(document.querySelectorAll(".notice button")).toHaveLength(1);
+    click(button("OK"));
+    expect(notice()).toBeNull();
+  });
+
+  it("says '1 tab' for one file and tells the same way for any other reason a file cannot be opened", async () => {
+    const { app, api } = make();
+    api.open.mockImplementation((path: string) =>
+      path === "/docs/b.pdf"
+        ? Promise.reject({ code: "corrupt", message: "damaged" })
+        : Promise.resolve(opened(path.charCodeAt(6), 3, path.split("/").pop())),
+    );
+    await app.start({ session: saved });
+    await flush();
+    expect(notice()?.textContent).toContain("1 tab from your last session could not be opened");
+    expect(tabTitles()).toEqual(["a.pdf", "c.pdf"]);
+  });
+
+  it("never asks for a password at the start: the file stays closed and the notice says so", async () => {
+    const { app, api } = make();
+    api.open.mockImplementation((path: string) =>
+      path === "/docs/a.pdf"
+        ? Promise.reject({ code: "password_required", message: "locked" })
+        : Promise.resolve(opened(path.charCodeAt(6), 3, path.split("/").pop())),
+    );
+    await app.start({ session: saved });
+    await flush();
+    expect(document.querySelector('.notice input[type="password"]')).toBeNull();
+    expect(tabTitles()).toEqual(["b.pdf", "c.pdf"]);
+    expect(notice()?.textContent).toContain("1 password protected file was left closed");
+    expect(notice()?.textContent).not.toContain("could not be opened");
+    // The same file asks for its password as before when the reader opens it themselves.
+    click(button("OK"));
+    const done = app.openPath("/docs/a.pdf");
+    await flush();
+    expect(notice()?.textContent).toContain("needs a password");
+    click(button("Cancel"));
+    await done;
+  });
+
+  it("keeps to the document limit: it opens at most 16 tabs, counting the files named at the start", async () => {
+    const { app, api } = make();
+    const many = Array.from({ length: 20 }, (_, i) => `/docs/f${i}.pdf`);
+    await app.start({ session: { paths: many, active: 19 }, given: ["/docs/x.pdf", "/docs/y.pdf"] });
+    await flush();
+    expect(app.tabCount).toBe(16);
+    expect(api.open).toHaveBeenCalledTimes(16);
+    // The one that was in view is among them, and the notice says that some were left out.
+    expect(api.open.mock.calls.map(([path]) => path)).toContain("/docs/f19.pdf");
+    expect(notice()?.textContent).toContain("6 tabs from your last session could not be opened");
+    expect(notice()?.textContent).toContain("at most 16");
+  });
+
+  it("still brings back every file after an update, also with the setting off and a list that disagrees", async () => {
+    const { app, api } = make({ reopenTabs: false });
+    const restored = Array.from({ length: 12 }, (_, i) => `/docs/r${i}.pdf`);
+    await app.start({ restored, session: saved });
+    await flush();
+    expect(app.tabCount).toBe(12);
+    expect(api.open.mock.calls.map(([path]) => path)).not.toContain("/docs/a.pdf");
+    expect(selectedTab()).toBe("r0.pdf");
+  });
+});
+
+describe("App: remembering the tabs", () => {
+  const lastSaved = (api: ReturnType<typeof make>["api"]) => api.saveSession.mock.calls.at(-1)?.slice(0, 2);
+
+  it("writes the paths in tab order and the tab in view whenever a tab is opened, closed or brought to the front", async () => {
+    const { app, api } = make();
+    await app.openPath("/docs/a.pdf");
+    expect(lastSaved(api)).toEqual([["/docs/a.pdf"], 0]);
+    await app.openPath("/docs/b.pdf");
+    expect(lastSaved(api)).toEqual([["/docs/a.pdf", "/docs/b.pdf"], 1]);
+    click(tab("a.pdf"));
+    expect(lastSaved(api)).toEqual([["/docs/a.pdf", "/docs/b.pdf"], 0]);
+    app.closeTab(Number((tab("a.pdf").closest(".tab") as HTMLElement).dataset.id));
+    expect(lastSaved(api)).toEqual([["/docs/b.pdf"], 0]);
+    app.closeTab(Number((tab("b.pdf").closest(".tab") as HTMLElement).dataset.id));
+    expect(lastSaved(api)).toEqual([[], null]);
+  });
+
+  it("sends the same list only once and nothing but paths", async () => {
+    const { app, api } = make();
+    await app.openPath("/docs/a.pdf");
+    const before = api.saveSession.mock.calls.length;
+    click(tab("a.pdf"));
+    app.currentView?.goToPage(2);
+    await flush();
+    expect(api.saveSession.mock.calls.length).toBe(before);
+    for (const call of api.saveSession.mock.calls) {
+      expect(call).toHaveLength(3);
+      expect(JSON.stringify(call)).not.toContain("Hello");
+    }
+  });
+
+  it("writes nothing while the tabs of the last session are still coming back, then the list as it is", async () => {
+    const { app, api } = make();
+    await app.start({ session: { paths: ["/docs/a.pdf", "/docs/b.pdf", "/docs/c.pdf"], active: 2 } });
+    // One write at the end of the start, not one for each tab and never a list that is still short.
+    expect(api.saveSession.mock.calls).toEqual([[["/docs/a.pdf", "/docs/b.pdf", "/docs/c.pdf"], 2, []]]);
+  });
+
+  it("is left alone by the update path: a restore is not a reason to forget tabs either", async () => {
+    const { app, api } = make();
+    await app.start({ restored: ["/docs/a.pdf", "/docs/b.pdf"] });
+    expect(lastSaved(api)).toEqual([["/docs/a.pdf", "/docs/b.pdf"], 0]);
+  });
+
+  it("keeps no list while the setting is off", async () => {
+    const { app, api } = make({ reopenTabs: false });
+    await flush();
+    await app.start({});
+    await app.openPath("/docs/a.pdf");
+    await app.openPath("/docs/b.pdf");
+    click(tab("a.pdf"));
+    app.closeTab(Number((tab("b.pdf").closest(".tab") as HTMLElement).dataset.id));
+    expect(api.saveSession).not.toHaveBeenCalled();
+    expect(q("#reopen-tabs").getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("shows the setting, turns it off at once, and writes the list again when it is turned on", async () => {
+    const { app, api } = make();
+    await app.openPath("/docs/a.pdf");
+    await flush();
+    const toggle = q<HTMLButtonElement>("#reopen-tabs");
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+    api.saveSession.mockClear();
+
+    click(toggle);
+    await flush();
+    expect(api.setReopenTabs).toHaveBeenLastCalledWith(false);
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    await app.openPath("/docs/b.pdf");
+    expect(api.saveSession).not.toHaveBeenCalled();
+
+    click(toggle);
+    await flush();
+    expect(api.setReopenTabs).toHaveBeenLastCalledWith(true);
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+    expect(lastSaved(api)).toEqual([["/docs/a.pdf", "/docs/b.pdf"], 1]);
+  });
+
+  it("says so when the setting could not be saved", async () => {
+    const { app, api } = make();
+    await app.openPath("/docs/a.pdf");
+    api.setReopenTabs.mockRejectedValueOnce({ code: "internal", message: "disk full" });
+    click(q("#reopen-tabs"));
+    await flush();
+    expect(notice()?.textContent).toContain("The setting was not saved");
+    // For this run it is as the reader chose.
+    expect(q("#reopen-tabs").getAttribute("aria-checked")).toBe("false");
+    click(button("OK"));
+  });
+
+  it("does not write the list again after the positions were forgotten, until the tabs change", async () => {
+    const { app, api } = make();
+    await app.openPath("/docs/a.pdf");
+    await flush();
+    const before = api.saveSession.mock.calls.length;
+    click(q("#forget-positions"));
+    await flush();
+    click(button("Forget positions"));
+    await flush();
+    expect(api.clearPositions).toHaveBeenCalledTimes(1);
+    expect(api.saveSession.mock.calls.length).toBe(before);
+    await app.openPath("/docs/b.pdf");
+    expect(lastSaved(api)).toEqual([["/docs/a.pdf", "/docs/b.pdf"], 1]);
+  });
+});
+
+describe("App: a start that goes wrong", () => {
+  const saved = { paths: ["/docs/a.pdf", "/docs/b.pdf", "/docs/c.pdf"], active: 0 };
+  const name = (path: string) => path.split("/").pop();
+
+  it("opens the file named at the start at once, also when the tab in view never answers", async () => {
+    const { app, api } = make({ sessionOpenLimitMs: 150 });
+    let late: (doc: OpenedDocument) => void = () => undefined;
+    api.open.mockImplementation((path: string) =>
+      path === "/docs/a.pdf"
+        ? new Promise<OpenedDocument>((resolve) => (late = resolve))
+        : Promise.resolve(opened(path.charCodeAt(6), 3, name(path))),
+    );
+    const starting = app.start({ session: saved, given: ["/docs/new.pdf"] });
+    await flush();
+    // The limit has not passed yet: the named file is open and in view, and the list is held back.
+    expect(tabTitles()).toEqual(["new.pdf"]);
+    expect(selectedTab()).toBe("new.pdf");
+    expect(api.saveSession).not.toHaveBeenCalled();
+
+    await starting;
+    // After the limit: the others came, the list was written, and one notice counts the lost tab.
+    expect(tabTitles()).toEqual(["b.pdf", "c.pdf", "new.pdf"]);
+    expect(selectedTab()).toBe("new.pdf");
+    expect(api.saveSession).toHaveBeenCalled();
+    expect(document.querySelectorAll(".notice")).toHaveLength(1);
+    expect(notice()?.textContent).toContain("1 tab from your last session could not be opened");
+
+    // The file answers at last: its document is closed and no tab appears.
+    late(opened(77, 3, "a.pdf"));
+    await flush();
+    expect(api.close).toHaveBeenCalledWith(77);
+    expect(tabTitles()).toEqual(["b.pdf", "c.pdf", "new.pdf"]);
+    expect(selectedTab()).toBe("new.pdf");
+  });
+
+  it("writes the list as soon as the limit has passed, while other tabs are still being opened", async () => {
+    const { app, api } = make({ sessionOpenLimitMs: 20 });
+    api.open.mockImplementation((path: string) =>
+      path === "/docs/a.pdf"
+        ? new Promise<OpenedDocument>(() => undefined)
+        : new Promise((resolve) => setTimeout(() => resolve(opened(path.charCodeAt(6), 3, name(path))), 60)),
+    );
+    const starting = app.start({ session: saved });
+    expect(api.saveSession).not.toHaveBeenCalled();
+    await new Promise((r) => setTimeout(r, 40));
+    expect(api.saveSession).toHaveBeenCalled();
+    await starting;
+  });
+
+  it("does not open a zero-page file with a dialog of its own: it counts in the one notice", async () => {
+    const { app, api } = make();
+    api.open.mockImplementation((path: string) =>
+      Promise.resolve(opened(path.charCodeAt(6), path === "/docs/a.pdf" ? 3 : 0, name(path))),
+    );
+    await app.start({ session: saved });
+    await flush();
+    expect(tabTitles()).toEqual(["a.pdf"]);
+    expect(document.querySelectorAll(".notice")).toHaveLength(1);
+    expect(notice()?.textContent).toContain("2 tabs from your last session could not be opened");
+    expect(api.close).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps a file that could not be reached in the list for one more start, and forgets it after that", async () => {
+    const down = (path: string) =>
+      path === "/docs/b.pdf"
+        ? Promise.reject({ code: "io", message: "no route" })
+        : path === "/docs/c.pdf"
+          ? Promise.reject({ code: "corrupt", message: "damaged" })
+          : Promise.resolve(opened(path.charCodeAt(6), 3, name(path)));
+
+    const first = make();
+    first.api.open.mockImplementation(down);
+    await first.app.start({ session: saved });
+    await flush();
+    // The unreachable file stays, marked; the damaged one does not.
+    expect(first.api.saveSession.mock.calls.at(-1)).toEqual([["/docs/a.pdf", "/docs/b.pdf"], 0, ["/docs/b.pdf"]]);
+    click(button("OK"));
+    // Later changes keep it too, but not once the file is open.
+    await first.app.openPath("/docs/d.pdf");
+    expect(first.api.saveSession.mock.calls.at(-1)).toEqual([
+      ["/docs/a.pdf", "/docs/d.pdf", "/docs/b.pdf"],
+      1,
+      ["/docs/b.pdf"],
+    ]);
+
+    // The next start: it fails again, and now it is forgotten.
+    document.body.replaceChildren();
+    installPage();
+    const second = make();
+    second.api.open.mockImplementation(down);
+    await second.app.start({
+      session: { paths: ["/docs/a.pdf", "/docs/b.pdf"], active: 0, failed: ["/docs/b.pdf"] },
+    });
+    await flush();
+    expect(second.api.saveSession.mock.calls.at(-1)).toEqual([["/docs/a.pdf"], 0, []]);
   });
 });
