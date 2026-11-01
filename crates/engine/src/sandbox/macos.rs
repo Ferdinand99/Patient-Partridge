@@ -56,10 +56,22 @@ fn verify() -> Result<(), String> {
             libc::close(fd);
             return Err("a file could still be opened".to_string());
         }
-        let s = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+        // Making a socket is not governed by the profile; using it is. Binding one must fail.
+        let s = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
         if s >= 0 {
+            let mut address: libc::sockaddr_in = std::mem::zeroed();
+            address.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+            address.sin_family = libc::AF_INET as libc::sa_family_t;
+            address.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
+            let bound = libc::bind(
+                s,
+                (&address as *const libc::sockaddr_in).cast(),
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            );
             libc::close(s);
-            return Err("a socket could still be created".to_string());
+            if bound == 0 {
+                return Err("a socket could still be bound".to_string());
+            }
         }
     }
     Ok(())

@@ -104,6 +104,21 @@ const SE_GROUP_USE_FOR_DENY_ONLY: u32 = 0x0000_0010;
 /// Memory the engine may use when the caller names no limit: 3 GiB, as on the other systems.
 const DEFAULT_MEMORY_LIMIT: u64 = 3 * 1024 * 1024 * 1024;
 
+/// Switches for finding out which restriction stops an engine from starting on a system (debug
+/// builds only): `PARTRIDGE_TEST_WINDOWS_SKIP` holds a comma separated list of the parts to leave
+/// out.
+#[cfg(debug_assertions)]
+fn skip(part: &str) -> bool {
+    std::env::var("PARTRIDGE_TEST_WINDOWS_SKIP")
+        .map(|v| v.split(',').any(|p| p == part))
+        .unwrap_or(false)
+}
+
+#[cfg(not(debug_assertions))]
+fn skip(_part: &str) -> bool {
+    false
+}
+
 /// A handle that is closed when it goes out of scope.
 struct Owned(HANDLE);
 
@@ -339,8 +354,16 @@ fn make_tokens() -> io::Result<(Owned, Owned)> {
                 disable.as_ptr(),
                 0,
                 null(),
-                restricting.len() as u32,
-                restricting.as_ptr(),
+                if skip("restricting") {
+                    0
+                } else {
+                    restricting.len() as u32
+                },
+                if skip("restricting") {
+                    null()
+                } else {
+                    restricting.as_ptr()
+                },
                 &mut restricted,
             ),
             "CreateRestrictedToken",
@@ -402,6 +425,9 @@ fn make_job(memory_limit: u64) -> io::Result<Owned> {
                 | JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS
                 | JOB_OBJECT_UILIMIT_WRITECLIPBOARD,
         };
+        if skip("ui") {
+            return Ok(job);
+        }
         check(
             SetInformationJobObject(
                 job.raw(),
@@ -552,7 +578,18 @@ pub(super) fn spawn(request: &SpawnRequest<'_>) -> io::Result<SpawnedEngine> {
 
     // The attribute list: handles to inherit, mitigation policies, no child processes.
     let mut mitigations: u64 = MITIGATIONS;
-    let mut child_policy: u32 = PROCESS_CREATION_CHILD_PROCESS_RESTRICTED;
+    if skip("win32k") {
+        mitigations &= !WIN32K_SYSTEM_CALL_DISABLE_ALWAYS_ON;
+    }
+    if skip("mitigations") {
+        mitigations = 0;
+    }
+    let mut child_policy: u32 = if skip("child") {
+        // PROCESS_CREATION_CHILD_PROCESS_OVERRIDE
+        0x02
+    } else {
+        PROCESS_CREATION_CHILD_PROCESS_RESTRICTED
+    };
     let mut size = 0usize;
     // SAFETY: the first call only asks how large the list is.
     unsafe { InitializeProcThreadAttributeList(null_mut(), 3, 0, &mut size) };
@@ -624,7 +661,11 @@ pub(super) fn spawn(request: &SpawnRequest<'_>) -> io::Result<SpawnedEngine> {
                     1,
                     EXTENDED_STARTUPINFO_PRESENT
                         | CREATE_SUSPENDED
-                        | CREATE_NO_WINDOW
+                        | if skip("nowindow") {
+                            0
+                        } else {
+                            CREATE_NO_WINDOW
+                        }
                         | CREATE_UNICODE_ENVIRONMENT,
                     null(),
                     null(),
@@ -640,10 +681,12 @@ pub(super) fn spawn(request: &SpawnRequest<'_>) -> io::Result<SpawnedEngine> {
                 // The first thread starts as the app's own identity, so that the engine can load
                 // its libraries. The engine ends that with RevertToSelf.
                 let thread_handle = thread.raw();
-                check(
-                    SetThreadToken(&thread_handle, initial.raw()),
-                    "SetThreadToken",
-                )?;
+                if !skip("starttoken") {
+                    check(
+                        SetThreadToken(&thread_handle, initial.raw()),
+                        "SetThreadToken",
+                    )?;
+                }
                 check(
                     AssignProcessToJobObject(job.raw(), process.raw()),
                     "AssignProcessToJobObject",

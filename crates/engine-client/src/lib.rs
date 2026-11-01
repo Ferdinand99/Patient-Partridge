@@ -470,8 +470,12 @@ impl EngineClient {
         id: u32,
         body: RequestBody,
     ) -> Result<ResponseBody, String> {
-        write_request(&mut running.stdin, &Request { id, body })
-            .map_err(|e| format!("the request could not be sent ({e})"))?;
+        write_request(&mut running.stdin, &Request { id, body }).map_err(|e| {
+            format!(
+                "the request could not be sent ({e}); {}",
+                exit_text(&running.child)
+            )
+        })?;
         // One request is in flight at a time, so the next event is its answer or a failure.
         match running.events.recv_timeout(self.config.timeout) {
             Ok(Event::Response(r)) if r.id == id => Ok(r.body),

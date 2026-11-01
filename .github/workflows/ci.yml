@@ -88,6 +88,9 @@ jobs:
         env:
           PARTRIDGE_TEST_NO_LANDLOCK: "1"
         run: cargo test -p partridge-engine -p partridge-engine-client --locked
+      - name: Which restrictions stop the engine on Windows (diagnosis)
+        if: always() && runner.os == 'Windows'
+        run: cargo test -p partridge-engine --locked --test windows_matrix -- --ignored --nocapture
       - name: The sandbox log (macOS)
         if: failure() && runner.os == 'macOS'
         run: log show --last 10m --predicate 'sender == "Sandbox"' --style compact | grep -i 'engine|partridge' | tail -100 || true
