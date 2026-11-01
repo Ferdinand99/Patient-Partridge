@@ -1,6 +1,10 @@
 //! Process entry of the PDF engine. Standard output carries the protocol and nothing else, so
 //! this program must never print to it. Everything it has to say goes into a response.
 
+// On Windows the engine has no console: it is started by the app with pipes, and a console
+// program that starts without a console (or with a restricted token) fails in its start-up code.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use std::io::{self, BufReader, BufWriter};
 use std::process::ExitCode;
 

@@ -11,6 +11,9 @@
 //! `engine_selftest [...] memory MIB`
 //! `engine_selftest [...] document`
 
+// Like the engine, a program without a console on Windows (it is started with a restricted token).
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use std::io::Write;
 
 use partridge_engine::{parse_args, startup};

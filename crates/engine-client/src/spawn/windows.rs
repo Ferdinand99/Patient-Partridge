@@ -78,6 +78,9 @@ const HEAP_TERMINATE_ALWAYS_ON: u64 = 1 << 12;
 const BOTTOM_UP_ASLR_ALWAYS_ON: u64 = 1 << 16;
 const HIGH_ENTROPY_ASLR_ALWAYS_ON: u64 = 1 << 20;
 const STRICT_HANDLE_CHECKS_ALWAYS_ON: u64 = 1 << 24;
+// Not in the list below: PDFium's DLL links user32 and gdi32, whose start-up fails in a process
+// that has win32k system calls disabled from its first instruction. The engine switches them off
+// itself after PDFium is loaded (see `partridge-engine`). Kept here for the diagnosis switch.
 const WIN32K_SYSTEM_CALL_DISABLE_ALWAYS_ON: u64 = 1 << 28;
 const EXTENSION_POINT_DISABLE_ALWAYS_ON: u64 = 1 << 32;
 const PROHIBIT_DYNAMIC_CODE_ALWAYS_ON: u64 = 1 << 36;
@@ -90,7 +93,6 @@ const MITIGATIONS: u64 = HEAP_TERMINATE_ALWAYS_ON
     | BOTTOM_UP_ASLR_ALWAYS_ON
     | HIGH_ENTROPY_ASLR_ALWAYS_ON
     | STRICT_HANDLE_CHECKS_ALWAYS_ON
-    | WIN32K_SYSTEM_CALL_DISABLE_ALWAYS_ON
     | EXTENSION_POINT_DISABLE_ALWAYS_ON
     | PROHIBIT_DYNAMIC_CODE_ALWAYS_ON
     | FONT_DISABLE_ALWAYS_ON
@@ -578,8 +580,8 @@ pub(super) fn spawn(request: &SpawnRequest<'_>) -> io::Result<SpawnedEngine> {
 
     // The attribute list: handles to inherit, mitigation policies, no child processes.
     let mut mitigations: u64 = MITIGATIONS;
-    if skip("win32k") {
-        mitigations &= !WIN32K_SYSTEM_CALL_DISABLE_ALWAYS_ON;
+    if skip("win32k-at-start") {
+        mitigations |= WIN32K_SYSTEM_CALL_DISABLE_ALWAYS_ON;
     }
     if skip("mitigations") {
         mitigations = 0;

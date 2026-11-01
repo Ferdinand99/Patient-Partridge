@@ -22,10 +22,11 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::System::JobObjects::IsProcessInJob;
 use windows_sys::Win32::System::SystemServices::{
     PROCESS_MITIGATION_DYNAMIC_CODE_POLICY, PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY,
+    PROCESS_MITIGATION_SYSTEM_CALL_DISABLE_POLICY, PROCESS_MITIGATION_SYSTEM_CALL_DISABLE_POLICY_0,
 };
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetProcessMitigationPolicy, OpenProcessToken, ProcessDynamicCodePolicy,
-    ProcessExtensionPointDisablePolicy,
+    ProcessExtensionPointDisablePolicy, ProcessSystemCallDisablePolicy, SetProcessMitigationPolicy,
 };
 
 const SE_GROUP_INTEGRITY: u32 = 0x0000_0020;
@@ -123,6 +124,24 @@ fn check_layers() -> Result<Vec<&'static str>, String> {
     Ok(layers)
 }
 
+/// Switches the win32k system calls off for this process (the largest part of the kernel surface
+/// that a normal program uses for windows and graphics). This is done here and not when the
+/// process starts, because PDFium's DLL needs them to start. It is an extra: where the system
+/// refuses, the engine goes on without it.
+fn disable_win32k() -> bool {
+    let policy = PROCESS_MITIGATION_SYSTEM_CALL_DISABLE_POLICY {
+        Anonymous: PROCESS_MITIGATION_SYSTEM_CALL_DISABLE_POLICY_0 { Flags: 1 },
+    };
+    // SAFETY: documented call with a live structure of the size the policy expects.
+    unsafe {
+        SetProcessMitigationPolicy(
+            ProcessSystemCallDisablePolicy,
+            (&policy as *const PROCESS_MITIGATION_SYSTEM_CALL_DISABLE_POLICY).cast::<c_void>(),
+            size_of::<PROCESS_MITIGATION_SYSTEM_CALL_DISABLE_POLICY>(),
+        ) != 0
+    }
+}
+
 /// Tries what the token forbids. If a file can be opened, the sandbox is not in force.
 fn verify() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -176,7 +195,10 @@ pub fn lock_down() -> Result<Vec<&'static str>, String> {
     unsafe {
         RevertToSelf();
     }
-    let layers = check_layers()?;
+    let mut layers = check_layers()?;
     verify()?;
+    if disable_win32k() {
+        layers.push("no-win32k");
+    }
     Ok(layers)
 }

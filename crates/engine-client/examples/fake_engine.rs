@@ -12,6 +12,9 @@
 //! - `good`: behaves like an engine with one 612 x 792 document.
 //! - `no-sandbox`: like `good`, but greets without naming a sandbox.
 
+// Like the engine, a program without a console on Windows (it is started with a restricted token).
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use std::io::{self, BufReader, BufWriter};
 use std::path::Path;
 

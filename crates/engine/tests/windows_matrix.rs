@@ -13,16 +13,14 @@ fn which_restrictions_stop_the_engine_from_starting() {
     let file = kit::TempFile::new("matrix.pdf", &kit::simple_pdf(1));
     for skip in [
         "",
-        "win32k",
+        "win32k-at-start",
         "mitigations",
         "ui",
         "child",
         "nowindow",
         "starttoken",
         "restricting",
-        "win32k,ui",
-        "win32k,mitigations,ui,child",
-        "win32k,mitigations,ui,child,nowindow",
+        "mitigations,ui,child",
     ] {
         // SAFETY: this test is the only one in its program.
         unsafe { std::env::set_var("PARTRIDGE_TEST_WINDOWS_SKIP", skip) };
