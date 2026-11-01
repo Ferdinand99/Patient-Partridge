@@ -6,7 +6,7 @@ Today it reads PDFs. The editing tools are planned and do not exist yet.
 
 Patient Partridge is part of the Hedgerow family of apps, next to [Nimble Newt](https://github.com/Ferdinand99/Nimble-Newt).
 
-**Status: in development.** There is no release yet and nothing to install. Expect rough edges and missing features.
+**Status: early release.** Version 0.1.0 is on the [releases page](https://github.com/Ferdinand99/Patient-Partridge/releases/latest). Expect rough edges and missing features.
 
 ## What works now
 
