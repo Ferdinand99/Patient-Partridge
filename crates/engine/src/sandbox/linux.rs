@@ -429,6 +429,20 @@ struct CapData {
 /// cannot be entered by a process with more.
 pub fn enter_empty_root() -> Result<(), String> {
     use std::ffi::CString;
+    // Ubuntu 24.04 and later let a program make a user namespace but move it to an AppArmor
+    // profile that has no rights in it, and that profile is also applied to the descriptors the
+    // program already holds: the document would stop being readable. The switch that does this is
+    // read first, and the namespace is not tried where it is on.
+    if std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+        .is_ok_and(|v| v.trim() == "1")
+    {
+        return Err("user namespaces are restricted by AppArmor on this system".to_string());
+    }
+    if std::fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone")
+        .is_ok_and(|v| v.trim() == "0")
+    {
+        return Err("user namespaces are switched off on this system".to_string());
+    }
     let path = |p: &str| CString::new(p).expect("no nul in a constant");
     // SAFETY: plain system calls with constant arguments and live C strings.
     unsafe {
@@ -536,6 +550,16 @@ pub fn lock_down() -> Result<Vec<&'static str>, String> {
     apply_seccomp()?;
     layers.insert(0, "seccomp");
     verify()?;
+    // The descriptors the engine was given must still work after all this (an AppArmor profile or
+    // another module could take that away). The input is checked here; the document is taken only
+    // when this has passed.
+    // SAFETY: plain call on descriptor 0 with a live buffer.
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(0, &mut st) != 0 {
+            return Err(errno_text("the standard input stopped working"));
+        }
+    }
     if EMPTY_ROOT.load(std::sync::atomic::Ordering::SeqCst) {
         // A path lookup must find nothing at all.
         if std::fs::metadata("/etc").is_ok() || std::fs::metadata("/proc").is_ok() {
