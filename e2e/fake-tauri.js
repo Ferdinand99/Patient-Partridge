@@ -3,6 +3,10 @@
 //
 //   - /docs/book.pdf: 3 Letter pages with text, links and a table of contents
 //   - /docs/second.pdf: 2 pages
+//   - /docs/rtl.pdf: 1 page with two lines of Hebrew, laid out the way the real engine reports them
+//     for rtl_pdf() in crates/testkit: letters in reading order, the first one at the right end
+//   - /docs/slivers.pdf: 5000 pages one point high, each with the most text a page can have
+//     (100,000 characters). It stands for a small file made to fill the memory of the window.
 //
 // Nothing here is part of the app. The app code is the real code, built by Vite and served with the
 // same content security policy as the real window.
@@ -33,7 +37,42 @@
       ["Third page", "The end of the book"],
     ],
     "/docs/second.pdf": [["Other document"], ["Its second page"]],
+    "/docs/rtl.pdf": [[]],
+    "/docs/slivers.pdf": Array.from({ length: 5000 }, () => []),
   };
+
+  // The text of a sliver page: 100,000 tiny boxes. Every call gives new arrays, as a message from
+  // the Rust side would, so what the window keeps is really kept.
+  const SLIVER_TEXT = "x".repeat(100000);
+  const SLIVER_TEMPLATE = Array.from({ length: 100000 }, () => [0, 0.2, 0.5, 0.8]).flat();
+
+  // Text copied from the output of the real engine for the page of rtl_pdf() (see reader.rs).
+  const RTL_TEXT = "\u05D0\u05D1\u05D2\u05D3\u05D4\u05D5\u05D6\u05D7\u05D8\u05D9\n\u05D5\u05D6\u05D7\u05D8\u05D9";
+  const RTL_RECTS = [
+    [405, 75, 414, 96.0625],
+    [400, 75, 405, 96.0625],
+    [387, 75, 400, 96.0625],
+    [373, 75, 387, 96.0625],
+    [362, 75, 373, 96.0625],
+    [350, 75, 362, 96.0625],
+    [337, 75, 350, 96.0625],
+    [324, 75, 337, 96.0625],
+    [312, 75, 324, 96.0625],
+    [300, 75, 312, 96.0625],
+    [0, 0, 0, 0],
+    [350, 115, 362, 136.0625],
+    [337, 115, 350, 136.0625],
+    [324, 115, 337, 136.0625],
+    [312, 115, 324, 136.0625],
+    [300, 115, 312, 136.0625],
+  ].flat();
+
+  /** The text of a page of a document, with a box for every character. */
+  function pageData(path, page) {
+    if (path === "/docs/rtl.pdf") return { text: RTL_TEXT, rects: RTL_RECTS };
+    if (path === "/docs/slivers.pdf") return { text: SLIVER_TEXT, rects: SLIVER_TEMPLATE.slice() };
+    return boxesFor(LINES[path]?.[page] ?? []);
+  }
 
   function boxesFor(lines) {
     // One line of text per entry, 6 x 10 points per character, 18 points between lines.
@@ -65,7 +104,7 @@
     return {
       doc,
       name: path.split("/").pop(),
-      pages: pages.map(() => [PAGE.w, PAGE.h]),
+      pages: pages.map(() => (path === "/docs/slivers.pdf" ? [PAGE.w, 1] : [PAGE.w, PAGE.h])),
       position: null,
     };
   }
@@ -76,7 +115,8 @@
     const rgba = new Uint8ClampedArray(w * h * 4).fill(255);
     const d = docs.get(doc);
     if (!d) throw { code: "unknown_document", message: "gone" };
-    const { rects } = boxesFor(d.pages[page] ?? []);
+    if (d.path === "/docs/slivers.pdf") return rgba.buffer;
+    const { rects } = pageData(d.path, page);
     const sx = w / PAGE.w;
     const sy = h / PAGE.h;
     for (let i = 0; i < rects.length; i += 4) {
@@ -117,7 +157,7 @@
   function search(doc, page, query) {
     const d = docs.get(doc);
     if (!d) throw { code: "unknown_document", message: "gone" };
-    const { text } = boxesFor(d.pages[page] ?? []);
+    const { text } = pageData(d.path, page);
     const hay = Array.from(text).map((c) => (c === "\n" ? " " : c.toLowerCase()));
     const needle = Array.from(query.toLowerCase());
     const found = [];
@@ -162,7 +202,7 @@
       case "get_outline":
         return OUTLINE[docs.get(args.doc)?.path] ?? [];
       case "get_page_text":
-        return boxesFor(docs.get(args.doc)?.pages[args.page] ?? []);
+        return pageData(docs.get(args.doc)?.path, args.page);
       case "get_page_links":
         return LINKS[docs.get(args.doc)?.path]?.[args.page] ?? [];
       case "search_page":

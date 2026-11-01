@@ -259,7 +259,9 @@ fn the_number_of_links_on_a_page_is_limited() {
 }
 
 #[test]
-fn a_document_with_an_attachment_opens_and_the_attachment_stays_closed() {
+fn a_document_with_an_attachment_can_be_read_without_a_problem() {
+    // This only shows that nothing crashes. It cannot see whether an attachment was opened: that is
+    // kept from happening by the check in scripts/check-engine-deps.sh, not by this test.
     // The file holds an embedded file and a file attachment annotation. Opening, drawing and
     // reading everything the reader reads must work, and nothing may start a program: the engine
     // has no code that opens attachments (scripts/check-engine-deps.sh keeps it that way).
@@ -290,7 +292,7 @@ fn the_new_requests_check_document_and_page() {
         code_of(client.search_page(doc.doc, 9, "a").unwrap_err()),
         ErrorCode::PageOutOfRange
     );
-    // A handle that was never given out is refused without asking the engine.
+    // A handle of this engine that was never given out reaches the engine, which refuses it.
     assert_eq!(
         code_of(client.outline(doc.doc + 100).unwrap_err()),
         ErrorCode::UnknownDocument
@@ -343,4 +345,39 @@ fn stray_output_does_not_reach_the_protocol() {
     assert!(partridge_protocol::read_frame(&mut cursor)
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn right_to_left_text_comes_in_reading_order_with_the_first_letter_at_the_right_end() {
+    let file = kit::TempFile::new("rtl.pdf", &kit::rtl_pdf());
+    let client = client();
+    let doc = client.open(&file.path_str(), None).unwrap();
+    let page = client.page_text(doc.doc, 0).unwrap();
+    // The letters are drawn from the left to the right of the line, but PDFium gives them in
+    // reading order, so the text is the way it is written and the boxes run from right to left.
+    let lines: Vec<&str> = page.text.split('\n').collect();
+    assert_eq!(
+        lines,
+        vec![kit::RTL_LINE, "\u{5d5}\u{5d6}\u{5d7}\u{5d8}\u{5d9}"]
+    );
+    let chars: Vec<char> = page.text.chars().collect();
+    assert_eq!(chars.len(), page.rects.len());
+    for line in [0..10, 11..16] {
+        let boxes = &page.rects[line];
+        for pair in boxes.windows(2) {
+            // Each letter sits to the left of the one before it, on the same line.
+            assert!(pair[1][2] <= pair[0][0] + 0.5, "{pair:?}");
+            assert_eq!(pair[1][1], pair[0][1], "{pair:?}");
+        }
+    }
+    // The first letter is the rightmost one, near x = 405 (the line starts at x = 300).
+    assert!(
+        page.rects[0][0] > 400.0 && page.rects[0][2] < 420.0,
+        "{:?}",
+        page.rects[0]
+    );
+    assert!(page.rects[9][0] < 305.0, "{:?}", page.rects[9]);
+    // The line break has no box, and the second line is lower on the page.
+    assert_eq!(page.rects[10], [0.0, 0.0, 0.0, 0.0]);
+    assert!(page.rects[11][1] > page.rects[0][1] + 30.0);
 }

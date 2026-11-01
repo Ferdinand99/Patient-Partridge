@@ -50,7 +50,7 @@ fn an_answer_of_the_wrong_kind_stops_the_engine() {
     let client = client_with("wrong-kind");
     let doc = client.open("a.pdf", None).unwrap();
     assert_stopped(client.outline(doc.doc), "unexpected answer");
-    // The next request starts a fresh engine; the old handle is stale.
+    // Opening a file starts a fresh engine; the old handle is stale.
     match client.outline(doc.doc).unwrap_err() {
         ClientError::Engine { code, .. } => assert_eq!(code, ErrorCode::UnknownDocument),
         other => panic!("{other:?}"),
@@ -61,10 +61,10 @@ fn an_answer_of_the_wrong_kind_stops_the_engine() {
 fn an_answer_that_is_too_big_stops_the_engine() {
     let client = client_with("big-text");
     let doc = client.open("a.pdf", None).unwrap();
-    assert_stopped(client.page_text(doc.doc, 0), "");
+    assert_stopped(client.page_text(doc.doc, 0), "too large");
     // The engine was replaced: the old handle is stale, and a new open works.
     let doc = client.open("a.pdf", None).unwrap();
-    assert_stopped(client.outline(doc.doc), "");
+    assert_stopped(client.outline(doc.doc), "too large");
     assert_eq!(client.spawn_count(), 2);
 }
 

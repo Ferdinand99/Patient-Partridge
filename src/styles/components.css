@@ -293,6 +293,10 @@
   color: var(--text);
 }
 
+.context-menu {
+  min-width: 8rem;
+}
+
 .menu-label {
   padding: 8px 10px 4px;
   color: var(--muted);

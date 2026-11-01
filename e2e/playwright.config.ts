@@ -26,5 +26,15 @@ export default defineConfig({
     reuseExistingServer: false,
     timeout: 20_000,
   },
-  projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"], viewport: { width: 1100, height: 760 } } }],
+  projects: [
+    {
+      name: "chromium",
+      use: {
+        ...devices["Desktop Chrome"],
+        viewport: { width: 1100, height: 760 },
+        // The memory test reads the size of the JavaScript heap and collects garbage first.
+        launchOptions: { args: ["--enable-precise-memory-info", "--js-flags=--expose-gc"] },
+      },
+    },
+  ],
 });

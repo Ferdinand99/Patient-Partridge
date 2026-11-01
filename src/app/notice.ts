@@ -19,6 +19,13 @@ export interface NoticeOptions {
   password?: boolean;
   /** A line shown in a box of its own and in a fixed-width font, such as a web address. */
   quote?: string;
+  /**
+   * Keeps the primary button off for this many milliseconds after the box appears. For a question
+   * whose wrong answer does harm: a double click, a key that is held down or a press that was
+   * already on its way when the box came up must not be able to answer it. The safe answer works
+   * at once. Without it the box can be answered at once.
+   */
+  armMs?: number;
 }
 
 export interface NoticeResult {
@@ -84,7 +91,31 @@ export function showNotice(layer: HTMLElement, options: NoticeOptions): Promise<
     }
     box.append(row);
 
+    let armTimer: ReturnType<typeof setTimeout> | undefined;
+    const armMs = options.armMs ?? 0;
+    if (armMs > 0) {
+      const guarded = buttons.get(primary.id);
+      if (guarded) guarded.disabled = true;
+      armTimer = setTimeout(() => {
+        armTimer = undefined;
+        if (guarded) guarded.disabled = false;
+      }, armMs);
+      // A key that is held down repeats Enter or Space; until the box is armed those repeats do
+      // nothing, so they cannot press whatever has the focus.
+      box.addEventListener(
+        "keydown",
+        (e) => {
+          if (armTimer !== undefined && e.repeat && (e.key === "Enter" || e.key === " ")) {
+            e.preventDefault();
+            e.stopPropagation();
+          }
+        },
+        true,
+      );
+    }
+
     const finish = (button: string) => {
+      clearTimeout(armTimer);
       layer.removeEventListener("keydown", onKey);
       box.remove();
       layer.hidden = layer.childElementCount === 0;

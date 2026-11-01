@@ -3,7 +3,7 @@
 // it.
 
 import { toAppError, type AppErrorLike } from "../lib/errors";
-import { MatchCursor, SearchSession, cleanQuery, type PageSearch } from "../viewer/search";
+import { MatchCursor, SearchSession, cleanQuery, type PageSearch, type SearchLimit } from "../viewer/search";
 import type { DocumentView } from "../viewer/viewer";
 
 /** The document a search runs on. */
@@ -25,6 +25,8 @@ interface State {
   text: string;
   session: SearchSession | null;
   cursor: MatchCursor;
+  /** The screen update that is waiting for this document. */
+  frame: ReturnType<typeof setTimeout> | undefined;
 }
 
 export interface StatusInput {
@@ -35,6 +37,8 @@ export interface StatusInput {
   position: number;
   searched: number;
   pageCount: number;
+  /** What cut the search short, if anything. */
+  limit?: SearchLimit;
 }
 
 /** The short line next to the box: how far the search is, or which match is shown. */
@@ -46,6 +50,12 @@ export function findStatus(s: StatusInput): string {
     return s.total === 0 ? `Searching…${progress}` : `${s.position || 1} of ${s.total}+${progress}`;
   }
   if (s.total === 0) return "No matches";
+  if (s.limit === "total") {
+    return `${s.position || 1} of ${s.total.toLocaleString("en-US")}+ (stopped at the limit)`;
+  }
+  if (s.limit === "page") {
+    return `${s.position || 1} of ${s.total} (some pages have more matches than are shown)`;
+  }
   return `${s.position || 1} of ${s.total}`;
 }
 
@@ -63,7 +73,6 @@ export class FindBar {
   private readonly states = new Map<DocumentView, State>();
   private target: FindTarget | null = null;
   private timer: ReturnType<typeof setTimeout> | undefined;
-  private frame: ReturnType<typeof setTimeout> | undefined;
 
   constructor(
     root: Document,
@@ -154,7 +163,9 @@ export class FindBar {
 
   /** A document was closed: its search goes with it. */
   forget(view: DocumentView): void {
-    this.states.get(view)?.session?.cancel();
+    const state = this.states.get(view);
+    state?.session?.cancel();
+    clearTimeout(state?.frame);
     this.states.delete(view);
   }
 
@@ -182,6 +193,7 @@ export class FindBar {
         text: "",
         session: null,
         cursor: new MatchCursor(() => this.states.get(target.view)?.session ?? null),
+        frame: undefined,
       };
       this.states.set(target.view, created);
       state = created;
@@ -208,6 +220,9 @@ export class FindBar {
     const state = this.stateOf(target);
     state.text = this.input.value;
     state.session?.cancel();
+    // An update that the old search was waiting to show must not stand in for the new one.
+    clearTimeout(state.frame);
+    state.frame = undefined;
     state.cursor.clear();
     const query = cleanQuery(this.input.value);
     if (query === null) {
@@ -235,11 +250,15 @@ export class FindBar {
     void session.run();
   }
 
-  /** The pages come in quickly; the screen is brought up to date at most every 60 ms. */
+  /**
+   * The pages come in quickly; the screen is brought up to date at most every 60 ms. Each document
+   * has its own wait, so an update for one never takes the place of an update for another.
+   */
   private scheduleUpdate(target: FindTarget, session: SearchSession): void {
-    if (this.frame !== undefined) return;
-    this.frame = setTimeout(() => {
-      this.frame = undefined;
+    const waiting = this.states.get(target.view);
+    if (!waiting || waiting.frame !== undefined) return;
+    waiting.frame = setTimeout(() => {
+      waiting.frame = undefined;
       const state = this.states.get(target.view);
       if (!state || state.session !== session) return;
       let revealed: ReturnType<MatchCursor["start"]> = null;
@@ -269,6 +288,7 @@ export class FindBar {
       position: state?.cursor.position ?? 0,
       searched: session?.pagesSearched ?? 0,
       pageCount: session?.pageCount ?? 0,
+      limit: session?.limit ?? null,
     });
   }
 }

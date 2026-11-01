@@ -2,9 +2,10 @@
 //!
 //! [`EngineClient`] starts `partridge-engine` as a child process, speaks the protocol with it, and
 //! keeps going when the engine does not: if the process crashes, hangs, exits or sends something
-//! unreadable, the current request fails with [`ClientError::EngineStopped`], the process is
-//! cleaned up, and the next request starts a fresh engine. A bad PDF can therefore never take the
-//! app down.
+//! unreadable, the current request fails with [`ClientError::EngineStopped`] and the process is
+//! cleaned up. The documents that engine held are gone with it (their handles are stale, and a
+//! request for one fails with `UnknownDocument`); opening a file starts a fresh engine. A bad PDF
+//! can therefore never take the app down.
 //!
 //! Document handles carry the number of the engine process that made them (the generation), so a
 //! handle from an engine that has been replaced can never reach a document of the new one. Asking
@@ -75,7 +76,7 @@ impl EngineConfig {
 #[derive(Debug)]
 pub enum ClientError {
     /// The engine process could not be started, died, hung, or sent unreadable data. It has been
-    /// stopped; the next request starts a new one.
+    /// stopped, and the documents it held are gone; opening a file starts a new one.
     EngineStopped(String),
     /// The engine is fine and refused or failed this one request.
     Engine { code: ErrorCode, message: String },
@@ -208,10 +209,23 @@ impl EngineClient {
             password: password.map(str::to_string),
         };
         match self.run(&mut inner, body)? {
-            ResponseBody::Opened { doc, pages } => Ok(OpenedDocument {
-                doc: (generation << 32) | u64::from(doc),
-                pages,
-            }),
+            ResponseBody::Opened { doc, pages } => {
+                // A size the window cannot lay out (NaN, zero, negative, huge) is not a size. The
+                // real engine never sends one, so an engine that does is not the real engine.
+                if pages
+                    .iter()
+                    .any(|p| !usable_page_side(p.width) || !usable_page_side(p.height))
+                {
+                    self.stop(&mut inner);
+                    return Err(ClientError::EngineStopped(
+                        "it sent a page size that is not a size".into(),
+                    ));
+                }
+                Ok(OpenedDocument {
+                    doc: (generation << 32) | u64::from(doc),
+                    pages,
+                })
+            }
             _ => self.unexpected(&mut inner, "open"),
         }
     }
@@ -348,7 +362,8 @@ impl EngineClient {
         }
     }
 
-    /// Stops the engine process now. The next request starts a new one. This works while another
+    /// Stops the engine process now. The documents it held are gone; opening a file starts a new
+    /// engine. This works while another
     /// thread is waiting for an answer: that request then fails with `EngineStopped`.
     pub fn kill(&self) {
         // First the quick way that needs no request lock: a hung engine must not keep this out.
@@ -567,6 +582,13 @@ fn stop_running(inner: &mut Inner) {
         let _ = child.kill();
         let _ = child.wait();
     }
+}
+
+/// Largest page side PDF allows, in points (200 inches). The engine cuts sizes to this.
+const MAX_PAGE_SIDE: f32 = 14_400.0;
+
+fn usable_page_side(side: f32) -> bool {
+    side.is_finite() && side > 0.0 && side <= MAX_PAGE_SIDE
 }
 
 impl Drop for EngineClient {

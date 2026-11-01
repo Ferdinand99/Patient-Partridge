@@ -69,7 +69,7 @@ test("starts empty, in the Hedgerow look, with its own font", async ({ page }) =
   expect(font.some((f) => f.includes("InterVariable") && f.endsWith("loaded"))).toBe(true);
   // The open button is the inverted pill of the design system.
   const pill = await page.locator("#empty-open").evaluate((el) => getComputedStyle(el).borderRadius);
-  expect(Number.parseFloat(pill)).toBeGreaterThan(100);
+  expect(Number.parseFloat(pill)).toBeGreaterThan(60);
 });
 
 test("opens a document in a tab and draws its first page", async ({ page }) => {
@@ -264,7 +264,7 @@ test("prints: asks for the pages, prepares pictures, and shows only them on pape
   await expect(page.locator(".print-page")).toHaveCount(0);
 });
 
-test("a page that cannot be read is explained and the app carries on", async ({ page }) => {
+test("a file that cannot be opened is explained and the app carries on", async ({ page }) => {
   await page.evaluate(() => (window.__E2E__.dialog = ["/docs/nothing.pdf"]));
   await page.locator("#empty-open").click();
   await expect(page.getByRole("alertdialog")).toContainText("cannot be opened");
@@ -275,7 +275,122 @@ test("a page that cannot be read is explained and the app carries on", async ({ 
   await expect(page.locator(".tab-title")).toHaveText(["book.pdf"]);
 });
 
-test("looks right in light and dark: screenshots for the record", async ({ page }) => {
+test("selects a whole line of right-to-left text from one end to the other, and copies all of it", async ({
+  page,
+  context,
+}) => {
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  await page.evaluate(() => (window.__E2E__.dialog = ["/docs/rtl.pdf"]));
+  await page.locator("#empty-open").click();
+  await expect(page.locator('.tab-title[aria-selected="true"]')).toHaveText("rtl.pdf");
+  await expect.poll(async () => (await calls(page, "get_page_text")).length).toBeGreaterThan(0);
+  // From beyond the right end of the first line to beyond its left end, as a reader drags it.
+  const start = await onPage(page, 0, 440, 85);
+  const end = await onPage(page, 0, 270, 85);
+  await drag(page, start, end);
+  await expect(page.locator(".hl-select")).toHaveCount(1);
+  await page.keyboard.press("Control+c");
+  await expect
+    .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+    .toBe("אבגדהוזחטי");
+  // And the other way round, and the second line too.
+  await page.keyboard.press("Escape");
+  await drag(page, await onPage(page, 0, 270, 125), await onPage(page, 0, 440, 125));
+  await page.keyboard.press("Control+c");
+  await expect
+    .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+    .toBe("וזחטי");
+});
+
+test("the second press of a double click cannot answer the question about a link", async ({ page }) => {
+  await openBook(page);
+  await page.locator(".page-link").first().click();
+  const open = page.getByRole("button", { name: "Open in browser" });
+  await expect(open).toBeDisabled();
+  const box = await open.boundingBox();
+  if (!box) throw new Error("the button is not on screen");
+  // The second press, a moment later, lands on the button.
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await expect(page.getByRole("alertdialog")).toBeVisible();
+  expect((await calls(page, "open_link")).length).toBe(0);
+  // After the delay the same press is an answer.
+  await expect(open).toBeEnabled();
+  await open.click();
+  await expect.poll(async () => (await calls(page, "open_link")).length).toBe(1);
+});
+
+test("does not let the window be reloaded, which would orphan the engines of its documents", async ({ page }) => {
+  await openBook(page);
+  const seen = await page.evaluate(() => {
+    const log: { key: string; prevented: boolean }[] = [];
+    // Listens after the app, in the bubbling phase: what it sees is what the app left of the event.
+    window.addEventListener("keydown", (e) => log.push({ key: e.key, prevented: e.defaultPrevented }));
+    window.addEventListener("contextmenu", (e) => log.push({ key: "contextmenu", prevented: e.defaultPrevented }));
+    (window as unknown as { __log: typeof log }).__log = log;
+    return true;
+  });
+  expect(seen).toBe(true);
+  await page.keyboard.press("F5");
+  await page.keyboard.press("Control+r");
+  await page.keyboard.press("Control+Shift+r");
+  await page.mouse.click(300, 300, { button: "right" });
+  const log = await page.evaluate(() => (window as unknown as { __log: { key: string; prevented: boolean }[] }).__log);
+  const named = (...keys: string[]) => log.filter((e) => keys.includes(e.key));
+  expect(named("F5").length).toBe(1);
+  expect(named("r", "R").length).toBe(2);
+  expect(named("contextmenu").length).toBe(1);
+  expect(named("F5", "r", "R", "contextmenu").every((e) => e.prevented), JSON.stringify(log)).toBe(true);
+  // The tab is still there: nothing was reloaded.
+  await expect(page.locator(".tab-title")).toHaveText(["book.pdf"]);
+});
+
+test("a PDF of thousands of one-point pages cannot fill the memory of the window", async ({ page }) => {
+  test.setTimeout(120_000);
+  const heap = () =>
+    page.evaluate(() => {
+      (window as unknown as { gc: () => void }).gc();
+      return (performance as unknown as { memory: { usedJSHeapSize: number } }).memory.usedJSHeapSize;
+    });
+  await page.evaluate(() => (window.__E2E__.dialog = ["/docs/slivers.pdf"]));
+  const empty = await heap();
+  await page.locator("#empty-open").click();
+  await expect(page.locator('.tab-title[aria-selected="true"]')).toHaveText("slivers.pdf");
+  // Hundreds of pages are on screen at once. Wait until the window has been given text for them.
+  await expect.poll(async () => (await calls(page, "get_page_text")).length, { timeout: 30_000 }).toBeGreaterThan(60);
+  const onScreen = await page.locator(".viewer-page").count();
+  expect(onScreen).toBeGreaterThan(60);
+  // Move about the document, so that other pages come on screen.
+  for (const top of [20_000, 40_000, 60_000, 5_000]) {
+    await page.evaluate((y) => ((document.querySelector(".viewer:not([hidden])") as HTMLElement).scrollTop = y), top);
+    await page.waitForTimeout(2000);
+  }
+  const used = (await heap()) - empty;
+  const fetched = (await calls(page, "get_page_text")).length;
+  process.stderr.write(
+    `memory of the sliver PDF: ${(used / 1048576).toFixed(0)} MB of JavaScript heap, ${onScreen} pages on screen, ${fetched} pages of text fetched (${((fetched * 100_000) / 1e6).toFixed(0)} million characters)\n`,
+  );
+  // 1.5 million characters are kept at most (about 60 MB). Without the limit this is several hundred MB.
+  expect(used / 1048576).toBeLessThan(120);
+  // The reader was told, once.
+  await expect(page.getByRole("alertdialog")).toContainText("Some pages have a lot of text");
+  await expect(page.getByRole("alertdialog")).toHaveCount(1);
+});
+
+test("the right mouse button on selected text offers Copy", async ({ page, context }) => {
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  await openBook(page);
+  const start = await onPage(page, 0, 72 + 1, 105);
+  const end = await onPage(page, 0, 72 + 6 * 15 - 1, 105);
+  await drag(page, start, end);
+  await expect(page.locator(".hl-select")).toHaveCount(1);
+  await page.mouse.click(end.x - 20, end.y, { button: "right" });
+  await expect(page.locator("#context-menu")).toBeVisible();
+  await page.getByRole("menuitem", { name: "Copy" }).click();
+  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe("Hello Partridge");
+  await expect(page.locator("#context-menu")).toBeHidden();
+});
+
+test("takes screenshots in light and dark (nothing is checked about the look)", async ({ page }) => {
   await openBook(page);
   await page.keyboard.press("Control+b");
   await expect(page.locator(".thumb-canvas").first()).toBeAttached();

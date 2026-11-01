@@ -7,7 +7,7 @@ import "./styles/components.css";
 import "./styles/app.css";
 import { App } from "./app/app";
 import { api } from "./lib/api";
-import { pickPdfPaths } from "./lib/paths";
+import { blockReload } from "./lib/reload";
 
 function storage(): Storage | null {
   try {
@@ -25,6 +25,9 @@ window.addEventListener("error", (e) => {
 window.addEventListener("unhandledrejection", (e) => {
   void api.frontendError(`unhandled rejection: ${String(e.reason)}`).catch(() => undefined);
 });
+
+// A finished app never reloads its page (see lib/reload.ts); a development build still can.
+blockReload(document, import.meta.env.PROD);
 
 const app = new App(document, {
   api,
@@ -54,8 +57,7 @@ const app = new App(document, {
 app.init();
 
 function openAll(paths: string[]): void {
-  const chosen = pickPdfPaths(paths);
-  if (chosen.length > 0) void app.openPaths(chosen);
+  void app.openChosen(paths);
 }
 
 // Files dropped on the window. Tauri hands us real paths; the page never reads the file itself.

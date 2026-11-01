@@ -4,7 +4,8 @@
   "description": "Permissions for the main window: events (file drops and paths), the window title and the open dialog",
   "windows": ["main"],
   "permissions": [
-    "core:event:default",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
     "core:window:allow-set-title",
     "dialog:allow-open"
   ]
