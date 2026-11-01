@@ -300,11 +300,13 @@ fn engine_handles(fonts: &[(FontScript, std::fs::File)]) -> usize {
         .unwrap_or_else(|_| panic!("no count in {text}"))
 }
 
-/// The smallest of three counts: a handle that the system or a library holds for a moment may be
-/// counted once, and the ones the engine keeps are in every count.
-fn engine_handles_least(fonts: &[(FontScript, std::fs::File)]) -> (usize, Vec<usize>) {
-    let counts: Vec<usize> = (0..3).map(|_| engine_handles(fonts)).collect();
-    (*counts.iter().min().unwrap(), counts)
+/// The largest of five counts. On Windows a count can be short by a handle or two that the system
+/// or a library has not made yet or has already closed (an engine without fonts was seen at 101,
+/// 101 and 103); the handles that the engine keeps are in every count, so the largest is the one
+/// with nothing missing.
+fn engine_handles_most(fonts: &[(FontScript, std::fs::File)]) -> (usize, Vec<usize>) {
+    let counts: Vec<usize> = (0..5).map(|_| engine_handles(fonts)).collect();
+    (*counts.iter().max().unwrap(), counts)
 }
 
 /// The engine holds one handle for each font it was given, and no other: with all seven scripts it
@@ -318,16 +320,16 @@ fn the_engine_holds_only_the_handles_it_was_given() {
         .into_iter()
         .map(|s| (s, std::fs::File::open(stand_in.path()).unwrap()))
         .collect();
-    let (none, none_all) = engine_handles_least(&[]);
-    let (all, all_all) = engine_handles_least(&seven);
-    let (one, one_all) = engine_handles_least(&seven[..1]);
+    let (none, none_all) = engine_handles_most(&[]);
+    let (all, all_all) = engine_handles_most(&seven);
+    let (one, one_all) = engine_handles_most(&seven[..1]);
     println!("handles in the engine: {none_all:?} with no font, {one_all:?} with one, {all_all:?} with seven");
     assert_eq!(one, none + 1, "{none_all:?} {one_all:?} {all_all:?}");
     assert_eq!(all, none + 7, "{none_all:?} {one_all:?} {all_all:?}");
 
     // The fonts this system really has.
     let real = system_fonts::open_all();
-    let (with_real, with_real_all) = engine_handles_least(&real);
+    let (with_real, with_real_all) = engine_handles_most(&real);
     println!(
         "handles in the engine: {with_real} with the {} fonts of this system",
         real.len()
