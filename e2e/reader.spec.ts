@@ -378,6 +378,8 @@ test("a PDF of thousands of one-point pages cannot fill the memory of the window
 
 test("a PDF made to fill the window with elements cannot do it", async ({ page }) => {
   test.setTimeout(120_000);
+  // A tall window, so that without the limit on mounted pages far more than 120 would be on screen.
+  await page.setViewportSize({ width: 1100, height: 2400 });
   await page.evaluate(() => (window.__E2E__.dialog = ["/docs/crafted.pdf"]));
   await page.locator("#empty-open").click();
   await expect(page.locator('.tab-title[aria-selected="true"]')).toHaveText("crafted.pdf");
@@ -403,7 +405,7 @@ test("a PDF made to fill the window with elements cannot do it", async ({ page }
     `elements of the crafted PDF: ${count.elements} in all, ${count.boxes} boxes, ${count.buttons} buttons, ${count.pages} pages on screen
 `,
   );
-  expect(count.pages).toBeGreaterThan(20);
+  expect(count.pages).toBeGreaterThan(100);
   expect(count.pages).toBeLessThanOrEqual(120);
   expect(count.boxes).toBeGreaterThan(0);
   expect(count.buttons).toBeGreaterThan(0);
@@ -429,8 +431,12 @@ test("the right mouse button on a choice in the print dialog does not bring back
   expect(await radios.count()).toBeGreaterThan(1);
   await radios.first().click({ button: "right" });
   await radios.last().click({ button: "right", force: true });
+  // The Pages box starts greyed out: it is not editable, so its menu is the page menu too.
+  const pagesBox = dialog.getByRole("textbox");
+  await expect(pagesBox).toBeDisabled();
+  await pagesBox.click({ button: "right", force: true });
   const menus = await page.evaluate(() => (window as unknown as { __menus: boolean[] }).__menus);
-  expect(menus.length).toBe(2);
+  expect(menus.length).toBe(3);
   expect(menus.every(Boolean)).toBe(true);
 });
 

@@ -17,13 +17,15 @@ export function isReloadKey(e: Pick<KeyboardEvent, "key" | "code" | "ctrlKey" | 
 
 /**
  * True for a box the reader types in, which keeps the menu of the web view (Cut, Copy, Paste). A
- * radio button or a check box is not one: its menu is the page menu, which holds Reload.
+ * radio button, a check box, and a text box that is disabled or read only are not one: their menu
+ * is the page menu, which holds Reload.
  */
 export function isTextBox(target: Element): boolean {
   const box = target.closest("input, textarea");
   if (!box) return false;
-  if (box instanceof HTMLTextAreaElement) return true;
-  return box instanceof HTMLInputElement && TEXT_TYPES.has(box.type);
+  // A box that cannot be edited (greyed out, or read only) gets the page menu from the web view.
+  if (box instanceof HTMLTextAreaElement) return !box.disabled && !box.readOnly;
+  return box instanceof HTMLInputElement && TEXT_TYPES.has(box.type) && !box.disabled && !box.readOnly;
 }
 
 const TEXT_TYPES: ReadonlySet<string> = new Set(["text", "search", "password", "email", "tel", "url", "number"]);
