@@ -185,3 +185,22 @@ fn handles_do_not_survive_an_engine_restart() {
     // None of that started another engine.
     assert_eq!(client.spawn_count(), 2);
 }
+
+#[test]
+fn i3_a_slow_save_is_not_taken_for_a_hung_engine() {
+    // The answer to SaveBegin takes 1.5 s, three times the limit that a render gets here.
+    let mut config = EngineConfig::new(fake_engine());
+    config.args = vec!["save-slow".into()];
+    config.timeout = Duration::from_millis(500);
+    let client = EngineClient::new(config);
+    let doc = client.open(&doc_path(), None).unwrap();
+    let mut size = 0usize;
+    let saved = client.save_to(doc.doc, &mut |piece| {
+        size += piece.len();
+        Ok(())
+    });
+    assert!(saved.is_ok(), "the engine was killed: {saved:?}");
+    assert_eq!(size, 2_500_000);
+    // The engine is still the same one.
+    assert_eq!(client.spawn_count(), 1);
+}

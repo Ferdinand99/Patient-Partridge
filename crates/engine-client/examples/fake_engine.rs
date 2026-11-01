@@ -191,6 +191,11 @@ fn main() {
                         message: "the stand-in cannot save".into(),
                     },
                 ),
+                "save-slow" => {
+                    // Slow, but alive: it answers after a while.
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    reply(&mut output, id, ResponseBody::SaveReady { size: SAVE_SIZE });
+                }
                 _ => reply(&mut output, id, ResponseBody::SaveReady { size: SAVE_SIZE }),
             },
             RequestBody::SaveChunk { offset, len, .. } => {

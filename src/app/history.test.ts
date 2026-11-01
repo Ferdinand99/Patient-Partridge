@@ -220,3 +220,32 @@ describe("EditHistory: unsaved changes", () => {
     expect(seen).toHaveBeenCalledTimes(4);
   });
 });
+
+describe("EditHistory: the state a save wrote", () => {
+  it("a save marks only the state it wrote, also when the oldest edits are forgotten meanwhile", () => {
+    const h = new EditHistory(3);
+    const { apply } = counter();
+    apply(h, "one", 1);
+    apply(h, "two", 1);
+    apply(h, "three", 1);
+    const began = h.revision;
+    // An edit is made while the file is written; the history is full, so the oldest edit goes
+    // and the number of edits in effect stays the same.
+    apply(h, "four", 1);
+    h.markSaved(began);
+    expect(h.dirty).toBe(true);
+    h.markSaved(h.revision);
+    expect(h.dirty).toBe(false);
+  });
+
+  it("gives a state its number again when an undo returns to it", async () => {
+    const h = new EditHistory();
+    const { apply } = counter();
+    apply(h, "one", 1);
+    const saved = h.revision;
+    apply(h, "two", 1);
+    expect(h.revision).not.toBe(saved);
+    await h.undo();
+    expect(h.revision).toBe(saved);
+  });
+});

@@ -2339,3 +2339,66 @@ describe("App: changes that are not saved", () => {
     expect(tabTitles()).toEqual([]);
   });
 });
+
+describe("App: a save that an edit overtakes", () => {
+  it("is reported as not saved, so closing the tab does not drop the edit", async () => {
+    const m = make();
+    await m.app.openPath("/docs/book.pdf");
+    await flush();
+    const edit = { label: "Change", undo: () => undefined, redo: () => undefined };
+    m.app.recordEdit(edit);
+    let finish!: (file: SavedFile) => void;
+    m.api.save.mockImplementationOnce(() => new Promise<SavedFile>((resolve) => (finish = resolve)));
+    click(q(".tab-close"));
+    await flush();
+    click(button("Save"));
+    await flush();
+    // An edit is made while the file is written.
+    m.app.recordEdit({ ...edit, label: "Later" });
+    finish({ path: "/docs/book.pdf", name: "book.pdf" });
+    await flush();
+    expect(tabTitles()).toEqual(["book.pdf"]);
+    expect(m.api.close).not.toHaveBeenCalled();
+    expect(m.app.unsavedCount).toBe(1);
+    // The app process was told the document is dirty and never that it is clean.
+    expect(m.api.setDirty).toHaveBeenLastCalledWith(1, true);
+    expect(m.api.setDirty).not.toHaveBeenCalledWith(1, false);
+  });
+
+  it("Save and quit does not quit over an edit made during the save", async () => {
+    const m = make();
+    await m.app.openPath("/docs/book.pdf");
+    await flush();
+    m.app.recordEdit({ label: "Change", undo: () => undefined, redo: () => undefined });
+    let finish!: (file: SavedFile) => void;
+    m.api.save.mockImplementationOnce(() => new Promise<SavedFile>((resolve) => (finish = resolve)));
+    const asking = m.app.requestQuit();
+    await flush();
+    click(button("Save and quit"));
+    await flush();
+    m.app.recordEdit({ label: "Later", undo: () => undefined, redo: () => undefined });
+    finish({ path: "/docs/book.pdf", name: "book.pdf" });
+    await asking;
+    expect(m.api.quitApp).not.toHaveBeenCalled();
+    expect(m.api.stayOpen).toHaveBeenCalledTimes(1);
+  });
+
+  it("waits for a save that is running instead of giving up with no message", async () => {
+    const m = make();
+    await m.app.openPath("/docs/book.pdf");
+    await flush();
+    m.app.recordEdit({ label: "Change", undo: () => undefined, redo: () => undefined });
+    let finish!: (file: SavedFile) => void;
+    m.api.save.mockImplementationOnce(() => new Promise<SavedFile>((resolve) => (finish = resolve)));
+    key("s", { ctrlKey: true });
+    await flush();
+    const asking = m.app.requestQuit();
+    await flush();
+    click(button("Save and quit"));
+    await flush();
+    finish({ path: "/docs/book.pdf", name: "book.pdf" });
+    await asking;
+    expect(m.api.save).toHaveBeenCalledTimes(1);
+    expect(m.api.quitApp).toHaveBeenCalledTimes(1);
+  });
+});

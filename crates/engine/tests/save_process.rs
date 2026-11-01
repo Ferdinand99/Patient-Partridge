@@ -360,3 +360,200 @@ fn a_document_that_is_closed_cannot_be_saved() {
     }
     assert_eq!(pool.source_path(handle), None);
 }
+
+// ---- findings of the review of PR 31: each of these failed on the first version --------------
+
+/// Rewrites a file in place: the same file (same inode), new bytes.
+fn rewrite_in_place(path: &Path, bytes: &[u8]) {
+    use std::io::Write;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .unwrap();
+    file.write_all(bytes).unwrap();
+    file.sync_all().unwrap();
+}
+
+#[test]
+fn c1_a_file_rewritten_in_place_is_not_saved_over_with_a_mix_of_both() {
+    let dir = Dir::new("c1");
+    let path = dir.write("a.pdf", &kit::simple_pdf(3));
+    let pool = pool();
+    let (handle, _) = pool.open(&text(&path), None).unwrap();
+
+    // Another program rewrites the file in place: the engine's handle now reads the new bytes.
+    let theirs = kit::simple_pdf(5);
+    rewrite_in_place(&path, &theirs);
+
+    // Neither Replace nor Save a copy may write what the engine can make of it.
+    let replace = SaveOptions {
+        overwrite_changed: true,
+        ..SaveOptions::default()
+    };
+    let err = save_error(pool.save(handle, replace));
+    assert_eq!(err.code(), "save_source_changed", "{err:?}");
+    assert_eq!(fs::read(&path).unwrap(), theirs, "their file was overwritten");
+    let copy = dir.0.join("copy.pdf");
+    let err = save_error(pool.save_as(handle, &copy, SaveOptions::default()));
+    assert_eq!(err.code(), "save_source_changed", "{err:?}");
+    assert!(!copy.exists(), "a copy of a mix was written");
+    assert_eq!(dir.names(), vec!["a.pdf".to_string()]);
+}
+
+#[test]
+fn c1_a_same_size_rewrite_with_the_old_time_is_seen_in_the_part_that_was_read() {
+    let dir = Dir::new("c1b");
+    let original = kit::simple_pdf(2);
+    let path = dir.write("a.pdf", &original);
+    let before = fs::metadata(&path).unwrap().modified().unwrap();
+    let pool = pool();
+    let (handle, _) = pool.open(&text(&path), None).unwrap();
+    // Reading the text of page 1 makes the engine read its content stream.
+    assert!(pool.page_text(handle, 0).unwrap().text.contains("Page 1"));
+
+    // The same length, a different content stream, and the time of change put back.
+    let mut theirs = original.clone();
+    let at = theirs
+        .windows(6)
+        .position(|w| w == b"Page 1")
+        .expect("the text of page 1");
+    theirs[at..at + 6].copy_from_slice(b"Page X");
+    rewrite_in_place(&path, &theirs);
+    let file = fs::File::options().write(true).open(&path).unwrap();
+    file.set_modified(before).unwrap();
+    drop(file);
+
+    let replace = SaveOptions {
+        overwrite_changed: true,
+        ..SaveOptions::default()
+    };
+    let err = save_error(pool.save(handle, replace));
+    assert_eq!(err.code(), "save_source_changed", "{err:?}");
+}
+
+#[test]
+fn c1_a_file_replaced_by_a_rename_keeps_the_old_handle_and_a_copy_is_safe() {
+    let dir = Dir::new("c1c");
+    let path = dir.write("a.pdf", &kit::simple_pdf(3));
+    let pool = pool();
+    let (handle, _) = pool.open(&text(&path), None).unwrap();
+    assert!(pool.page_text(handle, 0).unwrap().text.contains("Page 1"));
+
+    // Somebody saves their own version the way editors do: a new file, renamed over this one.
+    let theirs = kit::simple_pdf(5);
+    let tmp = dir.write("tmp.pdf", &theirs);
+    fs::rename(&tmp, &path).unwrap();
+
+    // Save asks (the file at the path is not the one that was opened) ...
+    assert_eq!(
+        save_error(pool.save(handle, SaveOptions::default())),
+        SaveError::Changed
+    );
+    // ... and a copy holds the document that was opened, whole.
+    let copy = dir.0.join("copy.pdf");
+    pool.save_as(handle, &copy, SaveOptions::default()).unwrap();
+    assert_eq!(describe(&copy, None).pages, 3);
+    assert_eq!(fs::read(&path).unwrap(), theirs);
+}
+
+#[test]
+fn c2_a_file_cut_off_after_it_was_opened_does_not_become_a_save_with_blank_pages() {
+    let dir = Dir::new("c2");
+    let original = kit::simple_pdf(6);
+    let path = dir.write("a.pdf", &original);
+    let pool = pool();
+    let (handle, _) = pool.open(&text(&path), None).unwrap();
+    // The share drops, or the stick is pulled: what is left of the file is the first part.
+    rewrite_in_place(&path, &original[..original.len() * 6 / 10]);
+
+    let replace = SaveOptions {
+        overwrite_changed: true,
+        ..SaveOptions::default()
+    };
+    let result = pool.save(handle, replace);
+    assert!(result.is_err(), "a save was made from a cut-off file");
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        &original[..original.len() * 6 / 10],
+        "the file was replaced"
+    );
+    assert_eq!(dir.names(), vec!["a.pdf".to_string()]);
+}
+
+#[test]
+fn i5_a_signature_field_under_a_grouping_field_is_still_a_signed_document() {
+    let dir = Dir::new("i5");
+    let path = dir.write("a.pdf", &kit::signed_nested_pdf());
+    let pool = pool();
+    let (handle, _) = pool.open(&text(&path), None).unwrap();
+    let err = save_error(pool.save(handle, SaveOptions::default()));
+    assert!(matches!(err, SaveError::Signed { .. }), "{err:?}");
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        kit::signed_nested_pdf(),
+        "the file was touched"
+    );
+}
+
+#[cfg(unix)]
+fn running_as_root() -> bool {
+    // SAFETY: a plain system call without arguments.
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(unix)]
+#[test]
+fn i6_a_file_the_user_cannot_write_is_refused_although_its_folder_is_writable() {
+    use std::os::unix::fs::PermissionsExt;
+    if running_as_root() {
+        eprintln!("skipped: the super user can write every file");
+        return;
+    }
+    let dir = Dir::new("i6");
+    let original = kit::simple_pdf(1);
+    let path = dir.write("a.pdf", &original);
+    // The owner has no write right; the group has one. Some write bit is set, so the old test
+    // for "read-only" found nothing wrong.
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o464)).unwrap();
+    let pool = pool();
+    let (handle, _) = pool.open(&text(&path), None).unwrap();
+    let err = save_error(pool.save(handle, SaveOptions::default()));
+    assert!(matches!(err, SaveError::ReadOnly(_)), "{err:?}");
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert_eq!(dir.names(), vec!["a.pdf".to_string()]);
+}
+
+#[cfg(unix)]
+#[test]
+fn i8_a_file_with_two_names_is_not_silently_split_in_two() {
+    let dir = Dir::new("i8h");
+    let original = kit::simple_pdf(1);
+    let path = dir.write("a.pdf", &original);
+    let other_name = dir.0.join("b.pdf");
+    fs::hard_link(&path, &other_name).unwrap();
+    let pool = pool();
+    let (handle, _) = pool.open(&text(&path), None).unwrap();
+    let err = save_error(pool.save(handle, SaveOptions::default()));
+    assert_eq!(err.code(), "save_hard_link", "{err:?}");
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert_eq!(fs::read(&other_name).unwrap(), original);
+}
+
+#[cfg(unix)]
+#[test]
+fn i8_the_owner_and_the_group_of_a_file_are_kept_where_the_system_allows() {
+    use std::os::unix::fs::MetadataExt;
+    if !running_as_root() {
+        eprintln!("skipped: only the super user can make a file of another owner");
+        return;
+    }
+    let dir = Dir::new("i8o");
+    let path = dir.write("a.pdf", &kit::simple_pdf(1));
+    std::os::unix::fs::chown(&path, Some(2345), Some(3456)).unwrap();
+    let pool = pool();
+    let (handle, _) = pool.open(&text(&path), None).unwrap();
+    pool.save(handle, SaveOptions::default()).unwrap();
+    let meta = fs::metadata(&path).unwrap();
+    assert_eq!((meta.uid(), meta.gid()), (2345, 3456));
+}

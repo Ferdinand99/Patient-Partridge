@@ -266,6 +266,35 @@ pub fn signed_pdf() -> Vec<u8> {
     )
 }
 
+/// A one page document whose signature field sits under a grouping field, as some form designers
+/// make them: the entry of `/AcroForm /Fields` has no type of its own, and the widget below it
+/// carries `/FT /Sig` and the signature. PDFium's own count of signatures looks only at the
+/// direct entries of the field list and sees none.
+pub fn signed_nested_pdf() -> Vec<u8> {
+    let specs = [PageSpec {
+        width: 612,
+        height: 792,
+        content: Some(demo_content(1, 612, 792)),
+        extra: "/Annots [7 0 R]".into(),
+    }];
+    // Object numbers: 1 catalog, 2 tree, 3 font, 4 page, 5 content, 6 group, 7 widget, 8 signature.
+    let extras: Vec<Vec<u8>> = vec![
+        b"<< /T (Group) /Kids [7 0 R] >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Widget /Parent 6 0 R /T (Sig) /FT /Sig /Rect [50 50 250 100] /F 132 /P 4 0 R /V 8 0 R >>".to_vec(),
+        format!(
+            "<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /ByteRange [0 100 200 100] /Contents <{}> /M (D:20260101000000Z) >>",
+            "30".repeat(64)
+        )
+        .into_bytes(),
+    ];
+    build(
+        &specs,
+        "/AcroForm << /Fields [6 0 R] /SigFlags 3 >>",
+        "",
+        extras,
+    )
+}
+
 /// Letters of the right-to-left test page, in reading order: the first ten letters of the Hebrew
 /// alphabet (U+05D0 to U+05D9).
 pub const RTL_LINE: &str = "\u{5d0}\u{5d1}\u{5d2}\u{5d3}\u{5d4}\u{5d5}\u{5d6}\u{5d7}\u{5d8}\u{5d9}";
