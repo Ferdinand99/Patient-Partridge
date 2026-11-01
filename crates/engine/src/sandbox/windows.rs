@@ -222,27 +222,32 @@ fn open_network_device() -> i32 {
     }
 }
 
-/// Tries what the token forbids. If a file can be opened, or a socket made, or the device that
-/// sockets are made from opened, the sandbox is not in force.
-fn verify(winsock_started: bool) -> Result<(), String> {
+/// Tries what the token forbids. If a file can be opened, the sandbox is not in force.
+fn verify() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     if std::fs::File::open(&exe).is_ok() {
         return Err("a file could still be opened".to_string());
     }
+    Ok(())
+}
+
+/// Whether the network is out of reach: no socket can be made and the device that sockets are made
+/// from cannot be opened. The CI run of this check found that the restricted token does **not** do
+/// this on Windows (a socket can be made, and the device can be opened), so the engine does not
+/// report the layer and the README says the engine can use the network on Windows. Only an
+/// AppContainer stops it; see the README.
+fn network_is_blocked(winsock_started: bool) -> bool {
     if winsock_started {
         // SAFETY: documented calls; a socket that is made is closed again.
         unsafe {
             let s = socket(AF_INET as i32, SOCK_DGRAM, 0);
             if s != INVALID_SOCKET {
                 closesocket(s);
-                return Err("a socket could still be created".to_string());
+                return false;
             }
         }
     }
-    if open_network_device() >= 0 {
-        return Err("the network device could still be opened".to_string());
-    }
-    Ok(())
+    open_network_device() < 0
 }
 
 /// True when the engine runs on the desktop the app made for it, not on the user's.
@@ -316,7 +321,10 @@ pub fn lock_down() -> Result<Vec<&'static str>, String> {
         RevertToSelf();
     }
     let mut layers = check_layers()?;
-    verify(winsock_started)?;
+    verify()?;
+    if network_is_blocked(winsock_started) {
+        layers.push("no-network");
+    }
     // The desktop is an extra layer: the engines run on the user's desktop where the system would
     // not make one.
     if on_own_desktop() {

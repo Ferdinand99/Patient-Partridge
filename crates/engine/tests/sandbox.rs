@@ -312,15 +312,22 @@ fn a_locked_in_engine_cannot_open_files_use_the_network_or_start_programs() {
     }
     // The network: real attempts. Not "the network support did not start": on Windows the
     // program starts Winsock before the lock-in, so the refusal is the system's.
+    // On Windows the restricted token does not stop the network (found by this very check, see
+    // the README): the engine does not report the layer `no-network` there, and what the attempts
+    // got is only printed. Everywhere else they must be refused.
+    let network_must_be_blocked = !cfg!(windows) || layers.contains("no-network");
     for attempt in ["connect_socket", "bind_udp_socket"] {
         let l = line(lines, attempt);
-        assert!(l.starts_with(&format!("{attempt}: denied")), "{l}");
-        assert!(!l.contains("did not start"), "{l}");
+        println!("network: {l}");
         let c = line(&control, attempt);
         assert!(
             c.starts_with(&format!("{attempt}: ALLOWED")),
             "{attempt} does not work in the control either: {c}"
         );
+        if network_must_be_blocked {
+            assert!(l.starts_with(&format!("{attempt}: denied")), "{l}");
+            assert!(!l.contains("did not start"), "{l}");
+        }
     }
     // The system call filter on Linux and the dynamic code policy on Windows stop code from being
     // made at run time. (macOS refuses it on this hardware by its own rule, not by the profile.)
@@ -341,6 +348,8 @@ fn a_locked_in_engine_cannot_open_files_use_the_network_or_start_programs() {
     for name in names.split(',').filter(|n| !n.is_empty()) {
         assert!(
             name.starts_with("PARTRIDGE_TEST_")
+                // The system puts this one in every process on macOS.
+                || name == "__CF_USER_TEXT_ENCODING"
                 || name.eq_ignore_ascii_case("SystemRoot")
                 || name.eq_ignore_ascii_case("windir"),
             "the engine got the variable {name}"
@@ -396,12 +405,17 @@ fn a_locked_in_engine_cannot_open_files_use_the_network_or_start_programs() {
             "{}",
             line(lines, "desktop")
         );
-        assert_eq!(
+        println!(
+            "afd: {} (control: {})",
             line(lines, "afd_endpoint"),
-            "afd_endpoint: denied (NTSTATUS 0xC0000022)",
-            "the control got: {}",
             line(&control, "afd_endpoint")
         );
+        if layers.contains("no-network") {
+            assert_eq!(
+                line(lines, "afd_endpoint"),
+                "afd_endpoint: denied (NTSTATUS 0xC0000022)"
+            );
+        }
         let l = line(lines, "open_network_path");
         assert!(l.starts_with("open_network_path: denied"), "{l}");
         println!("control: {}", line(&control, "open_network_path"));
