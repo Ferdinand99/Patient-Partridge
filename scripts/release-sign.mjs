@@ -75,3 +75,12 @@ export function notaryAccepted(text) {
     return false;
   }
 }
+
+/**
+ * An argument for a command that is started through the Windows shell (`npx` is a .cmd file there):
+ * one with a space in it, like `Patient Partridge_0.1.0_x64-setup.exe`, would be split into two.
+ */
+export function shellArg(arg, windows) {
+  if (!windows || !/[ \t"]/.test(arg)) return arg;
+  return `"${arg.replace(/"/g, '\\"')}"`;
+}

@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { bundleDirFor, notaryAccepted, notaryArgs, optionOf, payloadsFor, signerArgs } from "./release-sign.mjs";
+import { bundleDirFor, notaryAccepted, notaryArgs, optionOf, payloadsFor, shellArg, signerArgs } from "./release-sign.mjs";
 
 const dirs = [];
 afterEach(() => dirs.splice(0).forEach((d) => rmSync(d, { recursive: true, force: true })));
@@ -58,5 +58,13 @@ describe("notarisation of the disk image", () => {
     expect(notaryAccepted('{"id":"1","status":"Accepted"}')).toBe(true);
     expect(notaryAccepted('{"status":"Invalid"}')).toBe(false);
     expect(notaryAccepted("not json")).toBe(false);
+  });
+});
+
+describe("shellArg", () => {
+  it("keeps a file name with a space in one piece on Windows, and leaves everything alone elsewhere", () => {
+    expect(shellArg("D:/a/Patient Partridge_0.1.0_x64-setup.exe", true)).toBe('"D:/a/Patient Partridge_0.1.0_x64-setup.exe"');
+    expect(shellArg("--app-version", true)).toBe("--app-version");
+    expect(shellArg("a b", false)).toBe("a b");
   });
 });

@@ -26,7 +26,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { codesignArgs } from "./bundle-config.mjs";
-import { bundleDirFor, notaryAccepted, notaryArgs, payloadsFor, signerArgs } from "./release-sign.mjs";
+import { bundleDirFor, notaryAccepted, notaryArgs, payloadsFor, shellArg, signerArgs } from "./release-sign.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const win = process.platform === "win32";
@@ -36,7 +36,7 @@ function run(command, args, options = {}) {
   if (result.status !== 0) throw new Error(`${command} ${args[0] ?? ""} failed (${result.status})`);
 }
 
-const tauri = (args, env = process.env) => run("npx", ["tauri", ...args], { env });
+const tauri = (args, env = process.env) => run("npx", ["tauri", ...args].map((a) => shellArg(a, win)), { env });
 
 function macOs(args, env) {
   const identity = env.APPLE_SIGNING_IDENTITY;
