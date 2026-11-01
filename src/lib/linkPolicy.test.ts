@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MAX_URI_LENGTH, classifyUri, shortAddress } from "./linkPolicy";
+import { MAX_URI_LENGTH, classifyUri, describeLink, shortAddress, visibleAddress } from "./linkPolicy";
 
 describe("classifyUri", () => {
   it("accepts plain http and https addresses", () => {
@@ -74,5 +74,23 @@ describe("shortAddress", () => {
     expect(short.startsWith("https://example.com/")).toBe(true);
     expect(short.endsWith("end")).toBe(true);
     expect(short).toContain("…");
+  });
+});
+
+describe("visibleAddress and describeLink", () => {
+  it("writes out the characters that turn text around, and control characters", () => {
+    expect(visibleAddress("https://example.com/a")).toBe("https://example.com/a");
+    expect(visibleAddress("https://example.com/\u202Egpj.exe")).toBe("https://example.com/\\u{202E}gpj.exe");
+    expect(visibleAddress("a\u0000b\u2066c\u200Fd\u0085")).toBe("a\\u{0}b\\u{2066}c\\u{200F}d\\u{85}");
+  });
+
+  it("describes a web address the way it would be opened, and says nothing else about the rest", () => {
+    // A backslash before an @ makes the address read as google.com. The parsed form shows the site.
+    expect(describeLink("https://evil.example\\@google.com/")).toBe("https://evil.example/@google.com/");
+    expect(describeLink("HTTPS://EXAMPLE.COM")).toBe("https://example.com/");
+    expect(describeLink("javascript:alert(1)")).toBe("not a web address, not opened");
+    expect(describeLink("https://user:pw@example.com/")).toBe("not a web address, not opened");
+    // A turn-around character in a web address is shown in its safe, percent-encoded form.
+    expect(describeLink("https://example.com/\u202Egpj.exe")).toBe("https://example.com/%E2%80%AEgpj.exe");
   });
 });

@@ -2,11 +2,12 @@
 //!
 //! This process shows the window and decides what to open. It never parses a PDF: all of that is
 //! done by `partridge-engine`, a separate process that this app starts and supervises. If the
-//! engine crashes or hangs on a bad file, the command that was waiting returns an error, the
-//! window stays up, and the next command starts a new engine.
+//! engine crashes or hangs on a bad file, the command that was waiting returns an error and the
+//! window stays up.
 //!
 //! Every open document has its own engine process (see `EnginePool`), so a file that crashes its
-//! engine closes only its own tab.
+//! engine closes only its own tab. The documents belong to the page in the window: when the page
+//! starts again (a reload, whatever the cause), every engine is ended and the window starts clean.
 
 mod links;
 mod locate;
@@ -20,6 +21,7 @@ use links::KnownLinks;
 use partridge_engine_client::{ClientError, EngineConfig, EnginePool, LinkTarget};
 use positions::{Position, Positions};
 use serde::Serialize;
+use tauri::webview::PageLoadEvent;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 static START: OnceLock<Instant> = OnceLock::new();
@@ -54,6 +56,64 @@ impl Pending {
         inner.ready = true;
         std::mem::take(&mut inner.paths)
     }
+
+    /// The page is starting again, so nobody is listening: paths wait until it asks for them.
+    fn reset(&self) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).ready = false;
+    }
+}
+
+/// True for the pages of the app itself: the built window (`tauri://localhost` on macOS and Linux,
+/// `http://tauri.localhost` on Windows) and, in a development build, the dev server. The window
+/// never goes anywhere else, so any other address is refused instead of being loaded in a window
+/// that can talk to the app.
+fn is_app_page(url: &url::Url, development: bool) -> bool {
+    match url.scheme() {
+        "tauri" => url.host_str() == Some("localhost"),
+        "http" | "https" => {
+            url.host_str() == Some("tauri.localhost")
+                || (development
+                    && matches!(url.host_str(), Some("localhost" | "127.0.0.1"))
+                    && url.port() == Some(1421))
+        }
+        "about" => url.as_str() == "about:blank",
+        _ => false,
+    }
+}
+
+/// Everything the app keeps for the page that was in the window: the engines of its documents, the
+/// addresses they reported, and the wait for the page to ask for the files it was started with.
+/// The new page knows nothing of the old documents, so nobody could close them.
+fn release_documents(pool: &EnginePool, known: &Mutex<KnownLinks>, pending: &Pending) {
+    pool.kill_all();
+    known.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    pending.reset();
+}
+
+/// Called when the page in the window starts to load, the first time and after every reload.
+fn page_started(app: &AppHandle) {
+    if let (Some(engine), Some(known)) = (app.try_state::<Engine>(), app.try_state::<LinkMemory>())
+    {
+        release_documents(&engine.0, &known.0, &app.state::<Pending>());
+    }
+}
+
+/// The checks before a web address from a document is opened: the engine reported it for that
+/// document, and it is a plain `http` or `https` address. Gives the address to open.
+fn authorize_link(known: &Mutex<KnownLinks>, doc: u64, url: &str) -> Result<String, CommandError> {
+    let refuse = |message: &str| CommandError {
+        code: "link_refused".into(),
+        message: message.into(),
+    };
+    if !known
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .allows(doc, url)
+    {
+        return Err(refuse("this address is not a link of the document"));
+    }
+    links::check_web_address(url)
+        .map_err(|_| refuse("only web addresses (http and https) are opened"))
 }
 
 /// Most documents open at once. Each one has an engine process of its own, about 4 MiB when idle.
@@ -316,21 +376,11 @@ async fn get_page_links(
 /// engine reported for this document.
 #[tauri::command]
 fn open_link(known: State<'_, LinkMemory>, doc: u64, url: String) -> Result<(), CommandError> {
-    let refuse = |message: &str| CommandError {
+    let address = authorize_link(&known.0, doc, &url)?;
+    links::open_in_browser(&address).map_err(|_| CommandError {
         code: "link_refused".into(),
-        message: message.into(),
-    };
-    if !known
-        .0
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .allows(doc, &url)
-    {
-        return Err(refuse("this address is not a link of the document"));
-    }
-    let address = links::check_web_address(&url)
-        .map_err(|_| refuse("only web addresses (http and https) are opened"))?;
-    links::open_in_browser(&address).map_err(|_| refuse("the web browser could not be started"))
+        message: "the web browser could not be started".into(),
+    })
 }
 
 /// Finds a text on one page. Each match is `[start, length]` in characters of the page text.
@@ -427,6 +477,16 @@ pub fn run() {
     let _ = START.set(Instant::now());
 
     let app = tauri::Builder::default()
+        .on_page_load(|webview, payload| {
+            if matches!(payload.event(), PageLoadEvent::Started) {
+                page_started(webview.app_handle());
+            }
+        })
+        .plugin(
+            tauri::plugin::Builder::<tauri::Wry>::new("navigation-guard")
+                .on_navigation(|_webview, url| is_app_page(url, cfg!(debug_assertions)))
+                .build(),
+        )
         .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
             deliver_paths(
                 app,
@@ -524,6 +584,83 @@ mod tests {
             Some(vec!["c.pdf".to_string()])
         );
         assert!(pending.take().is_empty());
+    }
+
+    #[test]
+    fn a_page_that_starts_again_gets_a_clean_start() {
+        let pool = EnginePool::new(EngineConfig::new("no-such-engine"), 2);
+        let known = Mutex::new(KnownLinks::default());
+        known.lock().unwrap().remember(1, "https://example.com/a");
+        let pending = Pending::default();
+        assert!(pending.take().is_empty());
+        assert!(pending.deliver(vec!["now.pdf".into()]).is_some());
+
+        release_documents(&pool, &known, &pending);
+
+        // The addresses of the old documents are forgotten ...
+        assert!(!known.lock().unwrap().allows(1, "https://example.com/a"));
+        // ... and files that arrive before the new page asks are kept for it.
+        assert!(pending.deliver(vec!["later.pdf".into()]).is_none());
+        assert_eq!(pending.take(), vec!["later.pdf".to_string()]);
+        assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn only_the_pages_of_the_app_may_be_loaded_in_the_window() {
+        let url = |s: &str| url::Url::parse(s).unwrap();
+        for ok in [
+            "tauri://localhost/",
+            "tauri://localhost/index.html",
+            "http://tauri.localhost/",
+            "https://tauri.localhost/index.html",
+            "about:blank",
+        ] {
+            assert!(is_app_page(&url(ok), false), "{ok}");
+        }
+        for bad in [
+            "https://example.com/",
+            "http://tauri.localhost.example.com/",
+            "tauri://example/",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "data:text/html,hi",
+            "about:srcdoc",
+            "http://localhost:1421/",
+            "ipc://localhost/",
+        ] {
+            assert!(!is_app_page(&url(bad), false), "{bad}");
+        }
+        // The dev server is allowed in a development build, on its own port only.
+        assert!(is_app_page(&url("http://localhost:1421/"), true));
+        assert!(!is_app_page(&url("http://localhost:8080/"), true));
+        assert!(!is_app_page(&url("http://example.com:1421/"), true));
+    }
+
+    #[test]
+    fn a_link_is_opened_only_when_the_document_holds_it_and_it_is_a_web_address() {
+        let known = Mutex::new(KnownLinks::default());
+        {
+            let mut k = known.lock().unwrap();
+            k.remember(1, "https://example.com/a");
+            k.remember(1, "file:///etc/passwd");
+            k.remember(1, "https://user:pw@example.com/");
+        }
+        // The cleaned up address is what gets opened.
+        assert_eq!(
+            authorize_link(&known, 1, "https://example.com/a").unwrap(),
+            "https://example.com/a"
+        );
+        let refused = |doc, url: &str| authorize_link(&known, doc, url).unwrap_err().code;
+        // Not an address of that document, whether another document holds it or none does.
+        assert_eq!(refused(2, "https://example.com/a"), "link_refused");
+        assert_eq!(refused(1, "https://example.com/other"), "link_refused");
+        // An address the document holds but that is not a plain web address.
+        assert_eq!(refused(1, "file:///etc/passwd"), "link_refused");
+        assert_eq!(refused(1, "https://user:pw@example.com/"), "link_refused");
+        assert!(authorize_link(&known, 1, "file:///etc/passwd")
+            .unwrap_err()
+            .message
+            .contains("web addresses"));
     }
 
     #[test]

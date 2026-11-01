@@ -229,3 +229,64 @@ describe("FindBar", () => {
     expect(q("#findbar").hidden).toBe(false);
   });
 });
+
+describe("findStatus: limits", () => {
+  const base = {
+    query: "x",
+    running: false,
+    failed: false,
+    total: 20000,
+    position: 3,
+    searched: 10,
+    pageCount: 5000,
+  };
+  it("says when the search stopped at the total, and when a page has more matches than are shown", () => {
+    expect(findStatus({ ...base, limit: "total" })).toBe("3 of 20,000+ (stopped at the limit)");
+    expect(findStatus({ ...base, total: 7, limit: "page" })).toBe("3 of 7 (some pages have more matches than are shown)");
+    expect(findStatus({ ...base, total: 7, limit: null })).toBe("3 of 7");
+  });
+});
+
+describe("FindBar: the limit and shared timers", () => {
+  it("tells the user that the search stopped at the limit", async () => {
+    const searchPage = vi.fn((_doc: number, _page: number, _query: string) =>
+      Promise.resolve(Array.from({ length: 2000 }, (_, i) => [i * 2, 1] as [number, number])),
+    );
+    const bar = new FindBar(document, { searchPage, onEngineLost: vi.fn(), debounceMs: 5 });
+    const view = fakeView(5000);
+    bar.setTarget({ doc: 3, view: view as unknown as DocumentView });
+    bar.open();
+    await type("e");
+    await wait(400);
+    expect(q("#find-status").textContent).toContain("20,000+");
+    expect(q("#find-status").textContent).toContain("stopped at the limit");
+    expect(searchPage.mock.calls.length).toBe(10);
+  });
+
+  it("does not lose the last update of a search because another document had one waiting", async () => {
+    let releaseA: () => void = () => undefined;
+    const gateA = new Promise<void>((r) => (releaseA = r));
+    const searchPage = vi.fn(async (doc: number, page: number, _query: string) => {
+      // Document 1 finds a match on its first page and then waits.
+      if (doc === 1 && page === 1) await gateA;
+      return page === 0 ? ([[0, 3]] as [number, number][]) : [];
+    });
+    const bar = new FindBar(document, { searchPage, onEngineLost: vi.fn(), debounceMs: 5 });
+    const a = fakeView(3);
+    const b = fakeView(1);
+    bar.setTarget({ doc: 1, view: a as unknown as DocumentView });
+    bar.open();
+    const input = q<HTMLInputElement>("#find-input");
+    input.value = "fox";
+    input.dispatchEvent(new Event("input"));
+    await wait(15);
+    // The search of document 1 has an update waiting. Now the other tab comes to the front.
+    bar.setTarget({ doc: 2, view: b as unknown as DocumentView });
+    input.value = "fox";
+    input.dispatchEvent(new Event("input"));
+    await wait(15);
+    await wait(150);
+    expect(q("#find-status").textContent).toBe("1 of 1");
+    releaseA();
+  });
+});

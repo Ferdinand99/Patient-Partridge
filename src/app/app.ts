@@ -4,8 +4,9 @@
 
 import type { OpenedDocument, OutlineEntry, SavedPosition } from "../lib/api";
 import { describeError, fileNameOf, toAppError, type AppErrorLike } from "../lib/errors";
-import { classifyUri } from "../lib/linkPolicy";
+import { classifyUri, visibleAddress } from "../lib/linkPolicy";
 import { parsePageInput } from "../lib/pageInput";
+import { pickPdfPaths } from "../lib/paths";
 import {
   THEME_CHOICES,
   applyTheme,
@@ -16,7 +17,7 @@ import {
 } from "../lib/theme";
 import { actionForKey } from "../viewer/keys";
 import type { PageLinkInfo } from "../viewer/overlays";
-import { DocumentView } from "../viewer/viewer";
+import { DocumentView, type ViewPosition, type ViewerOptions } from "../viewer/viewer";
 import { zoomLabel, type ZoomMode } from "../viewer/zoom";
 import { FindBar } from "./find";
 import { MenuController } from "./menu";
@@ -60,6 +61,13 @@ export interface AppDeps {
   findDebounceMs?: number;
   /** What printing needs besides the engine. Without it the browser's own functions are used. */
   print?: Partial<Omit<PrintDeps, "render">>;
+  /**
+   * How long the question before a link is opened cannot be answered with its primary button, in
+   * milliseconds. Default: LINK_ANSWER_DELAY_MS.
+   */
+  linkAnswerDelayMs?: number;
+  /** Limits on the text kept for each document. For tests; the defaults are meant for the app. */
+  viewLimits?: ViewerOptions["limits"];
 }
 
 interface Tab {
@@ -71,10 +79,27 @@ interface Tab {
   /** What the side panel knows about this document. */
   sidebarDoc: SidebarDocument;
   saveTimer: ReturnType<typeof setTimeout> | undefined;
+  /**
+   * Where the reader was when the remembered positions were forgotten. Until the reader moves
+   * from there, the place of this file is not written down again.
+   */
+  forgottenAt: ViewPosition | null;
 }
 
 const ZOOM_CHOICES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
 const DEFAULT_POSITION_DELAY_MS = 600;
+/**
+ * How long the question before a web address is opened has its primary button off. A double click
+ * on a link raises the question with the first press, and the second press must not answer it.
+ * The delay is a little longer than the double-click time of the systems (500 ms).
+ */
+export const LINK_ANSWER_DELAY_MS = 700;
+
+/** True when two places in a document are the same, as far as the reader can tell. */
+function samePlace(a: ViewPosition, b: ViewPosition): boolean {
+  const sameZoom = a.zoom === b.zoom || (a.zoom !== null && b.zoom !== null && Math.abs(a.zoom - b.zoom) < 1e-6);
+  return a.page === b.page && Math.abs(a.offset - b.offset) < 0.002 && sameZoom;
+}
 const APP_NAME = "Patient Partridge";
 
 function byId<T extends HTMLElement>(root: Document, id: string): T {
@@ -191,7 +216,8 @@ export class App {
   // ---- opening and closing ---------------------------------------------------
 
   async openDialog(): Promise<void> {
-    const paths = await this.deps.pickFiles();
+    // The same choice and the same limit as for files that are dropped or named at the start.
+    const paths = pickPdfPaths(await this.deps.pickFiles());
     if (paths.length > 0) await this.openPaths(paths);
   }
 
@@ -281,6 +307,7 @@ export class App {
       view: undefined as unknown as DocumentView,
       sidebarDoc: undefined as unknown as SidebarDocument,
       saveTimer: undefined,
+      forgottenAt: null,
     };
     tab.view = new DocumentView(
       { doc: opened.doc, pages: opened.pages },
@@ -311,7 +338,7 @@ export class App {
         },
         onSelectionSettled: () => this.updateSelectionProxy(tab),
       },
-      { start: opened.position ?? null },
+      { start: opened.position ?? null, limits: this.deps.viewLimits },
     );
     tab.sidebarDoc = {
       doc: opened.doc,
@@ -367,7 +394,11 @@ export class App {
     const [tab] = this.tabs.splice(index, 1);
     this.saveNow(tab);
     clearTimeout(tab.saveTimer);
-    if (this.tabs.length === 0) this.printJob?.cleanup();
+    // The pictures made for printing go with the document they show.
+    if (this.printJob && (this.tabs.length === 0 || this.printJob.document === tab.doc)) {
+      this.printJob.cancel();
+      this.printJob.cleanup();
+    }
     this.find.forget(tab.view);
     tab.view.destroy();
     this.sidebar.forget(tab.doc);
@@ -407,7 +438,14 @@ export class App {
     clearTimeout(tab.saveTimer);
     tab.saveTimer = undefined;
     if (tab.view.pageCount === 0) return;
-    void this.deps.api.setPosition(tab.path, tab.view.getPosition()).catch(() => undefined);
+    const place = tab.view.getPosition();
+    if (tab.forgottenAt) {
+      // The reader asked to forget positions: a file that was open at that moment is written down
+      // again only after the reader has really moved in it.
+      if (samePlace(tab.forgottenAt, place)) return;
+      tab.forgottenAt = null;
+    }
+    void this.deps.api.setPosition(tab.path, place).catch(() => undefined);
   }
 
   private saveAll(): void {
@@ -426,10 +464,12 @@ export class App {
       ],
     });
     if (answer.button !== "forget") return;
-    // Clear the file first, then the timers: nothing may write a position back after this.
+    // Nothing may write a position back after this, also not the files that are open now: closing
+    // a tab, choosing another one or hiding the window all save the place of a tab.
     for (const tab of this.tabs) {
       clearTimeout(tab.saveTimer);
       tab.saveTimer = undefined;
+      tab.forgottenAt = tab.view.getPosition();
     }
     await this.deps.api.clearPositions().catch(() => undefined);
   }
@@ -576,7 +616,9 @@ export class App {
       target instanceof HTMLTextAreaElement;
     // Plain keys belong to a field or button while one has the focus; shortcuts with Ctrl always work.
     const isShortcut = e.ctrlKey || e.metaKey;
-    if (!isShortcut && (typing || target instanceof HTMLButtonElement)) return;
+    // F3 steps through the matches also while the find box has the focus.
+    const stepsMatches = action.type === "find-next" || action.type === "find-previous";
+    if (!isShortcut && !stepsMatches && (typing || target instanceof HTMLButtonElement)) return;
     if (this.noticeLayer.childElementCount > 0) return;
 
     if (action.type === "open-file") {
@@ -699,7 +741,62 @@ export class App {
     }
     // Some pages are not loaded yet: fetch them, then write the text to the clipboard.
     e.preventDefault();
-    void view.loadSelectedText().then((all) => this.root.defaultView?.navigator.clipboard?.writeText(all));
+    void this.copyFetched(view);
+  }
+
+  /**
+   * Copies a selection that has pages not loaded yet. The text is written after the copy event is
+   * over, which some web views allow only after a press of a key: that can fail. Whatever goes
+   * wrong, or is left out, the reader is told, so a copy is never taken for the whole text when it
+   * is not.
+   */
+  private async copyFetched(view: DocumentView): Promise<void> {
+    const copy = await view.loadSelectedText();
+    if (copy.text.length > 0) {
+      try {
+        const clipboard = this.root.defaultView?.navigator.clipboard;
+        if (!clipboard) throw new Error("no clipboard");
+        await clipboard.writeText(copy.text);
+      } catch {
+        await showNotice(this.noticeLayer, {
+          title: "The text could not be copied",
+          detail:
+            "Patient Partridge could not put the text on the clipboard. Select it again and press Copy, or select less text.",
+          buttons: [{ id: "ok", label: "OK", primary: true }],
+        });
+        return;
+      }
+    } else if (copy.failed.length === 0 && !copy.truncated) {
+      return;
+    }
+    const left: string[] = [];
+    if (copy.truncated) {
+      left.push(
+        `The text of ${copy.pages} of ${copy.total} pages was copied. One copy holds a limited amount of text, so the rest is missing. Select a smaller part to copy the rest.`,
+      );
+    }
+    if (copy.failed.length > 0) {
+      const n = copy.failed.length;
+      left.push(`${n === 1 ? "1 page" : `${n} pages`} could not be read, so the text is missing there.`);
+    }
+    if (copy.cut > 0) {
+      left.push(
+        `${copy.cut === 1 ? "1 page has" : `${copy.cut} pages have`} more text than the reader can handle, so the end of the text on ${copy.cut === 1 ? "it is" : "them is"} missing.`,
+      );
+    }
+    if (copy.text.length === 0) {
+      await showNotice(this.noticeLayer, {
+        title: "The text could not be copied",
+        detail: left.join(" "),
+        buttons: [{ id: "ok", label: "OK", primary: true }],
+      });
+    } else if (left.length > 0) {
+      await showNotice(this.noticeLayer, {
+        title: "Only part of the text was copied",
+        detail: left.join(" "),
+        buttons: [{ id: "ok", label: "OK", primary: true }],
+      });
+    }
   }
 
   /** A link on a page was pressed. A page link just goes there; a web address is asked about first. */
@@ -714,7 +811,7 @@ export class App {
       await showNotice(this.noticeLayer, {
         title: "This link is not opened",
         detail: verdict.reason,
-        quote: uri.length > 300 ? `${uri.slice(0, 300)}…` : uri,
+        quote: visibleAddress(uri.length > 300 ? `${uri.slice(0, 300)}…` : uri),
         buttons: [{ id: "ok", label: "OK", primary: true }],
       });
       return;
@@ -723,6 +820,7 @@ export class App {
       title: "Open this link in your browser?",
       detail: `This document wants to open a web address on the site ${verdict.host}. Only open it if you trust the document.`,
       quote: verdict.url,
+      armMs: this.deps.linkAnswerDelayMs ?? LINK_ANSWER_DELAY_MS,
       buttons: [
         { id: "cancel", label: "Cancel", safe: true },
         { id: "open", label: "Open in browser", primary: true },

@@ -1,5 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
-import { MAX_QUERY_CHARS, MatchCursor, SearchSession, cleanQuery, type PageSearch } from "./search";
+import {
+  MAX_MATCHES_PER_PAGE,
+  MAX_QUERY_CHARS,
+  MAX_SEARCH_MATCHES,
+  MatchCursor,
+  SearchSession,
+  cleanQuery,
+  type PageSearch,
+} from "./search";
 
 const wait = () => new Promise((r) => setTimeout(r, 0));
 
@@ -201,5 +209,56 @@ describe("MatchCursor", () => {
     expect(cursor.current).toEqual({ page: 3, start: 5, len: 3 });
     expect(cursor.position).toBe(2);
     expect(cursor.total).toBe(2);
+  });
+});
+
+describe("SearchSession: limits", () => {
+  const many = (count: number): [number, number][] => Array.from({ length: count }, (_, i) => [i * 2, 1]);
+
+  it("stops at a total, keeps exactly that many matches and says why", async () => {
+    // Every page has 2 000 matches, the most the engine gives for a page.
+    const search = vi.fn<PageSearch>(() => Promise.resolve(many(MAX_MATCHES_PER_PAGE)));
+    const onUpdate = vi.fn();
+    const s = new SearchSession({
+      query: "e",
+      pageCount: 5000,
+      startPage: 0,
+      search,
+      onUpdate,
+      onError: vi.fn(),
+      maxMatches: 5000,
+    });
+    await s.run();
+    expect(s.matches).toHaveLength(5000);
+    expect(s.limit).toBe("total");
+    // It did not go on to the other pages, and it is over.
+    expect(search).toHaveBeenCalledTimes(3);
+    expect(s.running).toBe(false);
+    expect(s.done).toBe(false);
+    expect(onUpdate).toHaveBeenCalled();
+  });
+
+  it("has a total of 20 000 matches by default", async () => {
+    expect(MAX_SEARCH_MATCHES).toBe(20_000);
+    const search = vi.fn<PageSearch>(() => Promise.resolve(many(MAX_MATCHES_PER_PAGE)));
+    const { s } = session(search, 5000);
+    await s.run();
+    expect(s.matches).toHaveLength(MAX_SEARCH_MATCHES);
+    expect(search).toHaveBeenCalledTimes(MAX_SEARCH_MATCHES / MAX_MATCHES_PER_PAGE);
+    expect(s.limit).toBe("total");
+  });
+
+  it("says when a page has more matches than the engine gives", async () => {
+    const search = vi.fn<PageSearch>((page) => Promise.resolve(page === 1 ? many(MAX_MATCHES_PER_PAGE) : []));
+    const { s } = session(search, 3);
+    await s.run();
+    expect(s.done).toBe(true);
+    expect(s.limit).toBe("page");
+  });
+
+  it("has no limit to report when nothing was cut", async () => {
+    const { s } = session(fake({ 0: [[0, 3]] }), 3);
+    await s.run();
+    expect(s.limit).toBeNull();
   });
 });

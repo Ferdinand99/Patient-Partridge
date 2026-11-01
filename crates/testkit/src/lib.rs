@@ -238,6 +238,42 @@ BT /F1 12 Tf 72 400 Td 16 TL (A needle in a haystack.) Tj T* (Another NEEDLE her
     )
 }
 
+/// Letters of the right-to-left test page, in reading order: the first ten letters of the Hebrew
+/// alphabet (U+05D0 to U+05D9).
+pub const RTL_LINE: &str = "\u{5d0}\u{5d1}\u{5d2}\u{5d3}\u{5d4}\u{5d5}\u{5d6}\u{5d7}\u{5d8}\u{5d9}";
+
+/// One page with two lines of right-to-left text, laid out the way such text is drawn: the glyphs
+/// are placed from the left to the right of the line, so the last letter in reading order comes
+/// first in the content. The font maps its codes to Hebrew letters with a `ToUnicode` table, so
+/// PDFium has to put the letters back in reading order, with the first letter at the right end.
+///
+/// Line 1 (the top line) reads `RTL_LINE`, ten letters. Line 2 reads U+05D5 to U+05D9, the last
+/// five letters of the first line.
+pub fn rtl_pdf() -> Vec<u8> {
+    // Code 0x41 + i is the i-th glyph from the left; it stands for the letter U+05D9 - i.
+    let map: String = (0..10)
+        .map(|i| format!("<{:02X}> <{:04X}>\n", 0x41 + i, 0x5d9 - i))
+        .collect();
+    let cmap = format!(
+        "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
+/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
+/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n\
+1 begincodespacerange\n<00> <FF>\nendcodespacerange\n\
+10 beginbfchar\n{map}endbfchar\nendcmap\nCMapName currentdict /CMap defineresource pop\nend\nend"
+    );
+    let content =
+        "BT /F1 18 Tf 300 700 Td (ABCDEFGHIJ) Tj ET\nBT /F1 18 Tf 300 660 Td (ABCDE) Tj ET\n";
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [4 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 6 0 R >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Resources << /Font << /F1 3 0 R >> >> >>".to_vec(),
+        stream_object("", content),
+        stream_object("", &cmap),
+    ];
+    assemble(&objects, "")
+}
+
 /// A page-free helper: three plain pages and an outline built by `outline_objects`, which returns
 /// the objects from number 10 (the outline root) on. Page 1 is object 4, page 2 is 6, page 3 is 8.
 fn plain_pdf_with_outline(outline_objects: Vec<Vec<u8>>, annots: &str) -> Vec<u8> {

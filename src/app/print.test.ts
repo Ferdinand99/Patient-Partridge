@@ -286,3 +286,30 @@ describe("the progress box", () => {
     }
   });
 });
+
+describe("the print dialog for a very long document", () => {
+  let layer: HTMLElement;
+  beforeEach(() => {
+    document.body.innerHTML = '<div id="layer" hidden></div>';
+    layer = document.getElementById("layer") as HTMLElement;
+  });
+  afterEach(() => document.body.replaceChildren());
+  const submit = () => layer.querySelector("form")?.dispatchEvent(new Event("submit", { cancelable: true }));
+
+  it("does not offer all pages when there are more than a job can hold, and says what will be printed", async () => {
+    const answer = showPrintDialog(layer, { name: "big.pdf", pageCount: 5000, currentPage: 0 });
+    expect(layer.textContent).not.toContain("All 5000 pages");
+    expect(layer.textContent).toContain("The first 1000 of 5000 pages");
+    expect(layer.textContent).toContain("at most 1000 pages");
+    submit();
+    const choice = await answer;
+    expect(choice?.pages).toHaveLength(MAX_PRINT_PAGES);
+    expect(choice?.pages.at(-1)).toBe(MAX_PRINT_PAGES - 1);
+  });
+
+  it("keeps the plain wording for a document that fits", () => {
+    void showPrintDialog(layer, { name: "small.pdf", pageCount: 12, currentPage: 0 });
+    expect(layer.textContent).toContain("All 12 pages");
+    expect(layer.textContent).not.toContain("at most");
+  });
+});

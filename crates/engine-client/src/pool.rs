@@ -27,6 +27,9 @@ struct State {
     /// The handle the next document gets. Counted from 1, never reused.
     next: u64,
     docs: HashMap<u64, Entry>,
+    /// Goes up every time all documents are let go of. A document that was still being opened when
+    /// that happened belongs to a window that is gone, and is not added to the pool.
+    epoch: u64,
 }
 
 pub struct EnginePool {
@@ -80,6 +83,7 @@ impl EnginePool {
                 ),
             });
         }
+        let epoch = state(&self.state).epoch;
         let client = Arc::new(EngineClient::new(self.config.clone()));
         let opened = match client.open(path, password) {
             Ok(opened) => opened,
@@ -88,25 +92,38 @@ impl EnginePool {
                 return Err(e);
             }
         };
+        let handle = self.register(client, opened.doc, epoch)?;
+        Ok((handle, opened.pages))
+    }
+
+    /// Adds an opened document to the pool, unless the pool was emptied or filled up while the
+    /// document was being opened. In that case the engine is ended again.
+    fn register(
+        &self,
+        client: Arc<EngineClient>,
+        doc: u64,
+        epoch: u64,
+    ) -> Result<u64, ClientError> {
         let mut st = state(&self.state);
-        if st.docs.len() >= self.max_documents {
+        let refusal = if st.epoch != epoch {
+            Some("the documents were let go of while this one was opening")
+        } else if st.docs.len() >= self.max_documents {
+            Some("too many documents are open")
+        } else {
+            None
+        };
+        if let Some(message) = refusal {
             drop(st);
             client.kill();
             return Err(ClientError::Engine {
                 code: ErrorCode::InvalidRequest,
-                message: "too many documents are open".into(),
+                message: message.into(),
             });
         }
         st.next += 1;
         let handle = st.next;
-        st.docs.insert(
-            handle,
-            Entry {
-                client,
-                doc: opened.doc,
-            },
-        );
-        Ok((handle, opened.pages))
+        st.docs.insert(handle, Entry { client, doc });
+        Ok(handle)
     }
 
     fn entry(&self, handle: u64) -> Result<(Arc<EngineClient>, u64), ClientError> {
@@ -173,9 +190,16 @@ impl EnginePool {
         }
     }
 
-    /// Ends every engine. Used when the app quits.
+    /// Ends every engine and lets go of every document. Used when the app quits, and when the
+    /// window starts again (a reload): the window then knows nothing about the documents it had,
+    /// so nobody could close them. A document that is still opening when this is called is ended
+    /// as soon as it has opened. The pool can be used again afterwards.
     pub fn kill_all(&self) {
-        let all: Vec<Entry> = state(&self.state).docs.drain().map(|(_, e)| e).collect();
+        let all: Vec<Entry> = {
+            let mut st = state(&self.state);
+            st.epoch += 1;
+            st.docs.drain().map(|(_, e)| e).collect()
+        };
         for entry in all {
             entry.client.kill();
         }
@@ -185,5 +209,57 @@ impl EnginePool {
 impl Drop for EnginePool {
     fn drop(&mut self) {
         self.kill_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pool() -> EnginePool {
+        // No engine is started in these tests: a client starts its engine with its first request.
+        EnginePool::new(EngineConfig::new("no-such-engine"), 4)
+    }
+
+    fn client(pool: &EnginePool) -> Arc<EngineClient> {
+        Arc::new(EngineClient::new(pool.config.clone()))
+    }
+
+    fn epoch(pool: &EnginePool) -> u64 {
+        state(&pool.state).epoch
+    }
+
+    #[test]
+    fn a_document_that_finishes_opening_after_a_reset_is_not_kept() {
+        let pool = pool();
+        let before = epoch(&pool);
+        // The window starts again while a document is still opening ...
+        pool.kill_all();
+        // ... so when that document is ready, nobody is left to use or close it.
+        let err = pool.register(client(&pool), 1, before).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ClientError::Engine {
+                    code: ErrorCode::InvalidRequest,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn a_document_opened_after_a_reset_is_kept_and_handles_go_on_counting() {
+        let pool = pool();
+        let now = epoch(&pool);
+        let first = pool.register(client(&pool), 1, now).unwrap();
+        pool.kill_all();
+        assert!(pool.is_empty());
+        let now = epoch(&pool);
+        let second = pool.register(client(&pool), 1, now).unwrap();
+        assert!(second > first, "{second} should come after {first}");
+        assert_eq!(pool.len(), 1);
     }
 }

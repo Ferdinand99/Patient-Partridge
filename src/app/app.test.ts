@@ -84,7 +84,15 @@ class MemoryStorage {
   }
 }
 
-function make(options: { measureOn?: boolean; storage?: MemoryStorage } = {}) {
+function make(
+  options: {
+    measureOn?: boolean;
+    storage?: MemoryStorage;
+    /** Keeps the real delay before a link question can be answered. Tests wait for it otherwise. */
+    realLinkDelay?: boolean;
+    viewLimits?: { preloadChars?: number; copyChars?: number };
+  } = {},
+) {
   let nextDoc = 1;
   let urlCounter = 0;
   const api = {
@@ -134,6 +142,8 @@ function make(options: { measureOn?: boolean; storage?: MemoryStorage } = {}) {
     positionDelayMs: 5,
     thumbSettleMs: 5,
     findDebounceMs: 5,
+    linkAnswerDelayMs: options.realLinkDelay ? undefined : 0,
+    viewLimits: options.viewLimits,
     print: {
       encode: vi.fn(() => Promise.resolve(new Blob(["jpeg"]))),
       createUrl: vi.fn(() => `blob:test/${++urlCounter}`),
@@ -1075,5 +1085,257 @@ describe("App: measurement mode", () => {
     const [openMs, paintMs, pages] = api.measureReport.mock.calls[0];
     expect(pages).toBe(3);
     expect(paintMs).toBeGreaterThanOrEqual(openMs);
+  });
+});
+
+describe("App: a link question cannot be answered by a press already on its way", () => {
+  const links = () => [...document.querySelectorAll<HTMLElement>(".page-link")];
+
+  it("keeps the primary button off for a moment, so the second press of a double click does nothing", async () => {
+    const { app, api } = make({ realLinkDelay: true });
+    await app.openPath("/a.pdf");
+    await flush();
+    links()[0].click();
+    await flush();
+    const open = button("Open in browser");
+    expect(open?.disabled).toBe(true);
+    // The second press of the double click lands on the button, a moment later.
+    click(open);
+    await flush();
+    expect(api.openLink).not.toHaveBeenCalled();
+    expect(notice()).not.toBeNull();
+    // The safe answer is there at once.
+    expect(button("Cancel")?.disabled).toBe(false);
+    expect(document.activeElement).toBe(button("Cancel"));
+    // A real answer, given after the delay, works.
+    await new Promise((r) => setTimeout(r, 800));
+    expect(button("Open in browser")?.disabled).toBe(false);
+    click(button("Open in browser"));
+    await flush();
+    expect(api.openLink).toHaveBeenCalledWith(1, "https://example.com/a");
+  });
+
+  it("is safe with the keyboard: Enter and Space, held down, only reach Cancel", async () => {
+    const { app, api } = make({ realLinkDelay: true });
+    await app.openPath("/a.pdf");
+    await flush();
+    links()[0].click();
+    await flush();
+    for (const k of ["Enter", " "]) {
+      const held = new KeyboardEvent("keydown", { key: k, repeat: true, bubbles: true, cancelable: true });
+      document.activeElement?.dispatchEvent(held);
+      expect(held.defaultPrevented, k).toBe(true);
+    }
+    expect(api.openLink).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(button("Cancel"));
+  });
+});
+
+describe("App: forgetting positions also holds for the files that are open", () => {
+  const closeButton = (name: string) => document.querySelector(`[aria-label="Close ${name}"]`);
+
+  async function forget() {
+    click(q("#menu-button"));
+    click(q("#forget-positions"));
+    await flush();
+    click(button("Forget positions"));
+    await flush();
+  }
+
+  it("does not write the place of an open file back when its tab is closed", async () => {
+    const { app, api } = make();
+    await app.openPath("/secret.pdf");
+    await flush();
+    app.currentView!.goToPage(1);
+    await flush();
+    await forget();
+    api.setPosition.mockClear();
+    click(closeButton("secret.pdf"));
+    await flush();
+    expect(api.setPosition).not.toHaveBeenCalled();
+  });
+
+  it("does not write it back when another tab is chosen, when the window is hidden, or on a repaint", async () => {
+    const { app, api } = make();
+    await app.openPath("/a.pdf");
+    await app.openPath("/b.pdf");
+    await flush();
+    click(tab("a.pdf"));
+    await flush();
+    app.currentView!.goToPage(1);
+    await flush();
+    await forget();
+    api.setPosition.mockClear();
+    click(tab("b.pdf"));
+    document.dispatchEvent(new Event("visibilitychange"));
+    window.dispatchEvent(new Event("pagehide"));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(api.setPosition).not.toHaveBeenCalled();
+  });
+
+  it("remembers the place again once the reader moves", async () => {
+    const { app, api } = make();
+    await app.openPath("/a.pdf");
+    await flush();
+    await forget();
+    api.setPosition.mockClear();
+    app.currentView!.goToPage(2);
+    await flush();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(api.setPosition).toHaveBeenCalled();
+    expect(api.setPosition.mock.calls.at(-1)?.[1].page).toBe(2);
+  });
+
+  it("treats a file opened after the forgetting like any other", async () => {
+    const { app, api } = make();
+    await forget();
+    await app.openPath("/new.pdf");
+    await flush();
+    api.setPosition.mockClear();
+    click(closeButton("new.pdf"));
+    await flush();
+    expect(api.setPosition).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("App: copying says when it could not copy everything", () => {
+  function clipboard(writeText: (text: string) => Promise<void> | undefined) {
+    Object.defineProperty(window.navigator, "clipboard", { configurable: true, value: { writeText } });
+  }
+  afterEach(() => {
+    Object.defineProperty(window.navigator, "clipboard", { configurable: true, value: undefined });
+  });
+  const copy = () => {
+    const event = new Event("copy", { bubbles: true, cancelable: true }) as Event & { clipboardData: unknown };
+    event.clipboardData = { setData: vi.fn() };
+    document.body.dispatchEvent(event);
+  };
+
+  /** A document of 30 pages, so that most of its text is not loaded when everything is selected. */
+  const longDoc = (api: { open: { mockImplementationOnce(f: () => Promise<OpenedDocument>): unknown } }) =>
+    api.open.mockImplementationOnce(() => Promise.resolve(opened(1, 30, "long.pdf")));
+  const manyLines = Array.from({ length: 30 }, () => "Hello world").join("\n");
+
+  it("shows how many pages were copied when the copy was cut at the limit", async () => {
+    const write = vi.fn(() => Promise.resolve());
+    clipboard(write);
+    // Room for one page only. Nothing is loaded ahead, so Copy has to fetch the pages itself.
+    const { app, api } = make({ viewLimits: { preloadChars: 0, copyChars: 15 } });
+    longDoc(api);
+    await app.openPath("/a.pdf");
+    await flush();
+    key("a", { ctrlKey: true });
+    await flush();
+    copy();
+    await flush();
+    expect(write).toHaveBeenCalledWith("Hello world");
+    expect(notice()?.textContent).toContain("Only part of the text was copied");
+    expect(notice()?.textContent).toContain("1 of 30 pages");
+    expect(notice()?.textContent).not.toContain("could not be copied");
+  });
+
+  it("says so when pages cannot be read", async () => {
+    clipboard(vi.fn(() => Promise.resolve()));
+    const { app, api } = make({ viewLimits: { preloadChars: 0 } });
+    longDoc(api);
+    api.getPageText.mockImplementation((_d: number, p: number) =>
+      p === 20
+        ? Promise.reject(new Error("no"))
+        : Promise.resolve({ text: "Hello world", rects: layoutRects("Hello world") }),
+    );
+    await app.openPath("/a.pdf");
+    await flush();
+    key("a", { ctrlKey: true });
+    await flush();
+    copy();
+    await flush();
+    expect(notice()?.textContent).toContain("Only part of the text was copied");
+    expect(notice()?.textContent).toContain("could not be read");
+  });
+
+  it("says so when the clipboard refuses the text", async () => {
+    clipboard(vi.fn(() => Promise.reject(new Error("not allowed"))));
+    const { app, api } = make({ viewLimits: { preloadChars: 0 } });
+    longDoc(api);
+    await app.openPath("/a.pdf");
+    await flush();
+    key("a", { ctrlKey: true });
+    await flush();
+    copy();
+    await flush();
+    expect(notice()?.textContent).toContain("could not be copied");
+  });
+
+  it("says so when there is no clipboard", async () => {
+    const { app, api } = make({ viewLimits: { preloadChars: 0 } });
+    longDoc(api);
+    await app.openPath("/a.pdf");
+    await flush();
+    key("a", { ctrlKey: true });
+    await flush();
+    copy();
+    await flush();
+    expect(notice()?.textContent).toContain("could not be copied");
+  });
+
+  it("is quiet when everything was copied", async () => {
+    const write = vi.fn(() => Promise.resolve());
+    clipboard(write);
+    const { app, api } = make({ viewLimits: { preloadChars: 0 } });
+    longDoc(api);
+    await app.openPath("/a.pdf");
+    await flush();
+    key("a", { ctrlKey: true });
+    await flush();
+    copy();
+    await flush();
+    expect(write).toHaveBeenCalledWith(manyLines);
+    expect(notice()).toBeNull();
+  });
+});
+
+describe("App: smaller behaviours", () => {
+  it("moves between matches with F3 also while the find box has the focus", async () => {
+    const { app } = make();
+    await app.openPath("/a.pdf");
+    await flush();
+    key("f", { ctrlKey: true });
+    const input = q<HTMLInputElement>("#find-input");
+    input.value = "hello";
+    input.dispatchEvent(new Event("input"));
+    await new Promise((r) => setTimeout(r, 120));
+    await flush();
+    expect(q("#find-status").textContent).toBe("1 of 1");
+    const f3 = new KeyboardEvent("keydown", { key: "F3", bubbles: true, cancelable: true });
+    input.dispatchEvent(f3);
+    expect(f3.defaultPrevented).toBe(true);
+  });
+
+  it("drops the print pictures of a document when its tab closes, also when other tabs stay open", async () => {
+    const { app, api, deps } = make();
+    await app.openPath("/a.pdf");
+    await app.openPath("/b.pdf");
+    await flush();
+    click(tab("a.pdf"));
+    await flush();
+    api.render.mockClear();
+    key("p", { ctrlKey: true });
+    document.querySelector(".print-dialog")?.dispatchEvent(new Event("submit", { cancelable: true }));
+    await flush();
+    await flush();
+    expect(document.querySelectorAll("#print-root img").length).toBeGreaterThan(0);
+    key("w", { ctrlKey: true });
+    await flush();
+    expect(app.tabCount).toBe(1);
+    expect(document.querySelectorAll("#print-root img")).toHaveLength(0);
+    expect(deps.print.revokeUrl).toHaveBeenCalled();
+  });
+
+  it("keeps the file dialog to the same limit as a drop", async () => {
+    const { app, deps, api } = make();
+    deps.pickFiles.mockResolvedValueOnce(Array.from({ length: 20 }, (_, i) => `/f${i}.pdf`));
+    await app.openDialog();
+    await flush();
+    expect(api.open).toHaveBeenCalledTimes(8);
   });
 });

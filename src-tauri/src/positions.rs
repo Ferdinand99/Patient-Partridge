@@ -136,7 +136,7 @@ impl Positions {
             return Ok(());
         };
         if let Some(dir) = file.parent() {
-            fs::create_dir_all(dir)?;
+            create_private_dir(dir)?;
         }
         let stored = Stored {
             version: 1,
@@ -145,9 +145,39 @@ impl Positions {
         let json = serde_json::to_vec(&stored).map_err(io::Error::other)?;
         // Write beside the file and move it into place, so a crash cannot leave half a file.
         let temp = file.with_extension("json.tmp");
-        fs::write(&temp, json)?;
+        write_private_file(&temp, &json)?;
         fs::rename(&temp, file)
     }
+}
+
+/// Makes the folder if it is missing. On Unix it is for the user alone (the file holds the paths of
+/// everything that was read).
+fn create_private_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(dir)
+    }
+}
+
+/// Writes a file that, on Unix, only the user can read.
+fn write_private_file(file: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(file)?.write_all(bytes)
 }
 
 fn read_entries(file: &Path) -> Vec<Entry> {
@@ -239,6 +269,23 @@ mod tests {
         assert_eq!(again.len(), 2);
         assert_eq!(again.get("a.pdf"), Some(pos(7)));
         assert_eq!(again.get("b.pdf").unwrap().zoom, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_file_and_its_folder_are_for_the_user_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new();
+        let inner = dir.0.join("data");
+        let file = inner.join("positions.json");
+        let mut positions = Positions::load(Some(file.clone()));
+        positions.set("a.pdf", pos(1), 1).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&file), 0o600);
+        assert_eq!(mode(&inner), 0o700);
+        // Writing again keeps it so.
+        positions.set("b.pdf", pos(2), 2).unwrap();
+        assert_eq!(mode(&file), 0o600);
     }
 
     #[test]

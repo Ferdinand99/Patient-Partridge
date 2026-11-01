@@ -244,3 +244,117 @@ describe("TextStore", () => {
     expect(store.size).toBeLessThanOrEqual(3);
   });
 });
+
+// ---- right-to-left text -------------------------------------------------------------
+
+/**
+ * The page of `rtl_pdf()` (crates/testkit) as the real engine reports it, in points: two lines of
+ * Hebrew in reading order. PDFium puts the first letter at the right end of the line, so the boxes
+ * of each line run from right to left. The numbers were copied from the output of the engine.
+ */
+const REAL_RTL: PageText = {
+  chars: Array.from("אבגדהוזחטי\nוזחטי"),
+  boxes: [
+    [405, 75, 414, 96.0625],
+    [400, 75, 405, 96.0625],
+    [387, 75, 400, 96.0625],
+    [373, 75, 387, 96.0625],
+    [362, 75, 373, 96.0625],
+    [350, 75, 362, 96.0625],
+    [337, 75, 350, 96.0625],
+    [324, 75, 337, 96.0625],
+    [312, 75, 324, 96.0625],
+    [300, 75, 312, 96.0625],
+    [0, 0, 0, 0],
+    [350, 115, 362, 136.0625],
+    [337, 115, 350, 136.0625],
+    [324, 115, 337, 136.0625],
+    [312, 115, 324, 136.0625],
+    [300, 115, 312, 136.0625],
+  ].flat(),
+};
+
+/** A line of right-to-left text drawn with equal boxes: the first letter is the rightmost. */
+function mirrored(count: number, right = 200): PageText {
+  const boxes: number[] = [];
+  for (let i = 0; i < count; i++) boxes.push(right - (i + 1) * W, 100, right - i * W, 100 + H);
+  return { chars: Array.from({ length: count }, (_, i) => String.fromCodePoint(0x5d0 + i)), boxes };
+}
+
+describe("offsetAt in right-to-left text", () => {
+  it("puts the start of the line at its right end, as a reader expects", () => {
+    const page = mirrored(10);
+    // c0 spans x 194..200. Its right half is before it, its left half after it.
+    expect(offsetAt(page, 199, 105)).toBe(0);
+    expect(offsetAt(page, 195, 105)).toBe(1);
+    expect(offsetAt(page, 193, 105)).toBe(1);
+    expect(offsetAt(page, 189, 105)).toBe(2);
+    // Beyond the right end: before the first letter. Beyond the left end: after the last.
+    expect(offsetAt(page, 400, 105)).toBe(0);
+    expect(offsetAt(page, 0, 105)).toBe(10);
+  });
+
+  it("keeps the whole line when it is dragged from beyond one end to beyond the other", () => {
+    const page = mirrored(10);
+    const from = offsetAt(page, 400, 105);
+    const to = offsetAt(page, 0, 105);
+    expect(textInRange(page, from, to)).toBe(page.chars.join(""));
+    // And the other way round, as orderSelection will sort it out.
+    const back = orderSelection({
+      anchor: { page: 0, offset: offsetAt(page, 0, 105) },
+      focus: { page: 0, offset: offsetAt(page, 400, 105) },
+    });
+    expect(textInRange(page, back.start.offset, back.end.offset)).toBe(page.chars.join(""));
+  });
+
+  it("works on the line as the real engine reports it, for the first and the last letter", () => {
+    // Press right of the middle of the first letter (x 405..414), release left of the last one.
+    expect(offsetAt(REAL_RTL, 412, 85)).toBe(0);
+    expect(offsetAt(REAL_RTL, 407, 85)).toBe(1);
+    expect(offsetAt(REAL_RTL, 302, 85)).toBe(10);
+    expect(offsetAt(REAL_RTL, 310, 85)).toBe(9);
+    expect(textInRange(REAL_RTL, offsetAt(REAL_RTL, 600, 85), offsetAt(REAL_RTL, 100, 85))).toBe("אבגדהוזחטי");
+    // The second line starts at its right end too (x 350..362).
+    expect(offsetAt(REAL_RTL, 360, 125)).toBe(11);
+    expect(offsetAt(REAL_RTL, 302, 125)).toBe(16);
+    expect(textInRange(REAL_RTL, offsetAt(REAL_RTL, 600, 125), offsetAt(REAL_RTL, 100, 125))).toBe("וזחטי");
+  });
+
+  it("still reads a left-to-right line left to right", () => {
+    const page = layout("abcdef");
+    expect(offsetAt(page, 51, 105)).toBe(0);
+    expect(offsetAt(page, 55, 105)).toBe(1);
+    expect(offsetAt(page, 500, 105)).toBe(6);
+  });
+
+  it("copes with a single letter, and with a left-to-right run inside a right-to-left line", () => {
+    const one = mirrored(1);
+    expect(offsetAt(one, 199, 105)).toBeGreaterThanOrEqual(0);
+    // "ab" then "12" drawn left to right inside a right-to-left line: digits keep their own order.
+    const mixed: PageText = {
+      chars: ["א", "ב", "1", "2", "ג"],
+      // Reading order is right to left, except the two digits, which read left to right.
+      boxes: [
+        [194, 100, 200, 110],
+        [188, 100, 194, 110],
+        [176, 100, 182, 110],
+        [182, 100, 188, 110],
+        [170, 100, 176, 110],
+      ].flat(),
+    };
+    expect(offsetAt(mixed, 199, 105)).toBe(0);
+    expect(offsetAt(mixed, 169, 105)).toBe(5);
+    // The digits: '1' (x 176..182) is left of '2' (182..188). Its left half is before it.
+    expect(offsetAt(mixed, 177, 105)).toBe(2);
+    expect(offsetAt(mixed, 187, 105)).toBe(4);
+  });
+});
+
+describe("lineRects in right-to-left text", () => {
+  it("makes one box for the whole line, and one for each line", () => {
+    expect(lineRects(REAL_RTL, 0, 10)).toEqual([{ left: 300, top: 75, right: 414, bottom: 96.0625 }]);
+    expect(lineRects(REAL_RTL, 0, 16)).toHaveLength(2);
+    // A part of the line: the middle letters are a box in the middle.
+    expect(lineRects(REAL_RTL, 2, 4)).toEqual([{ left: 373, top: 75, right: 400, bottom: 96.0625 }]);
+  });
+});

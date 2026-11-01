@@ -73,6 +73,11 @@ impl KnownLinks {
         self.0.remove(&doc);
     }
 
+    /// Forgets every document: the window that knew them is gone.
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
     pub fn allows(&self, doc: u64, uri: &str) -> bool {
         self.0.get(&doc).is_some_and(|set| set.contains(uri))
     }

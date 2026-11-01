@@ -63,7 +63,51 @@ export function offsetAt(page: PageText, x: number, y: number): number {
   }
   if (best < 0) return 0;
   const r = boxOf(page, best);
-  return x >= (r.left + r.right) / 2 ? best + 1 : best;
+  const rightHalf = x >= (r.left + r.right) / 2;
+  // In left-to-right text the right half of a character is after it. In right-to-left text the
+  // characters are in reading order but run from the right, so the right half is before it.
+  return rightHalf !== (direction(page, best) < 0) ? best + 1 : best;
+}
+
+/** How many characters on each side are looked at to tell which way the text runs. */
+const DIRECTION_REACH = 4;
+
+/**
+ * Which way the text runs around a character: 1 for left to right, -1 for right to left, 0 when it
+ * cannot be told (a lone character). The engine gives characters in reading order, so the next
+ * character on the same line is to the right in left-to-right text and to the left in right-to-left
+ * text. A character at the edge of a run may have neighbours that disagree; then the nearer wins.
+ */
+function direction(page: PageText, index: number): -1 | 0 | 1 {
+  const here = boxOf(page, index);
+  const centre = (here.left + here.right) / 2;
+  const middle = (here.top + here.bottom) / 2;
+  const width = here.right - here.left;
+  const height = here.bottom - here.top;
+
+  const look = (step: 1 | -1): { sign: -1 | 1; distance: number } | null => {
+    let seen = 0;
+    for (let j = index + step; j >= 0 && j < page.chars.length && seen < DIRECTION_REACH; j += step) {
+      if (!hasBox(page, j)) continue;
+      seen++;
+      const r = boxOf(page, j);
+      // A character on another line says nothing about this one.
+      if (Math.abs((r.top + r.bottom) / 2 - middle) > height * 0.5) return null;
+      const dx = (r.left + r.right) / 2 - centre;
+      // A mark drawn over this character (a vowel sign, say) does not show the direction.
+      if (Math.abs(dx) < 0.3 * Math.min(width, r.right - r.left)) continue;
+      return { sign: dx * step > 0 ? 1 : -1, distance: Math.abs(dx) };
+    }
+    return null;
+  };
+
+  const next = look(1);
+  const previous = look(-1);
+  if (next && previous) {
+    if (next.sign === previous.sign) return next.sign;
+    return previous.distance < next.distance ? previous.sign : next.sign;
+  }
+  return (next ?? previous)?.sign ?? 0;
 }
 
 /**

@@ -40,11 +40,13 @@ The editor side is planned, and none of it exists yet. There are no dates; each 
 
 ## Known limits
 
-- **Memory.** Measured on Linux (WebKitGTK, software rendering) with a 500-page file open: the whole app, all its processes together, uses about 490 MB of memory (proportional share), of which about 325 MB is the web view and about 14 MB the engine. The plan's target of 150 MB is not met there. Windows and macOS have not been measured on real hardware; their web views behave differently.
+- **Memory.** Measured on Linux (WebKitGTK, software rendering) with a 500-page file open: the whole app, all its processes together, uses about 490 MB of memory (proportional share), of which about 325 MB is the web view and about 14 MB the engine. The goal of 150 MB is not met there. Windows and macOS have not been measured on real hardware; their web views behave differently.
 - **Web view.** The look uses CSS `light-dark()`, so the web view must be recent: WebView2 (always up to date), WebKitGTK 2.46 or newer, and a macOS version whose web view is Safari 17.5 or newer.
-- **Search** finds text as PDFium reports it. It does not join words split by a hyphen at the end of a line, and it does not match a ligature character against its letters.
-- **Text selection** follows the order of the text in the file. In documents with several columns that are stored in an odd order, a selection can jump between columns.
-- **Printing** sends pictures of the pages, at 150 dpi, to the system's print dialog. Pages of different sizes are fitted to the paper.
+- **Search** finds text as PDFium reports it. It does not join words split by a hyphen at the end of a line, and it does not match a ligature character against its letters. A search stops after 20,000 matches and says so (for example "20,000+ (stopped at the limit)"); a page with more than 2,000 matches shows the first 2,000 and the find bar says that some pages have more.
+- **Text selection** follows the order of the text in the file. In documents with several columns that are stored in an odd order, a selection can jump between columns. Right-to-left text (Hebrew, Arabic) is selected from its right end, in reading order; text that runs sideways or up and down is not placed well yet.
+- **Copying** gathers at most 20 million characters at a time. When a copy is cut short, or a page cannot be read, or a page has more text than the engine hands over (100,000 characters), a message says what is missing. On some systems the web view allows the text to be put on the clipboard only straight after a key press; if it refuses, a message says so.
+- **Printing** sends pictures of the pages, at 150 dpi, to the system's print dialog. Pages of different sizes are fitted to the paper. One print job holds at most 1,000 pages: for a longer document the dialog offers "The first 1000 of N pages" instead of "All", and a list of pages can be printed in parts.
+- **Reloading the window** (F5, Ctrl+R, the context menu) is switched off in release builds, because a reload would lose the tabs. Whatever else restarts the page, the app ends the engines of the old page and starts clean.
 
 ## How it is built
 

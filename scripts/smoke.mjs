@@ -163,8 +163,9 @@ const results = [];
 let retries = 0;
 /**
  * A launch that never reports a drawn page is tried once more. Web views on shared CI machines (the
- * macOS ones in particular) now and then do not start at all, which says nothing about the app.
- * Two launches in a row that fail are a failure, and the output of both is shown.
+ * macOS ones in particular) now and then do not start at all. The cause is not known: it may be
+ * the machine, or a real hang at startup that the retry hides. Two launches in a row that fail are
+ * a failure, and the output of both is shown.
  */
 async function launch() {
   try {

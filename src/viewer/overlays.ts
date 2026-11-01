@@ -5,7 +5,7 @@
 // without being placed again. PDF text and addresses are data: they are never put in the page as
 // markup, only as text content, and nothing here follows a link by itself.
 
-import { shortAddress } from "../lib/linkPolicy";
+import { describeLink } from "../lib/linkPolicy";
 import type { PageSizePt } from "./layout";
 import type { SearchMatch } from "./search";
 import {
@@ -18,6 +18,7 @@ import {
   parsePageText,
   rangeOnPage,
   selectionText,
+  textInRange,
   wordRange,
   type PageText,
   type Rect,
@@ -56,8 +57,37 @@ export interface OverlayEvents {
   onSelectionSettled?(): void;
 }
 
-/** Most pages whose text is loaded in the background after Select all. */
-export const MAX_SELECT_ALL_PAGES = 600;
+/** Limits on the text a document keeps in the window. */
+export interface OverlayLimits {
+  /**
+   * Most characters of text loaded ahead after Select all, so that a short Copy needs no waiting
+   * and the Copy of the system has something to copy. A longer selection is fetched when it is
+   * copied.
+   */
+  preloadChars: number;
+  /** Most characters one Copy gathers. About 40 MB of text at the limit. */
+  copyChars: number;
+}
+
+export const DEFAULT_LIMITS: OverlayLimits = { preloadChars: 1_000_000, copyChars: 20_000_000 };
+
+/** The engine cuts the text of one page at this many characters (see MAX_PAGE_CHARS there). */
+const ENGINE_PAGE_CHARS = 100_000;
+
+/** What a Copy of the selection gathered, and what it could not. */
+export interface CopyResult {
+  text: string;
+  /** Pages of the selection that were read and are in the text. */
+  pages: number;
+  /** Pages the selection covers. */
+  total: number;
+  /** Pages that could not be read. */
+  failed: number[];
+  /** True when the copy stopped at the limit and the pages after the last one are not in the text. */
+  truncated: boolean;
+  /** Pages as long as the engine allows: the engine cuts such a page, so its end is missing. */
+  cut: number;
+}
 /** How far the pointer must move before a press becomes a drag, in pixels. */
 const DRAG_DISTANCE = 4;
 /** How close to the edge of the view the pointer must be to scroll it while dragging, in pixels. */
@@ -75,8 +105,11 @@ export class PageOverlays {
   private readonly overlays = new Map<number, HTMLElement>();
   private readonly links = new Map<number, PageLinkInfo[]>();
   private readonly linksPending = new Set<number>();
+  /** Pages of the selection whose text was loaded ahead, within the limit, and is kept. */
+  private readonly preloaded = new Set<number>();
+  private readonly limits: OverlayLimits;
   private selection: Selection | null = null;
-  private find = new Map<number, [number, number][]>();
+  private find: ReadonlyMap<number, readonly [number, number][]> = new Map();
   private findCurrent: SearchMatch | null = null;
   private dragging = false;
   private pressed: { x: number; y: number; moved: boolean; detail: number } | null = null;
@@ -91,10 +124,12 @@ export class PageOverlays {
     private readonly api: OverlayApi,
     private readonly host: OverlayHost,
     private readonly events: OverlayEvents,
+    limits: Partial<OverlayLimits> = {},
   ) {
+    this.limits = { ...DEFAULT_LIMITS, ...limits };
     this.texts = new TextStore(
       (page) => this.fetchText(page),
-      (page) => this.isNeeded(page),
+      (page) => this.isKept(page),
     );
     const el = host.element;
     el.addEventListener("pointerdown", this.onPointerDown);
@@ -122,6 +157,9 @@ export class PageOverlays {
   unmount(page: number): void {
     this.overlays.get(page)?.remove();
     this.overlays.delete(page);
+    // The links of a page that is off screen are not kept: they are asked for again when the page
+    // is drawn again, so a long document does not pile them up.
+    this.links.delete(page);
   }
 
   /** A page has been drawn: now is the time to ask for its text and its links. */
@@ -155,18 +193,25 @@ export class PageOverlays {
     this.linksPending.add(page);
     this.api
       .getPageLinks(this.doc, page)
-      .then((links) => this.links.set(page, links))
-      .catch(() => this.links.set(page, []))
+      .then((links) => {
+        if (this.overlays.has(page)) this.links.set(page, links);
+      })
+      .catch(() => {
+        if (this.overlays.has(page)) this.links.set(page, []);
+      })
       .then(() => {
         this.linksPending.delete(page);
         this.paint(page);
       });
   }
 
-  /** A page whose text must be kept: it is inside the selection or holds a search match. */
-  private isNeeded(page: number): boolean {
-    if (this.selection && rangeOnPage(this.selection, page)) return true;
-    return this.find.has(page);
+  /**
+   * A page whose text must be kept: it is on screen (its highlights are drawn from the text), or
+   * it is part of the selection that was loaded ahead. Everything else can be fetched again, so the
+   * text kept for a document stays within a fixed total however much is selected or found.
+   */
+  private isKept(page: number): boolean {
+    return this.overlays.has(page) || this.preloaded.has(page);
   }
 
   // ---- painting ----------------------------------------------------------------
@@ -228,12 +273,11 @@ export class PageOverlays {
         b.style.top = percent(t, size.height);
         b.style.width = percent(r - l, size.width);
         b.style.height = percent(bt - t, size.height);
+        // A web address is shown the way it would be opened, not as the document wrote it.
         const label =
-          link.page !== null
-            ? `Go to page ${link.page + 1}`
-            : `Link to ${shortAddress(link.uri ?? "", 80)}`;
+          link.page !== null ? `Go to page ${link.page + 1}` : `Link to ${describeLink(link.uri ?? "")}`;
         b.setAttribute("aria-label", label);
-        b.title = link.page !== null ? label : shortAddress(link.uri ?? "", 80);
+        b.title = link.page !== null ? label : describeLink(link.uri ?? "");
         b.addEventListener("click", (e) => {
           e.preventDefault();
           e.stopPropagation();
@@ -264,12 +308,15 @@ export class PageOverlays {
   private setSelection(sel: Selection | null): void {
     const was = this.hasSelection;
     this.selection = sel;
+    for (const page of this.preloaded) {
+      if (!sel || !rangeOnPage(sel, page)) this.preloaded.delete(page);
+    }
     this.paintAll();
     const now = this.hasSelection;
     if (was !== now) this.events.onSelectionChange?.(now);
   }
 
-  /** Selects all the text of the document. Text is loaded in the background for copying. */
+  /** Selects all the text of the document. Some of the text is loaded ahead, for a quick copy. */
   selectAll(): void {
     const last = this.pages.length - 1;
     if (last < 0) return;
@@ -277,7 +324,7 @@ export class PageOverlays {
       anchor: { page: 0, offset: 0 },
       focus: { page: last, offset: Number.MAX_SAFE_INTEGER },
     });
-    void this.loadSelected();
+    void this.preloadSelected();
   }
 
   /** The selected text from the pages that are loaded, and the pages that are not. */
@@ -286,20 +333,58 @@ export class PageOverlays {
     return selectionText(this.selection, (page) => this.texts.get(page));
   }
 
-  /** The selected text, loading the pages it still lacks. */
-  async loadSelectedText(): Promise<string> {
-    await this.loadSelected();
-    return this.selectedText().text;
+  /**
+   * The selected text for a Copy. Pages that are not loaded are fetched one at a time and left to
+   * the store to drop, so a selection of a whole book never sits in memory page by page. The copy
+   * stops at a fixed size, and the result says how far it got, which pages could not be read, and
+   * whether the engine had cut a page.
+   */
+  async loadSelectedText(): Promise<CopyResult> {
+    const result: CopyResult = { text: "", pages: 0, total: 0, failed: [], truncated: false, cut: 0 };
+    const sel = this.selection;
+    if (!sel || isEmptySelection(sel)) return result;
+    const { start, end } = orderSelection(sel);
+    result.total = end.page - start.page + 1;
+    const parts: string[] = [];
+    let used = 0;
+    for (let page = start.page; page <= end.page; page++) {
+      if (this.destroyed) break;
+      const text = this.texts.get(page) ?? (await this.texts.load(page));
+      if (!text) {
+        result.failed.push(page);
+        continue;
+      }
+      if (text.chars.length >= ENGINE_PAGE_CHARS) result.cut++;
+      const range = rangeOnPage(sel, page);
+      const piece = range ? textInRange(text, range[0], Math.min(range[1], text.chars.length)) : "";
+      if (piece.length > 0) {
+        const cost = piece.length + (parts.length > 0 ? 1 : 0);
+        if (used + cost > this.limits.copyChars) {
+          result.truncated = true;
+          break;
+        }
+        parts.push(piece);
+        used += cost;
+      }
+      result.pages++;
+    }
+    result.text = parts.join("\n");
+    return result;
   }
 
-  private async loadSelected(): Promise<void> {
+  /** Loads the text of the first pages of the selection, up to the limit, and keeps it. */
+  private async preloadSelected(): Promise<void> {
     const sel = this.selection;
     if (!sel) return;
     const { start, end } = orderSelection(sel);
-    const last = Math.min(end.page, start.page + MAX_SELECT_ALL_PAGES);
-    for (let page = start.page; page <= last; page++) {
+    let chars = 0;
+    for (let page = start.page; page <= end.page && chars < this.limits.preloadChars; page++) {
       if (this.destroyed || this.selection !== sel) return;
-      if (!this.texts.get(page)) await this.texts.load(page);
+      const text = this.texts.get(page) ?? (await this.texts.load(page));
+      if (text) {
+        chars += text.chars.length;
+        this.preloaded.add(page);
+      }
     }
     if (!this.destroyed && this.selection === sel) {
       this.paintAll();
@@ -433,10 +518,21 @@ export class PageOverlays {
 
   /** Shows the matches of a search. `current` is the one that is picked out. */
   setFind(matches: ReadonlyMap<number, readonly [number, number][]>, current: SearchMatch | null): void {
-    const before = new Set(this.find.keys());
-    this.find = new Map([...matches].map(([page, list]) => [page, [...list] as [number, number][]]));
+    const before = this.find;
+    const beforeCurrent = this.findCurrent;
+    // The lists of matches are kept as they are given (a search does not change a list once it has
+    // given it), so a page is painted again only when its list is a new one, or when the match that
+    // is picked out moved from it or to it.
+    this.find = new Map(matches);
     this.findCurrent = current;
-    for (const page of new Set([...before, ...this.find.keys()])) this.paint(page);
+    const changed = new Set<number>();
+    for (const [page, list] of this.find) if (before.get(page) !== list) changed.add(page);
+    for (const page of before.keys()) if (!this.find.has(page)) changed.add(page);
+    if (beforeCurrent?.page !== current?.page || beforeCurrent?.start !== current?.start) {
+      if (beforeCurrent) changed.add(beforeCurrent.page);
+      if (current) changed.add(current.page);
+    }
+    for (const page of changed) this.paint(page);
   }
 
   clearFind(): void {
@@ -457,7 +553,7 @@ export class PageOverlays {
 
   /** Lets go of the text that is not needed now, such as when the view is hidden. */
   releaseText(): void {
-    this.texts.retain((page) => this.isNeeded(page));
+    this.texts.retain((page) => this.isKept(page));
   }
 
   /** The text of a page, if it is loaded. For tests and for the receiver of a copy. */

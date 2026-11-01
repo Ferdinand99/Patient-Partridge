@@ -20,7 +20,7 @@ import {
   scrollTopForPage,
   visibleRange,
 } from "./layout";
-import { PageOverlays, type OverlayApi, type PageLinkInfo } from "./overlays";
+import { PageOverlays, type CopyResult, type OverlayApi, type OverlayLimits, type PageLinkInfo } from "./overlays";
 import { RenderScheduler, type RenderJob } from "./scheduler";
 import type { SearchMatch } from "./search";
 import type { Rect } from "./textlayer";
@@ -58,6 +58,8 @@ export interface ViewPosition {
 export interface ViewerOptions {
   /** Where to start. Without it the view starts at the top, fitted to the width. */
   start?: ViewPosition | null;
+  /** Limits on the text kept for the document. For tests; the defaults are meant for the app. */
+  limits?: Partial<OverlayLimits>;
 }
 
 export interface DocumentInfo {
@@ -135,6 +137,7 @@ export class DocumentView {
         onSelectionChange: (has) => events.onSelectionChange?.(has),
         onSelectionSettled: () => events.onSelectionSettled?.(),
       },
+      options.limits,
     );
 
     this.element.addEventListener("scroll", this.onScroll, { passive: true });
@@ -328,8 +331,8 @@ export class DocumentView {
     return this.overlays.selectedText();
   }
 
-  /** The selected text, loading the pages it still lacks. */
-  loadSelectedText(): Promise<string> {
+  /** The selected text for a Copy, loading the pages it still lacks, and what it could not do. */
+  loadSelectedText(): Promise<CopyResult> {
     return this.overlays.loadSelectedText();
   }
 
