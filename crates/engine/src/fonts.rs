@@ -7,15 +7,19 @@
 //!
 //! - Fonts that sit in a `fonts` folder next to the PDFium library are read into memory at start,
 //!   before the sandbox is applied, and served by family name. The app ships none yet.
+//! - The app can hand over one system font file for each of seven scripts (Japanese, Korean, two
+//!   Chinese, Arabic, Hebrew, Thai) as read-only handles; see `partridge_engine_client::system_fonts`.
+//!   The file is read through its handle when PDFium first asks for that script, never before. The
+//!   engine does not choose or open a path, and a name in the PDF cannot reach a file: it only
+//!   decides which of the seven handles answers.
 //! - For everything else the provider answers "no font", and PDFium falls back on the fonts that
 //!   are built into the library itself: a sans serif, a serif and a monospace face with a
 //!   multiple-master range of weights, and the Symbol and Dingbats faces. These cover Latin text of
 //!   the 14 standard PDF fonts and anything named like them.
 //!
-//! What this does not give: text in a script that needs a font the PDF does not embed (Chinese,
-//! Japanese, Korean, Arabic, Hebrew, Thai) shows as blanks or boxes unless a font for it is in the
-//! `fonts` folder. A PDF that embeds its fonts, which is nearly every PDF made for the web or
-//! print, is not affected.
+//! What this does not give: text in one of those scripts in a PDF that does not embed its font,
+//! on a computer where the app found no font for the script, shows as blanks. A PDF that embeds its
+//! fonts, which is nearly every PDF made for the web or print, is not affected.
 
 use std::collections::HashMap;
 use std::fs::File;
