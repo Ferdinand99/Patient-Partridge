@@ -106,9 +106,19 @@ async function runOnce({ bin, pdf, memory }) {
     env.XDG_DATA_HOME = join(dir, "home", ".local", "share");
     env.XDG_CACHE_HOME = join(dir, "home", ".cache");
   }
-  const child = spawn(bin, [pdf], { env, stdio: "ignore" });
+  const child = spawn(bin, [pdf], { env: { ...env, RUST_BACKTRACE: "1" }, stdio: ["ignore", "pipe", "pipe"] });
+  // Keep the end of what the app wrote, to show it if the run fails.
+  let output = "";
+  const keep = (chunk) => {
+    output = (output + chunk).slice(-6000);
+  };
+  child.stdout.on("data", keep);
+  child.stderr.on("data", keep);
   let exited = false;
-  child.on("exit", () => (exited = true));
+  child.on("exit", (code, signal) => {
+    exited = true;
+    keep(`\n[the app exited: code ${code}, signal ${signal}]\n`);
+  });
   try {
     const deadline = Date.now() + 90_000;
     while (Date.now() < deadline) {
@@ -117,7 +127,9 @@ async function runOnce({ bin, pdf, memory }) {
       await sleep(100);
     }
     if (!existsSync(report) || !readFileSync(report, "utf8").trim()) {
-      throw new Error("The app did not report a drawn page (it exited or took longer than 90 s).");
+      throw new Error(
+        `The app did not report a drawn page (it exited or took longer than 90 s). What it wrote:\n${output}`,
+      );
     }
     await sleep(300);
     const result = JSON.parse(readFileSync(report, "utf8"));
@@ -130,7 +142,13 @@ async function runOnce({ bin, pdf, memory }) {
   } finally {
     killTree(child);
     await sleep(200);
-    rmSync(dir, { recursive: true, force: true });
+    // The web view may still be writing its caches for a moment. A folder that cannot be removed
+    // is not a failure of the app, so it is only retried, never reported.
+    try {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
+    } catch {
+      // Left behind in the temporary folder.
+    }
   }
 }
 
@@ -142,14 +160,31 @@ const median = (values) => {
 const options = parse(process.argv.slice(2));
 if (!existsSync(options.bin)) throw new Error(`App binary not found: ${options.bin}`);
 const results = [];
+let retries = 0;
+/**
+ * A launch that never reports a drawn page is tried once more. Web views on shared CI machines (the
+ * macOS ones in particular) now and then do not start at all, which says nothing about the app.
+ * Two launches in a row that fail are a failure, and the output of both is shown.
+ */
+async function launch() {
+  try {
+    return await runOnce(options);
+  } catch (first) {
+    retries += 1;
+    console.log(`A launch did not report a drawn page; trying once more.
+${first.message}`);
+    return await runOnce(options);
+  }
+}
 for (let i = 0; i < options.runs; i++) {
-  const r = await runOnce(options);
+  const r = await launch();
   results.push(r);
   console.log(`run ${i + 1}: ${JSON.stringify(r)}`);
 }
 const summary = {
   pages: results[0].pages,
   runs: results.length,
+  retries,
   open_ms_median: median(results.map((r) => r.open_ms)),
   first_page_ms_median: median(results.map((r) => r.first_page_ms)),
   since_process_start_ms_median: median(results.map((r) => r.since_process_start_ms)),

@@ -3,37 +3,126 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="color-scheme" content="light" />
+    <meta name="color-scheme" content="light dark" />
     <title>Patient Partridge</title>
+    <!-- Sets a forced theme before the first paint. Same origin, so the strict CSP allows it. -->
+    <script src="/theme-init.js"></script>
   </head>
   <body>
+    <!-- Icon sprite: 24px grid, 1.5px stroke, painted with currentColor. -->
+    <svg class="vh" width="0" height="0" aria-hidden="true" focusable="false">
+      <defs>
+        <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" /></symbol>
+        <symbol id="i-minus" viewBox="0 0 24 24"><path d="M5 12h14" /></symbol>
+        <symbol id="i-x" viewBox="0 0 24 24"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11" /></symbol>
+        <symbol id="i-more" viewBox="0 0 24 24">
+          <circle cx="6" cy="12" r="1.35" fill="currentColor" stroke="none" />
+          <circle cx="12" cy="12" r="1.35" fill="currentColor" stroke="none" />
+          <circle cx="18" cy="12" r="1.35" fill="currentColor" stroke="none" />
+        </symbol>
+        <symbol id="i-sun" viewBox="0 0 24 24">
+          <circle cx="12" cy="12" r="4" />
+          <path d="M12 3v1.75M12 19.25V21M3 12h1.75M19.25 12H21M5.64 5.64l1.24 1.24M17.12 17.12l1.24 1.24M5.64 18.36l1.24-1.24M17.12 6.88l1.24-1.24" />
+        </symbol>
+        <symbol id="i-moon" viewBox="0 0 24 24"><path d="M19.5 14.6A7.75 7.75 0 0 1 9.4 4.5a7.75 7.75 0 1 0 10.1 10.1z" /></symbol>
+        <symbol id="i-theme-auto" viewBox="0 0 24 24">
+          <circle cx="12" cy="12" r="8.25" />
+          <path d="M12 3.75a8.25 8.25 0 0 1 0 16.5z" fill="currentColor" stroke="none" />
+        </symbol>
+        <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6" /><path d="M15 15l4.75 4.75" /></symbol>
+        <symbol id="i-chevron-up" viewBox="0 0 24 24"><path d="M5.5 14.5L12 8l6.5 6.5" /></symbol>
+        <symbol id="i-chevron-down" viewBox="0 0 24 24"><path d="M5.5 9.5L12 16l6.5-6.5" /></symbol>
+        <symbol id="i-chevron-right" viewBox="0 0 24 24"><path d="M9.5 5.5L16 12l-6.5 6.5" /></symbol>
+        <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.75l4.5 4.5L19 7.5" /></symbol>
+        <symbol id="i-external" viewBox="0 0 24 24">
+          <path d="M14 4.5h5.5V10" /><path d="M19.5 4.5L11 13" />
+          <path d="M18 13.5v4.75a1.25 1.25 0 0 1-1.25 1.25H5.75a1.25 1.25 0 0 1-1.25-1.25V7.25C4.5 6.56 5.06 6 5.75 6h4.75" />
+        </symbol>
+        <symbol id="i-file" viewBox="0 0 24 24">
+          <path d="M7 3.5h6.5L18 8v11.5a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1v-15a1 1 0 0 1 1-1z" /><path d="M13.5 3.5V8H18" />
+        </symbol>
+        <symbol id="i-panel" viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="14" rx="2.5" /><path d="M9.5 5v14" /></symbol>
+        <symbol id="i-printer" viewBox="0 0 24 24">
+          <path d="M7 9V4.5h10V9" /><rect x="4" y="9" width="16" height="8" rx="2" /><path d="M7 14h10v5.5H7z" />
+        </symbol>
+        <symbol id="i-list" viewBox="0 0 24 24">
+          <path d="M9.5 7h10M9.5 12h10M9.5 17h10" />
+          <circle cx="5" cy="7" r="1" fill="currentColor" stroke="none" />
+          <circle cx="5" cy="12" r="1" fill="currentColor" stroke="none" />
+          <circle cx="5" cy="17" r="1" fill="currentColor" stroke="none" />
+        </symbol>
+        <symbol id="i-grid" viewBox="0 0 24 24">
+          <rect x="4" y="4" width="6.5" height="6.5" rx="1.75" /><rect x="13.5" y="4" width="6.5" height="6.5" rx="1.75" />
+          <rect x="4" y="13.5" width="6.5" height="6.5" rx="1.75" /><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.75" />
+        </symbol>
+        <symbol id="i-trash" viewBox="0 0 24 24">
+          <path d="M5 7h14M9.5 7V4.75h5V7M7 7l.75 12.25a1 1 0 0 0 1 .95h6.5a1 1 0 0 0 1-.95L17 7" />
+        </symbol>
+      </defs>
+    </svg>
+
     <div class="app" id="app">
-      <header class="toolbar" id="toolbar">
-        <button class="btn" id="open-button" type="button" title="Open a PDF (Ctrl+O)">Open</button>
-        <span class="toolbar-gap"></span>
-        <label class="page-box">
-          <span class="visually-hidden">Page number</span>
-          <input id="page-input" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" size="4" disabled />
-          <span id="page-total" class="page-total"></span>
-        </label>
-        <span class="toolbar-gap"></span>
-        <button class="btn btn-icon" id="zoom-out" type="button" title="Zoom out (Ctrl+-)" aria-label="Zoom out" disabled>&minus;</button>
-        <label class="zoom-box">
-          <span class="visually-hidden">Zoom</span>
-          <select id="zoom-select" disabled></select>
-        </label>
-        <button class="btn btn-icon" id="zoom-in" type="button" title="Zoom in (Ctrl++)" aria-label="Zoom in" disabled>+</button>
+      <header class="bar" id="bar">
+        <div class="tabstrip">
+          <div class="tabs" id="tabs" role="tablist" aria-label="Open documents"></div>
+          <button class="btn btn-icon btn-plain" id="open-button" type="button" title="Open a PDF (Ctrl+O)" aria-label="Open a PDF">
+            <svg class="icon" aria-hidden="true"><use href="#i-plus"></use></svg>
+          </button>
+        </div>
+        <div class="toolbar" id="toolbar">
+          <label class="page-box">
+            <span class="vh">Page number</span>
+            <input class="field-input" id="page-input" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" size="4" disabled />
+            <span id="page-total" class="page-total muted num"></span>
+          </label>
+          <span class="toolbar-sep" aria-hidden="true"></span>
+          <button class="btn btn-icon btn-plain" id="zoom-out" type="button" title="Zoom out (Ctrl+-)" aria-label="Zoom out" disabled>
+            <svg class="icon" aria-hidden="true"><use href="#i-minus"></use></svg>
+          </button>
+          <label class="zoom-box">
+            <span class="vh">Zoom</span>
+            <select class="select" id="zoom-select" disabled></select>
+          </label>
+          <button class="btn btn-icon btn-plain" id="zoom-in" type="button" title="Zoom in (Ctrl++)" aria-label="Zoom in" disabled>
+            <svg class="icon" aria-hidden="true"><use href="#i-plus"></use></svg>
+          </button>
+          <span class="grow"></span>
+          <button class="btn btn-icon btn-plain" id="menu-button" type="button" title="Settings" aria-label="Settings" aria-haspopup="true" aria-expanded="false" aria-controls="menu">
+            <svg class="icon" aria-hidden="true"><use href="#i-more"></use></svg>
+          </button>
+        </div>
       </header>
+
       <main class="stage" id="stage">
         <div class="empty" id="empty">
-          <h1>Patient Partridge</h1>
-          <p>Drop a PDF file here, or</p>
-          <button class="btn btn-primary" id="empty-open" type="button">Open a PDF</button>
-          <p class="hint">Ctrl+O opens a file. Page Down, Space and the arrow keys scroll.</p>
+          <div class="empty-icon"><svg class="icon" aria-hidden="true"><use href="#i-file"></use></svg></div>
+          <h1 class="empty-title">Patient Partridge</h1>
+          <p class="empty-text">Drop a PDF file here, or open one. Nothing leaves this computer.</p>
+          <div class="empty-actions">
+            <button class="btn btn-primary btn-lg" id="empty-open" type="button">Open a PDF</button>
+          </div>
+          <p class="empty-text">
+            <kbd>Ctrl</kbd> <kbd>O</kbd> opens a file. <kbd>Page Down</kbd>, <kbd>Space</kbd> and the arrow keys scroll.
+          </p>
         </div>
         <div class="drop-overlay" id="drop-overlay" hidden><span>Drop a PDF to open it</span></div>
       </main>
-      <div class="notice-layer" id="notice-layer" hidden></div>
+
+      <div class="menu" id="menu" role="menu" aria-label="Settings" hidden>
+        <p class="menu-label" id="theme-label">Appearance</p>
+        <div class="segmented" id="theme-choice" role="radiogroup" aria-labelledby="theme-label">
+          <label><input type="radio" name="theme" value="auto" /><svg class="icon" aria-hidden="true"><use href="#i-theme-auto"></use></svg><span>Auto</span></label>
+          <label><input type="radio" name="theme" value="light" /><svg class="icon" aria-hidden="true"><use href="#i-sun"></use></svg><span>Light</span></label>
+          <label><input type="radio" name="theme" value="dark" /><svg class="icon" aria-hidden="true"><use href="#i-moon"></use></svg><span>Dark</span></label>
+        </div>
+        <hr class="menu-sep" />
+        <button class="menu-item" id="forget-positions" type="button" role="menuitem">
+          <svg class="icon" aria-hidden="true"><use href="#i-trash"></use></svg>
+          <span>Forget remembered positions</span>
+        </button>
+      </div>
+
+      <div class="sheet-layer" id="notice-layer" hidden></div>
     </div>
     <script type="module" src="/src/main.ts"></script>
   </body>

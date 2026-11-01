@@ -1,10 +1,14 @@
-// A small message box for errors and the password question, drawn over the app. If a second one
-// is shown while the first is open (a drop or an engine error), they stack and the newest is on top.
+// A small message box for errors and questions, drawn over the app: the password question, a
+// failed file, and the question before a link is opened. If a second one is shown while the first
+// is open (a drop or an engine error), the newest is on top and the older ones wait behind it.
 
 export interface NoticeButton {
   id: string;
   label: string;
   primary?: boolean;
+  /** The button that has the focus when the box opens, for a question where a quick Enter should
+   * give the safe answer. Without it the primary button has the focus. */
+  safe?: boolean;
 }
 
 export interface NoticeOptions {
@@ -13,6 +17,8 @@ export interface NoticeOptions {
   buttons: NoticeButton[];
   /** Shows a password field. The typed value is returned with the answer. */
   password?: boolean;
+  /** A line shown in a box of its own and in a fixed-width font, such as a web address. */
+  quote?: string;
 }
 
 export interface NoticeResult {
@@ -29,38 +35,47 @@ export function showNotice(layer: HTMLElement, options: NoticeOptions): Promise<
     const id = `notice-${++counter}`;
 
     const box = document.createElement("form");
-    box.className = "notice";
+    box.className = "sheet notice";
     box.setAttribute("role", "alertdialog");
     box.setAttribute("aria-modal", "true");
     box.setAttribute("aria-labelledby", `${id}-title`);
     box.setAttribute("aria-describedby", `${id}-detail`);
 
     const title = document.createElement("h2");
+    title.className = "sheet-title";
     title.id = `${id}-title`;
     title.textContent = options.title;
     const detail = document.createElement("p");
+    detail.className = "sheet-text";
     detail.id = `${id}-detail`;
     detail.textContent = options.detail;
     box.append(title, detail);
+
+    if (options.quote !== undefined) {
+      const quote = document.createElement("p");
+      quote.className = "sheet-url";
+      quote.textContent = options.quote;
+      box.append(quote);
+    }
 
     let input: HTMLInputElement | null = null;
     if (options.password) {
       input = document.createElement("input");
       input.type = "password";
-      input.className = "notice-input";
+      input.className = "field-input sheet-field";
       input.autocomplete = "off";
       input.setAttribute("aria-label", "Password");
       box.append(input);
     }
 
     const row = document.createElement("div");
-    row.className = "notice-buttons";
+    row.className = "sheet-foot";
     const primary = options.buttons.find((b) => b.primary) ?? options.buttons[0];
     const buttons = new Map<string, HTMLButtonElement>();
     for (const b of options.buttons) {
       const el = document.createElement("button");
       el.type = b === primary && input ? "submit" : "button";
-      el.className = b.primary ? "btn btn-primary" : "btn";
+      el.className = b.primary ? "btn btn-primary" : "btn btn-secondary";
       el.textContent = b.label;
       // The submit button is handled by the form's submit event, so Enter and a click act alike.
       if (el.type !== "submit") el.addEventListener("click", () => finish(b.id));
@@ -77,7 +92,8 @@ export function showNotice(layer: HTMLElement, options: NoticeOptions): Promise<
       resolve({ button, password: input ? input.value : undefined });
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
+      // Only the box on top answers; the ones behind it wait.
+      if (e.key === "Escape" && layer.lastElementChild === box) {
         e.preventDefault();
         e.stopPropagation();
         finish("cancel");
@@ -92,6 +108,8 @@ export function showNotice(layer: HTMLElement, options: NoticeOptions): Promise<
 
     layer.append(box);
     layer.hidden = false;
-    (input ?? buttons.get(primary.id))?.focus();
+    // A question about opening something starts on the safe answer, not on the dangerous one.
+    const focusButton = options.buttons.find((b) => b.safe) ?? primary;
+    (input ?? buttons.get(focusButton.id))?.focus();
   });
 }

@@ -171,17 +171,26 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # The desktop file must pass the file to the app (%F) and end its MimeType list with ';',
-      # or opening a PDF from a file manager starts an empty app.
-      - name: Check the Linux desktop entry
+      # The app must be registered as a viewer for PDF files in what the build made. On Linux the
+      # desktop file must pass the file to the app (%F) and end its MimeType list with ';', or
+      # opening a PDF from a file manager starts an empty app. On macOS the Info.plist must name
+      # the PDF type, and on Windows the installer must register the .pdf extension.
+      - name: Check the file association (Linux)
         if: runner.os == 'Linux'
         run: |
           mkdir -p "$RUNNER_TEMP/deb"
           dpkg-deb -x out/*.deb "$RUNNER_TEMP/deb"
-          f=$(find "$RUNNER_TEMP/deb" -name '*.desktop' | head -n1)
-          cat "$f"
-          grep -q '^Exec=.* %F$' "$f"
-          grep -q '^MimeType=application/pdf;$' "$f"
+          node scripts/association.mjs linux "$RUNNER_TEMP/deb"
+      - name: Check the file association (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          app=$(find target/release/bundle/macos -maxdepth 1 -name '*.app' | head -n1)
+          node scripts/association.mjs macos "$app"
+      - name: Check the file association (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          msi=$(find target/release/bundle/msi -name '*.msi' | head -n1)
+          node scripts/association.mjs windows "$msi"
 
       - name: Installer sizes
         if: always()

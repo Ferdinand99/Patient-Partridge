@@ -18,7 +18,10 @@ export type Action =
   | { type: "zoom-fit-width" }
   | { type: "zoom-actual" }
   | { type: "focus-page-box" }
-  | { type: "open-file" };
+  | { type: "open-file" }
+  | { type: "close-tab" }
+  | { type: "next-tab" }
+  | { type: "previous-tab" };
 
 /** CSS pixels one arrow key press scrolls. */
 export const LINE_SCROLL = 48;
@@ -49,6 +52,15 @@ export function actionForKey(e: KeyInfo): Action | null {
       case "o":
       case "O":
         return { type: "open-file" };
+      case "w":
+      case "W":
+        return { type: "close-tab" };
+      case "Tab":
+        return { type: e.shiftKey ? "previous-tab" : "next-tab" };
+      case "PageDown":
+        return { type: "next-tab" };
+      case "PageUp":
+        return { type: "previous-tab" };
       case "Home":
         return { type: "go-first" };
       case "End":

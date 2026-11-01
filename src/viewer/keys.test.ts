@@ -62,4 +62,17 @@ describe("pageScrollDistance", () => {
   it("moves at least a line in a tiny viewport", () => {
     expect(pageScrollDistance(10)).toBe(LINE_SCROLL);
   });
+
+  it("closes and switches tabs", () => {
+    expect(actionForKey(key("w", { ctrlKey: true }))).toEqual({ type: "close-tab" });
+    expect(actionForKey(key("W", { metaKey: true }))).toEqual({ type: "close-tab" });
+    expect(actionForKey(key("Tab", { ctrlKey: true }))).toEqual({ type: "next-tab" });
+    expect(actionForKey(key("Tab", { ctrlKey: true, shiftKey: true }))).toEqual({ type: "previous-tab" });
+    expect(actionForKey(key("PageDown", { ctrlKey: true }))).toEqual({ type: "next-tab" });
+    expect(actionForKey(key("PageUp", { ctrlKey: true }))).toEqual({ type: "previous-tab" });
+    // Without Ctrl these are still scroll keys, and a plain Tab is left to the browser.
+    expect(actionForKey(key("PageDown"))).toEqual({ type: "scroll-page", direction: 1 });
+    expect(actionForKey(key("Tab"))).toBeNull();
+    expect(actionForKey(key("w"))).toBeNull();
+  });
 });
