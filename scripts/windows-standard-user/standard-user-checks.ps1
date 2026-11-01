@@ -39,7 +39,18 @@ try {
   Check 'the token has no Administrators SID (not even deny-only)' ($groups -notmatch 'S-1-5-32-544')
   Check 'the token is not elevated' ([PPProbe]::Elevated() -eq 0) "(TokenElevation $([PPProbe]::Elevated()))"
   Check 'the integrity level is Medium' ($groups -match 'Mandatory Label\\Medium Mandatory Level')
-  Check 'the user name has a letter outside ASCII' ($env:USERNAME -match '[^\x00-\x7F]') "($env:USERNAME)"
+  # What an administrator could do and this user must not be able to.
+  $probeFile = Join-Path $env:SystemRoot 'pp-standard-user-probe.txt'
+  $wrote = $true
+  try { Set-Content -LiteralPath $probeFile -Value 'x' -ErrorAction Stop } catch { $wrote = $false }
+  if ($wrote) { Remove-Item -LiteralPath $probeFile -Force -ErrorAction SilentlyContinue }
+  Check 'the user cannot write to the Windows folder' (-not $wrote)
+  $machineKey = 'HKLM:\SOFTWARE\PPStandardUserProbe'
+  $wroteMachine = $true
+  try { New-Item -Path $machineKey -ErrorAction Stop | Out-Null } catch { $wroteMachine = $false }
+  if ($wroteMachine) { Remove-Item -Path $machineKey -ErrorAction SilentlyContinue }
+  Check 'the user cannot write to HKLM' (-not $wroteMachine)
+  Check 'the user name has a letter outside ASCII'($env:USERNAME -match '[^\x00-\x7F]') "($env:USERNAME)"
   Check 'the profile folder has a letter outside ASCII' ($env:USERPROFILE -match '[^\x00-\x7F]') "($env:USERPROFILE)"
 
   # ---- 2. Install, as this user -----------------------------------------------------------------
@@ -86,7 +97,7 @@ try {
   Copy-Item -LiteralPath $plain -Destination $unicodePdf -Force
   $asciiPdf = Join-Path $Root 'docs\plain.pdf'
 
-  function Open-InApp([string]$pdf, [string]$tag, [string]$reportFolder) {
+  function Open-InApp([string]$pdf, [string]$tag, [string]$reportFolder, [int]$waitSeconds = 90, [bool]$expectDrawn = $true) {
     Log "--- case '$tag': $pdf ---"
     $report = Join-Path $reportFolder "report-$tag.json"
     Remove-Item -LiteralPath $report -Force -ErrorAction SilentlyContinue
@@ -95,7 +106,7 @@ try {
     $app = Start-Process -FilePath $exe -ArgumentList ('"' + $pdf + '"') -PassThru
     $engineSeen = $null
     $reported = $false
-    while ($clock.Elapsed.TotalSeconds -lt 90) {
+    while ($clock.Elapsed.TotalSeconds -lt $waitSeconds) {
       if ((Test-Path -LiteralPath $report) -and ((Get-Item -LiteralPath $report).Length -gt 0)) { $reported = $true; break }
       if ($app.HasExited) { break }
       if (-not $engineSeen) {
@@ -115,7 +126,11 @@ try {
       } catch { Log "the report could not be read: $_" }
     }
     Log "engine process seen: $engineSeen; app session: $($app.SessionId); waited $([int]$clock.Elapsed.TotalMilliseconds) ms"
-    Check "case '$tag': the first page was drawn" $drawn
+    if ($expectDrawn) {
+      Check "case '$tag': the first page was drawn" $drawn
+    } else {
+      Check "case '$tag': no first page is reported (negative control)" (-not $drawn)
+    }
     # The app closes itself a few seconds after it has reported.
     if ($reported -and -not $app.WaitForExit(30000)) {
       Log 'the app did not close itself'
@@ -126,7 +141,7 @@ try {
     } elseif (-not $reported) {
       Log "the app ended without a report, exit code $($app.ExitCode)"
     }
-    if (-not $drawn) {
+    if (-not $drawn -and $expectDrawn) {
       Log 'The application events of the last minutes:'
       try {
         Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = (Get-Date).AddMinutes(-3) } -MaxEvents 15 -ErrorAction Stop |
@@ -143,6 +158,10 @@ try {
   # The report is written into the profile folder too: a path with a letter outside ASCII.
   Open-InApp $unicodePdf 'unicode-path' $env:USERPROFILE
   Open-InApp $asciiPdf 'plain-path' $out
+  # A control for the checks themselves: a file that is not a PDF must not look like a drawn page.
+  $notPdf = Join-Path $docs 'not a pdf.pdf'
+  Set-Content -LiteralPath $notPdf -Value 'this is not a PDF file' -Encoding ascii
+  Open-InApp $notPdf 'not-a-pdf' $out 20 $false
 
   # ---- 4. The engine's own sandbox tests, as this user -------------------------------------------
   Log ''

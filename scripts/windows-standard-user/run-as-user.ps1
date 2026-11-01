@@ -25,6 +25,7 @@ Remove-Item -LiteralPath $log -Force -ErrorAction SilentlyContinue
 
 $process = Start-Process -FilePath $shell -ArgumentList $arguments -Credential $credential `
   -LoadUserProfile -WorkingDirectory $Root -PassThru
+$null = $process.Handle   # keeps the exit code readable after the process has ended
 Write-Host "Started the checks as '$($env:PP_USER)' (process $($process.Id))."
 $finished = $process.WaitForExit($TimeoutSeconds * 1000)
 if (-not $finished) {
@@ -39,5 +40,11 @@ if (Test-Path -LiteralPath $log) {
   Write-Host '(nothing: the checks never started or could not write)'
 }
 if (-not $finished) { exit 1 }
-Write-Host "The checks ended with exit code $($process.ExitCode)."
-exit $process.ExitCode
+$code = $process.ExitCode
+Write-Host "The checks ended with exit code '$code'."
+# The checks end the log with this line when every check passed. Both must agree, so that a lost
+# exit code can never turn a failure into a pass.
+$passed = (Test-Path -LiteralPath $log) -and
+  ((Get-Content -LiteralPath $log -Encoding UTF8) -contains 'ALL CHECKS PASSED')
+if (($null -ne $code -and $code -ne 0) -or -not $passed) { exit 1 }
+exit 0
