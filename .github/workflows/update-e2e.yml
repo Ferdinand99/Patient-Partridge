@@ -11,6 +11,7 @@ on:
       - src-tauri/**
       - crates/engine-client/**
       - scripts/update-e2e.mjs
+      - scripts/windows-diagnostics.mjs
       - scripts/prepare-bundle.mjs
       - scripts/bundle-config.mjs
       - scripts/release-build.mjs
@@ -27,6 +28,7 @@ on:
       - src-tauri/**
       - crates/engine-client/**
       - scripts/update-e2e.mjs
+      - scripts/windows-diagnostics.mjs
       - scripts/prepare-bundle.mjs
       - scripts/bundle-config.mjs
       - scripts/release-build.mjs
