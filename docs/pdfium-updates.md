@@ -37,3 +37,12 @@ The workflow has read-only rights. Only its last job, which opens or updates the
 ## What the V8 check does
 
 `scripts/check-pdfium-v8.mjs` searches each PDFium library for the symbol names that only a V8 build has (`_ZN2v8`, `@v8@`, `v8::`, `V8Flags`). A plain build has none of them, and the V8 build of every platform has hundreds. It runs when the library is fetched, and again on the library inside each installer built by CI. It fails when it finds no library at all, so it can not pass by looking in the wrong folder.
+
+## What the annotation tests rely on
+
+Some of what the README promises about annotations is a fact about PDFium, and the engine tests (`crates/engine/tests/annots_from_files.rs`, `annots_readers.rs`) would show a change in it:
+
+- A save leaves out the objects of a loaded file that nothing refers to any more, and writes the objects made during the session as they are, whether or not anything refers to them. That is why the text of a deleted comment is not in the saved file, and why the text of an annotation made in the session is overwritten before it is removed.
+- A free text box that came without an appearance stream gets one, with its words, when the page is first drawn, and no call can overwrite it. The test `a_free_text_box_without_an_appearance_keeps_its_words_in_the_saved_file_after_a_delete` states that; if it fails after an update, PDFium stopped doing it, and the exception in the README and in the question before a delete can go.
+- A closed popup gets no appearance (`CPDF_Annot::ShouldGenerateAP`). Older builds drew the comment into one for every draw, which would leave every old version of a comment in the saved file. The tests may not notice a change here, because such an appearance would hold the comment letter by letter, and the text search in the tests looks for whole words. On each update, read `ShouldGenerateAP` for the popup and check that a closed popup still gets no appearance.
+- `FPDF_GetDocPermissions` gives all rights to a document that was opened with its owner password and the stored permissions to any other, while `FPDF_GetDocUserPermissions` always gives the stored permissions. The engine uses the first one for annotating, so an owner who typed the password may annotate. The test `the_owner_password_allows_what_the_user_password_does_not` fails if that changes.

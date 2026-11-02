@@ -2,8 +2,10 @@
 
 import { Channel, invoke } from "@tauri-apps/api/core";
 import type { PageSizePt } from "../viewer/layout";
+import type { FormFieldInfo, FormInfo, FormValueIn } from "../viewer/forms";
 import type { PageLinkInfo } from "../viewer/overlays";
 import type { SignaturesInfo } from "./signatures";
+import type { Annotation, AnnotKind, Rgba, StampName } from "./annotations";
 
 /** Where the reader was in a file, as remembered on this computer. */
 export interface SavedPosition {
@@ -169,6 +171,67 @@ export const api = {
   },
 
   /**
+   * The annotations of a page that can be shown and changed. Their text and author come from the
+   * file: show them as text only.
+   */
+  listAnnotations(doc: number, page: number): Promise<Annotation[]> {
+    return invoke<Annotation[]>("list_annotations", { doc, page });
+  },
+
+  /** Marks the characters `start..end` of the page text (numbered as `getPageText` numbers them). */
+  addMarkup(
+    doc: number,
+    page: number,
+    kind: Extract<AnnotKind, "highlight" | "underline" | "strikeout">,
+    color: Rgba,
+    start: number,
+    end: number,
+  ): Promise<Annotation> {
+    return invoke<Annotation>("add_markup", { doc, page, kind, color, start, end });
+  },
+
+  /** A sticky note at a place of the page, in points from its top left as it is drawn. */
+  addNote(doc: number, page: number, x: number, y: number, color: Rgba, text: string): Promise<Annotation> {
+    return invoke<Annotation>("add_note", { doc, page, x, y, color, text });
+  },
+
+  /** A free drawing: strokes of points in points from the top left of the page as it is drawn. */
+  addInk(doc: number, page: number, color: Rgba, width: number, strokes: [number, number][][]): Promise<Annotation> {
+    return invoke<Annotation>("add_ink", { doc, page, color, width, strokes });
+  },
+
+  addStamp(doc: number, page: number, x: number, y: number, stamp: StampName): Promise<Annotation> {
+    return invoke<Annotation>("add_stamp", { doc, page, x, y, stamp });
+  },
+
+  /** Changes the text, the colour or the place (`dx`, `dy` in points on the drawn page). */
+  updateAnnotation(
+    doc: number,
+    page: number,
+    id: number,
+    change: { text?: string; color?: Rgba; dx?: number; dy?: number },
+  ): Promise<Annotation> {
+    return invoke<Annotation>("update_annotation", {
+      doc,
+      page,
+      id,
+      text: change.text ?? null,
+      color: change.color ?? null,
+      dx: change.dx ?? 0,
+      dy: change.dy ?? 0,
+    });
+  },
+
+  async removeAnnotation(doc: number, page: number, id: number): Promise<void> {
+    await invoke<void>("remove_annotation", { doc, page, id });
+  },
+
+  /** Puts back an annotation that was removed. It keeps its id. */
+  restoreAnnotation(doc: number, page: number, id: number): Promise<Annotation> {
+    return invoke<Annotation>("restore_annotation", { doc, page, id });
+  },
+
+  /**
    * The scripts for which the engine of a document was asked for a font and had none to give
    * ("japanese", "korean", "chinese-simplified", ...): text in them that the PDF does not carry a
    * font for is drawn as blanks.
@@ -188,6 +251,30 @@ export const api = {
    */
   getSignatures(doc: number): Promise<SignaturesInfo> {
     return invoke<SignaturesInfo>("get_signatures", { doc });
+  },
+
+  /** What kind of form a document has, and whether it has scripts or actions. */
+  formInfo(doc: number): Promise<FormInfo> {
+    return invoke<FormInfo>("form_info", { doc });
+  },
+
+  /** The fields of a page that can be filled in. Names, tooltips and values are text from the PDF. */
+  getFormFields(doc: number, page: number): Promise<FormFieldInfo[]> {
+    return invoke<FormFieldInfo[]>("get_form_fields", { doc, page });
+  },
+
+  /**
+   * Sets one field and returns the fields of the page as they are then. `index` and `name` say
+   * which field; the app refuses the request when the widget at that place is not that field.
+   */
+  setFormField(
+    doc: number,
+    page: number,
+    index: number,
+    name: string,
+    value: FormValueIn,
+  ): Promise<FormFieldInfo[]> {
+    return invoke<FormFieldInfo[]>("set_form_field", { doc, page, index, name, value });
   },
 
   /** Finds a text on one page. Each match is `[start, length]` in characters of the page text. */

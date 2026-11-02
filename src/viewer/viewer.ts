@@ -7,6 +7,7 @@
 // its canvases and asks the engine for nothing, and remembers where the reader was.
 
 import type { TextScript } from "../lib/scripts";
+import type { Annotation, Tool } from "../lib/annotations";
 import { type AppErrorLike, isEngineLost, toAppError } from "../lib/errors";
 import { type Action, pageScrollDistance } from "./keys";
 import {
@@ -22,6 +23,8 @@ import {
   visibleRange,
   type Range,
 } from "./layout";
+import { FormLayer, type FormEdit, type FormsApi } from "./forms";
+import { AnnotationLayer, type AnnotLayerEvents } from "./annotlayer";
 import { PageOverlays, type CopyResult, type OverlayApi, type OverlayLimits, type PageLinkInfo } from "./overlays";
 import { RenderScheduler, type RenderJob } from "./scheduler";
 import type { SearchMatch } from "./search";
@@ -30,6 +33,8 @@ import { type ZoomMode, clampZoom, fitWidthZoom, stepZoom } from "./zoom";
 
 export interface ViewerApi extends OverlayApi {
   render(doc: number, page: number, width: number, height: number): Promise<ArrayBuffer>;
+  /** The annotations of a page. Without it the pages carry no annotation layer. */
+  listAnnotations?(doc: number, page: number): Promise<Annotation[]>;
 }
 
 export interface ViewerEvents {
@@ -53,6 +58,8 @@ export interface ViewerEvents {
   onScripts?(scripts: TextScript[]): void;
   /** A page has been drawn (the engine has asked for the fonts it needed for it). */
   onPageDrawn?(page: number): void;
+  /** What the annotation layer of the pages reports: a box picked, a click, a stroke, a drag. */
+  annotations?: AnnotLayerEvents;
 }
 
 /** Where the reader was: a page, how far down it, and the zoom (null means fit width). */
@@ -68,6 +75,17 @@ export interface ViewerOptions {
   start?: ViewPosition | null;
   /** Limits on the text kept for the document. For tests; the defaults are meant for the app. */
   limits?: Partial<OverlayLimits>;
+  /**
+   * Lets the reader fill in the form of the document, if it has one. `record` is given every change,
+   * for undo and redo and for the mark that the document has changes that are not saved.
+   */
+  forms?: {
+    api: FormsApi;
+    record(edit: FormEdit): void;
+    pending?(pending: boolean): void;
+    /** The picture of a page is out of date after a change of a field (the side panel draws it again). */
+    redrawn?(page: number): void;
+  };
 }
 
 export interface DocumentInfo {
@@ -101,6 +119,14 @@ export class DocumentView {
   private readonly mounted = new Map<number, Mounted>();
   private readonly scheduler: RenderScheduler;
   private overlays: PageOverlays;
+  /** True while a tool of the annotation bar that takes the pointer is picked (see `setAnnotationTool`). */
+  private pointerTool = false;
+  private forms: FormLayer | null;
+  private annots: AnnotationLayer;
+  /** How many times the picture of a page was asked to be drawn afresh (see `invalidatePage`). */
+  private versions = new Map<number, number>();
+  /** Those waiting for a page to be drawn (see `whenRedrawn`). */
+  private redrawn = new Map<number, (() => void)[]>();
   private readonly resizeObserver?: ResizeObserver;
   private layout: Layout;
   private zoom = 1;
@@ -141,6 +167,9 @@ export class DocumentView {
     });
 
     this.overlays = this.makeOverlays();
+    this.forms = this.makeForms();
+    this.forms?.start();
+    this.annots = this.makeAnnots();
 
     this.element.addEventListener("scroll", this.onScroll, { passive: true });
     this.element.addEventListener("wheel", this.onWheel, { passive: false });
@@ -175,6 +204,39 @@ export class DocumentView {
     );
   }
 
+  /** The layer of the form fields for the pages now in the view, or none when the view has no form support. */
+  private makeForms(): FormLayer | null {
+    const { options } = this;
+    if (!options.forms) return null;
+    return new FormLayer(this.info.doc, this.info.pages, options.forms.api, this.element, {
+      onEdit: (edit) => options.forms?.record(edit),
+      onRedraw: (page) => {
+        this.invalidatePage(page);
+        options.forms?.redrawn?.(page);
+      },
+      onPending: (pending) => options.forms?.pending?.(pending),
+      onLost: (error) => this.engineLost(toAppError(error)),
+    });
+  }
+
+  /** The layer of the annotations for the pages now in the view. */
+  private makeAnnots(): AnnotationLayer {
+    const { events, api } = this;
+    const doc = this.info.doc;
+    const listAnnotations = api.listAnnotations?.bind(api);
+    return new AnnotationLayer(
+      this.info.pages,
+      listAnnotations ? (page) => listAnnotations(doc, page) : null,
+      events.annotations ?? {
+        onSelect() {},
+        onPlace() {},
+        onStroke() {},
+        onMove() {},
+        onEdit() {},
+      },
+    );
+  }
+
   /**
    * The pages of the document changed (some were deleted, moved, turned, cropped or added): lays
    * the view out again for the new list. What was drawn, selected or found on the old pages, and
@@ -190,8 +252,25 @@ export class DocumentView {
     this.scheduler.setWanted([]);
     for (const index of [...this.mounted.keys()]) this.unmount(index);
     this.overlays.destroy();
+    // The layers of the fields and of the annotations know their pages by number, and number their
+    // boxes by place on the page: they are made again for the new list, and what they held for the
+    // old pages (a field with typed text, a picked annotation, a list of annotations) goes. The code
+    // that changed the pages has sent typed text and waited for the changes of the form before it
+    // asked for the change (see `flushForms`).
+    this.forms?.destroy();
+    const replaced = this.annots;
+    replaced.destroy();
+    this.versions = new Map();
+    const waiting = [...this.redrawn.values()].flat();
+    this.redrawn = new Map();
+    for (const done of waiting) done();
     this.info = { doc: this.info.doc, pages };
     this.overlays = this.makeOverlays();
+    this.overlays.setSuspended(this.pointerTool);
+    this.forms = this.makeForms();
+    this.forms?.start();
+    this.annots = this.makeAnnots();
+    this.annots.inherit(replaced);
     this.lastPage = -1;
     const page = pages.length === 0 ? 0 : Math.min(Math.max(0, show ?? had), pages.length - 1);
     this.hiddenAnchor = { page, fraction: 0 };
@@ -302,8 +381,10 @@ export class DocumentView {
     cancelAnimationFrame(this.frame);
     this.resizeObserver?.disconnect();
     window.removeEventListener("resize", this.onWindowResize);
+    this.forms?.destroy();
     for (const index of [...this.mounted.keys()]) this.unmount(index);
     this.overlays.destroy();
+    this.annots.destroy();
     this.element.remove();
   }
 
@@ -377,6 +458,93 @@ export class DocumentView {
 
   clearSelection(): void {
     this.overlays.clearSelection();
+  }
+
+  /** The size of a page in points. */
+  pageSizeOf(index: number): PageSizePt {
+    return this.info.pages[Math.min(Math.max(index, 0), Math.max(0, this.pageCount - 1))];
+  }
+
+  /** The annotations of the pages, and the tool that works on them. */
+  get annotationLayer(): AnnotationLayer {
+    return this.annots;
+  }
+
+  /**
+   * The tool of the annotation bar. The pen, the note and the stamp work on the page with the
+   * pointer, so the selection of text, which also takes the pointer, steps aside while they do.
+   */
+  setAnnotationTool(tool: Tool): void {
+    this.annots.setTool(tool);
+    this.pointerTool = tool === "pen" || tool === "note" || tool === "stamp";
+    this.overlays.setSuspended(this.pointerTool);
+  }
+
+  /** The selected stretches of text, page by page: characters `start..end` of the page text. */
+  selectedRanges(): Promise<{ ranges: { page: number; start: number; end: number }[]; truncated: boolean }> {
+    return this.overlays.selectedRanges();
+  }
+
+  /**
+   * Draws a page afresh (after an annotation was added, changed or taken away) and asks for the
+   * list of its annotations again. A picture that was on its way when this was called is dropped.
+   */
+  invalidatePage(index: number): void {
+    if (this.destroyed || index < 0 || index >= this.pageCount) return;
+    this.versions.set(index, (this.versions.get(index) ?? 0) + 1);
+    const m = this.mounted.get(index);
+    if (m) {
+      m.drawnKey = null;
+      m.failedKey = null;
+      m.el.classList.remove("viewer-page-failed");
+    }
+    void this.annots.reload(index);
+    this.refresh();
+  }
+
+  /**
+   * Resolves after the next time the picture of a page is drawn, or after `timeoutMs` when it is not
+   * (the page scrolled away, the engine is slow). For something that must stay on screen until the
+   * page shows what it stands for.
+   */
+  whenRedrawn(index: number, timeoutMs = 1500): Promise<void> {
+    return new Promise((resolve) => {
+      if (this.destroyed || !this.mounted.has(index)) {
+        resolve();
+        return;
+      }
+      const timer = setTimeout(done, timeoutMs);
+      function done(): void {
+        clearTimeout(timer);
+        resolve();
+      }
+      const list = this.redrawn.get(index) ?? [];
+      list.push(done);
+      this.redrawn.set(index, list);
+    });
+  }
+
+  /** The page in the middle of the window, and the point of it that is in the middle. */
+  centreOfView(): { page: number; x: number; y: number } | null {
+    if (this.pageCount === 0 || !this.active) return null;
+    const view = this.element.getBoundingClientRect();
+    const cx = view.left + view.width / 2;
+    const cy = view.top + view.height / 2;
+    let best: { page: number; distance: number } | null = null;
+    for (const [index, m] of this.mounted) {
+      const r = m.el.getBoundingClientRect();
+      const distance = cy < r.top ? r.top - cy : cy > r.bottom ? cy - r.bottom : 0;
+      if (!best || distance < best.distance) best = { page: index, distance };
+    }
+    if (!best) return null;
+    const r = (this.mounted.get(best.page) as Mounted).el.getBoundingClientRect();
+    const size = this.info.pages[best.page];
+    const clamp = (v: number, side: number) => Math.min(Math.max(v, 0), side);
+    return {
+      page: best.page,
+      x: clamp(((cx - r.left) / (r.width || 1)) * size.width, size.width),
+      y: clamp(((cy - r.top) / (r.height || 1)) * size.height, size.height),
+    };
   }
 
   /** The selected text from the pages that are loaded, and the pages that are not. */
@@ -535,7 +703,7 @@ export class DocumentView {
       for (let index = range.first; index <= range.last; index++) {
         const m = this.mounted.get(index) ?? this.mount(index);
         const size = bitmapSize(this.info.pages[index], this.zoom, dpr);
-        const key = `${this.generation}:${index}:${size.width}x${size.height}`;
+        const key = `${this.generation}:${index}:${size.width}x${size.height}:${this.versions.get(index) ?? 0}`;
         m.wantKey = key;
         if (m.drawnKey === key || m.failedKey === key) continue;
         const pageCenter = this.layout.tops[index] + this.layout.heights[index] / 2;
@@ -575,11 +743,17 @@ export class DocumentView {
     const canvas = document.createElement("canvas");
     canvas.className = "viewer-canvas";
     el.append(canvas);
-    this.sizer.append(el);
+    // In page order, so that the Tab key walks the fields of the pages in reading order.
+    const after = [...this.mounted.keys()].filter((i) => i > index).sort((a, b) => a - b)[0];
+    const next = after === undefined ? null : (this.mounted.get(after)?.el ?? null);
+    if (next) this.sizer.insertBefore(el, next);
+    else this.sizer.append(el);
     const m: Mounted = { el, canvas, wantKey: "", drawnKey: null, failedKey: null };
     this.mounted.set(index, m);
     this.placePage(index, m);
     this.overlays.mount(index, el);
+    this.forms?.mount(index, el);
+    this.annots.mount(index, el);
     return m;
   }
 
@@ -589,9 +763,35 @@ export class DocumentView {
     // Shrinking the canvas frees its bitmap right away instead of when the garbage collector runs.
     m.canvas.width = 0;
     m.canvas.height = 0;
+    this.forms?.unmount(index);
     this.overlays.unmount(index);
+    this.annots.unmount(index);
     m.el.remove();
     this.mounted.delete(index);
+  }
+
+  /**
+   * Sends what was typed in a field of the form that was not left, and waits until every change of
+   * the form is made. Call it before anything that looks at the document.
+   */
+  flushForms(): Promise<void> {
+    return this.forms?.flush() ?? Promise.resolve();
+  }
+
+  /** True while a field of the form holds text that is not in the document yet. */
+  get hasPendingFormInput(): boolean {
+    return this.forms?.hasPendingInput ?? false;
+  }
+
+  /** The fields that hold text the document did not accept: where they are and what they are called. */
+  get refusedFormFields(): { page: number; index: number; label: string }[] {
+    return this.forms?.refusedFields ?? [];
+  }
+
+  /** Scrolls to a field of the form and puts the focus in it. */
+  revealFormField(page: number, index: number): void {
+    this.goToPage(page);
+    this.forms?.reveal(page, index);
   }
 
   private async renderJob(job: RenderJob): Promise<void> {
@@ -610,8 +810,15 @@ export class DocumentView {
     ctx.putImageData(new ImageData(new Uint8ClampedArray(buffer), job.width, job.height), 0, 0);
     m.drawnKey = job.key;
     m.el.classList.remove("viewer-page-failed");
+    const waiting = this.redrawn.get(job.page);
+    if (waiting) {
+      this.redrawn.delete(job.page);
+      for (const done of waiting) done();
+    }
     // Text and links come after the picture, so they never delay the page the reader waits for.
     this.overlays.pageDrawn(job.page);
+    this.forms?.pageDrawn(job.page);
+    this.annots.pageDrawn(job.page);
     this.events.onPageDrawn?.(job.page);
     if (!this.painted) {
       this.painted = true;
@@ -619,15 +826,24 @@ export class DocumentView {
     }
   }
 
+  /** The engine of the document was lost: the window is told once, and the view stops drawing. */
+  private engineLost(error: AppErrorLike): void {
+    if (this.destroyed || this.fatal) return;
+    this.fatal = true;
+    this.scheduler.stop();
+    this.events.onFatal(error);
+  }
+
+  /** True while a field of the form holds text that the engine did not take. */
+  get hasRefusedFormInput(): boolean {
+    return this.forms?.hasRefusedInput ?? false;
+  }
+
   private renderFailed(job: RenderJob, error: unknown): void {
     if (this.destroyed) return;
     const appError = toAppError(error);
     if (isEngineLost(appError)) {
-      if (!this.fatal) {
-        this.fatal = true;
-        this.scheduler.stop();
-        this.events.onFatal(appError);
-      }
+      this.engineLost(appError);
       return;
     }
     // One page failed to draw. Say so on that page and carry on with the rest.

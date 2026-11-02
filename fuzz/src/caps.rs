@@ -9,11 +9,14 @@
 
 use arbitrary::{Result, Unstructured};
 use partridge_protocol::{
-    FontScript, LinkTarget, Request, RequestBody, Response, ResponseBody, MAX_BYTE_RANGE,
-    MAX_LINKS_PER_PAGE, MAX_MATCHES_PER_PAGE, MAX_OUTLINE_DEPTH, MAX_OUTLINE_ITEMS,
-    MAX_OUTLINE_TITLE, MAX_PAGES, MAX_PAGE_CHARS, MAX_PAGE_TEXT_BYTES, MAX_QUERY_LEN,
-    MAX_RENDER_PIXELS, MAX_RENDER_SIDE, MAX_SAVE_BYTES, MAX_SAVE_CHUNK, MAX_SIGNATURES,
-    MAX_SIG_NAME, MAX_STRING_LEN, MAX_UNIX_TIME, MAX_URI_LEN,
+    ability, FontScript, FormValue, LinkTarget, Request, RequestBody, Response, ResponseBody,
+    MAX_ANNOTS_PER_PAGE, MAX_ANNOT_AUTHOR, MAX_ANNOT_TEXT, MAX_BYTE_RANGE, MAX_COORDINATE,
+    MAX_FORM_ANSWER_BYTES, MAX_FORM_FIELDS_PER_PAGE, MAX_FORM_NAME, MAX_FORM_OPTIONS,
+    MAX_FORM_OPTION_LABEL, MAX_FORM_TOOLTIP, MAX_FORM_VALUE, MAX_INK_POINTS, MAX_INK_STROKES,
+    MAX_INK_WIDTH, MAX_LINKS_PER_PAGE, MAX_MARKUP_CHARS, MAX_MATCHES_PER_PAGE, MAX_OUTLINE_DEPTH,
+    MAX_OUTLINE_ITEMS, MAX_OUTLINE_TITLE, MAX_PAGES, MAX_PAGE_CHARS, MAX_PAGE_TEXT_BYTES,
+    MAX_QUERY_LEN, MAX_RENDER_PIXELS, MAX_RENDER_SIDE, MAX_SAVE_BYTES, MAX_SAVE_CHUNK,
+    MAX_SIGNATURES, MAX_SIG_NAME, MAX_STRING_LEN, MAX_UNIX_TIME, MAX_URI_LEN, MIN_INK_WIDTH,
 };
 
 use crate::{chance, check_signature_report};
@@ -39,6 +42,49 @@ pub fn check_request_caps(request: &Request) {
             assert!(*len as usize <= MAX_SAVE_CHUNK, "piece of {len} bytes");
         }
         RequestBody::Pages(request) => crate::pages::check_pages_request_caps(request),
+        RequestBody::SetFormField { name, value, .. } => {
+            assert!(name.len() <= MAX_FORM_NAME, "field name of {} bytes", name.len());
+            match value {
+                FormValue::Text(text) => {
+                    assert!(text.len() <= MAX_FORM_VALUE, "value of {} bytes", text.len())
+                }
+                FormValue::Choice(picked) => {
+                    assert!(picked.len() <= MAX_FORM_OPTIONS, "{} choices", picked.len())
+                }
+                FormValue::Checked(_) => {}
+            }
+        }
+        RequestBody::AddMarkup { start, end, .. } => {
+            assert!(end > start, "an empty range of text");
+            assert!(
+                (end - start) as usize <= MAX_MARKUP_CHARS,
+                "{} characters marked",
+                end - start
+            );
+        }
+        RequestBody::AddNote { x, y, text, .. } => {
+            assert!(text.len() <= MAX_ANNOT_TEXT, "note of {} bytes", text.len());
+            assert!(x.abs() <= MAX_COORDINATE && y.abs() <= MAX_COORDINATE);
+        }
+        RequestBody::AddInk { width, strokes, .. } => {
+            assert!((MIN_INK_WIDTH..=MAX_INK_WIDTH).contains(width), "width {width}");
+            assert!(!strokes.is_empty() && strokes.len() <= MAX_INK_STROKES);
+            assert!(strokes.iter().all(|s| !s.is_empty()));
+            assert!(strokes.iter().map(Vec::len).sum::<usize>() <= MAX_INK_POINTS);
+            assert!(strokes
+                .iter()
+                .flatten()
+                .all(|p| p[0].abs() <= MAX_COORDINATE && p[1].abs() <= MAX_COORDINATE));
+        }
+        RequestBody::AddStamp { x, y, .. } => {
+            assert!(x.abs() <= MAX_COORDINATE && y.abs() <= MAX_COORDINATE);
+        }
+        RequestBody::UpdateAnnot { text, dx, dy, .. } => {
+            if let Some(text) = text {
+                assert!(text.len() <= MAX_ANNOT_TEXT, "text of {} bytes", text.len());
+            }
+            assert!(dx.abs() <= MAX_COORDINATE && dy.abs() <= MAX_COORDINATE);
+        }
         _ => {}
     }
 }
@@ -58,6 +104,18 @@ pub fn check_response_caps(response: &Response) {
             assert!(pdfium_version.len() <= MAX_STRING_LEN);
             assert!(sandbox.len() <= MAX_STRING_LEN);
         }
+        ResponseBody::Annots { items } => {
+            assert!(
+                items.len() <= MAX_ANNOTS_PER_PAGE,
+                "{} annotations",
+                items.len()
+            );
+            for item in items {
+                check_annot(item);
+            }
+        }
+        ResponseBody::Annot { item } => check_annot(item),
+        ResponseBody::AnnotRemoved => {}
         ResponseBody::Opened { pages, .. } => {
             assert!(pages.len() <= MAX_PAGES, "{} pages", pages.len());
         }
@@ -130,6 +188,23 @@ pub fn check_response_caps(response: &Response) {
             );
         }
         ResponseBody::Signatures { report } => check_signature_report(report),
+        ResponseBody::FormInfo { .. } => {}
+        ResponseBody::FormFields { fields } => {
+            assert!(
+                fields.len() <= MAX_FORM_FIELDS_PER_PAGE,
+                "{} fields",
+                fields.len()
+            );
+            for field in fields {
+                assert!(field.name.len() <= MAX_FORM_NAME);
+                assert!(field.tooltip.len() <= MAX_FORM_TOOLTIP);
+                assert!(field.value.len() <= MAX_FORM_VALUE);
+                assert!(field.options.len() <= MAX_FORM_OPTIONS);
+                for option in &field.options {
+                    assert!(option.label.len() <= MAX_FORM_OPTION_LABEL);
+                }
+            }
+        }
         ResponseBody::FontReport { missed } => {
             assert!(
                 missed.len() <= FontScript::ALL.len(),
@@ -141,6 +216,17 @@ pub fn check_response_caps(response: &Response) {
             assert!(message.len() <= MAX_STRING_LEN);
         }
     }
+}
+
+fn check_annot(item: &partridge_protocol::AnnotInfo) {
+    assert!(item.text.len() <= MAX_ANNOT_TEXT, "text of {} bytes", item.text.len());
+    assert!(
+        item.author.len() <= MAX_ANNOT_AUTHOR,
+        "author of {} bytes",
+        item.author.len()
+    );
+    assert_eq!(item.abilities & !ability::ALL, 0, "abilities {}", item.abilities);
+    assert!(item.rect.iter().all(|v| v.is_finite()));
 }
 
 // ---- messages that break exactly one cap ------------------------------------------------
@@ -155,6 +241,10 @@ fn push_str(out: &mut Vec<u8>, len: usize) {
     out.resize(out.len() + len, b'a');
 }
 
+fn push_f32(out: &mut Vec<u8>, v: f32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
 fn push_rect(out: &mut Vec<u8>) {
     for v in [1.0f32, 2.0, 3.0, 4.0] {
         out.extend_from_slice(&v.to_le_bytes());
@@ -167,14 +257,45 @@ fn header(tag: u8, id: u32) -> Vec<u8> {
     out
 }
 
+/// One form field with a name and a value of the given sizes and the given number of choices (each
+/// with a label of `label` bytes), the way the engine writes it.
+fn raw_form_field(name: usize, value: usize, options: usize, label: usize) -> Vec<u8> {
+    let mut p = Vec::new();
+    push_u32(&mut p, 0);
+    p.push(1);
+    p.extend_from_slice(&0u16.to_le_bytes());
+    p.push(0);
+    push_rect(&mut p);
+    p.extend_from_slice(&0.0f32.to_le_bytes());
+    push_str(&mut p, name);
+    push_str(&mut p, 0);
+    push_str(&mut p, value);
+    push_u32(&mut p, 0);
+    push_u32(&mut p, options as u32);
+    for _ in 0..options {
+        p.push(0);
+        push_str(&mut p, label);
+    }
+    p
+}
+
+/// An answer with the fields of a page: one field.
+fn form_answer(id: u32, name: usize, value: usize, options: usize, label: usize) -> Vec<u8> {
+    let mut p = header(171, id);
+    push_u32(&mut p, 1);
+    p.extend_from_slice(&raw_form_field(name, value, options, label));
+    assert!(p.len() <= MAX_FORM_ANSWER_BYTES);
+    p
+}
+
 /// How many cases `over_cap_request_case` has.
-pub const OVER_CAP_REQUESTS: usize = 4 + crate::pages::PAGES_OVER_REQUESTS;
+pub const OVER_CAP_REQUESTS: usize = 15 + crate::pages::PAGES_OVER_REQUESTS;
 
 /// A request that is valid except that one string is one byte over its cap. Returns a name and
 /// the payload; the decoder must return an error.
 pub fn over_cap_request_case(case: usize, id: u32) -> (&'static str, Vec<u8>) {
     match case % OVER_CAP_REQUESTS {
-        n if n >= 4 => crate::pages::pages_over_cap_request_case(n - 4, id),
+        n if n >= 15 => crate::pages::pages_over_cap_request_case(n - 15, id),
         0 => {
             let mut p = header(2, id);
             p.push(1);
@@ -188,7 +309,148 @@ pub fn over_cap_request_case(case: usize, id: u32) -> (&'static str, Vec<u8>) {
             push_str(&mut p, MAX_QUERY_LEN + 1);
             ("search text over the cap", p)
         }
+        2 => {
+            // A request for a piece of the saved file that is one byte longer than a piece may be.
+            let mut p = header(12, id);
+            push_u32(&mut p, 1);
+            push_u32(&mut p, 0);
+            push_u32(&mut p, MAX_SAVE_CHUNK as u32 + 1);
+            ("save piece one byte too long", p)
+        }
         3 => {
+            // Markup of one character more than a page holds.
+            let mut p = header(16, id);
+            push_u32(&mut p, 1);
+            push_u32(&mut p, 0);
+            p.push(1);
+            p.extend_from_slice(&[0, 0, 0, 255]);
+            push_u32(&mut p, 0);
+            push_u32(&mut p, MAX_MARKUP_CHARS as u32 + 1);
+            ("markup of one character too many", p)
+        }
+        4 => {
+            // Markup with no characters.
+            let mut p = header(16, id);
+            push_u32(&mut p, 1);
+            push_u32(&mut p, 0);
+            p.push(1);
+            p.extend_from_slice(&[0, 0, 0, 255]);
+            push_u32(&mut p, 7);
+            push_u32(&mut p, 7);
+            ("markup of no characters", p)
+        }
+        5 => {
+            // Markup that is a note.
+            let mut p = header(16, id);
+            push_u32(&mut p, 1);
+            push_u32(&mut p, 0);
+            p.push(4);
+            p.extend_from_slice(&[0, 0, 0, 255]);
+            push_u32(&mut p, 0);
+            push_u32(&mut p, 1);
+            ("markup of a kind that is not markup", p)
+        }
+        6 => {
+            // A note whose text is one byte over the cap.
+            let mut p = header(17, id);
+            push_u32(&mut p, 1);
+            push_u32(&mut p, 0);
+            push_f32(&mut p, 1.0);
+            push_f32(&mut p, 2.0);
+            p.extend_from_slice(&[0, 0, 0, 255]);
+            push_str(&mut p, MAX_ANNOT_TEXT + 1);
+            ("note text one byte too long", p)
+        }
+        7 => {
+            // A note at a place that is not a number.
+            let mut p = header(17, id);
+            push_u32(&mut p, 1);
+            push_u32(&mut p, 0);
+            push_f32(&mut p, f32::NAN);
+            push_f32(&mut p, 2.0);
+            p.extend_from_slice(&[0, 0, 0, 255]);
+            push_str(&mut p, 3);
+            ("note at a place that is not a number", p)
+        }
+        8 => {
+            // A drawing of one stroke more than the cap, each stroke one point.
+            let mut p = header(18, id);
+            push_u32(&mut p, 1);
+            push_u32(&mut p, 0);
+            p.extend_from_slice(&[0, 0, 0, 255]);
+            push_f32(&mut p, 2.0);
+            push_u32(&mut p, MAX_INK_STROKES as u32 + 1);
+            for _ in 0..=MAX_INK_STROKES {
+                push_u32(&mut p, 1);
+                push_f32(&mut p, 1.0);
+                push_f32(&mut p, 1.0);
+            }
+            ("drawing of one stroke too many", p)
+        }
+        9 => {
+            // A drawing of one point more than the cap, in two strokes.
+            let mut p = header(18, id);
+            push_u32(&mut p, 1);
+            push_u32(&mut p, 0);
+            p.extend_from_slice(&[0, 0, 0, 255]);
+            push_f32(&mut p, 2.0);
+            push_u32(&mut p, 2);
+            for n in [MAX_INK_POINTS - 1, 2] {
+                push_u32(&mut p, n as u32);
+                for _ in 0..n {
+                    push_f32(&mut p, 1.0);
+                    push_f32(&mut p, 1.0);
+                }
+            }
+            ("drawing of one point too many", p)
+        }
+        10 => {
+            // A line a little thicker than the thickest.
+            let mut p = header(18, id);
+            push_u32(&mut p, 1);
+            push_u32(&mut p, 0);
+            p.extend_from_slice(&[0, 0, 0, 255]);
+            push_f32(&mut p, MAX_INK_WIDTH + 0.25);
+            push_u32(&mut p, 1);
+            push_u32(&mut p, 1);
+            push_f32(&mut p, 1.0);
+            push_f32(&mut p, 1.0);
+            ("drawing with a line too thick", p)
+        }
+        11 => {
+            // A change with text one byte over the cap.
+            let mut p = header(20, id);
+            push_u32(&mut p, 1);
+            push_u32(&mut p, 0);
+            push_u32(&mut p, 3);
+            p.push(1);
+            push_str(&mut p, MAX_ANNOT_TEXT + 1);
+            push_f32(&mut p, 0.0);
+            push_f32(&mut p, 0.0);
+            ("annotation text one byte too long", p)
+        }
+        12 => {
+            // A field named with one byte more than a name may have.
+            let mut p = header(42, id);
+            for v in [1u32, 0, 0] {
+                push_u32(&mut p, v);
+            }
+            push_str(&mut p, MAX_FORM_NAME + 1);
+            p.extend_from_slice(&[2, 1]);
+            ("form field name over the cap", p)
+        }
+        13 => {
+            // A text for a field that is one byte longer than a value may be.
+            let mut p = header(42, id);
+            for v in [1u32, 0, 0] {
+                push_u32(&mut p, v);
+            }
+            push_str(&mut p, 1);
+            p.push(1);
+            push_str(&mut p, MAX_FORM_VALUE + 1);
+            ("form field value over the cap", p)
+        }
+        _ => {
             // The time of the check is later than the end of the year 9999.
             let mut p = header(60, id);
             push_u32(&mut p, 1);
@@ -197,19 +459,11 @@ pub fn over_cap_request_case(case: usize, id: u32) -> (&'static str, Vec<u8>) {
             push_u32(&mut p, (now >> 32) as u32);
             ("signature check time past the year 9999", p)
         }
-        _ => {
-            // A request for a piece of the saved file that is one byte longer than a piece may be.
-            let mut p = header(12, id);
-            push_u32(&mut p, 1);
-            push_u32(&mut p, 0);
-            push_u32(&mut p, MAX_SAVE_CHUNK as u32 + 1);
-            ("save piece one byte too long", p)
-        }
     }
 }
 
 /// How many cases `over_cap_response_case` has.
-pub const OVER_CAP_RESPONSES: usize = 26 + crate::pages::PAGES_OVER_RESPONSES;
+pub const OVER_CAP_RESPONSES: usize = 37 + crate::pages::PAGES_OVER_RESPONSES;
 
 /// The two cases that are 1.7 MB.
 const PAGE_TEXT_OVER: usize = 6;
@@ -225,7 +479,7 @@ const PAGES_BIG: [usize; 3] = [26, 27, 28];
 /// name, the payload, and whether the decoder must accept it.
 pub fn over_cap_response_case(case: usize, id: u32) -> (&'static str, Vec<u8>, bool) {
     match case % OVER_CAP_RESPONSES {
-        n if n >= 26 => crate::pages::pages_over_cap_response_case(n - 26, id),
+        n if n >= 37 => crate::pages::pages_over_cap_response_case(n - 37, id),
         0 => {
             let mut p = header(133, id);
             push_u32(&mut p, MAX_OUTLINE_ITEMS as u32 + 1);
@@ -397,6 +651,56 @@ pub fn over_cap_response_case(case: usize, id: u32) -> (&'static str, Vec<u8>, b
             ("save piece shorter than it says", p, false)
         }
         20 => {
+            let mut p = header(144, id);
+            push_u32(&mut p, MAX_ANNOTS_PER_PAGE as u32 + 1);
+            for _ in 0..=MAX_ANNOTS_PER_PAGE {
+                push_annot(&mut p, 0, 0);
+            }
+            ("annotation list with one entry too many", p, false)
+        }
+        21 => {
+            let mut p = header(145, id);
+            push_annot(&mut p, MAX_ANNOT_TEXT + 1, 0);
+            ("annotation text one byte too long", p, false)
+        }
+        22 => {
+            let mut p = header(145, id);
+            push_annot(&mut p, 0, MAX_ANNOT_AUTHOR + 1);
+            ("annotation author one byte too long", p, false)
+        }
+        23 => {
+            let mut p = header(145, id);
+            push_annot(&mut p, 0, 0);
+            // The ability byte sits after the id and the kind.
+            p[1 + 4 + 4 + 1] = ability::ALL + 1;
+            ("annotation with an ability nobody defined", p, false)
+        }
+        24 => {
+            let mut p = header(144, id);
+            push_u32(&mut p, MAX_ANNOTS_PER_PAGE as u32);
+            for _ in 0..MAX_ANNOTS_PER_PAGE {
+                push_annot(&mut p, 0, 0);
+            }
+            ("annotation list of the longest size", p, true)
+        }
+        25 => {
+            let mut p = header(145, id);
+            push_annot(&mut p, MAX_ANNOT_TEXT, MAX_ANNOT_AUTHOR);
+            ("annotation with the longest text and author", p, true)
+        }
+        26 => ("form field name over the cap", form_answer(id, MAX_FORM_NAME + 1, 1, 0, 0), false),
+        27 => ("form field value over the cap", form_answer(id, 1, MAX_FORM_VALUE + 1, 0, 0), false),
+        28 => ("form field with one choice too many", form_answer(id, 1, 1, MAX_FORM_OPTIONS + 1, 0), false),
+        29 => ("form field at every cap", form_answer(id, MAX_FORM_NAME, MAX_FORM_VALUE, MAX_FORM_OPTIONS, 4), true),
+        30 => {
+            let mut p = header(171, id);
+            push_u32(&mut p, MAX_FORM_FIELDS_PER_PAGE as u32 + 1);
+            for _ in 0..=MAX_FORM_FIELDS_PER_PAGE {
+                p.extend_from_slice(&raw_form_field(1, 1, 0, 0));
+            }
+            ("page with one form field too many", p, false)
+        }
+        31 => {
             let mut p = header(190, id);
             for v in [MAX_SIGNATURES as u32 + 1, 0, 0, MAX_SIGNATURES as u32 + 1] {
                 push_u32(&mut p, v);
@@ -406,22 +710,22 @@ pub fn over_cap_response_case(case: usize, id: u32) -> (&'static str, Vec<u8>, b
             }
             ("signature report with one signature too many", p, false)
         }
-        21 => {
+        32 => {
             let mut p = signature_report(id);
             push_signature(&mut p, 0, MAX_SIG_NAME + 1, 0);
             ("signer name one byte too long", p, false)
         }
-        22 => {
+        33 => {
             let mut p = signature_report(id);
             push_signature(&mut p, 0, MAX_SIG_NAME, 0);
             ("signer name of the most bytes", p, true)
         }
-        23 => {
+        34 => {
             let mut p = signature_report(id);
             push_signature(&mut p, 0, 0, MAX_BYTE_RANGE + 1);
             ("signature byte range of one number too many", p, false)
         }
-        24 => {
+        35 => {
             // A tick for a signature whose reason is a broken one.
             let mut p = signature_report(id);
             push_signature(&mut p, 0, 0, 0);
@@ -432,7 +736,7 @@ pub fn over_cap_response_case(case: usize, id: u32) -> (&'static str, Vec<u8>, b
                 false,
             )
         }
-        25 => {
+        36 => {
             let mut p = signature_report(id);
             push_signature(&mut p, 0, 0, 0);
             // Make the signer a text with a line break in it.
@@ -473,6 +777,18 @@ fn push_signature(out: &mut Vec<u8>, index: u32, name: usize, ranges: usize) {
         out.push(0);
     }
     out.extend_from_slice(&[0; 12]);
+}
+
+/// One listed annotation: a note with the given lengths of text and author. Bytes of an entry:
+/// the id, the kind, the abilities, the box, the colour, the text and the author.
+fn push_annot(out: &mut Vec<u8>, text: usize, author: usize) {
+    push_u32(out, 1);
+    out.push(4);
+    out.push(ability::EDIT_TEXT);
+    push_rect(out);
+    out.extend_from_slice(&[255, 235, 59, 255]);
+    push_str(out, text);
+    push_str(out, author);
 }
 
 /// A request case picked by the fuzzer's bytes.

@@ -33,14 +33,14 @@ const PRECISION: f32 = 16.0;
 /// Turns page coordinates into points from the top left of the page as it is drawn, using the
 /// same conversion PDFium uses when it draws the page, so rotated pages and pages whose box does
 /// not start at zero come out right.
-struct Mapper {
+pub(crate) struct Mapper {
     config: PdfRenderConfig,
     sx: f32,
     sy: f32,
 }
 
 impl Mapper {
-    fn new(page: &PdfPage) -> Mapper {
+    pub(crate) fn new(page: &PdfPage) -> Mapper {
         let width = page.width().value;
         let height = page.height().value;
         let w = (width * PRECISION).round().clamp(PRECISION, 4.0e6) as i32;
@@ -59,8 +59,21 @@ impl Mapper {
         Some((px as f32 / self.sx, py as f32 / self.sy))
     }
 
+    /// The other way: a point on the drawn page, in points from its top left, as a point in page
+    /// coordinates. The answer is exact to a sixteenth of a point.
+    pub(crate) fn to_page(&self, page: &PdfPage, x: f32, y: f32) -> Option<(f32, f32)> {
+        if !x.is_finite() || !y.is_finite() {
+            return None;
+        }
+        let px = (x * self.sx).round().clamp(-1.0e9, 1.0e9) as i32;
+        let py = (y * self.sy).round().clamp(-1.0e9, 1.0e9) as i32;
+        let (u, v) = page.pixels_to_points(px, py, &self.config).ok()?;
+        let (u, v) = (u.value, v.value);
+        (u.is_finite() && v.is_finite()).then_some((u, v))
+    }
+
     /// A box in page coordinates, as `[left, top, right, bottom]` on the drawn page.
-    fn rect(&self, page: &PdfPage, r: &PdfRect) -> Option<[f32; 4]> {
+    pub(crate) fn rect(&self, page: &PdfPage, r: &PdfRect) -> Option<[f32; 4]> {
         let (x1, y1) = self.point(page, r.left().value, r.top().value)?;
         let (x2, y2) = self.point(page, r.right().value, r.bottom().value)?;
         Some([x1.min(x2), y1.min(y2), x1.max(x2), y1.max(y2)])

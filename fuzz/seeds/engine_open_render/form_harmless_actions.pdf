@@ -1,0 +1,90 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [6 0 R 9 0 R 10 0 R 11 0 R 14 0 R 15 0 R 16 0 R ] /DA (/Helv 0 Tf 0 g) /DR << /Font << /Helv 3 0 R >> >> >> >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R ] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Resources << /Font << /F1 3 0 R >> >> /Annots [6 0 R 9 0 R 10 0 R 11 0 R 14 0 R 15 0 R 16 0 R ] >>
+endobj
+5 0 obj
+<< /Length 19 >>
+stream
+0 g 10 10 1 1 re f
+
+endstream
+endobj
+6 0 obj
+<< /Type /Annot /Subtype /Widget /FT /Tx /T (keep) /V (kept) /DV () /Rect [100 700 300 720] /F 4 /P 4 0 R /DA (/Helv 12 Tf 0 g)  >>
+endobj
+7 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 16 16] /Length 22 >>
+stream
+q 0 g 3 3 10 10 re f Q
+endstream
+endobj
+8 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 16 16] /Length 0 >>
+stream
+
+endstream
+endobj
+9 0 obj
+<< /Type /Annot /Subtype /Widget /FT /Btn /T (box_uri) /V /Off /AS /Off /Rect [320 660 336 676] /F 4 /P 4 0 R /AP << /N << /Yes 7 0 R /Off 8 0 R >> >> /A << /S /URI /URI (https://example.com/reset) >> >>
+endobj
+10 0 obj
+<< /Type /Annot /Subtype /Widget /FT /Tx /T (text_named)  /Rect [100 620 300 640] /F 4 /P 4 0 R /DA (/Helv 12 Tf 0 g) /AA << /Fo << /S /Named /N /NextPage >> >> >>
+endobj
+11 0 obj
+<< /Type /Annot /Subtype /Widget /FT /Tx /T (text_submit)  /Rect [100 580 300 600] /F 4 /P 4 0 R /DA (/Helv 12 Tf 0 g) /AA << /Bl << /S /SubmitForm /F << /FS /URL /F (https://example.com/submit) >> /Flags 4 >> >> >>
+endobj
+12 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 16 16] /Length 22 >>
+stream
+q 0 g 3 3 10 10 re f Q
+endstream
+endobj
+13 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 16 16] /Length 0 >>
+stream
+
+endstream
+endobj
+14 0 obj
+<< /Type /Annot /Subtype /Widget /FT /Btn /T (box_goto) /V /Off /AS /Off /Rect [320 540 336 556] /F 4 /P 4 0 R /AP << /N << /Yes 12 0 R /Off 13 0 R >> >> /AA << /U << /S /GoTo /D [4 0 R /Fit] >> >> >>
+endobj
+15 0 obj
+<< /Type /Annot /Subtype /Widget /FT /Tx /T (text_launch)  /Rect [100 500 300 520] /F 4 /P 4 0 R /DA (/Helv 12 Tf 0 g) /AA << /Fo << /S /Launch /F (calc.exe) >> >> >>
+endobj
+16 0 obj
+<< /Type /Annot /Subtype /Widget /FT /Tx /T (text_js)  /Rect [100 460 300 480] /F 4 /P 4 0 R /DA (/Helv 12 Tf 0 g) /AA << /K << /S /JavaScript /JS (event.rc = false;) >> /Bl << /S /JavaScript /JS (this.resetForm\(\);) >> >> >>
+endobj
+xref
+0 17
+0000000000 65535 f 
+0000000015 00000 n 
+0000000193 00000 n 
+0000000251 00000 n 
+0000000321 00000 n 
+0000000505 00000 n 
+0000000574 00000 n 
+0000000721 00000 n 
+0000000841 00000 n 
+0000000938 00000 n 
+0000001157 00000 n 
+0000001337 00000 n 
+0000001569 00000 n 
+0000001690 00000 n 
+0000001788 00000 n 
+0000002005 00000 n 
+0000002188 00000 n 
+trailer
+<< /Size 17 /Root 1 0 R  >>
+startxref
+2431
+%%EOF

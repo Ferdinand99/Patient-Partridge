@@ -154,6 +154,11 @@ export class Sidebar {
     this.apply();
   }
 
+  /** The picture of a page of a document changed: its thumbnail is drawn again if it is shown. */
+  pageChanged(doc: number, page: number): void {
+    if (this.document?.doc === doc) this.thumbs?.invalidate(page);
+  }
+
   /** Forgets what is kept for a document that was closed. */
   forget(doc: number): void {
     this.outlines.delete(doc);

@@ -8,7 +8,7 @@
       content="default-src 'none'; script-src 'self' 'sha256-WZRJfWvsnNCPcxzZwvyhovnZGqhZaC+8gPGPRbx6wTk='; style-src 'self'; img-src 'self'; font-src 'self'; manifest-src 'self'; base-uri 'self'; form-action 'none'"
     />
     <title>Patient Partridge — an open source PDF reader and editor (early release)</title>
-    <meta name="description" content="Patient Partridge is an open source PDF reader and editor for Windows, macOS and Linux from the Hedgerow family. Reading PDFs works today and editing tools are planned. It is meant to be fast and small, with no account, no cloud, no advertising and no tracking. Version 0.1.0 is an early release." />
+    <meta name="description" content="Patient Partridge is an open source PDF reader and editor for Windows, macOS and Linux from the Hedgerow family. Reading, annotations and form filling work today; more editing tools are planned. It is meant to be fast and small, with no account, no cloud, no advertising and no tracking. Version 0.2.0 is an early release." />
     <script>document.documentElement.classList.add("js");</script>
     <link rel="canonical" href="https://hedgerow.tools/Patient-Partridge/" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
@@ -22,7 +22,7 @@
     <meta property="og:url" content="https://hedgerow.tools/Patient-Partridge/" />
     <meta property="og:site_name" content="Patient Partridge" />
     <meta property="og:title" content="Patient Partridge — an open source PDF reader and editor (early release)" />
-    <meta property="og:description" content="A PDF reader and editor that needs no account, no cloud and no tracking. Reading works today; editing is planned. Open source, from the Hedgerow family. Version 0.1.0 is an early release." />
+    <meta property="og:description" content="A PDF reader and editor that needs no account, no cloud and no tracking. Reading, annotations and form filling work today; more editing tools are planned. Open source, from the Hedgerow family. Version 0.2.0 is an early release." />
     <meta property="og:image" content="https://hedgerow.tools/Patient-Partridge/og-image.png" />
     <meta property="og:image:type" content="image/png" />
     <meta property="og:image:width" content="1200" />
@@ -30,7 +30,7 @@
     <meta property="og:image:alt" content="Patient Partridge: an amber partridge on a dark tile, next to the title, the tagline A PDF reader and editor that keeps to itself, the line No account, no cloud, no tracking, and the note Early release." />
     <meta name="twitter:card" content="summary_large_image" />
     <meta name="twitter:title" content="Patient Partridge — an open source PDF reader and editor (early release)" />
-    <meta name="twitter:description" content="A PDF reader and editor that needs no account, no cloud and no tracking. Reading works today; editing is planned. Open source, from the Hedgerow family. Version 0.1.0 is an early release." />
+    <meta name="twitter:description" content="A PDF reader and editor that needs no account, no cloud and no tracking. Reading, annotations and form filling work today; more editing tools are planned. Open source, from the Hedgerow family. Version 0.2.0 is an early release." />
     <meta name="twitter:image" content="https://hedgerow.tools/Patient-Partridge/og-image.png" />
     <link rel="preload" href="fonts/InterVariable.woff2" as="font" type="font/woff2" crossorigin />
     <link rel="stylesheet" href="styles.css" />
@@ -39,10 +39,10 @@
         "@context": "https://schema.org",
         "@type": "SoftwareApplication",
         "name": "Patient Partridge",
-        "description": "An open source PDF reader and editor for Windows, macOS and Linux. Reading works today; editing tools are planned. Version 0.1.0 is an early release.",
+        "description": "An open source PDF reader and editor for Windows, macOS and Linux. Reading, annotations and form filling work today; more editing tools are planned. Version 0.2.0 is an early release.",
         "url": "https://hedgerow.tools/Patient-Partridge/",
         "applicationCategory": "UtilitiesApplication",
-        "operatingSystem": "Windows, macOS, Linux (planned)",
+        "operatingSystem": "Windows, macOS, Linux",
         "image": "https://hedgerow.tools/Patient-Partridge/og-image.png",
         "license": "https://github.com/Ferdinand99/Patient-Partridge/blob/main/LICENSE",
         "sameAs": ["https://github.com/Ferdinand99/Patient-Partridge"]
@@ -95,20 +95,20 @@
             </div>
             <a class="live-pill" href="#roadmap">
               <span class="dot" aria-hidden="true"></span>
-              <span>Version 0.1.0</span>
+              <span>Version 0.2.0</span>
               <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#chevron-right"></use></svg>
             </a>
             <h1 class="display" id="hero-title">A PDF reader and editor<br class="br-wide" /> that keeps to itself.</h1>
             <p class="lead">
               Patient Partridge is an open source PDF reader and editor for Windows, macOS and Linux.
-              Today it reads PDFs; the editing tools are planned. It is meant to be fast and small,
+              Today it reads PDFs, adds annotations and fills in forms; more editing tools are planned. It is meant to be fast and small,
               and to work without an account, a cloud, advertising or tracking.
             </p>
-            <p class="hero-fine">Version 0.1.0 is out for Windows, macOS and Linux. It is an early release: reading works well, and editing tools are planned. Expect rough edges.</p>
+            <p class="hero-fine">Version 0.2.0 is out for Windows, macOS and Linux. It is an early release: reading, annotations and filling in forms work. Expect rough edges.</p>
             <div class="hero-actions">
               <a class="btn btn-primary btn-lg" href="https://github.com/Ferdinand99/Patient-Partridge/releases/latest">
                 <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#download"></use></svg>
-                <span>Download 0.1.0</span>
+                <span>Download 0.2.0</span>
               </a>
               <a class="btn btn-ghost btn-lg" href="#today">
                 <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#check-circle"></use></svg>
@@ -189,7 +189,7 @@
             <p class="eyebrow">What works today</p>
             <h2 class="headline" id="today-title">Open a PDF and read it.</h2>
             <p class="sub">
-              This is what version 0.1.0 can do.
+              This is what version 0.2.0 can do.
             </p>
           </header>
 
@@ -254,11 +254,36 @@
               <h3>Links ask first</h3>
               <p>A link in a PDF never opens by itself. Partridge shows you where it goes and asks.</p>
             </li>
+            <li class="card feature reveal">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#pencil"></use></svg></span>
+              <h3>Annotations</h3>
+              <p>Highlight, underline, strike out, notes, drawing and stamps, saved as real PDF annotations.</p>
+            </li>
+            <li class="card feature reveal d1">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#file"></use></svg></span>
+              <h3>Fill in forms</h3>
+              <p>Text fields, check boxes, radio buttons and lists, saved so that other PDF programs show the values.</p>
+            </li>
+            <li class="card feature reveal d2">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#shield-check"></use></svg></span>
+              <h3>Careful saving</h3>
+              <p>A new file is checked before it replaces the old one, and you can undo until you close the document.</p>
+            </li>
+            <li class="card feature reveal">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#globe"></use></svg></span>
+              <h3>More languages</h3>
+              <p>Chinese, Japanese, Korean, Arabic, Hebrew and Thai are drawn with your system’s fonts when a PDF does not carry its own.</p>
+            </li>
+            <li class="card feature reveal d1">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#undo"></use></svg></span>
+              <h3>Back where you were</h3>
+              <p>Your tabs can reopen when you start the app.</p>
+            </li>
           </ul>
 
           <p class="later reveal">
             Printing, file association and links have only been tested automatically so far, not on every
-            system by hand. Editing is not there yet: the tools below are planned.
+            system by hand. Editing text and images on the page is not there yet: the tools below are planned.
           </p>
         </div>
       </section>
@@ -277,16 +302,11 @@
 
           <ul class="grid">
             <li class="card feature reveal">
-              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#pencil"></use></svg></span>
-              <h3>Annotations</h3>
-              <p>Highlights, notes, drawing and stamps.</p>
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#file"></use></svg></span>
+              <h3>Create fillable forms</h3>
+              <p>Create new forms that others can fill in, and save them so they still work in other PDF programs.</p>
             </li>
             <li class="card feature reveal d1">
-              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#file"></use></svg></span>
-              <h3>Forms</h3>
-              <p>Fill in forms, create fillable forms, and save them so they still work in other PDF programs.</p>
-            </li>
-            <li class="card feature reveal d2">
               <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#shield-check"></use></svg></span>
               <h3>Signatures</h3>
               <p>View and validate digital signatures, and sign documents, including filling in and signing a form.</p>
@@ -417,6 +437,13 @@
                 lists what is and is not protected today.
               </p>
             </div>
+            <div class="callout status-info reveal d2">
+              <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#info"></use></svg>
+              <p>
+                <span class="callout-title">Deleting an annotation</span>
+                Deleting an annotation is not redaction. Copies and backups keep it, and some text boxes keep their words in the file.
+              </p>
+            </div>
           </div>
         </div>
       </section>
@@ -428,7 +455,7 @@
             <p class="eyebrow">Status</p>
             <h2 class="headline" id="roadmap-title">Where it stands.</h2>
             <p class="sub">
-              Version 0.1.0 is out, and there are no dates for what comes next. The
+              Version 0.2.0 is out, and there are no dates for what comes next. The
               steps show the order the work is planned in, and that order may change.
             </p>
           </header>
@@ -442,20 +469,20 @@
                 <p>Tabs, search, selecting and copying text, thumbnails, the table of contents, printing, dark mode and remembering your place all work.</p>
               </div>
             </li>
-            <li class="milestone reveal">
-              <span class="ms-marker" aria-hidden="true"></span>
+            <li class="milestone is-now reveal">
+              <span class="ms-marker" aria-hidden="true"><span class="dot is-live"></span></span>
               <div class="ms-body">
-                <p class="ms-status"><span class="pill">Planned</span></p>
-                <h3>Annotations and forms</h3>
-                <p>Highlights, notes, drawing and stamps, and filling in, creating and saving forms.</p>
+                <p class="ms-status"><span class="pill status-accent"><span class="dot"></span>Released: 0.2.0</span></p>
+                <h3>Annotations and filling in forms</h3>
+                <p>Highlights, underlines, strike-out, notes, drawing and stamps, and filling in forms, saved so that other PDF programs show the result.</p>
               </div>
             </li>
             <li class="milestone reveal">
               <span class="ms-marker" aria-hidden="true"></span>
               <div class="ms-body">
                 <p class="ms-status"><span class="pill">Planned</span></p>
-                <h3>Signatures and page tools</h3>
-                <p>Viewing, validating and making digital signatures, and merging, splitting, reordering, cropping, rotating, extracting and deleting pages.</p>
+                <h3>Signatures, page tools and creating forms</h3>
+                <p>Viewing, validating and making digital signatures, merging, splitting, reordering, cropping, rotating, extracting and deleting pages, and creating fillable forms.</p>
               </div>
             </li>
             <li class="milestone reveal">
@@ -495,7 +522,7 @@
               <div class="ms-body">
                 <p class="ms-status"><span class="pill">Planned</span></p>
                 <h3>Apple Intelligence on Mac</h3>
-                <p>An optional, on-device feature for summaries and questions, planned after annotations and forms.</p>
+                <p>An optional, on-device feature for summaries and questions, planned for later.</p>
               </div>
             </li>
           </ol>
@@ -513,7 +540,7 @@
               <details>
                 <summary>Can I download it?<svg class="icon" aria-hidden="true"><use href="assets/icons.svg#chevron-down"></use></svg></summary>
                 <div class="faq-body">
-                  <p>Yes. Version 0.1.0 is on the <a href="https://github.com/Ferdinand99/Patient-Partridge/releases/latest">releases page</a>. The macOS build is signed and notarised. The Windows build is not signed yet, so SmartScreen warns the first time: choose More info, then Run anyway. The app updates itself after that.</p>
+                  <p>Yes. Version 0.2.0 is on the <a href="https://github.com/Ferdinand99/Patient-Partridge/releases/latest">releases page</a>. The macOS build is signed and notarised. The Windows build is not signed yet, so SmartScreen warns the first time: choose More info, then Run anyway. The app updates itself after that.</p>
                 </div>
               </details>
             </li>
@@ -545,7 +572,7 @@
               <details>
                 <summary>What comes next?<svg class="icon" aria-hidden="true"><use href="assets/icons.svg#chevron-down"></use></svg></summary>
                 <div class="faq-body">
-                  <p>Fonts for more languages, then annotations and forms. There are no dates. Watch the <a href="https://github.com/Ferdinand99/Patient-Partridge">repository</a> to hear about progress.</p>
+                  <p>Signatures and page tools, then creating forms. There are no dates. Watch the <a href="https://github.com/Ferdinand99/Patient-Partridge">repository</a> to hear about progress.</p>
                 </div>
               </details>
             </li>
@@ -589,7 +616,7 @@
           a planned password manager.
         </p>
         <p>
-          Patient Partridge is open source under the GNU AGPL-3.0. Version 0.1.0 is an early release. This site uses no cookies and no analytics.
+          Patient Partridge is open source under the GNU AGPL-3.0. Version 0.2.0 is an early release. This site uses no cookies and no analytics.
         </p>
       </div>
     </footer>

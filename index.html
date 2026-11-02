@@ -84,6 +84,37 @@
           <path d="M9 3.5h5.5L19 8v5" /><path d="M14.5 3.5V8H19" /><path d="M8 3.5a1 1 0 0 0-1 1v15a1 1 0 0 0 1 1h4" />
           <path d="M16 15.5v6M13 18.5h6" />
         </symbol>
+        <symbol id="i-cursor" viewBox="0 0 24 24"><path d="M6.5 4.5l11.5 6.4-5 1.6-2.2 5.2z" /></symbol>
+        <symbol id="i-highlighter" viewBox="0 0 24 24">
+          <path d="M14.75 5.25l4 4-8.25 8.25-4.5.75.75-4.5z" /><path d="M4.5 20.25h8.5" />
+        </symbol>
+        <symbol id="i-underline" viewBox="0 0 24 24">
+          <path d="M7.5 4.5v6.25a4.5 4.5 0 0 0 9 0V4.5" /><path d="M5.5 20h13" />
+        </symbol>
+        <symbol id="i-strikeout" viewBox="0 0 24 24">
+          <path d="M4.5 12h15" />
+          <path d="M16.75 7.25A4.5 4.5 0 0 0 12.25 5c-2.5 0-4.25 1.3-4.25 3.25 0 1.3.8 2.2 2.4 2.75M14.1 13.2c1.5.55 2.4 1.4 2.4 2.7 0 2-1.9 3.35-4.5 3.35a5.5 5.5 0 0 1-4-1.6" />
+        </symbol>
+        <symbol id="i-note" viewBox="0 0 24 24">
+          <path d="M5.75 4.5h12.5a1.25 1.25 0 0 1 1.25 1.25v8.75l-5.5 5.5H5.75A1.25 1.25 0 0 1 4.5 18.75V5.75A1.25 1.25 0 0 1 5.75 4.5z" /><path d="M14 20v-4.25a1.25 1.25 0 0 1 1.25-1.25H19.5" />
+        </symbol>
+        <symbol id="i-pen" viewBox="0 0 24 24">
+          <path d="M4.5 19.5l.9-4.1L16.2 4.6a2.1 2.1 0 0 1 3 3L8.6 18.6z" /><path d="M14.5 6.3l3.2 3.2" />
+        </symbol>
+        <symbol id="i-stamp" viewBox="0 0 24 24">
+          <path d="M9.25 14V9.25a2.75 2.75 0 1 1 5.5 0V14" /><path d="M5.5 14h13v3.25h-13z" /><path d="M4.5 20.25h15" />
+        </symbol>
+        <symbol id="i-undo" viewBox="0 0 24 24"><path d="M8.5 5.5L4.5 9.5l4 4" /><path d="M4.5 9.5h9a5 5 0 0 1 0 10H9.5" /></symbol>
+        <symbol id="i-redo" viewBox="0 0 24 24"><path d="M15.5 5.5l4 4-4 4" /><path d="M19.5 9.5h-9a5 5 0 0 0 0 10h4" /></symbol>
+        <symbol id="i-save" viewBox="0 0 24 24">
+          <path d="M6 4.5h10.25L19.5 7.75V18.5a1 1 0 0 1-1 1h-12.5a1 1 0 0 1-1-1v-13a1 1 0 0 1 1-1z" /><path d="M8.5 4.5v4h6.5v-4" /><path d="M8.5 19.5v-5.25h7V19.5" />
+        </symbol>
+        <symbol id="i-save-copy" viewBox="0 0 24 24">
+          <path d="M13.5 3.5H7a1 1 0 0 0-1 1v15a1 1 0 0 0 1 1h4.5" /><path d="M13.5 3.5L18 8v3" /><path d="M13.5 3.5V8H18" /><path d="M17 14.5v6M14 17.5h6" />
+        </symbol>
+        <symbol id="i-comment" viewBox="0 0 24 24">
+          <path d="M5.75 5h12.5A1.25 1.25 0 0 1 19.5 6.25v8.5A1.25 1.25 0 0 1 18.25 16h-6.5L7.5 19.5V16H5.75a1.25 1.25 0 0 1-1.25-1.25v-8.5A1.25 1.25 0 0 1 5.75 5z" />
+        </symbol>
       </defs>
     </svg>
 
@@ -121,8 +152,17 @@
             <svg class="icon" aria-hidden="true"><use href="#i-download"></use></svg>
             <span id="update-pill-label">Update</span>
           </button>
+          <button class="btn btn-icon btn-plain" id="save-button" type="button" title="Save (Ctrl+S)" aria-label="Save" disabled>
+            <svg class="icon" aria-hidden="true"><use href="#i-save"></use></svg>
+          </button>
+          <button class="btn btn-icon btn-plain" id="save-copy-button" type="button" title="Save a copy… (Ctrl+Shift+S)" aria-label="Save a copy" disabled>
+            <svg class="icon" aria-hidden="true"><use href="#i-save-copy"></use></svg>
+          </button>
           <button class="btn btn-icon btn-plain" id="print-button" type="button" title="Print (Ctrl+P)" aria-label="Print" disabled>
             <svg class="icon" aria-hidden="true"><use href="#i-printer"></use></svg>
+          </button>
+          <button class="btn btn-icon btn-plain" id="annotate-button" type="button" title="Annotate (Ctrl+Shift+A)" aria-label="Annotate" aria-pressed="false" aria-controls="annotbar" disabled>
+            <svg class="icon" aria-hidden="true"><use href="#i-pen"></use></svg>
           </button>
           <button class="btn btn-icon btn-plain" id="find-button" type="button" title="Find in this document (Ctrl+F)" aria-label="Find" aria-pressed="false" aria-controls="findbar" disabled>
             <svg class="icon" aria-hidden="true"><use href="#i-search"></use></svg>
@@ -130,6 +170,49 @@
           <button class="btn btn-icon btn-plain" id="menu-button" type="button" title="Settings" aria-label="Settings" aria-haspopup="true" aria-expanded="false" aria-controls="menu">
             <svg class="icon" aria-hidden="true"><use href="#i-more"></use></svg>
           </button>
+        </div>
+        <div class="annotbar" id="annotbar" role="toolbar" aria-label="Annotations" aria-orientation="horizontal" hidden>
+          <div class="segmented" role="group" aria-label="Tool">
+            <button type="button" id="tool-select" aria-pressed="true" aria-label="Select" title="Select (V)">
+              <svg class="icon" aria-hidden="true"><use href="#i-cursor"></use></svg>
+            </button>
+            <button type="button" id="tool-highlight" aria-pressed="false" aria-label="Highlight" title="Highlight (H)">
+              <svg class="icon" aria-hidden="true"><use href="#i-highlighter"></use></svg>
+            </button>
+            <button type="button" id="tool-underline" aria-pressed="false" aria-label="Underline" title="Underline (U)">
+              <svg class="icon" aria-hidden="true"><use href="#i-underline"></use></svg>
+            </button>
+            <button type="button" id="tool-strikeout" aria-pressed="false" aria-label="Strike out" title="Strike out (T)">
+              <svg class="icon" aria-hidden="true"><use href="#i-strikeout"></use></svg>
+            </button>
+            <button type="button" id="tool-note" aria-pressed="false" aria-label="Note" title="Note (N)">
+              <svg class="icon" aria-hidden="true"><use href="#i-note"></use></svg>
+            </button>
+            <button type="button" id="tool-pen" aria-pressed="false" aria-label="Pen" title="Pen (P)">
+              <svg class="icon" aria-hidden="true"><use href="#i-pen"></use></svg>
+            </button>
+            <button type="button" id="tool-stamp" aria-pressed="false" aria-label="Stamp" title="Stamp (M)">
+              <svg class="icon" aria-hidden="true"><use href="#i-stamp"></use></svg>
+            </button>
+          </div>
+          <span class="toolbar-sep" aria-hidden="true"></span>
+          <div class="swatches" id="swatches" role="radiogroup" aria-label="Colour"></div>
+          <div class="segmented segmented-pen" id="pen-widths" role="group" aria-label="Line width" hidden></div>
+          <span class="grow"></span>
+          <button class="btn btn-icon btn-plain" id="annot-edit" type="button" title="Edit the text (Enter)" aria-label="Edit the text of the selected annotation" disabled>
+            <svg class="icon" aria-hidden="true"><use href="#i-comment"></use></svg>
+          </button>
+          <button class="btn btn-icon btn-plain" id="annot-delete" type="button" title="Delete (Del)" aria-label="Delete the selected annotation" disabled>
+            <svg class="icon" aria-hidden="true"><use href="#i-trash"></use></svg>
+          </button>
+          <span class="toolbar-sep" aria-hidden="true"></span>
+          <button class="btn btn-icon btn-plain" id="annot-undo" type="button" title="Undo (Ctrl+Z)" aria-label="Undo" disabled>
+            <svg class="icon" aria-hidden="true"><use href="#i-undo"></use></svg>
+          </button>
+          <button class="btn btn-icon btn-plain" id="annot-redo" type="button" title="Redo (Ctrl+Y)" aria-label="Redo" disabled>
+            <svg class="icon" aria-hidden="true"><use href="#i-redo"></use></svg>
+          </button>
+          <span class="annotbar-note muted" id="annot-note" hidden></span>
         </div>
         <div class="findbar" id="findbar" role="search" hidden>
           <label class="search">
@@ -234,6 +317,13 @@
           <span>Forget remembered positions</span>
         </button>
       </div>
+
+      <!-- The stamps the stamp tool can place. -->
+      <div class="menu stamp-menu" id="stamp-menu" role="menu" aria-label="Stamps" hidden></div>
+
+      <!-- What the annotation tools say to a screen reader, and the box for the text of a note. -->
+      <div class="vh" id="annot-status" role="status" aria-live="polite"></div>
+      <div class="annot-popovers" id="annot-popovers"></div>
 
       <!-- The menu of the right mouse button on selected text. The menu of the web view is off, because it also holds Reload. -->
       <div class="menu context-menu" id="context-menu" role="menu" aria-label="Selected text" hidden>

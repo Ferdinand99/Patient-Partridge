@@ -12,7 +12,8 @@ import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { launchEnvironment } from "./smoke-env.mjs";
+import { launchEnvironment, launchLimitMs } from "./smoke-env.mjs";
+import { describeWindows } from "./windows-diagnostics.mjs";
 
 function parse(argv) {
   const out = { runs: 3, memory: false };
@@ -96,7 +97,8 @@ function killTree(child) {
   }
 }
 
-async function runOnce({ bin, pdf, memory }) {
+async function runOnce({ bin, pdf, memory }, index) {
+  const limitMs = launchLimitMs(index);
   const dir = mkdtempSync(join(tmpdir(), "partridge-smoke-"));
   const report = join(dir, "report.json");
   // A fresh profile, so each run starts as a first run (see smoke-env.mjs).
@@ -115,15 +117,18 @@ async function runOnce({ bin, pdf, memory }) {
     keep(`\n[the app exited: code ${code}, signal ${signal}]\n`);
   });
   try {
-    const deadline = Date.now() + 90_000;
+    const deadline = Date.now() + limitMs;
     while (Date.now() < deadline) {
       if (existsSync(report) && readFileSync(report, "utf8").trim()) break;
       if (exited) break;
       await sleep(100);
     }
     if (!existsSync(report) || !readFileSync(report, "utf8").trim()) {
+      // On Windows, say whether the app and its web view were still running: a hang or an exit.
+      const state =
+        process.platform === "win32" ? `\n${describeWindows(exited ? "after the app exited" : "while the app was still running")}` : "";
       throw new Error(
-        `The app did not report a drawn page (it exited or took longer than 90 s). What it wrote:\n${output}`,
+        `The app did not report a drawn page (it exited or took longer than ${limitMs / 1000} s, run ${index + 1}). What it wrote:\n${output}${state}`,
       );
     }
     await sleep(300);
@@ -156,7 +161,7 @@ const options = parse(process.argv.slice(2));
 if (!existsSync(options.bin)) throw new Error(`App binary not found: ${options.bin}`);
 const results = [];
 for (let i = 0; i < options.runs; i++) {
-  const r = await runOnce(options);
+  const r = await runOnce(options, i);
   results.push(r);
   console.log(`run ${i + 1}: ${JSON.stringify(r)}`);
 }

@@ -32,15 +32,19 @@ use std::time::{Duration, Instant};
 
 use partridge_protocol::{
     read_frame_limited, write_request, ErrorCode, PageSize, Request, RequestBody, Response,
-    ResponseBody, MAX_QUERY_LEN, MAX_SAVE_BYTES, MAX_SAVE_CHUNK, MAX_SIGNATURE_REPORT,
-    MAX_STRING_LEN, PROTOCOL_VERSION, SAVE_DATA_HEADER_LEN,
+    ResponseBody, ANNOT_INFO_MIN, MAX_ANNOTS_PER_PAGE, MAX_ANNOT_AUTHOR, MAX_ANNOT_TEXT,
+    MAX_COORDINATE, MAX_FORM_ANSWER_BYTES, MAX_FORM_NAME, MAX_FORM_OPTIONS, MAX_FORM_VALUE,
+    MAX_INK_POINTS, MAX_INK_STROKES, MAX_INK_WIDTH, MAX_MARKUP_CHARS, MAX_QUERY_LEN,
+    MAX_SAVE_BYTES, MAX_SAVE_CHUNK, MAX_SIGNATURE_REPORT, MAX_STRING_LEN, MIN_INK_WIDTH,
+    PROTOCOL_VERSION, SAVE_DATA_HEADER_LEN,
 };
 
 pub use spawn::{spawn_engine, EngineProcess, SandboxPolicy, SpawnRequest, SpawnedEngine};
 
 pub use partridge_protocol::{
-    CertificateTime, FontScript, LinkTarget, OutlineItem, PageLink, SignatureInfo, SignatureReason,
-    SignatureReport, SignatureState, TextMatch,
+    ability, field_flag, AnnotInfo, AnnotKind, CertificateTime, FontScript, FormField,
+    FormFieldKind, FormKind, FormOption, FormValue, LinkTarget, OutlineItem, PageLink,
+    SignatureInfo, SignatureReason, SignatureReport, SignatureState, StampKind, TextMatch,
 };
 
 mod pages;
@@ -59,8 +63,8 @@ const MAX_SMALL_ANSWER: usize = 9 * 1024 * 1024;
 const IDLE_LIMIT: usize = 70 * 1024;
 /// Header of a `Rendered` answer in front of the pixels.
 const RENDERED_HEADER: usize = 17;
-/// How many times a long request (`DocInfo`, `Fingerprint`, `SaveBegin`) may have to read the
-/// whole document: the check of the file before and after, and the serialising itself.
+/// How many times a long request (`DocInfo`, `FormInfo`, `Fingerprint`, `SaveBegin`) may have to
+/// read the whole document: the check of the file before and after, and the serialising itself.
 const SAVE_PASSES: u64 = 4;
 /// How many times the engine may have to read the whole document to check its signatures: the
 /// check of the file before and after, the scan for signature marks, and one pass for each of the
@@ -86,6 +90,12 @@ const MAX_OUTLINE_ANSWER: usize = 3 * 1024 * 1024;
 const MAX_TEXT_ANSWER: usize = 2_200_000;
 /// Largest links answer: 500 links with an address of at most 2 048 bytes.
 const MAX_LINKS_ANSWER: usize = 1_300_000;
+/// Largest answer about the fields of a page. The engine keeps to `MAX_FORM_ANSWER_BYTES`; the rest is
+/// the room for the header.
+const MAX_FORMS_ANSWER: usize = MAX_FORM_ANSWER_BYTES + 64;
+/// Largest annotation list: 500 annotations with the longest text, author and framing they may have.
+const MAX_ANNOTS_ANSWER: usize =
+    MAX_ANNOTS_PER_PAGE * (ANNOT_INFO_MIN + MAX_ANNOT_TEXT + MAX_ANNOT_AUTHOR) + 64;
 
 /// How to start and supervise the engine.
 #[derive(Debug, Clone)]
@@ -95,7 +105,7 @@ pub struct EngineConfig {
     /// Longest the engine may take to answer one request before it is considered hung and killed.
     pub timeout: Duration,
     /// Longest the engine may go without a sign of life while it describes or serialises a
-    /// document (`DocInfo`, `Fingerprint`, `SaveBegin`). These requests can take minutes for a
+    /// document (`DocInfo`, `FormInfo`, `Fingerprint`, `SaveBegin`). These requests can take minutes for a
     /// large document on a slow disk, so the engine reports progress while it works (about every
     /// MiB written, 32 pages looked at or MiB of the file read), and every report starts this
     /// wait afresh. An engine that makes progress is not taken for a hung one for being slow;
@@ -445,6 +455,71 @@ impl EngineClient {
         )
     }
 
+    /// What kind of form the document has, and whether it has scripts or actions that are never run.
+    pub fn form_info(&self, doc: u64) -> Result<(FormKind, bool), ClientError> {
+        self.call(
+            doc,
+            "form info",
+            |doc| RequestBody::FormInfo { doc },
+            |body| match body {
+                ResponseBody::FormInfo { kind, has_actions } => Ok((kind, has_actions)),
+                other => Err(other),
+            },
+        )
+    }
+
+    /// The fields of one page that the reader fills in.
+    pub fn form_fields(&self, doc: u64, page: u32) -> Result<Vec<FormField>, ClientError> {
+        self.call(
+            doc,
+            "form fields",
+            |doc| RequestBody::ListFormFields { doc, page },
+            |body| match body {
+                ResponseBody::FormFields { fields } => Ok(fields),
+                other => Err(other),
+            },
+        )
+    }
+
+    /// Sets one field and returns the fields of the page as they are then. A name or a value over
+    /// the caps is refused here, before it is sent.
+    pub fn set_form_field(
+        &self,
+        doc: u64,
+        page: u32,
+        index: u32,
+        name: &str,
+        value: &FormValue,
+    ) -> Result<Vec<FormField>, ClientError> {
+        let too_long = name.len() > MAX_FORM_NAME
+            || match value {
+                FormValue::Text(text) => text.len() > MAX_FORM_VALUE,
+                FormValue::Choice(picked) => picked.len() > MAX_FORM_OPTIONS,
+                FormValue::Checked(_) => false,
+            };
+        if too_long {
+            return Err(ClientError::Engine {
+                code: ErrorCode::InvalidRequest,
+                message: "the name or the value is too long".into(),
+            });
+        }
+        self.call(
+            doc,
+            "set form field",
+            |doc| RequestBody::SetFormField {
+                doc,
+                page,
+                index,
+                name: name.to_string(),
+                value: value.clone(),
+            },
+            |body| match body {
+                ResponseBody::FormFields { fields } => Ok(fields),
+                other => Err(other),
+            },
+        )
+    }
+
     /// Finds `query` on one page. A search text that is too long is refused here.
     pub fn search_page(
         &self,
@@ -549,6 +624,210 @@ impl EngineClient {
                 ResponseBody::Signatures { report } if report_is_sound(&report) => Ok(report),
                 other => Err(other),
             },
+        )
+    }
+
+    /// The annotations of one page that the reader can show and change.
+    pub fn list_annots(&self, doc: u64, page: u32) -> Result<Vec<AnnotInfo>, ClientError> {
+        self.call(
+            doc,
+            "annotations",
+            |doc| RequestBody::ListAnnots { doc, page },
+            |body| match body {
+                ResponseBody::Annots { items } => Ok(items),
+                other => Err(other),
+            },
+        )
+    }
+
+    /// Sends a request that adds, changes or puts back an annotation and takes the annotation out
+    /// of the answer. `expect` says whether the annotation is the one the request was about: an
+    /// engine that answers with another one is not the engine we know.
+    fn annot_call(
+        &self,
+        doc: u64,
+        what: &str,
+        make: impl FnOnce(u32) -> RequestBody,
+        expect: impl FnOnce(&AnnotInfo) -> bool,
+    ) -> Result<AnnotInfo, ClientError> {
+        self.call(doc, what, make, |body| match body {
+            ResponseBody::Annot { item } if expect(&item) => Ok(item),
+            other => Err(other),
+        })
+    }
+
+    /// Marks the characters `start..end` of the page text (numbered as `page_text` numbers them).
+    pub fn add_markup(
+        &self,
+        doc: u64,
+        page: u32,
+        kind: AnnotKind,
+        color: [u8; 4],
+        start: u32,
+        end: u32,
+    ) -> Result<AnnotInfo, ClientError> {
+        if !matches!(
+            kind,
+            AnnotKind::Highlight | AnnotKind::Underline | AnnotKind::Strikeout
+        ) || end <= start
+            || (end - start) as usize > MAX_MARKUP_CHARS
+        {
+            return Err(refused_request("that is not a range of text to mark"));
+        }
+        self.annot_call(
+            doc,
+            "markup",
+            |doc| RequestBody::AddMarkup {
+                doc,
+                page,
+                kind,
+                color,
+                start,
+                end,
+            },
+            |item| item.kind == kind,
+        )
+    }
+
+    /// A sticky note at a point of the page, in points from its top left as it is drawn.
+    pub fn add_note(
+        &self,
+        doc: u64,
+        page: u32,
+        x: f32,
+        y: f32,
+        color: [u8; 4],
+        text: &str,
+    ) -> Result<AnnotInfo, ClientError> {
+        check_place(x, y)?;
+        check_text(text)?;
+        self.annot_call(
+            doc,
+            "note",
+            |doc| RequestBody::AddNote {
+                doc,
+                page,
+                x,
+                y,
+                color,
+                text: text.to_string(),
+            },
+            |item| item.kind == AnnotKind::Note,
+        )
+    }
+
+    /// A free drawing. The strokes are held to the limits of the protocol here, because the
+    /// protocol would leave out what is over them without saying so.
+    pub fn add_ink(
+        &self,
+        doc: u64,
+        page: u32,
+        color: [u8; 4],
+        width: f32,
+        strokes: Vec<Vec<[f32; 2]>>,
+    ) -> Result<AnnotInfo, ClientError> {
+        let points: usize = strokes.iter().map(Vec::len).sum();
+        if strokes.is_empty()
+            || strokes.len() > MAX_INK_STROKES
+            || strokes.iter().any(Vec::is_empty)
+            || points > MAX_INK_POINTS
+            || !(MIN_INK_WIDTH..=MAX_INK_WIDTH).contains(&width)
+        {
+            return Err(refused_request("that drawing is outside the limits"));
+        }
+        for p in strokes.iter().flatten() {
+            check_place(p[0], p[1])?;
+        }
+        self.annot_call(
+            doc,
+            "drawing",
+            |doc| RequestBody::AddInk {
+                doc,
+                page,
+                color,
+                width,
+                strokes,
+            },
+            |item| item.kind == AnnotKind::Ink,
+        )
+    }
+
+    /// A stamp with its top left corner at a point of the page.
+    pub fn add_stamp(
+        &self,
+        doc: u64,
+        page: u32,
+        x: f32,
+        y: f32,
+        stamp: StampKind,
+    ) -> Result<AnnotInfo, ClientError> {
+        check_place(x, y)?;
+        self.annot_call(
+            doc,
+            "stamp",
+            |doc| RequestBody::AddStamp {
+                doc,
+                page,
+                x,
+                y,
+                stamp,
+            },
+            |item| item.kind == AnnotKind::Stamp,
+        )
+    }
+
+    /// Changes the text, the colour or the place of an annotation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_annot(
+        &self,
+        doc: u64,
+        page: u32,
+        id: u32,
+        text: Option<&str>,
+        color: Option<[u8; 4]>,
+        dx: f32,
+        dy: f32,
+    ) -> Result<AnnotInfo, ClientError> {
+        check_place(dx, dy)?;
+        if let Some(text) = text {
+            check_text(text)?;
+        }
+        self.annot_call(
+            doc,
+            "annotation change",
+            |doc| RequestBody::UpdateAnnot {
+                doc,
+                page,
+                id,
+                text: text.map(str::to_string),
+                color,
+                dx,
+                dy,
+            },
+            |item| item.id == id,
+        )
+    }
+
+    /// Takes an annotation off the page.
+    pub fn remove_annot(&self, doc: u64, page: u32, id: u32) -> Result<(), ClientError> {
+        self.call(
+            doc,
+            "annotation removal",
+            |doc| RequestBody::RemoveAnnot { doc, page, id },
+            |body| match body {
+                ResponseBody::AnnotRemoved => Ok(()),
+                other => Err(other),
+            },
+        )
+    }
+
+    /// Puts back an annotation that was taken off; it keeps its id.
+    pub fn restore_annot(&self, doc: u64, page: u32, id: u32) -> Result<AnnotInfo, ClientError> {
+        self.annot_call(
+            doc,
+            "annotation restore",
+            |doc| RequestBody::RestoreAnnot { doc, page, id },
+            |item| item.id == id,
         )
     }
 
@@ -668,6 +947,10 @@ impl EngineClient {
             RequestBody::PageText { .. } => MAX_TEXT_ANSWER,
             RequestBody::PageLinks { .. } => MAX_LINKS_ANSWER,
             RequestBody::Signatures { .. } => MAX_SIGNATURE_REPORT.max(IDLE_LIMIT),
+            RequestBody::ListFormFields { .. } | RequestBody::SetFormField { .. } => {
+                MAX_FORMS_ANSWER
+            }
+            RequestBody::ListAnnots { .. } => MAX_ANNOTS_ANSWER,
             RequestBody::SaveChunk { len, .. } => {
                 (SAVE_DATA_HEADER_LEN + (*len as usize).min(MAX_SAVE_CHUNK)).max(IDLE_LIMIT)
             }
@@ -697,6 +980,7 @@ impl EngineClient {
         // A request that can take long gets the longer wait, renewed by every sign of life.
         let patience = match body {
             RequestBody::DocInfo { .. }
+            | RequestBody::FormInfo { .. }
             | RequestBody::Fingerprint { .. }
             | RequestBody::Signatures { .. }
             | RequestBody::SaveBegin { .. }
@@ -945,6 +1229,32 @@ fn stop_running(inner: &mut Inner) {
         let mut child = lock(&running.child);
         let _ = child.kill();
         let _ = child.wait();
+    }
+}
+
+fn refused_request(message: &str) -> ClientError {
+    ClientError::Engine {
+        code: ErrorCode::InvalidRequest,
+        message: message.into(),
+    }
+}
+
+/// A place that is a number and not absurd. The protocol would refuse the request; this says so
+/// before the engine is asked.
+fn check_place(x: f32, y: f32) -> Result<(), ClientError> {
+    if x.is_finite() && y.is_finite() && x.abs() <= MAX_COORDINATE && y.abs() <= MAX_COORDINATE {
+        Ok(())
+    } else {
+        Err(refused_request("that place is not on any page"))
+    }
+}
+
+/// Text for a note or a comment. The protocol would cut it, which would change what the person wrote.
+fn check_text(text: &str) -> Result<(), ClientError> {
+    if text.len() > MAX_ANNOT_TEXT {
+        Err(refused_request("the text is too long"))
+    } else {
+        Ok(())
     }
 }
 

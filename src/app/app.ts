@@ -4,6 +4,7 @@
 
 import type { OpenedDocument, OutlineEntry, SavedFile, SavedPosition } from "../lib/api";
 import type { SignaturesInfo, StaleReason } from "../lib/signatures";
+import { PALETTE, PEN_WIDTHS, type Annotation, type Tool } from "../lib/annotations";
 import { describeError, fileNameOf, isEngineLost, toAppError, type AppErrorLike } from "../lib/errors";
 import { classifyUri, visibleAddress } from "../lib/linkPolicy";
 import { parsePageInput } from "../lib/pageInput";
@@ -17,6 +18,7 @@ import {
   saveTheme,
   type StorageLike,
 } from "../lib/theme";
+import type { FormEdit, FormFieldInfo, FormInfo, FormValueIn, FormsApi } from "../viewer/forms";
 import { actionForKey } from "../viewer/keys";
 import type { CopyResult, PageLinkInfo } from "../viewer/overlays";
 import { DocumentView, type ViewPosition, type ViewerOptions } from "../viewer/viewer";
@@ -27,6 +29,8 @@ import type { PageToolsApi } from "../lib/pagesapi";
 import { describePageError } from "../lib/pageerrors";
 import { PageOps, type PageHost } from "./pageops";
 import { PagePanel, type PagePanelHost } from "./pagepanel";
+import { Annotator, CLEAN_REFUSALS, annotationNotice, type AnnotatorApi } from "./annotator";
+import { AnnotBar } from "./annotbar";
 import { EditHistory, type Edit } from "./history";
 import { MenuController } from "./menu";
 import {
@@ -57,6 +61,16 @@ export interface AppDeps {
     /** The digital signatures of a document, checked by its engine. */
     getSignatures?(doc: number): Promise<SignaturesInfo>;
     searchPage(doc: number, page: number, query: string): Promise<[number, number][]>;
+    /** The form of a document, if the app can fill in forms (the three go together). */
+    formInfo?(doc: number): Promise<FormInfo>;
+    getFormFields?(doc: number, page: number): Promise<FormFieldInfo[]>;
+    setFormField?(
+      doc: number,
+      page: number,
+      index: number,
+      name: string,
+      value: FormValueIn,
+    ): Promise<FormFieldInfo[]>;
     openLink(doc: number, url: string): Promise<void>;
     /** The scripts the engine of a document had no font for when PDFium asked. */
     missedFonts?(doc: number): Promise<string[]>;
@@ -67,7 +81,10 @@ export interface AppDeps {
     saveAs(doc: number, allowSigned: boolean): Promise<SavedFile | null>;
     quitApp(): Promise<void>;
     stayOpen(): Promise<void>;
-  };
+  } & Partial<AnnotatorApi> & {
+      /** The annotations of a page. Without it, and without the other annotation calls, the annotation bar is off. */
+      listAnnotations?(doc: number, page: number): Promise<Annotation[]>;
+    };
   /** Shows the file dialog. Resolves with the chosen paths, or an empty list when cancelled. */
   pickFiles(): Promise<string[]>;
   setWindowTitle(title: string): void;
@@ -118,7 +135,11 @@ interface Tab {
   dirtyTold: boolean;
   /** Set while the document is being saved; resolves with the answer of that save. */
   saving: Promise<boolean> | null;
+  /** The revision of the document when the running save began. */
+  savingFrom: number;
   view: DocumentView;
+  /** The annotations of the document, or null when the app process offers none. */
+  annotator: Annotator | null;
   /** What the side panel knows about this document. */
   sidebarDoc: SidebarDocument;
   saveTimer: ReturnType<typeof setTimeout> | undefined;
@@ -195,6 +216,9 @@ const CHANGE_GRACE_MS = 2000;
 const SAVE_SLOW_DETAIL =
   "A large file or a slow drive can take a while. You can wait, or give up the changes you made: the file on the disk stays as it is. Cancel keeps the program open and lets the save carry on.";
 
+/** Said when a form field holds text that the engine did not take (it is too long, for one). */
+const REFUSED_FIELD_DETAIL = "A form field holds text that the document did not accept, so that text is not in it.";
+
 function byId<T extends HTMLElement>(root: Document, id: string): T {
   const el = root.getElementById(id);
   if (!el) throw new Error(`missing element #${id}`);
@@ -235,6 +259,7 @@ export class App {
   /** Paths that are being opened right now, so that one file is not opened twice at once. */
   private readonly opening = new Set<string>();
   private measuring = false;
+  private appName = APP_NAME;
   private reported = false;
   /** Whether the tabs are remembered for the next start (the setting "Reopen tabs at start"). */
   private reopenTabs = true;
@@ -274,6 +299,13 @@ export class App {
   /** The commands of the app process, with the reads of a document watched (see `watchReads`). */
   private readonly api: AppDeps["api"];
   private readonly selectionProxy: HTMLElement;
+  private readonly annotbar: AnnotBar;
+  private readonly annotStatus: HTMLElement;
+  private readonly popovers: HTMLElement;
+  /** Whether the annotation bar is shown. */
+  private annotOpen = false;
+  /** Makes the same sentence be read twice in a row. */
+  private announceFlip = false;
   private readonly copyStatus: HTMLElement;
   /** The line of each running copy (copies of different tabs can run together) shows in one place. */
   private readonly copyLines = new Map<DocumentView, string>();
@@ -282,6 +314,12 @@ export class App {
   private readonly printRoot: HTMLElement;
   private printJob: PrintJob | null = null;
   private printing = false;
+  /**
+   * The saves the reader asked for that are under way, per tab (a press on another tab is its own
+   * save). A second press on the same tab is ignored, unless it is a Save and the document changed
+   * since the running save began.
+   */
+  private readonly savingByUser = new Map<Tab, { asCopy: boolean; count: number }>();
   private readonly positionDelay: number;
 
   constructor(
@@ -305,6 +343,25 @@ export class App {
     });
     this.menu = new MenuController(byId(root, "menu-button"), byId(root, "menu"));
     this.selectionProxy = byId(root, "sel-proxy");
+    this.annotStatus = byId(root, "annot-status");
+    this.popovers = byId(root, "annot-popovers");
+    this.annotbar = new AnnotBar(root, {
+      toggle: (open) => this.setAnnotating(open, true),
+      setTool: (tool) => this.active?.annotator?.setTool(tool),
+      setColor: (color) => this.active?.annotator?.setColor(color),
+      setPenWidth: (width) => this.active?.annotator?.setPenWidth(width),
+      setStamp: (stamp) => {
+        this.active?.annotator?.setStamp(stamp);
+        this.active?.view.element.focus({ preventScroll: true });
+      },
+      editText: () => {
+        const a = this.active?.annotator;
+        if (a?.selected) void a.editText(a.selected.page, a.selected.id);
+      },
+      remove: () => void this.active?.annotator?.removeSelected(),
+      undo: () => void this.undoActive(),
+      redo: () => void this.redoActive(),
+    });
     this.copyStatus = byId(root, "copy-status");
     this.printRoot = byId(root, "print-root");
     this.find = new FindBar(root, {
@@ -382,6 +439,22 @@ export class App {
   init(): void {
     byId(this.root, "open-button").addEventListener("click", () => void this.openDialog());
     byId(this.root, "print-button").addEventListener("click", () => void this.printActive());
+    for (const [id, asCopy] of [
+      ["save-button", false],
+      ["save-copy-button", true],
+    ] as const) {
+      const button = byId(this.root, id);
+      button.addEventListener("click", () => {
+        void this.saveFromUser(asCopy).then((ran) => {
+          // The focus goes back to the document, unless a question is open or the save sent the
+          // reader somewhere (to a field, say).
+          const at = this.root.activeElement;
+          if (ran && this.noticeLayer.childElementCount === 0 && (at === button || at === null || at === this.root.body)) {
+            this.active?.view.element.focus({ preventScroll: true });
+          }
+        });
+      });
+    }
     byId(this.root, "empty-open").addEventListener("click", () => void this.openDialog());
     this.zoomIn.addEventListener("click", () => this.active?.view.stepZoom(1));
     this.zoomOut.addEventListener("click", () => this.active?.view.stepZoom(-1));
@@ -433,9 +506,24 @@ export class App {
     return this.pageOps?.busy ? this.pageOps.whenIdle() : Promise.resolve();
   }
 
+  /**
+   * True when a document has changes that are not saved: the history says so, or a change is still
+   * being made, or text typed in the box of a note has not been saved yet, or text typed in a field
+   * of a form has not been sent yet (it will be, before anything looks at the document, but the tab
+   * counts as changed from the first key).
+   */
+  private isDirty(tab: Tab): boolean {
+    return tab.history.dirty || (tab.annotator?.unsaved ?? false) || tab.view.hasPendingFormInput;
+  }
+
   /** How many documents have changes that are not saved. */
   get unsavedCount(): number {
-    return this.tabs.filter((t) => t.history.dirty).length;
+    return this.tabs.filter((t) => this.isDirty(t)).length;
+  }
+
+  /** Sends what was typed in the forms of every tab, and waits for the changes to be made. */
+  private async flushForms(tabs: Tab[] = this.tabs): Promise<void> {
+    await Promise.all(tabs.map((t) => t.view.flushForms().catch(() => undefined)));
   }
 
   /**
@@ -767,7 +855,9 @@ export class App {
       history: new EditHistory(),
       dirtyTold: false,
       saving: null,
+      savingFrom: 0,
       view: undefined as unknown as DocumentView,
+      annotator: null,
       sidebarDoc: undefined as unknown as SidebarDocument,
       saveTimer: undefined,
       forgottenAt: null,
@@ -804,16 +894,28 @@ export class App {
         onSelectionChange: (has) => {
           if (!has && this.active === tab) this.selectionProxy.textContent = "";
         },
-        onSelectionSettled: () => this.updateSelectionProxy(tab),
+        onSelectionSettled: () => {
+          tab.annotator?.selectionSettled();
+          this.updateSelectionProxy(tab);
+        },
         onTextLimit: () => void this.textLimitHit(tab),
         onScripts: () => {
           tab.sawScripts = true;
           void this.fontsMissed(tab);
         },
         onPageDrawn: () => void this.fontsMissed(tab),
+        annotations: {
+          onSelect: (page, id) => tab.annotator?.onSelect(page, id),
+          onPlace: (page, x, y, client) => tab.annotator?.onPlace(page, x, y, client),
+          onStroke: (page, points) => tab.annotator?.onStroke(page, points),
+          onMove: (page, id, dx, dy) => tab.annotator?.onMove(page, id, dx, dy),
+          onEdit: (page, id) => tab.annotator?.onEdit(page, id),
+          onLoadFailed: (page, error) => tab.annotator?.onLoadFailed(page, error),
+        },
       },
-      { start: opened.position ?? null, limits: this.deps.viewLimits },
+      { start: opened.position ?? null, limits: this.deps.viewLimits, forms: this.formsFor(tab) },
     );
+    tab.annotator = this.makeAnnotator(tab);
     tab.history.onChange(() => this.historyChanged(tab));
     tab.sidebarDoc = {
       doc: opened.doc,
@@ -842,6 +944,42 @@ export class App {
         detail: `"${opened.name}" opened, but it does not contain any pages to show.`,
         buttons: [{ id: "ok", label: "OK", primary: true }],
       });
+    }
+  }
+
+  /**
+   * What the view of a tab needs to let the reader fill in a form: the three commands, and a place to
+   * record each change, so that it can be taken back and the document counts as changed.
+   */
+  private formsFor(tab: Tab): ViewerOptions["forms"] {
+    const api = this.deps.api;
+    if (!api.formInfo || !api.getFormFields || !api.setFormField) return undefined;
+    const forms: FormsApi = {
+      formInfo: (doc) => (api.formInfo as NonNullable<typeof api.formInfo>)(doc),
+      getFormFields: (doc, page) => (api.getFormFields as NonNullable<typeof api.getFormFields>)(doc, page),
+      setFormField: (doc, page, index, name, value) =>
+        (api.setFormField as NonNullable<typeof api.setFormField>)(doc, page, index, name, value),
+    };
+    return {
+      api: forms,
+      record: (edit) => this.recordFormEdit(tab, edit),
+      pending: () => this.historyChanged(tab),
+      redrawn: (page) => this.sidebar.pageChanged(tab.doc, page),
+    };
+  }
+
+  /**
+   * Puts a change of a form in the history of its tab. While an undo or a redo is still running the
+   * history refuses it, so the change waits for the end of that (a moment) and is not lost.
+   */
+  private recordFormEdit(tab: Tab, edit: FormEdit): void {
+    try {
+      tab.history.push(edit);
+    } catch {
+      // The change is made, so it is recorded however long the undo or redo takes.
+      if (this.tabs.includes(tab)) {
+        setTimeout(() => this.recordFormEdit(tab, edit), 20);
+      }
     }
   }
 
@@ -940,13 +1078,16 @@ export class App {
     }
     const tab = this.tabs.find((t) => t.id === id);
     if (!tab) return true;
-    if (!tab.history.dirty) {
+    // What was typed and not left yet is part of the document before the question is asked.
+    if (tab.view.hasPendingFormInput) await this.flushForms([tab]);
+    if (!this.tabs.includes(tab)) return true;
+    if (!this.isDirty(tab)) {
       this.closeTab(id);
       return true;
     }
     const answer = await showNotice(this.noticeLayer, {
       title: `Save changes to "${tab.name}"?`,
-      detail: "If you close it without saving, the changes you made are lost.",
+      detail: `${tab.view.hasRefusedFormInput ? `${REFUSED_FIELD_DETAIL} ` : ""}If you close it without saving, the changes you made are lost.`,
       buttons: [
         { id: "cancel", label: "Cancel", safe: true },
         { id: "discard", label: "Don't save" },
@@ -1101,6 +1242,7 @@ export class App {
       this.printJob.cleanup();
     }
     this.find.forget(tab.view);
+    tab.annotator?.destroy();
     tab.view.destroy();
     this.sidebar.forget(tab.doc);
     this.signatures.forget(tab.doc);
@@ -1113,10 +1255,112 @@ export class App {
     this.syncChrome();
   }
 
+  // ---- annotations -----------------------------------------------------------
+
+  /** The annotations of a document, if the app process offers the calls for them. */
+  private makeAnnotator(tab: Tab): Annotator | null {
+    const api = this.deps.api;
+    if (
+      !api.listAnnotations ||
+      !api.addMarkup ||
+      !api.addNote ||
+      !api.addInk ||
+      !api.addStamp ||
+      !api.updateAnnotation ||
+      !api.removeAnnotation ||
+      !api.restoreAnnotation
+    ) {
+      return null;
+    }
+    const annotator = new Annotator(tab.doc, tab.view, tab.history, api as AnnotatorApi, {
+      popovers: this.popovers,
+      announce: (text) => this.announce(text),
+      ask: (options) => showNotice(this.noticeLayer, options),
+      failed: (error) => void this.annotationFailed(tab, error),
+      changed: () => {
+        this.historyChanged(tab);
+        if (this.active === tab) this.syncAnnotBar();
+      },
+      pageChanged: (page) => this.sidebar.pageChanged(tab.doc, page),
+    });
+    // Reading is the way a page is shown until the bar is opened.
+    annotator.setReading(!this.annotOpen);
+    return annotator;
+  }
+
+  /** A change to an annotation failed. A lost engine ends the tab; anything else is told and forgotten. */
+  private async annotationFailed(tab: Tab, error: unknown): Promise<void> {
+    if (!this.tabs.includes(tab)) return;
+    const app = toAppError(error);
+    if (isEngineLost(app)) {
+      await this.documentLost(tab, app);
+      return;
+    }
+    const text = annotationNotice(app, tab.name);
+    await showNotice(this.noticeLayer, {
+      title: text.title,
+      detail: text.detail,
+      buttons: [{ id: "ok", label: "OK", primary: true }],
+    });
+  }
+
+  /** Says something to a screen reader, in the live region of the page. */
+  private announce(text: string): void {
+    this.announceFlip = !this.announceFlip;
+    this.annotStatus.textContent = this.announceFlip ? text : `${text}\u00a0`;
+  }
+
+  /** Shows or hides the annotation bar. Hiding it puts the pointer back to picking. */
+  private setAnnotating(open: boolean, focus = false): void {
+    this.annotOpen = open;
+    if (!open) {
+      for (const tab of this.tabs) tab.annotator?.setTool("select");
+    }
+    for (const tab of this.tabs) tab.annotator?.setReading(!open);
+    this.syncAnnotBar();
+    if (open && focus) this.annotbar.focusBar();
+  }
+
+  /** Picks a tool from the keyboard: the bar opens if it was closed. */
+  private chooseTool(tool: Tool): void {
+    const annotator = this.active?.annotator;
+    if (!annotator) return;
+    if (!this.annotOpen) this.setAnnotating(true);
+    if (tool === "stamp" && annotator.tool === "stamp") {
+      this.annotbar.openStampMenu();
+      return;
+    }
+    annotator.setTool(tool);
+    this.active?.view.element.focus({ preventScroll: true });
+  }
+
+  /** Brings the annotation bar in step with the document in front. */
+  private syncAnnotBar(): void {
+    const tab = this.active;
+    const annotator = tab?.annotator ?? null;
+    const picked = annotator?.current ?? null;
+    this.annotbar.render({
+      open: this.annotOpen,
+      enabled: annotator !== null,
+      tool: annotator?.tool ?? "select",
+      color: annotator?.color ?? PALETTE[0].rgba,
+      penWidth: annotator?.penWidth ?? PEN_WIDTHS[1].width,
+      stamp: annotator?.stamp ?? "approved",
+      note: annotator?.blockedReason ?? annotator?.pickedReason ?? null,
+      blocked: annotator?.blockedReason != null,
+      canEditText: picked?.can.editText ?? false,
+      canRemove: picked?.can.remove ?? false,
+      canUndo: tab?.history.canUndo ?? false,
+      canRedo: tab?.history.canRedo ?? false,
+      undoLabel: tab?.history.undoLabel ?? null,
+      redoLabel: tab?.history.redoLabel ?? null,
+    });
+  }
+
   /** The engine of one document stopped and took the document with it. The other tabs carry on. */
   private async documentLost(tab: Tab, error: AppErrorLike): Promise<void> {
     if (!this.tabs.includes(tab)) return;
-    const lostChanges = tab.history.dirty;
+    const lostChanges = this.isDirty(tab);
     this.closeTab(tab.id);
     const text = describeError(error, tab.name);
     const answer = await showNotice(this.noticeLayer, {
@@ -1147,7 +1391,7 @@ export class App {
     // Any change of the document (an edit, an undo, a save) means the tab no longer holds the
     // file whose signatures were checked.
     this.signatures.invalidate(tab.doc);
-    const dirty = tab.history.dirty;
+    const dirty = this.isDirty(tab);
     if (dirty !== tab.dirtyTold) {
       tab.dirtyTold = dirty;
       // If the app process does not get to know, the next change tries again.
@@ -1157,14 +1401,17 @@ export class App {
     }
     this.drawTabs();
     this.drawTitle();
+    if (this.active === tab) this.syncAnnotBar();
   }
 
   /** Saves the document that is shown, if it has changes. Resolves with true when nothing is left unsaved. */
   async saveActive(): Promise<boolean> {
     const tab = this.active;
+    if (!tab) return true;
+    if (tab.view.hasPendingFormInput) await this.flushForms([tab]);
     // History turns dirty only when a change ends, so a document that a tool is changing right now
     // still goes on: the save waits for the change, or says that it is under way.
-    if (!tab || (!tab.history.dirty && !this.pageOps?.busyOn(tab.doc))) return true;
+    if (!this.tabs.includes(tab) || (!this.isDirty(tab) && !this.pageOps?.busyOn(tab.doc))) return true;
     return this.saveTab(tab, false);
   }
 
@@ -1172,7 +1419,36 @@ export class App {
   async saveActiveAs(): Promise<boolean> {
     const tab = this.active;
     if (!tab || tab.view.pageCount === 0) return false;
+    if (tab.view.hasPendingFormInput) await this.flushForms([tab]);
+    if (!this.tabs.includes(tab)) return false;
     return this.saveTab(tab, true);
+  }
+
+  /**
+   * A save the reader asked for with a button or a key. A second press on the same tab while the
+   * first is still being answered (a dialog open, a question on the screen) does nothing: it would
+   * ask again, and would open a second dialog after the first was cancelled. The exception is a
+   * Save pressed after the document changed since the running save began: it is let through and
+   * waits for the running save. A press on another tab is a save of its own. Resolves with false
+   * when ignored.
+   */
+  private async saveFromUser(asCopy: boolean): Promise<boolean> {
+    const tab = this.active;
+    const running = tab ? this.savingByUser.get(tab) : undefined;
+    if (tab && running) {
+      const changed = tab.saving !== null && (tab.history.revision !== tab.savingFrom || tab.view.hasPendingFormInput);
+      if (asCopy || running.asCopy || !changed) return false;
+    }
+    const entry = running ?? { asCopy, count: 0 };
+    entry.count++;
+    if (tab) this.savingByUser.set(tab, entry);
+    try {
+      await (asCopy ? this.saveActiveAs() : this.saveActive());
+    } finally {
+      entry.count--;
+      if (tab && entry.count === 0 && this.savingByUser.get(tab) === entry) this.savingByUser.delete(tab);
+    }
+    return true;
   }
 
   /**
@@ -1180,7 +1456,8 @@ export class App {
    * was under way when the program was left). Resolves with true when all were saved.
    */
   async saveAllChanges(halt?: AbortSignal, given?: Tab): Promise<boolean> {
-    for (const tab of this.tabs.filter((t) => t.history.dirty && t !== given)) {
+    if (this.tabs.some((t) => t.view.hasPendingFormInput)) await this.flushForms();
+    for (const tab of this.tabs.filter((t) => this.isDirty(t) && t !== given)) {
       // The user stopped waiting: what is running finishes, but no other document is begun.
       if (halt?.aborted) return false;
       if (!(await this.saveTab(tab, false))) return false;
@@ -1210,14 +1487,24 @@ export class App {
         return false;
       }
     }
+    // Text a field refused is not in the document: a file written now would leave it out and the tab
+    // would look saved. Nothing is written until the reader has dealt with the text.
+    if (tab.view.hasRefusedFormInput) {
+      await this.tellRefusedField(tab);
+      return false;
+    }
+    // What is under way is done first (an open box of a note is saved, running changes finish),
+    // so that the file holds what the window shows.
+    await tab.annotator?.flush();
     // The change that was waited for may have left nothing to save (it failed, or it was undone).
-    if (!asCopy && !tab.history.dirty) return true;
+    if (!asCopy && !this.isDirty(tab)) return true;
     // A save that is running is waited for, and then the state is looked at again: it may have
     // saved everything, or an edit may have come after it.
     while (tab.saving) {
       await tab.saving.catch(() => false);
-      if (!asCopy && !tab.history.dirty) return true;
+      if (!asCopy && !this.isDirty(tab)) return true;
     }
+    tab.savingFrom = tab.history.revision;
     const running = this.writeTab(tab, asCopy);
     tab.saving = running;
     try {
@@ -1235,7 +1522,14 @@ export class App {
    */
   private async writeTab(tab: Tab, asCopy: boolean): Promise<boolean> {
     const began = tab.history.revision;
-    const saved = asCopy ? await this.runSaveAs(tab, false) : await this.runSave(tab);
+    // The engine is not changed while the file is written; changes made meanwhile wait.
+    const release = tab.annotator?.hold();
+    let saved: SavedFile | null;
+    try {
+      saved = asCopy ? await this.runSaveAs(tab, false) : await this.runSave(tab);
+    } finally {
+      release?.();
+    }
     if (!saved) return false;
     // The file that was written is not the one the signatures were checked on, whatever the tab
     // shows from now on. This comes before anything else is done with the tab.
@@ -1250,7 +1544,29 @@ export class App {
       tab.name = saved.name;
       this.syncChrome();
     }
-    return !tab.history.dirty;
+    return !this.isDirty(tab);
+  }
+
+  private async tellRefusedField(tab: Tab): Promise<void> {
+    const [first, ...others] = tab.view.refusedFormFields;
+    const where = first ? `The field "${first.label}" on page ${first.page + 1}` : "A field";
+    const more =
+      others.length === 0
+        ? ""
+        : ` ${others.length === 1 ? "One other field has" : `${others.length} other fields have`} the same problem.`;
+    const answer = await showNotice(this.noticeLayer, {
+      title: "A field has text that could not be added",
+      detail: `"${tab.name}" was not saved. ${where} holds text that is too long for the document, so that text is not in it.${more} Shorten the text, or press Escape in the field to put back what the document has, then save again.`,
+      buttons: first
+        ? [
+            { id: "ok", label: "OK" },
+            { id: "go", label: "Go to the field", primary: true },
+          ]
+        : [{ id: "ok", label: "OK", primary: true }],
+    });
+    if (answer.button !== "go" || !first || !this.tabs.includes(tab)) return;
+    if (this.active !== tab) this.activate(tab.id);
+    tab.view.revealFormField(first.page, first.index);
   }
 
   private async runSave(tab: Tab): Promise<SavedFile | null> {
@@ -1406,7 +1722,8 @@ export class App {
           if (ops.busy) given = working;
         }
       }
-      const dirty = this.tabs.filter((t) => t.history.dirty && t !== given);
+      if (this.tabs.some((t) => t.view.hasPendingFormInput)) await this.flushForms();
+      const dirty = this.tabs.filter((t) => this.isDirty(t) && t !== given);
       if (dirty.length === 0) {
         await this.deps.api.quitApp();
         return;
@@ -1416,10 +1733,11 @@ export class App {
       const answer = await showNotice(this.noticeLayer, {
         title:
           dirty.length === 1 ? `Save changes to "${dirty[0].name}"?` : `Save changes to ${dirty.length} documents?`,
-        detail:
+        detail: `${dirty.some((t) => t.view.hasRefusedFormInput) ? `${REFUSED_FIELD_DETAIL} ` : ""}${
           dirty.length === 1
             ? "If you quit without saving, the changes you made are lost."
-            : `${names.join(", ")} have changes that are not saved. If you quit without saving, they are lost.`,
+            : `${names.join(", ")} have changes that are not saved. If you quit without saving, they are lost.`
+        }`,
         buttons: [
           { id: "cancel", label: "Cancel", safe: true },
           { id: "discard", label: "Quit without saving" },
@@ -1459,23 +1777,24 @@ export class App {
   private async stepHistory(direction: "undo" | "redo"): Promise<void> {
     const tab = this.active;
     if (!tab || tab.saving || this.pageOps?.busy) return;
-    try {
+    const run = async (): Promise<void> => {
+      // A form change that is on its way is part of the history first: Undo takes back that one,
+      // not the one before it.
+      await tab.view.flushForms().catch(() => undefined);
       await (direction === "undo" ? tab.history.undo() : tab.history.redo());
+    };
+    try {
+      // After the changes asked for before it, and before the ones asked for later.
+      await (tab.annotator ? tab.annotator.sequenced(run) : run());
     } catch (e) {
       const error = toAppError(e);
-      // The engine of the document was lost: the tab is closed and the user has been told so (by
-      // the page tools, with what that means for the changes that were not saved). Saying that
-      // nothing was lost would be false.
-      if (isEngineLost(error)) return;
-      const text = describePageError(error, tab.name);
-      const known = ["snapshot_gone", "undo_unavailable", "busy", "save_busy", "pages_not_allowed"].includes(error.code);
-      await showNotice(this.noticeLayer, {
-        title: known ? text.title : direction === "undo" ? "The change could not be taken back" : "The change could not be made again",
-        detail: known
-          ? text.detail
-          : `${error.message ? `${error.message.charAt(0).toUpperCase()}${error.message.slice(1)}. ` : ""}The document is as it was before.`,
-        buttons: [{ id: "ok", label: "OK", primary: true }],
-      });
+      // The engine of the document was lost: the tab is closed (by the page tools, which told the
+      // user what that means for the changes that were not saved, or here, as for any other change).
+      if (isEngineLost(error)) {
+        await this.documentLost(tab, error);
+        return;
+      }
+      await showNotice(this.noticeLayer, undoFailure(error, direction, tab.name));
     }
   }
 
@@ -1615,6 +1934,7 @@ export class App {
     this.signatures.setDocument(active?.doc ?? null);
     this.find.setTarget(active ? { doc: active.doc, view: active.view } : null);
     this.selectionProxy.textContent = "";
+    this.syncAnnotBar();
     if (!active) {
       this.pageInput.value = "";
       this.pageTotal.textContent = "";
@@ -1631,18 +1951,37 @@ export class App {
   /** Draws the tab strip: one tab for each document, with a dot on those with unsaved changes. */
   private drawTabs(): void {
     this.tabStrip.render(
-      this.tabs.map((t) => ({ id: t.id, title: t.name, path: t.path, dirty: t.history.dirty })),
+      this.tabs.map((t) => ({ id: t.id, title: t.name, path: t.path, dirty: this.isDirty(t) })),
       this.activeId,
     );
   }
 
+  /**
+   * The name of the app in the window title: the product name the build was made with, so that a
+   * build with another product name (the beta) says so. Without it the title says "Patient Partridge".
+   */
+  setAppName(name: string | null | undefined): void {
+    const next = name?.trim() || APP_NAME;
+    if (next === this.appName) return;
+    this.appName = next;
+    this.drawTitle();
+  }
+
   private drawTitle(): void {
+    this.syncSaveButtons();
     const active = this.active;
     if (!active) {
-      this.deps.setWindowTitle(APP_NAME);
+      this.deps.setWindowTitle(this.appName);
       return;
     }
-    this.deps.setWindowTitle(`${active.history.dirty ? "\u2022 " : ""}${active.name} - ${APP_NAME}`);
+    this.deps.setWindowTitle(`${this.isDirty(active) ? "\u2022 " : ""}${active.name} - ${this.appName}`);
+  }
+
+  /** Save is there when the document in front has changes; Save a copy whenever a document is open. */
+  private syncSaveButtons(): void {
+    const active = this.active;
+    byId<HTMLButtonElement>(this.root, "save-button").disabled = !active || !this.isDirty(active);
+    byId<HTMLButtonElement>(this.root, "save-copy-button").disabled = !active || active.view.pageCount === 0;
   }
 
   private setControlsEnabled(on: boolean): void {
@@ -1721,6 +2060,10 @@ export class App {
   // ---- keyboard --------------------------------------------------------------
 
   private onKeyDown(e: KeyboardEvent): void {
+    if (this.noticeLayer.childElementCount === 0 && this.annotationKey(e)) {
+      e.preventDefault();
+      return;
+    }
     if (e.key === "Escape" && this.noticeLayer.childElementCount === 0) {
       const view = this.active?.view;
       if (view?.hasSelection && !(e.target instanceof HTMLInputElement)) {
@@ -1774,21 +2117,50 @@ export class App {
       if (this.activeId !== null) void this.requestClose(this.activeId);
     } else if (action.type === "save") {
       e.preventDefault();
-      void this.saveActive();
+      void this.saveFromUser(false);
     } else if (action.type === "save-as") {
       e.preventDefault();
-      void this.saveActiveAs();
+      void this.saveFromUser(true);
     } else if (action.type === "undo" || action.type === "redo") {
-      // In a text box, undo and redo belong to the box.
-      if (typing) return;
+      // In a text box, undo and redo belong to the box. A drop-down list has no undo of its own,
+      // and the focus stays in it after a choice.
+      if (typing && !(target instanceof HTMLSelectElement)) return;
       e.preventDefault();
       void (action.type === "undo" ? this.undoActive() : this.redoActive());
+    } else if (action.type === "tool") {
+      e.preventDefault();
+      this.chooseTool(action.tool);
+    } else if (action.type === "toggle-annotations") {
+      e.preventDefault();
+      if (this.active?.annotator) this.setAnnotating(!this.annotOpen, !this.annotOpen);
     } else if (action.type === "next-tab" || action.type === "previous-tab") {
       e.preventDefault();
       this.stepTab(action.type === "next-tab" ? 1 : -1);
     } else if (this.active?.view.handleAction(action)) {
       e.preventDefault();
     }
+  }
+
+  /**
+   * Keys for the annotation that is picked (Delete, Enter, the arrows) and for the tool in use
+   * (Escape, and Enter for the note and the stamp). They belong to the annotation only when no text
+   * is being typed and no button but an annotation has the focus.
+   */
+  private annotationKey(e: KeyboardEvent): boolean {
+    const annotator = this.active?.annotator;
+    if (!annotator || e.ctrlKey || e.metaKey || e.altKey) return false;
+    // With the bar closed the keys belong to the page: the arrows scroll it, and nothing is picked.
+    if (!this.annotOpen) return false;
+    const target = e.target as HTMLElement | null;
+    const typing =
+      target instanceof HTMLInputElement ||
+      target instanceof HTMLSelectElement ||
+      target instanceof HTMLTextAreaElement;
+    if (typing) return false;
+    const onBox = target instanceof Element && target.closest(".annot") !== null;
+    if (e.key === "Escape") return annotator.handleKey(e);
+    if (target instanceof HTMLButtonElement && !onBox) return false;
+    return annotator.handleKey(e);
   }
 
   // ---- printing --------------------------------------------------------------
@@ -1815,6 +2187,10 @@ export class App {
     if (!tab || this.printing || tab.view.pageCount === 0) return;
     this.printing = true;
     try {
+      // The pages are drawn from the document, so what was typed must be in it. The flush can end
+      // the tab (a lost engine); then there is nothing to print.
+      if (tab.view.hasPendingFormInput) await this.flushForms([tab]);
+      if (!this.tabs.includes(tab)) return;
       const choice = await showPrintDialog(this.noticeLayer, {
         name: tab.name,
         pageCount: tab.view.pageCount,

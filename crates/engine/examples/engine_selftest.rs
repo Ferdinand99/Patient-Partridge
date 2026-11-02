@@ -262,7 +262,7 @@ fn touch_process(pid: u32) -> std::io::Result<()> {
     }
 }
 
-/// Probes of the Unix systems: the ways round the system call filter that a review found.
+/// Probes of the Unix systems: the known ways round the system call filter.
 #[cfg(unix)]
 fn unix_probes(file: &str, say: &mut dyn FnMut(String)) {
     // The signal route: a pipe that is told to signal a process when it is used. Descriptor 0 is
