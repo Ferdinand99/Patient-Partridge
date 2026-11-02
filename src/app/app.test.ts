@@ -2894,6 +2894,68 @@ describe("App: page tools", () => {
     return { ...made, pages, ops: opsOf(made.app) };
   }
 
+  describe("a tool that is working on a document that looks clean", () => {
+    const firstTab = (app: App) => (app as unknown as { tabs: { id: number }[] }).tabs[0].id;
+
+    /** A document with nothing unsaved and a turn that has not answered yet. */
+    async function turningCleanDocument() {
+      const pages = fakePages();
+      const made = make({ pages: pages as unknown as PageToolsApi });
+      await made.app.openPath("/a.pdf");
+      await flush();
+      let finish!: (c: PagesChanged) => void;
+      pages.pagesRotate.mockImplementationOnce(() => new Promise((r) => (finish = r)));
+      const ops = opsOf(made.app);
+      const turning = ops.rotate([0], 1);
+      await flush();
+      return { ...made, pages, ops, turning, finish: (c: PagesChanged = changed(3, 0, 1)) => finish(c) };
+    }
+
+    it("closing its tab waits for it, and then asks about the change it made", async () => {
+      const { app, turning, finish } = await turningCleanDocument();
+      const closing = app.requestClose(firstTab(app));
+      await flush();
+      expect(tabTitles()).toEqual(["a.pdf"]);
+      expect(notice()).toBeNull();
+      finish();
+      await turning;
+      await flush();
+      // The tab is dirty now: the question is asked, and the tab is still there.
+      expect(notice()?.textContent).toContain("Save changes");
+      expect(tabTitles()).toEqual(["a.pdf"]);
+      click(button("Cancel"));
+      expect(await closing).toBe(false);
+    });
+
+    it("quitting waits for it, and asks about the change it made", async () => {
+      const { app, api, turning, finish } = await turningCleanDocument();
+      const quitting = app.requestQuit();
+      await flush();
+      expect(api.quitApp).not.toHaveBeenCalled();
+      expect(notice()).toBeNull();
+      finish();
+      await turning;
+      await flush();
+      expect(notice()?.textContent).toContain("Save changes");
+      expect(api.quitApp).not.toHaveBeenCalled();
+      click(button("Cancel"));
+      await quitting;
+    });
+
+    it("printing waits for it, so that the pages printed are those it leaves", async () => {
+      const { app, turning, finish } = await turningCleanDocument();
+      const printing = app.printActive();
+      await flush();
+      expect(document.querySelector(".print-dialog")).toBeNull();
+      finish();
+      await turning;
+      await flush();
+      expect(document.querySelector(".print-dialog")).not.toBeNull();
+      document.querySelector<HTMLElement>(".print-dialog .btn-secondary")?.click();
+      await printing;
+    });
+  });
+
   describe("on a signed document", () => {
     const item: SignatureItem = {
       index: 0,

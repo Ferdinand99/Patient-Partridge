@@ -72,10 +72,32 @@ pub struct InsertedInfo {
 type Progress = Channel<[u64; 2]>;
 
 /// A change that was made counts as an unsaved change at once, in the app process, before the answer
-/// is on its way to the window: an update that waits for the commands in flight and then looks at
-/// the documents with unsaved changes must not miss the one that has just been made.
+/// is on its way to the window: an update that waits for the commands in flight and then looks again
+/// at the documents with unsaved changes (it does, see `install_with_engines_stopped`) must not miss
+/// the one that has just been made.
 fn unsaved(update_state: &UpdateState, doc: u64) {
     update_state.unsaved().set(doc, true);
+}
+
+/// Held while a page tool changes a document: the document counts as having unsaved changes from
+/// the start, so that a quit, a close or an update that looks at the documents while the tool works
+/// does not find a clean one and lose the change.
+struct Changing<'a> {
+    state: &'a UpdateState,
+    doc: u64,
+}
+
+impl<'a> Changing<'a> {
+    fn begin(state: &'a UpdateState, doc: u64) -> Changing<'a> {
+        state.unsaved().begin_change(doc);
+        Changing { state, doc }
+    }
+}
+
+impl Drop for Changing<'_> {
+    fn drop(&mut self) {
+        self.state.unsaved().end_change(self.doc);
+    }
 }
 
 /// Page changes are not made while an update is being installed: it would end the engine in the
@@ -95,6 +117,7 @@ pub async fn pages_delete(
     pages: Vec<u32>,
 ) -> Result<ChangedInfo, CommandError> {
     let _permit = permit(&update_state)?;
+    let _changing = Changing::begin(&update_state, doc);
     let pool = engine.0.clone();
     let changed = blocking(move || pool.pages_delete(doc, &pages)).await?;
     unsaved(&update_state, doc);
@@ -109,6 +132,7 @@ pub async fn pages_reorder(
     order: Vec<u32>,
 ) -> Result<ChangedInfo, CommandError> {
     let _permit = permit(&update_state)?;
+    let _changing = Changing::begin(&update_state, doc);
     let pool = engine.0.clone();
     let changed = blocking(move || pool.pages_reorder(doc, &order)).await?;
     unsaved(&update_state, doc);
@@ -124,6 +148,7 @@ pub async fn pages_rotate(
     turns: u8,
 ) -> Result<ChangedInfo, CommandError> {
     let _permit = permit(&update_state)?;
+    let _changing = Changing::begin(&update_state, doc);
     let pool = engine.0.clone();
     let changed = blocking(move || pool.pages_rotate(doc, &pages, turns)).await?;
     unsaved(&update_state, doc);
@@ -140,6 +165,7 @@ pub async fn pages_crop(
     margins: [f32; 4],
 ) -> Result<CroppedInfo, CommandError> {
     let _permit = permit(&update_state)?;
+    let _changing = Changing::begin(&update_state, doc);
     let pool = engine.0.clone();
     let cropped = blocking(move || pool.pages_crop(doc, &pages, margins)).await?;
     unsaved(&update_state, doc);
@@ -155,6 +181,7 @@ pub async fn pages_set_boxes(
     boxes: Vec<[f32; 4]>,
 ) -> Result<ChangedInfo, CommandError> {
     let _permit = permit(&update_state)?;
+    let _changing = Changing::begin(&update_state, doc);
     let pool = engine.0.clone();
     blocking(move || pool.pages_set_boxes(doc, &pages, &boxes))
         .await
@@ -171,6 +198,7 @@ pub async fn pages_insert_blank(
     height: f32,
 ) -> Result<ChangedInfo, CommandError> {
     let _permit = permit(&update_state)?;
+    let _changing = Changing::begin(&update_state, doc);
     let pool = engine.0.clone();
     let changed = blocking(move || pool.pages_insert_blank(doc, at, width, height)).await?;
     unsaved(&update_state, doc);
@@ -185,6 +213,7 @@ pub async fn pages_restore(
     snapshot: u32,
 ) -> Result<ChangedInfo, CommandError> {
     let _permit = permit(&update_state)?;
+    let _changing = Changing::begin(&update_state, doc);
     let pool = engine.0.clone();
     blocking(move || pool.pages_restore(doc, snapshot))
         .await
@@ -209,6 +238,7 @@ pub async fn pages_insert_pdf(
     progress: Progress,
 ) -> Result<InsertedInfo, CommandError> {
     let _permit = permit(&update_state)?;
+    let _changing = Changing::begin(&update_state, doc);
     let pool = engine.0.clone();
     let options = InsertOptions {
         allow_protected,
@@ -336,6 +366,24 @@ mod tests {
         unsaved(&state, 3);
         state.forget_doc(3);
         assert!(!state.unsaved().any());
+    }
+
+    #[test]
+    fn a_document_counts_as_unsaved_while_a_page_tool_works_on_it_and_not_after_a_failure() {
+        let state = UpdateState::new(None, InstallMethod::Automatic);
+        {
+            let _changing = Changing::begin(&state, 5);
+            // The window has not been told of any change, and the tool has not answered.
+            assert!(state.unsaved().any());
+            assert!(state.unsaved().holds_exit());
+        }
+        // The tool failed: nothing was changed, and nothing is held.
+        assert!(!state.unsaved().any());
+        {
+            let _changing = Changing::begin(&state, 5);
+            unsaved(&state, 5);
+        }
+        assert!(state.unsaved().any(), "a change that was made stays");
     }
 
     #[test]

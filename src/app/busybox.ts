@@ -21,6 +21,8 @@ export interface BusyBox {
   progress(done: number, total: number): void;
   /** Takes the button away from use and says why: the step that is under way cannot be stopped. */
   cannotStop(note: string): void;
+  /** Gives the button back for the next step, which can be stopped again (a box that could be stopped at first). */
+  canStop(): void;
   /** Takes the box away while a question is shown, and brings it back. */
   hide(): void;
   show(): void;
@@ -102,6 +104,12 @@ export function showBusyBox(layer: HTMLElement, options: BusyBoxOptions): BusyBo
       note = why;
       text();
       box.focus();
+    },
+    canStop() {
+      stoppable = options.cancelLabel !== undefined && options.onCancel !== undefined;
+      if (cancel) cancel.disabled = false;
+      note = "";
+      text();
     },
     hide() {
       if (!shown) return;

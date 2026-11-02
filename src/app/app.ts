@@ -413,6 +413,11 @@ export class App {
     this.active?.history.push(edit);
   }
 
+  /** Resolves when no page tool is working: what it changes counts as unsaved only when it is done. */
+  settled(): Promise<void> {
+    return this.pageOps?.busy ? this.pageOps.whenIdle() : Promise.resolve();
+  }
+
   /** How many documents have changes that are not saved. */
   get unsavedCount(): number {
     return this.tabs.filter((t) => t.history.dirty).length;
@@ -891,6 +896,9 @@ export class App {
    * save, give the changes up, or keep the tab. Resolves with true when the tab is closed.
    */
   async requestClose(id: number): Promise<boolean> {
+    // A page tool that is still working makes the document dirty when it is done. A tab that
+    // looks clean now is closed with that change lost, so the tool is waited for first.
+    if (this.pageOps?.busy) await this.pageOps.whenIdle();
     const tab = this.tabs.find((t) => t.id === id);
     if (!tab) return true;
     if (!tab.history.dirty) {

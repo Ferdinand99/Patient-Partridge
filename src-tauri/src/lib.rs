@@ -300,6 +300,15 @@ impl From<ClientError> for CommandError {
                     message: why,
                 }
             }
+            // The same for a change to the pages: it went on, or was silent, for too long.
+            ClientError::EngineStopped(why)
+                if why.starts_with(partridge_engine_client::CHANGE_TOOK_TOO_LONG) =>
+            {
+                CommandError {
+                    code: "change_took_too_long".into(),
+                    message: why,
+                }
+            }
             ClientError::EngineStopped(why) => CommandError {
                 code: "engine_stopped".into(),
                 message: why,
@@ -1457,6 +1466,11 @@ mod tests {
             partridge_engine_client::TOOK_TOO_LONG
         )));
         assert_eq!(too_long.code, "save_took_too_long");
+        let change = CommandError::from(ClientError::EngineStopped(format!(
+            "{}: it did not answer within 300 seconds",
+            partridge_engine_client::CHANGE_TOOK_TOO_LONG
+        )));
+        assert_eq!(change.code, "change_took_too_long");
         let password = CommandError::from(ClientError::Engine {
             code: ErrorCode::PasswordRequired,
             message: "locked".into(),

@@ -995,3 +995,64 @@ fn a_source_file_that_cannot_be_used_leaves_the_target_alone() {
     assert_eq!(turned.pages.len(), 3);
     assert_eq!(turned.pages[0].width, 792.0);
 }
+
+// ---- changes that take long ----------------------------------------------------------------------
+
+/// A pool whose engine is let go of after `stall` without a sign of life, as a change to the pages
+/// is, with a long overall limit.
+fn pool_with_stall(stall: Duration) -> EnginePool {
+    let mut config = config();
+    config.save_stall = stall;
+    config.pages_floor = Duration::from_secs(600);
+    EnginePool::new(config, 6)
+}
+
+/// The slice of the stall limit that a page may use up: pages are made so heavy that a tool takes
+/// several times the stall limit on all of them, and a fraction of it on each.
+const HEAVY_PAGES: usize = 40;
+const HEAVY_SEGMENTS: usize = 500_000;
+
+#[test]
+fn a_change_that_takes_many_times_the_stall_limit_is_not_ended_while_it_reports_its_work() {
+    let dir = Dir::new("slow");
+    let path = dir.write(
+        "heavy.pdf",
+        &kit::heavy_pages_pdf(HEAVY_PAGES, HEAVY_SEGMENTS),
+    );
+    // How long a page takes is found out on a few of them with the ordinary limits; the stall limit
+    // of the pool under test is then several pages long, and the tools on all pages take several
+    // times the stall limit.
+    let measuring = pool_with_stall(Duration::from_secs(300));
+    let (handle, _) = measuring.open(&text(&path), None).unwrap();
+    let started = Instant::now();
+    measuring
+        .pages_rotate(handle, &[0, 1, 2, 3, 4, 5], 1)
+        .unwrap();
+    let one_page = started.elapsed() / 6;
+    drop(measuring);
+    let stall = (one_page * 8).max(Duration::from_millis(1000));
+    assert!(
+        one_page * HEAVY_PAGES as u32 > stall * 3,
+        "the pages are too light for this test: a page takes {one_page:?}"
+    );
+
+    let pool = pool_with_stall(stall);
+    let (handle, _) = pool.open(&text(&path), None).unwrap();
+    let all: Vec<u32> = (0..HEAVY_PAGES as u32).collect();
+    // A turn and a delete of all pages but one: neither says nothing for as long as the stall limit,
+    // though each takes longer than it altogether.
+    let started = Instant::now();
+    pool.pages_rotate(handle, &all, 1).unwrap();
+    assert!(
+        started.elapsed() > stall * 2,
+        "the turn was quicker than twice the stall limit"
+    );
+    let started = Instant::now();
+    pool.pages_delete(handle, &all[..HEAVY_PAGES - 1]).unwrap();
+    assert!(
+        started.elapsed() > stall * 2,
+        "the delete was quicker than twice the stall limit"
+    );
+    // The document is there, with one page, and the next tool works.
+    assert_eq!(pool.pages_rotate(handle, &[0], 1).unwrap().pages.len(), 1);
+}

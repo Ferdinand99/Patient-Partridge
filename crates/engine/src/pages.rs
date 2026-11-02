@@ -231,6 +231,13 @@ impl PageTools {
         self.keep(bytes, pages, None)
     }
 
+    /// As [`PageTools::keep_for_tests`], with the sizes of the pages that the copy must show when it
+    /// is read in again.
+    #[doc(hidden)]
+    pub fn keep_for_tests_as(&mut self, bytes: Vec<u8>, pages: usize, sizes: &[PageSize]) -> u32 {
+        self.keep(bytes, pages, Some(sizes_digest(sizes)))
+    }
+
     /// How many bytes of copies are held, for tests.
     #[doc(hidden)]
     pub fn held_bytes(&self) -> usize {

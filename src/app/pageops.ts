@@ -246,6 +246,8 @@ export class PageOps {
       async () => {
         for (const path of files) {
           let inserted: number | null;
+          // A Stop that came too late ended with the file before; the next one can be stopped again.
+          this.box?.canStop();
           const name = path.split(/[\\/]/).pop() ?? path;
           try {
             inserted = await this.insertOne(t, where, path);

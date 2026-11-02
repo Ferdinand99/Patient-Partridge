@@ -850,3 +850,29 @@ pub fn object_streams_pdf() -> Vec<u8> {
     );
     out
 }
+
+/// `pages` Letter pages that all draw the same long content of `segments` line segments, which
+/// every page takes a while to read, in a file that stays small.
+pub fn heavy_pages_pdf(pages: usize, segments: usize) -> Vec<u8> {
+    let mut content = String::with_capacity(segments * 16 + 16);
+    content.push_str("0.5 w\n");
+    for i in 0..segments {
+        let _ = writeln!(content, "{} 10 m {} 700 l", 10 + i % 500, 20 + i % 400);
+    }
+    content.push_str("S\n");
+    let mut kids = String::new();
+    for i in 0..pages {
+        let _ = write!(kids, "{} 0 R ", 4 + i);
+    }
+    let mut objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        format!("<< /Type /Pages /Kids [{kids}] /Count {pages} >>").into_bytes(),
+        stream_object("", &content),
+    ];
+    for _ in 0..pages {
+        objects.push(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 3 0 R >>".to_vec(),
+        );
+    }
+    assemble(&objects, "")
+}

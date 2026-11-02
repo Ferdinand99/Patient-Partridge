@@ -207,7 +207,7 @@ fn lists_and_sizes_that_do_not_fit_are_refused_before_anything_is_sent() {
 #[test]
 fn a_tool_that_works_for_ever_is_stopped_by_the_overall_limit() {
     let mut config = config("endless");
-    config.save_floor = Duration::from_secs(1);
+    config.pages_floor = Duration::from_secs(1);
     config.save_slowest = u64::MAX;
     let client = EngineClient::new(config);
     let doc = client.open(&doc_path(), None).unwrap().doc;
@@ -215,7 +215,7 @@ fn a_tool_that_works_for_ever_is_stopped_by_the_overall_limit() {
     match client.pages_delete(doc, &[0]) {
         Err(ClientError::EngineStopped(why)) => {
             assert!(
-                why.starts_with(partridge_engine_client::TOOK_TOO_LONG),
+                why.starts_with(partridge_engine_client::CHANGE_TOOK_TOO_LONG),
                 "{why}"
             )
         }
@@ -238,6 +238,18 @@ fn a_tool_that_never_answers_is_stopped() {
     let started = Instant::now();
     assert_stopped(client.pages_rotate(doc, &[0], 1), "did not answer");
     assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+#[test]
+fn a_tool_that_never_answers_is_stopped_in_words_about_the_change_and_not_about_the_file() {
+    let mut config = config("hang");
+    config.save_stall = Duration::from_millis(500);
+    let client = EngineClient::new(config);
+    let doc = client.open(&doc_path(), None).unwrap().doc;
+    assert_stopped(
+        client.pages_rotate(doc, &[0], 1),
+        partridge_engine_client::CHANGE_TOOK_TOO_LONG,
+    );
 }
 
 // ---- the pool ------------------------------------------------------------------------------------

@@ -66,6 +66,7 @@ new Updater(document, {
   api,
   openPaths: () => app.openDocumentPaths(),
   closeMenu: () => app.closeMenu(),
+  settled: () => app.settled(),
   unsavedCount: () => app.unsavedCount,
   saveAll: () => app.saveAllChanges(),
 }).init();

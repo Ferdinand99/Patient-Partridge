@@ -276,7 +276,7 @@ export const TOOL_NOTES = {
   crop:
     "Cropping hides the edges of a page. It does not remove anything: the text, pictures and everything else outside the box are still in the file, and a program that ignores the crop box shows them. Deleting a page takes its content out of the file, but a delete is not a way to redact a document either (see what a delete leaves).",
   delete:
-    "Deleting a page removes it from the file, with its text, pictures, fonts and notes, unless something that stays refers to them. Bookmarks that led to it stay in the list and lead nowhere. A few things stay: the names of form fields that were on it, and, in a tagged document, the alternative text and the actual text of the tags. A delete is not a way to redact a document.",
+    "Deleting a page removes it from the file, with its text, pictures, fonts and notes, unless something that stays refers to them. Bookmarks that led to it stay in the list and lead nowhere. A few things stay: the names of form fields that were on it, the lists of choices of choice fields, the captions of buttons, and, in a tagged document, the alternative text and the actual text of the tags and the text of notes that a tag points at. A delete is not a way to redact a document.",
   deleteForms:
     "The form's list of fields still holds the fields that were on the deleted pages, so their names stay in the file. The text typed into text fields, their default values, tooltips and the picture of the typed text were cleared. Other kinds of fields (check boxes, choices) and fields grouped under a parent field may keep what they hold.",
   insert:
@@ -294,7 +294,7 @@ export const TOOL_NOTES = {
   undoGone:
     "This change is too old to take back, or the document is too big for the app to keep a copy of it.",
   stopTooLate:
-    "This step cannot be stopped any more. It is nearly done.",
+    "This step cannot be stopped any more. Wait until it is done.",
   working:
     "A change to the pages cannot be stopped half way, so there is no Stop button. Wait until it is done.",
 } as const;

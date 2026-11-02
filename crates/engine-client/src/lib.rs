@@ -71,6 +71,12 @@ const SIGNATURE_PASSES: u64 = 70;
 /// into its own error code, so that the window can say what happened.
 pub const TOOK_TOO_LONG: &str = "it was still working when the overall time limit ended";
 
+/// What the error of an engine that was stopped in the middle of a change to the pages starts
+/// with, because it went on for too long or said nothing for too long. The app turns it into its
+/// own error code, so that the window says that the change took too long and not that the file
+/// may be damaged.
+pub const CHANGE_TOOK_TOO_LONG: &str = "a change to the pages took too long";
+
 /// Largest answer to a page tool: 100 000 page sizes of 8 bytes, or 10 000 pairs of boxes.
 const PAGES_ANSWER_LIMIT: usize = 2 * 1024 * 1024;
 
@@ -105,6 +111,12 @@ pub struct EngineConfig {
     /// The slowest speed, in bytes a second, at which a long request still has to get through the
     /// document (see `save_floor`). A slow drive or a share is allowed to be this slow.
     pub save_slowest: u64,
+    /// The overall limit of a change to the pages, which is much longer than `save_floor`: a
+    /// change to a long document of pages with a lot on them can take many minutes and still be
+    /// healthy, and it tells that it is working (the engine reports progress at least four times a
+    /// second), so it is only ended by `save_stall` when it says nothing, and by this when it goes
+    /// on for hours. `save_slowest` adds to it as for a save.
+    pub pages_floor: Duration,
     /// Most memory the engine may use, in bytes. `None` leaves the engine's own limit (3 GiB).
     pub memory_limit: Option<u64>,
     /// Whether an engine without a working sandbox is refused. Release builds always insist.
@@ -126,6 +138,7 @@ impl EngineConfig {
             save_stall: Duration::from_secs(300),
             save_floor: Duration::from_secs(600),
             save_slowest: 1024 * 1024,
+            pages_floor: Duration::from_secs(3600),
             memory_limit: None,
             sandbox: SandboxPolicy::default_for_build(),
             system_fonts: true,
@@ -706,6 +719,7 @@ impl EngineClient {
         } else {
             SAVE_PASSES
         };
+        let is_change = matches!(body, RequestBody::Pages(_));
         write_request(&mut running.stdin, &Request { id, body }).map_err(|e| {
             format!(
                 "the request could not be sent ({e}); {}",
@@ -720,9 +734,16 @@ impl EngineClient {
         // The signs of life renew the patience, but not the overall time.
         let started = Instant::now();
         let overall = if may_report {
-            self.overall_limit(running.document_len, passes)
+            self.overall_limit(running.document_len, passes, is_change)
         } else {
             Duration::MAX
+        };
+        let too_long = |limit: Duration| {
+            if is_change {
+                change_too_long(limit)
+            } else {
+                too_long(limit)
+            }
         };
         loop {
             let left = overall.saturating_sub(started.elapsed());
@@ -751,20 +772,29 @@ impl EngineClient {
                     if started.elapsed() >= overall {
                         return Err(too_long(overall));
                     }
-                    return Err(format!(
-                        "it did not answer within {} seconds",
-                        patience.as_secs_f32().ceil()
-                    ));
+                    let seconds = patience.as_secs_f32().ceil();
+                    return Err(if is_change {
+                        format!(
+                            "{CHANGE_TOOK_TOO_LONG}: it did not answer within {seconds} seconds"
+                        )
+                    } else {
+                        format!("it did not answer within {seconds} seconds")
+                    });
                 }
             }
         }
     }
 
     /// The longest a long request may take altogether, for a document of `len` bytes.
-    fn overall_limit(&self, len: u64, passes: u64) -> Duration {
+    fn overall_limit(&self, len: u64, passes: u64, is_change: bool) -> Duration {
         let slowest = self.config.save_slowest.max(1);
         let reading = Duration::from_secs(len.saturating_mul(passes) / slowest);
-        self.config.save_floor.saturating_add(reading)
+        let floor = if is_change {
+            self.config.pages_floor
+        } else {
+            self.config.save_floor
+        };
+        floor.saturating_add(reading)
     }
 
     /// Makes sure an engine runs. An engine that ended by itself while idle is replaced quietly;
@@ -970,6 +1000,13 @@ pub fn sandbox_in_force(report: &str) -> bool {
 /// Says how the engine ended. The pipe closes a moment before the system reports the exit, so this
 /// waits a little for the exit status.
 /// The error of a long request that was still going when its overall limit ended.
+fn change_too_long(limit: Duration) -> String {
+    format!(
+        "{CHANGE_TOOK_TOO_LONG}: it was still working after {} minutes",
+        limit.as_secs().div_ceil(60).max(1)
+    )
+}
+
 fn too_long(limit: Duration) -> String {
     format!(
         "{TOOK_TOO_LONG} ({} minutes)",

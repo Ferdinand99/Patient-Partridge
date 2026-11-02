@@ -3229,3 +3229,99 @@ fn a_refusal_that_is_not_sure_does_not_call_the_document_damaged() {
     let message = partridge_engine::pagetree::TreeError::Damaged("a node has no count").words();
     assert!(!message.contains("damaged"), "{message}");
 }
+
+#[test]
+fn a_restore_that_cannot_start_leaves_the_copy_where_it_was_for_the_next_try() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let original = kit::simple_pdf(3);
+    let (doc, file) = open_doc(e, &original);
+    let (_, token, _) = changed(page_op(
+        e,
+        PagesRequest::Delete {
+            doc,
+            pages: vec![0],
+        },
+    ));
+    assert_ne!(token, 0);
+    // Another program rewrites the file in place: the engine cannot write the document out to keep
+    // the state that taking the change back would leave, and says so.
+    let mut theirs = original.clone();
+    let at = theirs.windows(6).position(|w| w == b"Page 1").unwrap();
+    theirs[at..at + 6].copy_from_slice(b"Page X");
+    std::fs::write(file.path(), &theirs).unwrap();
+    assert_eq!(
+        page_op(
+            e,
+            PagesRequest::Restore {
+                doc,
+                snapshot: token
+            }
+        )
+        .unwrap_err(),
+        ErrorCode::SourceChanged
+    );
+    // The file is as it was again, but the engine has seen it change and keeps refusing. The copy
+    // was not let go of: the answer is still that the file changed, not that the copy is gone.
+    std::fs::write(file.path(), &original).unwrap();
+    assert_eq!(
+        page_op(
+            e,
+            PagesRequest::Restore {
+                doc,
+                snapshot: token,
+            },
+        )
+        .unwrap_err(),
+        ErrorCode::SourceChanged
+    );
+}
+
+#[test]
+fn a_copy_that_reads_back_as_other_pages_of_the_same_number_is_not_put_in_place_of_the_document() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let (doc, _f) = open_doc(e, &kit::blank_pages_pdf(3));
+    // A document of several pages of different sizes, kept as the copy of a document of that many
+    // pages of one size: the number is right and the pages are not.
+    let mixed = kit::mixed_size_pdf();
+    let file = TempFile::new("mixed.pdf", &mixed);
+    e.set_document(File::open(file.path()).unwrap());
+    let ResponseBody::Opened {
+        doc: other, pages, ..
+    } = ask(e, RequestBody::Open { password: None })
+    else {
+        panic!("the mixed document does not open");
+    };
+    let n = pages.len();
+    assert!(
+        pages.windows(2).any(|w| w[0] != w[1]),
+        "the pages differ in size"
+    );
+    let bytes = save_all(e, other);
+    let mut tools = PageTools::default();
+    let wrong = tools.keep_for_tests_as(bytes.clone(), n, &vec![pages[0]; n]);
+    let right = tools.keep_for_tests_as(bytes, n, &pages);
+    e.set_page_tools_for_tests(doc, tools);
+    assert_eq!(
+        page_op(
+            e,
+            PagesRequest::Restore {
+                doc,
+                snapshot: wrong
+            }
+        )
+        .unwrap_err(),
+        ErrorCode::PageChangeFailed
+    );
+    assert_eq!(page_count(e, doc), 3, "the document was not replaced");
+    // The copy with the sizes it was made from is taken.
+    let (sizes, _, _) = changed(page_op(
+        e,
+        PagesRequest::Restore {
+            doc,
+            snapshot: right,
+        },
+    ));
+    assert_eq!(sizes, pages);
+}
