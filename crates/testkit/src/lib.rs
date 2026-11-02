@@ -132,6 +132,18 @@ pub fn simple_pdf(pages: usize) -> Vec<u8> {
     build(&specs, "", "", Vec::new())
 }
 
+/// A valid document of one page that is `bytes` bytes bigger than it needs to be: an object no
+/// page uses holds the padding, so the document is small to read and big to copy.
+pub fn padded_pdf(bytes: usize) -> Vec<u8> {
+    let spec = PageSpec {
+        width: 612,
+        height: 792,
+        content: Some(demo_content(1, 612, 792)),
+        extra: String::new(),
+    };
+    build(&[spec], "", "", vec![stream_object("", &"%".repeat(bytes))])
+}
+
 /// A valid document whose pages differ in size: Letter, A4 landscape, a small square, a tall strip.
 pub fn mixed_size_pdf() -> Vec<u8> {
     let sizes = [(612, 792), (842, 595), (300, 300), (200, 1000)];

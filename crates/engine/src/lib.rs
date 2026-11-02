@@ -242,7 +242,14 @@ impl Engine {
         request: Request,
         progress: &mut dyn FnMut(u32),
     ) -> Response {
-        let body = match self.dispatch(request.body, progress) {
+        // Parts of one request report in different units (pages, blocks of the file, bytes
+        // written). The app wants one counter that only rises, so make it one here.
+        let mut last = 0u32;
+        let mut rising = |done: u32| {
+            last = done.max(last.saturating_add(1));
+            progress(last);
+        };
+        let body = match self.dispatch(request.body, &mut rising) {
             Ok(body) => body,
             Err((code, message)) => ResponseBody::Error { code, message },
         };
@@ -339,14 +346,14 @@ impl Engine {
                 let document = self.document(doc)?;
                 // Before anything else: a file that changed under the document is the first thing
                 // the user has to hear, not a question about replacing it.
-                self.check_source()?;
+                self.check_source(progress)?;
                 Ok(save::doc_info(document, self.source.as_deref(), progress))
             }
             RequestBody::Fingerprint { doc } => {
                 let document = self.document(doc)?;
-                self.check_source()?;
+                self.check_source(progress)?;
                 let print = save::fingerprint(document, progress);
-                self.check_source()?;
+                self.check_source(progress)?;
                 Ok(print)
             }
             RequestBody::SaveBegin { doc } => {
@@ -355,10 +362,10 @@ impl Engine {
                 let document = self.document(doc)?;
                 // The file must be what it was when the parts that are in memory were read: the
                 // parts that are not are read now, and a mix of two versions is not a document.
-                self.check_source()?;
+                self.check_source(progress)?;
                 let bytes =
                     save::serialise_up_to(document, partridge_protocol::MAX_SAVE_BYTES, progress)?;
-                self.check_source()?;
+                self.check_source(progress)?;
                 let size = bytes.len() as u32;
                 self.saves.insert(doc, bytes);
                 Ok(ResponseBody::SaveReady { size })
@@ -403,9 +410,11 @@ impl Engine {
     }
 
     /// Fails when the file the document is read from changed, or a read of it failed.
-    fn check_source(&self) -> Result<(), Failure> {
+    fn check_source(&self, progress: &mut dyn FnMut(u32)) -> Result<(), Failure> {
         match &self.source {
-            Some(source) => source::lock(source).verify().map_err(save::source_failure),
+            Some(source) => source::lock(source)
+                .verify(progress)
+                .map_err(save::source_failure),
             None => Ok(()),
         }
     }
