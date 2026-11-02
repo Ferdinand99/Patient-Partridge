@@ -305,7 +305,7 @@ test("Escape leaves a note box without making a note, and the keyboard can place
   await page.keyboard.press("Enter");
   await expect(page.getByRole("dialog", { name: "New note" })).toBeVisible();
   await page.keyboard.type("from the keyboard");
-  await page.getByRole("button", { name: "Save" }).click();
+  await page.getByRole("dialog", { name: "New note" }).getByRole("button", { name: "Save" }).click();
   await expect.poll(() => calls(page, "add_note").then((c) => c.length)).toBe(1);
   const [note] = await calls(page, "add_note");
   expect(note.args.text).toBe("from the keyboard");

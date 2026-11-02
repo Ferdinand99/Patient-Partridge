@@ -384,7 +384,7 @@ test("closing a tab with text typed in a field asks whether to save, and does no
   await page.getByRole("button", { name: "Cancel" }).click();
   await expect(page.locator(".tab-title")).toHaveText(["form.pdf"]);
   await page.keyboard.press("Control+w");
-  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Save", exact: true }).click();
   await expect.poll(async () => (await stand(page)).saves).toBe(1);
   await expect(page.locator(".tab-title")).toHaveCount(0);
 });
