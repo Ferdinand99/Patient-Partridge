@@ -537,6 +537,14 @@ impl Engine {
         self.docs.get_mut(&doc).map(edit)
     }
 
+    /// Test builds only: `None` while the form environment of a document has not been made, and
+    /// otherwise how many times it searched the pages for the other widgets of a field.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn form_scans_for_tests(&self, doc: u32) -> Option<u32> {
+        self.forms.get(&doc).map(forms::FormEnv::scans_for_tests)
+    }
+
     /// Runs `f` on the form environment of a document, making the environment first if it is not
     /// there yet.
     fn with_form<T>(

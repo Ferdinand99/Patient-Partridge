@@ -13,10 +13,6 @@
 //! - `plain` and `plain_box` have no action
 //! - `under_box` is a check box with no action, and a push button `over` with `/A /ResetForm` is
 //!   drawn over its middle (it is later in the page, so it is the one found at that point)
-//! - `par` is a text field whose actions (blur and focus) are on the field above its one widget,
-//!   not on the widget. PDFium reads those two events from the widget alone, so they are harmless
-//!   here, but the rule of the engine does not tell them apart from the events it reads through the
-//!   parent (see `forms_parent_actions_pdf`), and leaves the field alone
 
 use std::fmt::Write as _;
 
@@ -165,26 +161,8 @@ pub fn forms_actions_pdf() -> Vec<u8> {
         y1 = under_y + 20
     ));
     fields.push(button);
-    // A field whose actions are on the field above its widget.
-    let parent = objs.reserve();
-    let par_y = row(14);
-    let kid = objs.add(format!(
-        "<< /Type /Annot /Subtype /Widget /Parent {parent} 0 R \
-         /Rect [100 {par_y} 300 {top}] /F 4 /P {page} 0 R /DA (/Helv 12 Tf 0 g) >>",
-        top = par_y + 20
-    ));
-    objs.set(
-        parent,
-        format!(
-            "<< /FT /Tx /T (par) /V (parent value) /Kids [{kid} 0 R] \
-             /AA << /Bl {RESET} /Fo {RESET} >> >>"
-        ),
-    );
-
     // The widgets of the page in the order of the file: the button is after the check box.
-    let mut annots = fields.clone();
-    annots.push(kid);
-    fields.push(parent);
+    let annots = fields.clone();
     let annot_list: String = annots.iter().fold(String::new(), |mut s, f| {
         let _ = write!(s, "{f} 0 R ");
         s
@@ -607,4 +585,80 @@ pub fn forms_plain_parents_pdf() -> Vec<u8> {
         extra: format!("/Annots [{annot_list}]"),
     };
     build(&[spec], &catalog(&fields), "", objs.bodies)
+}
+
+/// What the widget `t` of `forms_kids_actions_pdf` says about its `/Parent`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KidsParent {
+    /// No `/Parent` at all.
+    Absent,
+    /// A `/Parent` that is an object which is no field and holds nothing.
+    Plain,
+}
+
+/// A form in which a field is built from its `/Kids`, as PDFium does it: the field `t` has two
+/// kids, a widget with no name (so that the first kid is no field of its own and PDFium makes `t`
+/// the terminal field) and the widget `t`, which has a name of its own, the same as its field's,
+/// and no `/Parent` that leads to the field (none, or a plain object). The additional actions
+/// (`events`, such as `/K << /S /ResetForm >>`) sit on the field `t`; PDFium reads the keystroke
+/// and validate events of the widget from there. With `None` the field has no `/AA`. `keep` holds
+/// "kept" and is what a reset clears or a hide removes. Both widgets are on the page.
+pub fn forms_kids_actions_pdf(events: Option<&str>, parent: KidsParent) -> Vec<u8> {
+    let mut objs = Objects::new(6);
+    let page = 4;
+    let keep = text(&mut objs, page, "keep", 740, "kept", "");
+    let dummy = objs.add("<< /Type /Annot /Subtype /Widget /Rect [0 0 1 1] >>");
+    let field = objs.reserve();
+    let plain = objs.add("<< /Note (nothing here) >>");
+    let parent_entry = match parent {
+        KidsParent::Absent => String::new(),
+        KidsParent::Plain => format!("/Parent {plain} 0 R"),
+    };
+    let widget = objs.add(format!(
+        "<< /Type /Annot /Subtype /Widget /T (t) /Rect [100 700 300 720] /F 4 /P {page} 0 R \
+         /DA (/Helv 12 Tf 0 g) {parent_entry} >>"
+    ));
+    let aa = events.map_or(String::new(), |events| format!("/AA << {events} >>"));
+    objs.set(
+        field,
+        format!("<< /FT /Tx /T (t) {aa} /Kids [{dummy} 0 R {widget} 0 R] >>"),
+    );
+    let spec = PageSpec {
+        width: 612,
+        height: 792,
+        content: Some("0 g 10 10 1 1 re f\n".to_string()),
+        extra: format!("/Annots [{keep} 0 R {widget} 0 R]"),
+    };
+    build(&[spec], &catalog(&[keep, field]), "", objs.bodies)
+}
+
+/// A form that holds a reset (on the check box `box_a`), a field `keep` ("kept") with no parent and
+/// the text field `par`, whose actions (blur and focus, both a reset) are on the field above its
+/// one widget, not on the widget. PDFium reads those two events from the widget alone, so they are
+/// harmless here, but the rule of the engine does not tell them apart from the events it reads
+/// through the parent (see `forms_parent_actions_pdf`) and leaves every widget of the form alone.
+pub fn forms_parent_event_pdf() -> Vec<u8> {
+    let mut objs = Objects::new(6);
+    let page = 4;
+    let keep = text(&mut objs, page, "keep", 740, "kept", "");
+    let boxed = check_box(&mut objs, page, "box_a", 710, &format!("/A {RESET}"));
+    let parent = objs.reserve();
+    let kid = objs.add(format!(
+        "<< /Type /Annot /Subtype /Widget /Parent {parent} 0 R \
+         /Rect [100 680 300 700] /F 4 /P {page} 0 R /DA (/Helv 12 Tf 0 g) >>"
+    ));
+    objs.set(
+        parent,
+        format!(
+            "<< /FT /Tx /T (par) /V (parent value) /Kids [{kid} 0 R] \
+             /AA << /Bl {RESET} /Fo {RESET} >> >>"
+        ),
+    );
+    let spec = PageSpec {
+        width: 612,
+        height: 792,
+        content: Some("0 g 10 10 1 1 re f\n".to_string()),
+        extra: format!("/Annots [{keep} 0 R {boxed} 0 R {kid} 0 R]"),
+    };
+    build(&[spec], &catalog(&[keep, boxed, parent]), "", objs.bodies)
 }

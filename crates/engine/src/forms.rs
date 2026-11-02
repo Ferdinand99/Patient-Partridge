@@ -28,12 +28,14 @@
 //!   not filled in: it is listed read only and marked, and a request for it is refused.
 //! - PDFium reads some events of a widget from the field above it, not from the widget: the
 //!   dictionary of additional actions is looked up through `/Parent`, up to 32 levels, and its
-//!   keystroke and validate events can hold a reset or a hide as well as a script. The plain
-//!   interface does not show those actions, so the written document is searched for them too: when
-//!   an object that some other object names as its `/Parent` has additional actions (`/AA`), every
-//!   widget that has a `/Parent` is treated like a widget with an action of its own.
-//!   (That is wider than needed: it also catches the events PDFium reads from the widget alone.
-//!   Narrowing it to the chain of one widget is left for later.)
+//!   keystroke and validate events can hold a reset or a hide as well as a script. PDFium also
+//!   builds a field from the field down, through `/Kids`, so a widget listed in the `/Kids` of a
+//!   field belongs to that field whatever its own `/Parent` says. The plain interface shows none of
+//!   this, so the written document is searched for it: when an object that some other object names
+//!   as its `/Parent`, or an object that has `/Kids`, has additional actions (`/AA`), every widget
+//!   of the document is treated like a widget with an action of its own.
+//!   (That is wider than needed: it also catches the events PDFium reads from the widget alone, and
+//!   widgets under other fields. Narrowing it to the chain of one widget is left for later.)
 //! - The widget that is named is the one that gets the focus and the key, never the widget found at
 //!   a point, so a button that lies over a field is never pressed.
 //! - No push button is listed, and nothing calls the functions that run the actions of a document
@@ -48,9 +50,10 @@
 //! `pdfium-render` keeps the handle of the document private, and its own form environment keeps the
 //! form handle private as well. The calls below need both, so the document handle is read from the
 //! pointer that the library prints for debugging (`{:?}` of a document is `PdfDocument {
-//! FPDF_DOCUMENT: "0x..." }`), and a form environment of the engine's own is made on it. The crate
-//! is pinned to an exact version and a test fails if the print changes. Before the pointer is used
-//! it is checked: PDFium must report the page count the library reports for the same document.
+//! FPDF_DOCUMENT: "0x..." }`, read by `annots::raw_document`, which the annotation code uses as
+//! well), and a form environment of the engine's own is made on it. The crate is pinned to an exact
+//! version and a test fails if the print changes. Before the pointer is used it is checked: PDFium
+//! must report the page count the library reports for the same document.
 //! The two environments do not interfere: pages are loaded again for every request, and everything
 //! PDFium keeps for a loaded page goes away with it.
 
@@ -139,13 +142,24 @@ pub struct FormEnv {
     /// The document holds a reset or a hide action somewhere (or could not be searched).
     state_actions: bool,
     /// The document holds a reset or a hide, and a field above a widget has additional actions (or
-    /// the document could not be searched): a widget that has a `/Parent` is left alone.
+    /// the document could not be searched): every widget is left alone.
     parent_actions: bool,
     /// The permissions of the document allow filling in forms.
     may_fill: bool,
     /// The pages that hold widgets of a field that has them on more than one page, by full name,
     /// found by the first change of that field. Looking for them loads pages, so it is done once.
     spread: RefCell<HashMap<String, Vec<u32>>>,
+    /// How many times the pages were searched for the other widgets of a field (see `spread`).
+    #[cfg(debug_assertions)]
+    scans: Cell<u32>,
+}
+
+impl FormEnv {
+    /// Test builds only: how many times the pages were searched for the other widgets of a field.
+    #[cfg(debug_assertions)]
+    pub fn scans_for_tests(&self) -> u32 {
+        self.scans.get()
+    }
 }
 
 impl Drop for FormEnv {
@@ -248,35 +262,58 @@ fn header_at(bytes: &[u8], at: usize) -> Option<u64> {
 /// start of an object, whatever the strings in the objects before it say. A stream can hold any
 /// bytes, and a header-like line in one only cuts the stream into more parts, which can make the
 /// search find more, never less.
-fn written_objects(bytes: &[u8]) -> Vec<(u64, &[u8])> {
-    let mut starts: Vec<(usize, u64)> = Vec::new();
-    for at in 0..bytes.len() {
+///
+/// The objects are found one at a time, so a file of nothing but headers (hundreds of megabytes of
+/// `1 0 obj` lines) costs no memory beyond the bytes themselves.
+fn written_objects(bytes: &[u8]) -> WrittenObjects<'_> {
+    WrittenObjects {
+        bytes,
+        next: next_header(bytes, 0),
+    }
+}
+
+/// The place and number of the first object header at or after `from` that starts a line.
+fn next_header(bytes: &[u8], from: usize) -> Option<(usize, u64)> {
+    (from..bytes.len()).find_map(|at| {
         let line_start = at == 0 || matches!(bytes[at - 1], b'\r' | b'\n');
         if line_start && bytes[at].is_ascii_digit() {
-            if let Some(number) = header_at(bytes, at) {
-                starts.push((at, number));
-            }
+            header_at(bytes, at).map(|number| (at, number))
+        } else {
+            None
         }
+    })
+}
+
+struct WrittenObjects<'a> {
+    bytes: &'a [u8],
+    /// The header of the object that comes next.
+    next: Option<(usize, u64)>,
+}
+
+impl<'a> Iterator for WrittenObjects<'a> {
+    type Item = (u64, &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (start, number) = self.next.take()?;
+        self.next = next_header(self.bytes, start + 1);
+        let end = self.next.map_or(self.bytes.len(), |(next, _)| next);
+        Some((number, &self.bytes[start..end]))
     }
-    starts
-        .iter()
-        .enumerate()
-        .map(|(i, (start, number))| {
-            let end = starts.get(i + 1).map_or(bytes.len(), |(next, _)| *next);
-            (*number, &bytes[*start..end])
-        })
-        .collect()
 }
 
 /// Whether a written document holds a field above a widget that has additional actions.
 ///
 /// PDFium reads the keystroke and validate events (and format and calculate, which only hold
 /// scripts here) of a widget from its field, looking up `/Parent` as far as 32 levels. Those events
-/// can hold a reset or a hide. So: the objects that are named as a `/Parent` by some object are
-/// the fields above widgets (a grandparent is the `/Parent` of a parent), and any of them with an
-/// `/AA` counts. A `/Parent` that is a dictionary written in place counts when the object holds an
-/// `/AA` at all. More than needed is caught on purpose: an `/AA` in the same object as a `/Parent`
-/// is not told apart from one that sits in a different dictionary of it.
+/// can hold a reset or a hide. PDFium builds a field the other way round, though: from the field
+/// down through `/Kids`, and a widget in the `/Kids` of a field belongs to it whatever its own
+/// `/Parent` says (or whether it has one). So two kinds of object count when they have an `/AA`:
+/// the objects that some object names as its `/Parent` (a grandparent is the `/Parent` of a
+/// parent), and the objects that have `/Kids`. A `/Parent` that is a dictionary written in place
+/// counts when the object holds an `/AA` at all. More than needed is caught on purpose: an `/AA` in
+/// the same object as a `/Parent` or as `/Kids` is not told apart from one that sits in a different
+/// dictionary of it, and a field that has `/Kids` and `/AA` is caught even when none of its
+/// widgets can be reached from it.
 fn holds_parent_action(bytes: &[u8]) -> bool {
     let mut parents: Vec<u64> = Vec::new();
     let mut with_actions: Vec<u64> = Vec::new();
@@ -284,6 +321,9 @@ fn holds_parent_action(bytes: &[u8]) -> bool {
         let actions = has_name(body, b"/AA");
         if actions {
             with_actions.push(number);
+            if has_name(body, b"/Kids") {
+                return true;
+            }
         }
         let mut from = 0;
         while let Some(at) = body[from..]
@@ -427,6 +467,8 @@ impl FormEnv {
             parent_actions,
             may_fill,
             spread: RefCell::new(HashMap::new()),
+            #[cfg(debug_assertions)]
+            scans: Cell::new(0),
         })
     }
 
@@ -574,6 +616,8 @@ impl FormEnv {
                 .filter_map(|other| self.load(*other).ok())
                 .collect();
         }
+        #[cfg(debug_assertions)]
+        self.scans.set(self.scans.get() + 1);
         // SAFETY: a read.
         let pages = unsafe { self.bindings.FPDF_GetPageCount(self.document) }.max(0) as usize;
         let mut kept = Vec::new();
@@ -790,9 +834,11 @@ impl<'e> LoadedPage<'e> {
                 flags |= field_flag::ACTION_BLOCKED | field_flag::READ_ONLY;
             }
         }
-        // The same for a widget under a field that has additional actions: PDFium reads some of
-        // them through `/Parent` (see the top of this file).
-        if self.env.parent_actions && unsafe { b.FPDFAnnot_HasKey(a, "Parent") } != 0 {
+        // The same for every widget when a field above some widget has additional actions: PDFium
+        // reads some of them through `/Parent` and gets the widgets of a field from its `/Kids`, and
+        // the plain interface does not say which widget belongs to which field above it, nor
+        // whether a widget's own `/Parent` leads to that field (see the top of this file).
+        if self.env.parent_actions {
             flags |= field_flag::ACTION | field_flag::ACTION_BLOCKED | field_flag::READ_ONLY;
         }
         if !self.env.may_fill {

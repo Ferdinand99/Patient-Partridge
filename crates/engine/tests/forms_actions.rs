@@ -13,6 +13,7 @@
 use std::fs::File;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
+use partridge_engine::source::SourceFile;
 use partridge_engine::Engine;
 use partridge_protocol::{
     field_flag, ErrorCode, FormField, FormFieldKind, FormValue, Request, RequestBody, ResponseBody,
@@ -367,7 +368,6 @@ fn a_field_with_an_action_that_could_change_the_form_is_left_alone_and_says_so()
     let list = fields(engine, doc, 0);
     let blocked = [
         "box_a", "box_u", "box_d", "text_fo", "text_bl", "text_k", "text_f", "text_v", "text_c",
-        "par",
     ];
     for name in blocked {
         let field = one(&list, name);
@@ -400,6 +400,36 @@ fn a_field_with_an_action_that_could_change_the_form_is_left_alone_and_says_so()
         .all(|f| f.name != "over" && f.name != "over_first"));
     // Nothing the refused requests did changed the page.
     assert_eq!(fields(engine, doc, 0), list);
+}
+
+#[test]
+fn an_event_on_the_field_above_a_widget_that_pdfium_reads_from_the_widget_alone_still_leaves_every_widget_alone(
+) {
+    // The blur and focus events of a widget are read from the widget alone, so the reset on the
+    // field above `par` cannot fire. The rule does not tell them apart from the events PDFium reads
+    // through the parent, and it cannot tell which widget sits under which field, so it leaves
+    // every widget of the form alone, also the ones with no parent. That is wider than needed.
+    let mut guard = engine();
+    let engine = &mut guard.0;
+    let (doc, _file) = open(engine, &kit::forms_parent_event_pdf());
+    let _ = ask(engine, RequestBody::FormInfo { doc });
+    let list = fields(engine, doc, 0);
+    for name in ["keep", "box_a", "par"] {
+        let field = one(&list, name);
+        assert!(
+            field.has(field_flag::ACTION_BLOCKED) && field.has(field_flag::READ_ONLY),
+            "{name}: {:#x}",
+            field.flags
+        );
+        match set(engine, doc, 0, &field, value_for(&field)) {
+            ResponseBody::Error {
+                code: ErrorCode::FormFieldRefused,
+                ..
+            } => {}
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+    assert_eq!(one(&fields(engine, doc, 0), "keep").value, "kept");
 }
 
 #[test]
@@ -524,10 +554,97 @@ fn a_reset_or_a_hide_on_the_field_above_a_widget_does_not_fire_because_the_widge
             );
             assert_eq!(names(&now), names(&list), "{name} hid a field");
         }
-        // The field with no parent is filled in as usual.
+        // The field with no parent is left alone too: the plain interface does not say which widget
+        // sits under which field, so one action above a widget stops them all.
         let keep = one(&list, "keep");
-        assert!(!keep.has(field_flag::ACTION_BLOCKED) && !keep.has(field_flag::READ_ONLY));
+        assert!(keep.has(field_flag::ACTION_BLOCKED) && keep.has(field_flag::READ_ONLY));
         assert_eq!(names(&fields(engine, doc, 0)), names(&list));
+    }
+}
+
+/// The ways the field `t` of `forms_kids_actions_pdf` can hold a reset or a hide.
+const KIDS_EVENTS: [(&str, &str); 3] = [
+    ("a reset on the keystroke", "/K << /S /ResetForm >>"),
+    ("a reset on the validate event", "/V << /S /ResetForm >>"),
+    (
+        "a hide of keep on the validate event",
+        "/V << /S /Hide /T (keep) /H true >>",
+    ),
+];
+
+#[test]
+fn a_reset_or_a_hide_on_a_field_does_not_fire_for_a_widget_in_its_kids_whose_parent_does_not_lead_there(
+) {
+    // PDFium builds a field from the field down, through `/Kids`: a widget listed there belongs to
+    // the field whatever its own `/Parent` says. The widget `t` has a name of its own and no parent
+    // that leads to its field, so a search that only follows `/Parent` up from the widgets misses
+    // the field and lets the action fire.
+    for (what, events) in KIDS_EVENTS {
+        for parent in [kit::KidsParent::Absent, kit::KidsParent::Plain] {
+            let mut guard = engine();
+            let engine = &mut guard.0;
+            let (doc, _file) = open(engine, &kit::forms_kids_actions_pdf(Some(events), parent));
+            // The window asks what kind of form it is before it lists the fields.
+            assert!(
+                matches!(
+                    ask(engine, RequestBody::FormInfo { doc }),
+                    ResponseBody::FormInfo {
+                        kind: partridge_protocol::FormKind::Acro,
+                        ..
+                    }
+                ),
+                "{what} ({parent:?})"
+            );
+            let list = fields(engine, doc, 0);
+            for name in ["t", "keep"] {
+                let field = one(&list, name);
+                assert!(
+                    field.has(field_flag::ACTION_BLOCKED)
+                        && field.has(field_flag::READ_ONLY)
+                        && field.has(field_flag::ACTION),
+                    "{name}, {what} ({parent:?}): {:#x}",
+                    field.flags
+                );
+                match set(engine, doc, 0, &field, value_for(&field)) {
+                    ResponseBody::Error {
+                        code: ErrorCode::FormFieldRefused,
+                        ..
+                    } => {}
+                    other => panic!("{name}, {what} ({parent:?}): {other:?}"),
+                }
+            }
+            let now = fields(engine, doc, 0);
+            assert_eq!(
+                one(&now, "keep").value,
+                "kept",
+                "{what} ({parent:?}) reset a field"
+            );
+            assert_eq!(
+                one(&now, "t").value,
+                "",
+                "{what} ({parent:?}) changed the field"
+            );
+            assert_eq!(names(&now), names(&list), "{what} ({parent:?}) hid a field");
+        }
+    }
+}
+
+#[test]
+fn a_field_built_from_its_kids_with_no_actions_is_filled_in() {
+    for parent in [kit::KidsParent::Absent, kit::KidsParent::Plain] {
+        let mut guard = engine();
+        let engine = &mut guard.0;
+        let (doc, _file) = open(engine, &kit::forms_kids_actions_pdf(None, parent));
+        let list = fields(engine, doc, 0);
+        let t = one(&list, "t");
+        assert!(!t.has(field_flag::ACTION_BLOCKED) && !t.has(field_flag::READ_ONLY));
+        match set(engine, doc, 0, &t, FormValue::Text("typed".into())) {
+            ResponseBody::FormFields { fields: now } => {
+                assert_eq!(one(&now, "t").value, "typed", "{parent:?}");
+                assert_eq!(one(&now, "keep").value, "kept", "{parent:?}");
+            }
+            other => panic!("{parent:?}: {other:?}"),
+        }
     }
 }
 
@@ -617,6 +734,20 @@ fn the_search_for_actions_above_a_widget_follows_parents_and_ignores_the_rest() 
     assert!(!holds(
         b"4 0 obj\r\n<</Parent 5 0 R>>\r\nendobj\r\n5 0 obj\r\n<</T(a)>>\r\nendobj\r\n"
     ));
+    // A field with kids and additional actions, whatever its widgets say about their parents.
+    assert!(holds(
+        b"7 0 obj\r\n<</FT/Tx/T(t)/AA<</K 9 0 R>>/Kids[8 0 R 6 0 R]>>\r\nendobj\r\n"
+    ));
+    assert!(holds(
+        b"4 0 obj\r\n<</Subtype/Widget/T(t)>>\r\nendobj\r\n7 0 obj\r\n<</Kids[4 0 R]/AA<<>>>>\r\nendobj\r\n"
+    ));
+    // Kids without actions (the page tree, a field), and other names that start the same way.
+    assert!(!holds(
+        b"2 0 obj\r\n<</Type/Pages/Kids[3 0 R]/Count 1>>\r\nendobj\r\n"
+    ));
+    assert!(!holds(
+        b"7 0 obj\r\n<</KidsOfNobody[8 0 R]/AA<<>>>>\r\nendobj\r\n"
+    ));
     // The page tree's parents and an object with actions that nothing names as a parent.
     assert!(!holds(
         b"3 0 obj\r\n<</Parent 2 0 R>>\r\nendobj\r\n7 0 obj\r\n<</AA<<>>>>\r\nendobj\r\n"
@@ -626,4 +757,144 @@ fn the_search_for_actions_above_a_widget_follows_parents_and_ignores_the_rest() 
         b"4 0 obj\r\n<</ParentTree 5 0 R>>\r\nendobj\r\n5 0 obj\r\n<</AAA 1>>\r\nendobj\r\n"
     ));
     assert!(!holds(b""));
+}
+
+// ---- what the engine does before the first listing and when the file cannot be read ----------
+
+#[test]
+fn the_form_environment_is_made_by_the_question_about_the_form_and_only_for_a_form_that_is_filled_in(
+) {
+    // The environment writes the whole document out to look for actions, which is why it is made
+    // while the window asks what kind of form there is (a request that may take long and reports
+    // its progress) and not at the first listing.
+    let mut guard = engine();
+    let engine = &mut guard.0;
+    for (bytes, made, what) in [
+        (kit::forms_pdf(), true, "a form"),
+        (kit::simple_pdf(2), false, "a document without a form"),
+        (kit::xfa_pdf(), false, "an XFA form"),
+    ] {
+        let (doc, _file) = open(engine, &bytes);
+        assert_eq!(
+            engine.form_scans_for_tests(doc),
+            None,
+            "{what}: before the question"
+        );
+        let _ = ask(engine, RequestBody::FormInfo { doc });
+        assert_eq!(
+            engine.form_scans_for_tests(doc).is_some(),
+            made,
+            "{what}: after the question"
+        );
+        ask(engine, RequestBody::Close { doc });
+    }
+}
+
+#[test]
+fn the_pages_of_a_field_are_searched_for_once_and_then_remembered() {
+    for without_page in [false, true] {
+        let mut guard = engine();
+        let engine = &mut guard.0;
+        let (doc, _file) = open(engine, &kit::forms_multipage_pdf(without_page));
+        let _ = ask(engine, RequestBody::FormInfo { doc });
+        assert_eq!(engine.form_scans_for_tests(doc), Some(0));
+        let list = fields(engine, doc, 0);
+        assert_eq!(
+            engine.form_scans_for_tests(doc),
+            Some(0),
+            "a listing searches nothing"
+        );
+        for round in 1..=3 {
+            let _ = set(
+                engine,
+                doc,
+                0,
+                &one(&list, "applicant"),
+                FormValue::Text(format!("Ada {round}")),
+            );
+            assert_eq!(
+                engine.form_scans_for_tests(doc),
+                Some(1),
+                "change {round} of the same field (without_page {without_page})"
+            );
+        }
+        // Another field has to be searched for on its own.
+        let _ = set(
+            engine,
+            doc,
+            0,
+            &one(&list, "country"),
+            FormValue::Choice(vec![1]),
+        );
+        assert_eq!(engine.form_scans_for_tests(doc), Some(2));
+        // What the search found is used: the widget on page 3 has the value of the last change.
+        assert_eq!(one(&fields(engine, doc, 2), "applicant").value, "Ada 3");
+    }
+}
+
+/// A file that can be made to fail.
+struct Flaky {
+    file: File,
+    broken: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SourceFile for Flaky {
+    fn read_at(&mut self, pos: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.broken.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(std::io::Error::other("the share is gone"));
+        }
+        self.file.read_at(pos, buf)
+    }
+
+    fn state(&mut self) -> std::io::Result<(u64, Option<std::time::SystemTime>)> {
+        self.file.state()
+    }
+
+    fn is_plain_file(&mut self) -> bool {
+        true
+    }
+}
+
+#[test]
+fn a_form_whose_file_failed_to_read_while_it_was_searched_is_treated_as_holding_an_action() {
+    use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc};
+    // PDFium leaves out what it cannot read and goes on, so the document written out for the
+    // search may lack the very action it looks for. A read that failed on the way means the
+    // answer "no action" cannot be trusted. The document here has no action at all, so only the
+    // failed read can make its fields be left alone.
+    for fail in [false, true] {
+        let mut guard = engine();
+        let engine = &mut guard.0;
+        let file = kit::TempFile::new("forms-flaky.pdf", &kit::forms_padded_pdf(200_000));
+        let broken = Arc::new(AtomicBool::new(false));
+        engine.set_document_source(Box::new(Flaky {
+            file: File::open(file.path()).unwrap(),
+            broken: broken.clone(),
+        }));
+        let ResponseBody::Opened { doc, .. } = ask(engine, RequestBody::Open { password: None })
+        else {
+            panic!("the document did not open");
+        };
+        // The file is several blocks long, and a look at all of it (the search for signatures)
+        // leaves the guard holding its last block, so that the next read of the first one goes to
+        // the file.
+        assert!(matches!(
+            ask(engine, RequestBody::DocInfo { doc }),
+            ResponseBody::DocInfo { .. }
+        ));
+        broken.store(fail, Ordering::SeqCst);
+        let _ = ask(engine, RequestBody::FormInfo { doc });
+        broken.store(false, Ordering::SeqCst);
+        let list = fields(engine, doc, 0);
+        assert!(!list.is_empty());
+        for field in &list {
+            assert_eq!(
+                field.has(field_flag::ACTION_BLOCKED) && field.has(field_flag::READ_ONLY),
+                fail,
+                "{} (failed read: {fail}): {:#x}",
+                field.name,
+                field.flags
+            );
+        }
+    }
 }

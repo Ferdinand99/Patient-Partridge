@@ -861,6 +861,11 @@ fn main() {
         ("form_multipage", kit::forms_multipage_pdf(false)),
         ("form_multipage_no_page", kit::forms_multipage_pdf(true)),
         ("form_loop", kit::forms_loop_pdf()),
+        ("form_parent_event", kit::forms_parent_event_pdf()),
+        (
+            "form_kids_actions",
+            kit::forms_kids_actions_pdf(Some("/K << /S /ResetForm >>"), kit::KidsParent::Absent),
+        ),
         ("form_awkward_values", kit::forms_awkward_values_pdf()),
         ("corrupt", kit::corrupt_pdf()),
     ];
