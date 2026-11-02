@@ -244,6 +244,7 @@ fn responses() -> Vec<(&'static str, Response)> {
                     security: 4,
                     signatures: 1,
                     maybe_signed: true,
+                    touched: false,
                 },
             ),
         ),
