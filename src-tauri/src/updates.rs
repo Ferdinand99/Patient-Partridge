@@ -1426,7 +1426,9 @@ mod tests {
         assert!(!refused.engines_stopped);
         // Only macOS asks, and a normal start is never taken for a link.
         assert!(!runs_through_symlink() || cfg!(target_os = "macos"));
-        assert!(!UpdateState::new(None, InstallMethod::Manual).symlinked || cfg!(target_os = "macos"));
+        assert!(
+            !UpdateState::new(None, InstallMethod::Manual).symlinked || cfg!(target_os = "macos")
+        );
     }
 
     #[test]
