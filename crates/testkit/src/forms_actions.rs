@@ -13,11 +13,14 @@
 //! - `plain` and `plain_box` have no action
 //! - `under_box` is a check box with no action, and a push button `over` with `/A /ResetForm` is
 //!   drawn over its middle (it is later in the page, so it is the one found at that point)
-//! - `par` is a text field whose action is on the field above its one widget, not on the widget
+//! - `par` is a text field whose actions (blur and focus) are on the field above its one widget,
+//!   not on the widget. PDFium reads those two events from the widget alone, so they are harmless
+//!   here, but the rule of the engine does not tell them apart from the events it reads through the
+//!   parent (see `forms_parent_actions_pdf`), and leaves the field alone
 
 use std::fmt::Write as _;
 
-use super::{build, stream_object, PageSpec};
+use super::{assemble, assemble_packed, build, build_objects, stream_object, PageSpec};
 
 struct Objects {
     first: usize,
@@ -436,6 +439,167 @@ pub fn forms_shared_options_pdf() -> Vec<u8> {
         let _ = write!(s, "{f} 0 R ");
         s
     });
+    let spec = PageSpec {
+        width: 612,
+        height: 792,
+        content: Some("0 g 10 10 1 1 re f\n".to_string()),
+        extra: format!("/Annots [{annot_list}]"),
+    };
+    build(&[spec], &catalog(&fields), "", objs.bodies)
+}
+
+/// What a field under other fields is, for [`forms_parent_actions_pdf`].
+#[derive(Clone, Copy)]
+enum Under {
+    Text,
+    Check,
+    Combo,
+    List,
+}
+
+/// A field whose widget has no action, and whose additional actions `aa` (an `/AA` entry, or
+/// nothing) sit on the field above the widget, or on the field above that when `levels` is 2. Returns
+/// the field that is listed in the form and the widget.
+fn under(
+    objs: &mut Objects,
+    page: usize,
+    name: &str,
+    y: u32,
+    kind: Under,
+    aa: &str,
+    levels: usize,
+) -> (usize, usize) {
+    let top = objs.reserve();
+    let mid = if levels > 1 {
+        Some(objs.reserve())
+    } else {
+        None
+    };
+    let (field_entries, rect, widget_extra) = match kind {
+        Under::Text => (
+            "/FT /Tx".to_string(),
+            format!("100 {y} 300 {}", y + 20),
+            String::new(),
+        ),
+        Under::Combo => (
+            "/FT /Ch /Ff 131072 /Opt [(a) (b)]".to_string(),
+            format!("100 {y} 300 {}", y + 20),
+            String::new(),
+        ),
+        Under::List => (
+            "/FT /Ch /Opt [(a) (b)]".to_string(),
+            format!("100 {y} 300 {}", y + 20),
+            String::new(),
+        ),
+        Under::Check => {
+            let on = objs.add(stream_object(
+                "/Type /XObject /Subtype /Form /BBox [0 0 16 16]",
+                "q 0 g 3 3 10 10 re f Q",
+            ));
+            let off = objs.add(stream_object(
+                "/Type /XObject /Subtype /Form /BBox [0 0 16 16]",
+                "",
+            ));
+            (
+                "/FT /Btn /V /Off".to_string(),
+                format!("320 {y} 336 {}", y + 16),
+                format!("/AS /Off /AP << /N << /Yes {on} 0 R /Off {off} 0 R >> >>"),
+            )
+        }
+    };
+    let nearest = mid.unwrap_or(top);
+    let widget = objs.add(format!(
+        "<< /Type /Annot /Subtype /Widget /Parent {nearest} 0 R /Rect [{rect}] /F 4 /P {page} 0 R \
+         /DA (/Helv 12 Tf 0 g) {widget_extra} >>"
+    ));
+    if let Some(mid) = mid {
+        objs.set(mid, format!("<< /Parent {top} 0 R /Kids [{widget} 0 R] >>"));
+    }
+    let child = mid.unwrap_or(widget);
+    objs.set(
+        top,
+        format!("<< {field_entries} /T ({name}) /Kids [{child} 0 R] {aa} >>"),
+    );
+    (top, widget)
+}
+
+/// Fields whose widgets have no action, with additional actions on the field above them (or above
+/// that). The field `keep` holds "kept". With `dangerous` the actions are resets and a hide of
+/// `keep`; without it they are a link and a script, so the file holds nothing that changes a form.
+/// With `packed` the fields are kept in an object stream. The names:
+///
+/// - `pk_text`, `pk_combo`, `pk_check`: the keystroke event of the field above holds a reset
+/// - `pv_text`, `pv_list`: the validate event holds a reset
+/// - `pv_hide`: the validate event hides `keep`
+/// - `pk_next`: the keystroke event is a script that goes on to a reset (`/Next`)
+/// - `gp_text`, `gp_check`: the keystroke event is on the field above the field above the widget
+pub fn forms_parent_actions_pdf(packed: bool, dangerous: bool) -> Vec<u8> {
+    const LINK: &str = "<< /S /URI /URI (https://example.com/) >>";
+    let mut objs = Objects::new(6);
+    let page = 4;
+    let reset = if dangerous { RESET } else { LINK };
+    let hide = if dangerous {
+        "<< /S /Hide /T (keep) /H true >>".to_string()
+    } else {
+        LINK.to_string()
+    };
+    let next = if dangerous {
+        format!("<< /S /JavaScript /JS (1;) /Next {RESET} >>")
+    } else {
+        "<< /S /JavaScript /JS (1;) >>".to_string()
+    };
+    let row = |n: u32| 740 - 30 * n;
+    let mut fields = Vec::new();
+    let mut widgets = Vec::new();
+    let keep = text(&mut objs, page, "keep", row(0), "kept", "");
+    fields.push(keep);
+    widgets.push(keep);
+    let cases: [(&str, Under, String, usize); 9] = [
+        ("pk_text", Under::Text, format!("/AA << /K {reset} >>"), 1),
+        ("pv_text", Under::Text, format!("/AA << /V {reset} >>"), 1),
+        ("pv_hide", Under::Text, format!("/AA << /V {hide} >>"), 1),
+        ("pk_next", Under::Text, format!("/AA << /K {next} >>"), 1),
+        ("pk_combo", Under::Combo, format!("/AA << /K {reset} >>"), 1),
+        ("pv_list", Under::List, format!("/AA << /V {reset} >>"), 1),
+        ("pk_check", Under::Check, format!("/AA << /K {reset} >>"), 1),
+        ("gp_text", Under::Text, format!("/AA << /K {reset} >>"), 2),
+        ("gp_check", Under::Check, format!("/AA << /K {reset} >>"), 2),
+    ];
+    for (i, (name, kind, aa, levels)) in cases.iter().enumerate() {
+        let (field, widget) = under(&mut objs, page, name, row(1 + i as u32), *kind, aa, *levels);
+        fields.push(field);
+        widgets.push(widget);
+    }
+    let annot_list: String = widgets.iter().fold(String::new(), |mut s, f| {
+        let _ = write!(s, "{f} 0 R ");
+        s
+    });
+    let spec = PageSpec {
+        width: 612,
+        height: 792,
+        content: Some("0 g 10 10 1 1 re f\n".to_string()),
+        extra: format!("/Annots [{annot_list}]"),
+    };
+    let objects = build_objects(&[spec], &catalog(&fields), objs.bodies);
+    if packed {
+        assemble_packed(&objects, 6)
+    } else {
+        assemble(&objects, "")
+    }
+}
+
+/// A form that holds a reset (on the check box `box_a`) and fields under other fields that have no
+/// additional actions: `pc_plain` has one field above its widget and `pc_deep` two. They, and
+/// `keep` ("kept"), are filled in as usual.
+pub fn forms_plain_parents_pdf() -> Vec<u8> {
+    let mut objs = Objects::new(6);
+    let page = 4;
+    let keep = text(&mut objs, page, "keep", 740, "kept", "");
+    let boxed = check_box(&mut objs, page, "box_a", 710, &format!("/A {RESET}"));
+    let (plain, plain_widget) = under(&mut objs, page, "pc_plain", 680, Under::Text, "", 1);
+    let (deep, deep_widget) = under(&mut objs, page, "pc_deep", 650, Under::Text, "", 2);
+    let fields = [keep, boxed, plain, deep];
+    let annot_list = format!("{keep} 0 R {boxed} 0 R {plain_widget} 0 R {deep_widget} 0 R");
     let spec = PageSpec {
         width: 612,
         height: 792,

@@ -38,6 +38,9 @@ pub struct FormOptions {
     pub signed: bool,
     /// Fields that sit under a parent field: `person.first` and `person.last`.
     pub nested: bool,
+    /// An object that no page uses and that is this many bytes long, so that the file is big and
+    /// the form is small.
+    pub padding: usize,
 }
 
 /// A growing list of objects. The kit's `build` puts the catalog, the page tree and the font at 1 to
@@ -302,10 +305,21 @@ pub fn forms_pdf() -> Vec<u8> {
     forms_with(&FormOptions::default())
 }
 
+/// A form with the fields of [`forms_pdf`] in a file that is at least `bytes` bytes long.
+pub fn forms_padded_pdf(bytes: usize) -> Vec<u8> {
+    forms_with(&FormOptions {
+        padding: bytes,
+        ..FormOptions::default()
+    })
+}
+
 /// As [`forms_pdf`], with `options`.
 pub fn forms_with(opts: &FormOptions) -> Vec<u8> {
     let mut objs = Objects::new();
     let (mut annots, fields, mut content) = standard_fields(&mut objs, opts);
+    if opts.padding > 0 {
+        objs.add(stream_object("", &"%".repeat(opts.padding)));
+    }
     let mut field_refs: String = fields
         .iter()
         .map(|f| format!("{f} 0 R"))

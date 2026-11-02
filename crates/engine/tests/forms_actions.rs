@@ -2,7 +2,8 @@
 //!
 //! - No action of the PDF changes the document while a field is filled in: not a reset, not a hide,
 //!   whichever event of whichever field carries it (focus, blur, press, release, keystroke, format,
-//!   validate, calculate), and not an action that sits on the field above a widget.
+//!   validate, calculate), also when it sits on the field above a widget or above that, and also
+//!   when the file keeps those fields in an object stream.
 //! - The widget that is named is the one that changes, never the one that happens to lie on top of
 //!   it at a point.
 //! - A field with widgets on several pages gets a new appearance on every page.
@@ -366,6 +367,7 @@ fn a_field_with_an_action_that_could_change_the_form_is_left_alone_and_says_so()
     let list = fields(engine, doc, 0);
     let blocked = [
         "box_a", "box_u", "box_d", "text_fo", "text_bl", "text_k", "text_f", "text_v", "text_c",
+        "par",
     ];
     for name in blocked {
         let field = one(&list, name);
@@ -384,8 +386,8 @@ fn a_field_with_an_action_that_could_change_the_form_is_left_alone_and_says_so()
             other => panic!("{name}: {other:?}"),
         }
     }
-    // The others are filled in as usual, also the one whose action is on the field above it.
-    for name in ["keep", "victim", "plain", "plain_box", "under_box", "par"] {
+    // The others are filled in as usual.
+    for name in ["keep", "victim", "plain", "plain_box", "under_box"] {
         let field = one(&list, name);
         assert!(
             !field.has(field_flag::ACTION_BLOCKED) && !field.has(field_flag::READ_ONLY),
@@ -441,6 +443,15 @@ fn values_that_do_not_fit_the_wire_are_listed_in_a_way_that_cannot_hurt() {
         "{}",
         huge.max_len
     );
+    // A value with a zero character in it is refused, not cut: PDFium's editor stops at the zero.
+    match set(engine, doc, 0, &huge, FormValue::Text("a\0b".into())) {
+        ResponseBody::Error {
+            code: ErrorCode::FormFieldRefused,
+            ..
+        } => {}
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(fields(engine, doc, 0), list);
     // A value with a zero character in it cannot be shown whole, so the field is left alone.
     let nul = one(&list, "nul");
     assert!(nul.has(field_flag::VALUE_CUT), "{:?}", nul.value);
@@ -470,4 +481,149 @@ fn a_page_whose_fields_share_one_huge_list_of_choices_is_listed_with_a_bounded_a
     assert!(!list.is_empty());
     // The field whose list was cut is not one that can be changed.
     assert!(list.iter().any(|f| f.has(field_flag::READ_ONLY)));
+}
+
+// ---- actions on the field above a widget ---------------------------------------------------------
+
+const ABOVE_BLOCKED: [&str; 9] = [
+    "pk_text", "pv_text", "pv_hide", "pk_next", "pk_combo", "pv_list", "pk_check", "gp_text",
+    "gp_check",
+];
+
+#[test]
+fn a_reset_or_a_hide_on_the_field_above_a_widget_does_not_fire_because_the_widget_is_left_alone() {
+    // PDFium reads the keystroke and validate events of a widget from the field above it, up the
+    // chain, and they run a reset or a hide like any other event. Each case is tried with the fields
+    // in plain objects and in an object stream.
+    for packed in [false, true] {
+        let mut guard = engine();
+        let engine = &mut guard.0;
+        let (doc, _file) = open(engine, &kit::forms_parent_actions_pdf(packed, true));
+        let list = fields(engine, doc, 0);
+        for name in ABOVE_BLOCKED {
+            let field = one(&list, name);
+            assert!(
+                field.has(field_flag::ACTION_BLOCKED)
+                    && field.has(field_flag::READ_ONLY)
+                    && field.has(field_flag::ACTION),
+                "{name} (packed {packed}): {:#x}",
+                field.flags
+            );
+            match set(engine, doc, 0, &field, value_for(&field)) {
+                ResponseBody::Error {
+                    code: ErrorCode::FormFieldRefused,
+                    ..
+                } => {}
+                other => panic!("{name} (packed {packed}): {other:?}"),
+            }
+            let now = fields(engine, doc, 0);
+            assert_eq!(
+                one(&now, "keep").value,
+                "kept",
+                "{name} (packed {packed}) reset a field"
+            );
+            assert_eq!(names(&now), names(&list), "{name} hid a field");
+        }
+        // The field with no parent is filled in as usual.
+        let keep = one(&list, "keep");
+        assert!(!keep.has(field_flag::ACTION_BLOCKED) && !keep.has(field_flag::READ_ONLY));
+        assert_eq!(names(&fields(engine, doc, 0)), names(&list));
+    }
+}
+
+#[test]
+fn widgets_under_fields_with_no_actions_are_filled_in_in_a_form_that_holds_a_reset() {
+    let mut guard = engine();
+    let engine = &mut guard.0;
+    let (doc, _file) = open(engine, &kit::forms_plain_parents_pdf());
+    let list = fields(engine, doc, 0);
+    for name in ["keep", "pc_plain", "pc_deep"] {
+        let field = one(&list, name);
+        assert!(
+            !field.has(field_flag::ACTION_BLOCKED) && !field.has(field_flag::READ_ONLY),
+            "{name}: {:#x}",
+            field.flags
+        );
+        if name == "keep" {
+            continue;
+        }
+        match set(engine, doc, 0, &field, value_for(&field)) {
+            ResponseBody::FormFields { fields: now } => {
+                assert_eq!(one(&now, "keep").value, "kept", "{name}");
+                assert_eq!(one(&now, name).value, "typed", "{name}");
+            }
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+    // The check box with the reset is left alone, as before.
+    assert!(one(&list, "box_a").has(field_flag::ACTION_BLOCKED));
+}
+
+#[test]
+fn actions_on_the_field_above_a_widget_that_cannot_change_a_form_block_nothing() {
+    for packed in [false, true] {
+        let mut guard = engine();
+        let engine = &mut guard.0;
+        let (doc, _file) = open(engine, &kit::forms_parent_actions_pdf(packed, false));
+        let list = fields(engine, doc, 0);
+        assert_eq!(list.len(), 10, "{:?}", names(&list));
+        for field in &list {
+            assert!(
+                !field.has(field_flag::ACTION_BLOCKED) && !field.has(field_flag::READ_ONLY),
+                "{} (packed {packed}): {:#x}",
+                field.name,
+                field.flags
+            );
+        }
+        for name in ABOVE_BLOCKED {
+            let field = one(&list, name);
+            match set(engine, doc, 0, &field, value_for(&field)) {
+                ResponseBody::FormFields { fields: now } => {
+                    assert_eq!(one(&now, "keep").value, "kept", "{name}");
+                }
+                other => panic!("{name} (packed {packed}): {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn the_search_for_actions_above_a_widget_follows_parents_and_ignores_the_rest() {
+    use partridge_engine::forms::holds_parent_action_for_tests as holds;
+    // A field named as a parent by a widget, with additional actions.
+    assert!(holds(
+        b"%PDF-1.5\r\n4 0 obj\r\n<</Type/Annot/Parent 5 0 R>>\r\nendobj\r\n5 0 obj\r\n<</T(a)/AA<</K 6 0 R>>>>\r\nendobj\r\n"
+    ));
+    // Two levels: the actions sit on the parent of the parent.
+    assert!(holds(
+        b"4 0 obj\r\n<</Parent 5 0 R>>\r\nendobj\r\n5 0 obj\r\n<</Parent 6 0 R>>\r\nendobj\r\n6 0 obj\r\n<</AA<<>>>>\r\nendobj\r\n"
+    ));
+    // The order of the objects does not matter.
+    assert!(holds(
+        b"6 0 obj\r\n<</AA<<>>>>\r\nendobj\r\n4 0 obj\r\n<</Parent 6 0 R>>\r\nendobj\r\n"
+    ));
+    // A parent written in place.
+    assert!(holds(
+        b"4 0 obj\r\n<</Parent<</T(a)/AA<<>>>>>>\r\nendobj\r\n"
+    ));
+    // A text that looks like an end of object does not hide the actions behind it.
+    assert!(holds(
+        b"4 0 obj\r\n<</Parent 5 0 R>>\r\nendobj\r\n5 0 obj\r\n<</T(endobj)/AA<<>>>>\r\nendobj\r\n"
+    ));
+    // Actions on a widget that has no parent, and a parent without actions, are not it.
+    assert!(!holds(
+        b"4 0 obj\r\n<</Subtype/Widget/AA<<>>>>\r\nendobj\r\n"
+    ));
+    assert!(!holds(
+        b"4 0 obj\r\n<</Parent 5 0 R>>\r\nendobj\r\n5 0 obj\r\n<</T(a)>>\r\nendobj\r\n"
+    ));
+    // The page tree's parents and an object with actions that nothing names as a parent.
+    assert!(!holds(
+        b"3 0 obj\r\n<</Parent 2 0 R>>\r\nendobj\r\n7 0 obj\r\n<</AA<<>>>>\r\nendobj\r\n"
+    ));
+    // Other names that start the same way.
+    assert!(!holds(
+        b"4 0 obj\r\n<</ParentTree 5 0 R>>\r\nendobj\r\n5 0 obj\r\n<</AAA 1>>\r\nendobj\r\n"
+    ));
+    assert!(!holds(b""));
 }

@@ -276,3 +276,31 @@ fn a_form_with_scripts_is_filled_in_and_the_scripts_do_nothing() {
     assert_eq!(one(&fields, "fullname").value, "");
     pool.save(handle, SaveOptions::default()).unwrap();
 }
+
+#[test]
+fn a_form_of_several_mebibytes_opens_and_is_filled_in() {
+    // Looking for scripts in the file reports progress about once a MiB. The engine is allowed to
+    // do that in this request, and a file over a MiB must not be taken for a broken engine.
+    let dir = Dir::new("big");
+    let bytes = kit::forms_padded_pdf(3 * 1024 * 1024);
+    assert!(bytes.len() > 3 * 1024 * 1024);
+    let path = dir.write("big.pdf", &bytes);
+    let pool = EnginePool::new(config(), 4);
+    let (handle, _) = pool.open(&text(&path), None).unwrap();
+
+    assert_eq!(pool.form_info(handle).unwrap(), (FormKind::Acro, false));
+    let fields = pool.form_fields(handle, 0).unwrap();
+    assert_eq!(fields.len(), 13);
+    // The same engine, with the document still open: a field is set.
+    let target = one(&fields, "fullname");
+    let after = pool
+        .set_form_field(
+            handle,
+            0,
+            target.index,
+            &target.name,
+            &FormValue::Text("Ada".into()),
+        )
+        .unwrap();
+    assert_eq!(one(&after, "fullname").value, "Ada");
+}

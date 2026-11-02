@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use partridge_protocol::{
-    ErrorCode, FontScript, PageSize, Request, RequestBody, Response, ResponseBody,
+    ErrorCode, FontScript, FormKind, PageSize, Request, RequestBody, Response, ResponseBody,
     MAX_RENDER_PIXELS, MAX_RENDER_SIDE, MAX_SAVE_CHUNK, PROTOCOL_VERSION,
 };
 use pdfium_render::prelude::*;
@@ -398,7 +398,27 @@ impl Engine {
             }
             RequestBody::FormInfo { doc } => {
                 let document = self.document(doc)?;
-                forms::info(pdfium, document, self.source.as_deref(), progress)
+                let info = forms::info(pdfium, document, self.source.as_deref(), progress)?;
+                // The environment is made here and not at the first listing, because making it
+                // writes the whole document out to look for actions, and this is a request that
+                // may take long and report its progress. Listing and setting use it afterwards.
+                // If it cannot be made, the first listing says why.
+                if matches!(
+                    info,
+                    ResponseBody::FormInfo {
+                        kind: FormKind::Acro,
+                        ..
+                    }
+                ) && !self.forms.contains_key(&doc)
+                {
+                    let document = self.document(doc)?;
+                    if let Ok(env) =
+                        forms::FormEnv::create(pdfium, document, self.source.as_deref(), progress)
+                    {
+                        self.forms.insert(doc, env);
+                    }
+                }
+                Ok(info)
             }
             RequestBody::ListFormFields { doc, page } => self.with_form(pdfium, doc, |env| {
                 Ok(ResponseBody::FormFields {
@@ -446,7 +466,8 @@ impl Engine {
     ) -> Result<T, Failure> {
         if !self.forms.contains_key(&doc) {
             let document = self.document(doc)?;
-            let env = forms::FormEnv::create(pdfium, document)?;
+            let env =
+                forms::FormEnv::create(pdfium, document, self.source.as_deref(), &mut |_| {})?;
             self.forms.insert(doc, env);
         }
         let env = self

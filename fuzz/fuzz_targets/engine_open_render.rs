@@ -254,17 +254,12 @@ impl State {
             } => (pages, security),
             other => panic!("unexpected answer to DocInfo: {other:?}"),
         };
-        let print = match self.ask(RequestBody::Fingerprint { doc }) {
-            ResponseBody::Fingerprint {
-                pages: seen,
-                failed,
-                digest,
-            } => {
+        match self.ask(RequestBody::Fingerprint { doc }) {
+            ResponseBody::Fingerprint { pages: seen, .. } => {
                 assert_eq!(seen, count, "the fingerprint names another number of pages");
-                (failed, digest)
             }
             other => panic!("unexpected answer to Fingerprint: {other:?}"),
-        };
+        }
         assert_eq!(pages, count, "DocInfo names another number of pages");
         let size = match self.ask(RequestBody::SaveBegin { doc }) {
             ResponseBody::SaveReady { size } => size as usize,
@@ -335,6 +330,9 @@ impl State {
             other => panic!("the buffer outlived SaveEnd: {other:?}"),
         }
 
+        // The original, read afresh as the saved file will be.
+        let fresh = self.fresh_fingerprint();
+
         // The saved file opens again. (A file that PDFium had to repair may not; then the app's
         // check would refuse the save. One that opens must be the same document.)
         let saved = self.file.with_extension("saved.pdf");
@@ -350,19 +348,22 @@ impl State {
                     } => assert_eq!(now, security, "the saved file is protected differently"),
                     other => panic!("unexpected answer to DocInfo: {other:?}"),
                 }
-                // What a reader sees of the saved file is what it saw of the document. (A page that
-                // could not be read before cannot be expected to read now.)
-                if print.0 == 0 {
+                // A saved file that reads in full must hold what the original holds. The original is
+                // read afresh for this, not taken from the fingerprint made above: reading the
+                // outline fills PDFium's list of pages, so a page that a fresh read cannot load
+                // (a page tree that does not match its own count) reads in that session and not in
+                // the next one, and the two are not like for like. A saved file with a page that
+                // cannot be read is not compared: PDFium repairs a damaged file when it opens it
+                // and can write the repaired tree in a form it cannot read back, and the app's check
+                // of a saved file refuses exactly that (`crates/engine-client/src/save.rs`).
+                if let Some((0, digest)) = fresh {
                     match self.ask(RequestBody::Fingerprint { doc: again }) {
-                        ResponseBody::Fingerprint { failed, digest, .. } => {
-                            // A damaged file that PDFium repaired on opening can be written in a
-                            // form with a page it cannot read (a page tree it had to guess at).
-                            // The app's check of a saved file refuses exactly that, so the target
-                            // only holds a file whose pages all read to the digest.
-                            if failed == 0 {
-                                assert_eq!(digest, print.1, "the saved file is another document");
-                            }
-                        }
+                        ResponseBody::Fingerprint {
+                            failed: 0,
+                            digest: same,
+                            ..
+                        } => assert_eq!(same, digest, "the saved file is another document"),
+                        ResponseBody::Fingerprint { .. } => {}
                         other => panic!("unexpected answer to Fingerprint: {other:?}"),
                     }
                 }
@@ -371,6 +372,23 @@ impl State {
             }
         }
         let _ = std::fs::remove_file(&saved);
+    }
+
+    /// The fingerprint of the input file opened again from nothing: how many pages cannot be read,
+    /// and the digest of the rest. `None` when it does not open (it did once, so that is rare).
+    fn fresh_fingerprint(&mut self) -> Option<(u32, u64)> {
+        for password in [None, Some(PASSWORD.to_string())] {
+            self.hand_over();
+            if let ResponseBody::Opened { doc, .. } = self.ask(RequestBody::Open { password }) {
+                let print = match self.ask(RequestBody::Fingerprint { doc }) {
+                    ResponseBody::Fingerprint { failed, digest, .. } => Some((failed, digest)),
+                    _ => None,
+                };
+                self.ask(RequestBody::Close { doc });
+                return print;
+            }
+        }
+        None
     }
 
     fn expect_range_error(&mut self, body: RequestBody) {

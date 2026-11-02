@@ -58,8 +58,8 @@ const MAX_SMALL_ANSWER: usize = 9 * 1024 * 1024;
 const IDLE_LIMIT: usize = 70 * 1024;
 /// Header of a `Rendered` answer in front of the pixels.
 const RENDERED_HEADER: usize = 17;
-/// How many times a long request (`DocInfo`, `Fingerprint`, `SaveBegin`) may have to read the
-/// whole document: the check of the file before and after, and the serialising itself.
+/// How many times a long request (`DocInfo`, `FormInfo`, `Fingerprint`, `SaveBegin`) may have to
+/// read the whole document: the check of the file before and after, and the serialising itself.
 const SAVE_PASSES: u64 = 4;
 
 /// What the error of an engine that was stopped for taking too long starts with. The app turns it
@@ -84,7 +84,7 @@ pub struct EngineConfig {
     /// Longest the engine may take to answer one request before it is considered hung and killed.
     pub timeout: Duration,
     /// Longest the engine may go without a sign of life while it describes or serialises a
-    /// document (`DocInfo`, `Fingerprint`, `SaveBegin`). These requests can take minutes for a
+    /// document (`DocInfo`, `FormInfo`, `Fingerprint`, `SaveBegin`). These requests can take minutes for a
     /// large document on a slow disk, so the engine reports progress while it works (about every
     /// MiB written, 32 pages looked at or MiB of the file read), and every report starts this
     /// wait afresh. An engine that makes progress is not taken for a hung one for being slow;
@@ -722,6 +722,7 @@ impl EngineClient {
         // A request that can take long gets the longer wait, renewed by every sign of life.
         let patience = match body {
             RequestBody::DocInfo { .. }
+            | RequestBody::FormInfo { .. }
             | RequestBody::Fingerprint { .. }
             | RequestBody::SaveBegin { .. } => self.config.save_stall,
             _ => self.config.timeout,
