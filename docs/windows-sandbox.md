@@ -94,7 +94,17 @@ The previous wording of the README and of this page ("the block rests on the Win
 
 ## Packet capture
 
-PACKET_CAPTURE_RESULT
+The question was whether an echo request from a raw socket in the sandbox leaves the computer, which the first review of this change could not answer: `sendto` returned success, which says nothing about the wire. The job "Windows, packet capture" (`scripts/windows-packet-capture.ps1`) runs `pktmon` on the runner, with a filter on 192.0.2.1 (the documentation address; nobody answers it), while a program sends five raw ICMP echo requests to it. It does this three times, on both server images:
+
+| Run | Echo requests the program sent | Seen passing on to the network card | Seen dropped inside the stack |
+|---|---|---|---|
+| Control (not sandboxed) | 5 | 5 (an Ethernet frame to the gateway; 20 lines because several components log it) | 0 |
+| Sandbox as built | 0 (`socket` is refused) | 0 | 0 |
+| Sandbox with the privilege put back (a debug switch of the client, `PARTRIDGE_TEST_KEEP_TRAVERSE_PRIVILEGE`) | 5 | 0 | 5, reason "Inspection drop" |
+
+So: with the privilege put back the raw socket worked and the program believed it had sent the packets, but they did not leave. The stack dropped them before the network card. The reason pktmon names, "Inspection drop", is a drop by a filter or inspection point of the stack (the filtering platform is one; the capture does not say which filter). That fits the idea that the filtering platform's default rule for an AppContainer token stops what leaves, but it does not prove it: it is one runner image family, one destination address, ICMP echo only, and the firewall in its default state. It was not tried with the firewall off (a drop by a rule of the firewall would not hold then), nor on a computer with a different product. Nothing in the capture shows a packet from the sandbox as built, because none is sent. The control shows the capture sees what a raw socket sends.
+
+The earlier concern was a two-way channel through ICMP. The sandbox as built closes it by refusing the socket. The capture adds one observation about the older state: on these images it did not put the packets on the wire either.
 
 ## When the network block is not proved
 
