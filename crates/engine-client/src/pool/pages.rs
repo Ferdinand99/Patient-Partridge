@@ -13,6 +13,7 @@ use crate::save::{
     verify_written, write_checked, DocInfo, Fingerprint, SaveError, SaveOptions, SaveOutcome,
 };
 use crate::{ClientError, EngineClient, SaveStreamError};
+use partridge_protocol::ErrorCode;
 
 /// How far a transfer of pages has come: bytes done and bytes in all.
 pub type PageProgress<'a> = &'a (dyn Fn(u64, u64) + Sync);
@@ -51,9 +52,11 @@ pub enum Cancelled {
     Idle,
     /// A document was being handed over: that stops, and the document is as it was.
     Handover,
-    /// The engine was working on the document itself, which cannot be interrupted: the engine was
-    /// stopped, and the document is gone with its changes.
-    EngineStopped,
+    /// The engine is working on the document itself, which cannot be interrupted: stopping it
+    /// would end the engine and lose every change of the document that is not saved. Nothing was
+    /// done; the change finishes (an engine that stalls is stopped by the time limit of the pool,
+    /// like in a save).
+    Working,
 }
 
 struct Handles {
@@ -84,6 +87,27 @@ impl Drop for Work<'_> {
             list.retain(|c| !self.others.iter().any(|o| Arc::ptr_eq(c, o)));
         }
         self.ops.phase.store(0, Ordering::SeqCst);
+    }
+}
+
+/// An error of the engine that reads the file pages are inserted from, as the error to give about
+/// that file. A password that is needed or wrong keeps its meaning (the window asks for it), and so
+/// does a stop by the user; everything else (a damaged file, an engine that crashed, took too long
+/// or could not start) says the file could not be used, in words that name the reason.
+fn source_failed(e: ClientError) -> ClientError {
+    match e {
+        ClientError::Engine {
+            code: ErrorCode::PasswordRequired | ErrorCode::PasswordIncorrect,
+            ..
+        }
+        | ClientError::Save(_) => e,
+        other => ClientError::Engine {
+            code: ErrorCode::InsertSourceFailed,
+            message: match other {
+                ClientError::Engine { message, .. } => message,
+                other => other.to_string(),
+            },
+        },
     }
 }
 
@@ -209,8 +233,15 @@ impl EnginePool {
             }
         };
 
-        let opened = other.open(path, password).map_err(stopped)?;
-        let info = other.doc_info(opened.doc).map_err(stopped)?;
+        // Whatever goes wrong with the other file is about that file: the document the pages were
+        // to join is not affected, and must not be taken for lost (a file that crashes its
+        // engine, takes too long or cannot start one is not a reason to close the document).
+        let opened = other
+            .open(path, password)
+            .map_err(|e| stopped(source_failed(e)))?;
+        let info = other
+            .doc_info(opened.doc)
+            .map_err(|e| stopped(source_failed(e)))?;
         if cancelled() {
             return Err(SaveError::Cancelled.into());
         }
@@ -226,7 +257,7 @@ impl EnginePool {
         let all: Vec<u32> = (0..opened.pages.len() as u32).collect();
         if all.is_empty() {
             return Err(ClientError::Engine {
-                code: partridge_protocol::ErrorCode::ImportFailed,
+                code: ErrorCode::InsertSourceFailed,
                 message: "the file has no pages".into(),
             });
         }
@@ -267,7 +298,7 @@ impl EnginePool {
                     return Err(SaveError::Cancelled.into());
                 }
                 return Err(match failure {
-                    ExportError::Client(e) => e,
+                    ExportError::Client(e) => source_failed(e),
                     ExportError::Sink(io) => target_error
                         .borrow_mut()
                         .take()
@@ -423,15 +454,16 @@ impl EnginePool {
     }
 
     /// Stops the work a page tool is doing on a document: the transfer of pages ends and the
-    /// document is as it was; when the engine itself is in the middle of a change, which cannot be
-    /// interrupted, the engine is stopped (the file on the disk is not touched).
+    /// document is as it was. When the engine itself is in the middle of a change, which cannot be
+    /// interrupted, nothing is done and `Working` is the answer: ending the engine would lose
+    /// every change of the document that has not been saved.
     pub fn cancel_pages(&self, handle: u64) -> Cancelled {
-        let (client, ops) = {
+        let ops = {
             let st = state(&self.state);
             let Some(entry) = st.docs.get(&handle) else {
                 return Cancelled::Idle;
             };
-            (entry.client.clone(), entry.ops.clone())
+            entry.ops.clone()
         };
         match ops.phase.load(Ordering::SeqCst) {
             1 => {
@@ -439,11 +471,7 @@ impl EnginePool {
                 ops.kill_transients();
                 Cancelled::Handover
             }
-            2 => {
-                ops.cancel.store(true, Ordering::SeqCst);
-                client.kill();
-                Cancelled::EngineStopped
-            }
+            2 => Cancelled::Working,
             _ => Cancelled::Idle,
         }
     }

@@ -15,6 +15,7 @@
 //! - `save-signed`: like `save-good`, but the document holds two signatures.
 //! - `save-touched`: like `save-good`, but the description says the file was touched while parts of
 //!   it were unread.
+//! - `save-no-pages`: like `save-good`, but the document describes itself as one of no pages.
 //! - `save-short`, `save-wrong-offset`, `save-big`, `save-error`, `save-lies`: like `save-good`
 //!   but a piece is a byte too short, a piece comes from the wrong offset, a piece is a 10 MiB
 //!   frame, the save fails with an error, or the end of the file is missing (the last piece is
@@ -182,7 +183,7 @@ fn main() {
                 &mut output,
                 id,
                 ResponseBody::DocInfo {
-                    pages: 1,
+                    pages: if mode == "save-no-pages" { 0 } else { 1 },
                     security: 0,
                     signatures: if mode == "save-signed" { 2 } else { 0 },
                     maybe_signed: false,
@@ -284,7 +285,7 @@ fn main() {
                 &mut output,
                 id,
                 ResponseBody::Fingerprint {
-                    pages: 1,
+                    pages: if mode == "save-no-pages" { 0 } else { 1 },
                     failed: if mode == "save-unreadable" { 1 } else { 0 },
                     digest: 7,
                 },

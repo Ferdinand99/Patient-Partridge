@@ -305,18 +305,24 @@ fn a_file_that_is_not_a_pdf_or_too_long_is_not_inserted() {
     let target = dir.write("a.pdf", &kit::marked_pdf(2));
     let pool = pool();
     let (handle, _) = pool.open(&text(&target), None).unwrap();
+    // Whatever is wrong with the other file is told as being wrong with that file, never as
+    // something about the document the pages were to join.
     for (name, bytes, code) in [
-        ("plain.pdf", kit::not_a_pdf(), ErrorCode::Corrupt),
-        ("broken.pdf", kit::corrupt_pdf(), ErrorCode::Corrupt),
+        ("plain.pdf", kit::not_a_pdf(), ErrorCode::InsertSourceFailed),
+        (
+            "broken.pdf",
+            kit::corrupt_pdf(),
+            ErrorCode::InsertSourceFailed,
+        ),
         (
             "long.pdf",
             kit::blank_pages_pdf(MAX_PAGES + 1),
-            ErrorCode::TooManyPages,
+            ErrorCode::InsertSourceFailed,
         ),
         (
             "tall.pdf",
             kit::blank_pages_pdf(partridge_protocol::MAX_EDIT_PAGES + 1),
-            ErrorCode::TooManyPages,
+            ErrorCode::InsertSourceFailed,
         ),
     ] {
         let other = dir.write(name, &bytes);
@@ -864,4 +870,22 @@ fn a_document_that_forbids_changes_refuses_every_tool_and_stays_intact() {
     assert_eq!(code_of(error), ErrorCode::PagesNotAllowed);
     assert!(!copy.exists());
     assert!(pool.pages_delete(h, &[0]).is_err());
+}
+
+/// An insert from a file the engine cannot use must not touch the document it was meant for.
+#[test]
+fn a_source_file_that_cannot_be_used_leaves_the_target_alone() {
+    let dir = Dir::new("badsource");
+    let target = dir.write("target.pdf", &kit::marked_pdf(3));
+    let bad = dir.write("bad.pdf", &kit::corrupt_pdf());
+    let pool = pool();
+    let (h, _) = pool.open(&text(&target), None).unwrap();
+    pool.pages_rotate(h, &[0], 1).unwrap();
+    let error =
+        client_error(pool.insert_pdf(h, 0, &text(&bad), None, InsertOptions::default(), &nothing));
+    assert_eq!(code_of(error), ErrorCode::InsertSourceFailed);
+    // The target engine is alive and has its change.
+    let turned = pool.pages_rotate(h, &[1], 1).unwrap();
+    assert_eq!(turned.pages.len(), 3);
+    assert_eq!(turned.pages[0].width, 792.0);
 }

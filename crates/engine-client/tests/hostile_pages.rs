@@ -103,6 +103,18 @@ fn answers_with_pages_that_are_not_sizes_stop_the_engine() {
 }
 
 #[test]
+fn an_answer_with_a_document_of_no_pages_stops_the_engine() {
+    // Undo, redo and every other change give the new page list; a list with no pages is never a
+    // document, and the window must not be told it is one.
+    let client = client_with("empty");
+    let doc = client.open(&doc_path(), None).unwrap().doc;
+    assert_stopped(client.pages_restore(doc, 1), "unexpected answer");
+    let client = client_with("empty");
+    let doc = client.open(&doc_path(), None).unwrap().doc;
+    assert_stopped(client.pages_rotate(doc, &[0], 1), "unexpected answer");
+}
+
+#[test]
 fn an_answer_of_the_wrong_kind_stops_the_engine() {
     let client = client_with("wrong-kind");
     let doc = client.open(&doc_path(), None).unwrap().doc;
@@ -275,22 +287,102 @@ fn stopping_the_transfer_of_pages_leaves_the_document_alone() {
 }
 
 #[test]
-fn a_change_that_hangs_can_be_stopped_by_stopping_the_engine() {
+fn a_stop_in_the_middle_of_a_change_does_not_end_the_engine() {
+    // A change cannot be interrupted, and ending the engine would lose every change of the
+    // document that is not saved. So a stop says that it is too late and does nothing; an engine
+    // that never answers is ended by the time limit, like in a save.
     let mut cfg = config("hang");
-    cfg.save_stall = Duration::from_secs(120);
+    cfg.save_stall = Duration::from_secs(3);
     let pool = Arc::new(EnginePool::new(cfg, 4));
     let (handle, _) = pool.open(&doc_path(), None).unwrap();
     let stopper = pool.clone();
     let thread = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(400));
-        stopper.cancel_pages(handle)
+        let at = Instant::now();
+        let answer = stopper.cancel_pages(handle);
+        (answer, at.elapsed())
     });
     let started = Instant::now();
     let result = pool.pages_rotate(handle, &[0], 1);
+    let (answer, took) = thread.join().unwrap();
+    assert_eq!(answer, Cancelled::Working);
+    assert!(took < Duration::from_secs(1), "the stop returns at once");
+    match result {
+        Err(ClientError::EngineStopped(why)) => assert!(why.contains("did not answer"), "{why}"),
+        other => panic!("{other:?}"),
+    }
     assert!(
-        matches!(result, Err(ClientError::EngineStopped(_))),
-        "{result:?}"
+        started.elapsed() >= Duration::from_secs(2),
+        "the engine was not ended by the stop: {:?}",
+        started.elapsed()
     );
-    assert_eq!(thread.join().unwrap(), Cancelled::EngineStopped);
-    assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+#[test]
+fn a_stop_when_nothing_is_under_way_does_nothing() {
+    let pool = pool("good");
+    let (handle, _) = pool.open(&doc_path(), None).unwrap();
+    assert_eq!(pool.cancel_pages(handle), Cancelled::Idle);
+    assert_eq!(pool.pages_delete(handle, &[1]).unwrap().pages.len(), 2);
+    assert_eq!(pool.cancel_pages(handle), Cancelled::Idle);
+    assert!(pool.pages_rotate(handle, &[0], 1).is_ok());
+}
+
+// ---- the other file of an insert -----------------------------------------------------------------
+
+fn insert_error(mode: &str, stall: Duration) -> (EnginePool, u64, ClientError, Duration) {
+    let mut cfg = config(mode);
+    cfg.save_stall = stall;
+    let pool = EnginePool::new(cfg, 4);
+    let (handle, _) = pool.open(&doc_path(), None).unwrap();
+    let started = Instant::now();
+    let error = pool
+        .insert_pdf(
+            handle,
+            1,
+            &doc_path(),
+            None,
+            InsertOptions::default(),
+            &|_, _| {},
+        )
+        .unwrap_err();
+    (pool, handle, error, started.elapsed())
+}
+
+#[test]
+fn a_second_file_that_kills_its_engine_is_blamed_and_the_document_is_left_alone() {
+    let (pool, handle, error, _) = insert_error("source-dies", Duration::from_secs(60));
+    match error {
+        ClientError::Engine { code, message } => {
+            assert_eq!(code, ErrorCode::InsertSourceFailed);
+            assert!(!message.is_empty());
+        }
+        other => panic!("{other:?}"),
+    }
+    // The engine of the document is another process, and it is fine.
+    assert_eq!(pool.pages_rotate(handle, &[0], 1).unwrap().pages.len(), 3);
+}
+
+#[test]
+fn a_second_file_that_hangs_its_engine_is_blamed_and_the_document_is_left_alone() {
+    let (pool, handle, error, took) = insert_error("source-hangs", Duration::from_millis(800));
+    match error {
+        ClientError::Engine { code, .. } => assert_eq!(code, ErrorCode::InsertSourceFailed),
+        other => panic!("{other:?}"),
+    }
+    assert!(took < Duration::from_secs(20), "{took:?}");
+    assert_eq!(pool.pages_rotate(handle, &[0], 1).unwrap().pages.len(), 3);
+}
+
+#[test]
+fn a_second_file_that_does_not_allow_copying_is_blamed_with_its_reason() {
+    let (pool, handle, error, _) = insert_error("source-refuses", Duration::from_secs(60));
+    match error {
+        ClientError::Engine { code, message } => {
+            assert_eq!(code, ErrorCode::InsertSourceFailed);
+            assert!(message.contains("does not allow"), "{message}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(pool.pages_rotate(handle, &[0], 1).is_ok());
 }

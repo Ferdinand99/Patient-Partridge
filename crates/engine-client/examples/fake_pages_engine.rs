@@ -7,12 +7,16 @@
 //!   hands out 2 500 000 bytes (byte `i` is `i % 251`) for the pages asked for.
 //! - `bad-size`: every change answers with a page of NaN width.
 //! - `wrong-kind`: every page tool answers with `Closed`.
+//! - `empty`: every change answers with a document of no pages.
 //! - `too-many-pages`: a delete answers with more pages than a document may have.
 //! - `export-short`, `export-offset`, `export-pages`: a copy that hands a piece a byte too short, a
 //!   piece from the wrong offset, or announces another number of pages than were asked for.
 //! - `ack-wrong`: an insert acknowledges another number of bytes than were handed over.
 //! - `endless`: a delete says it is working for ever.
 //! - `hang`: a page tool never answers.
+//! - `source-dies`, `source-hangs`, `source-refuses`: as `good`, but the copy of pages (what an
+//!   insert asks of the engine that holds the other file) ends the engine, never answers, or is
+//!   refused because the document does not allow its pages to be copied.
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
@@ -123,6 +127,8 @@ fn main() {
                                 width: f32::NAN,
                                 height: 792.0,
                             }]
+                        } else if mode == "empty" {
+                            Vec::new()
                         } else {
                             sizes(pages)
                         },
@@ -199,6 +205,24 @@ fn main() {
                         reply(&mut output, id, ResponseBody::Pages(PagesResponse::Done))
                     }
                     PagesRequest::ExportBegin { pages: list, .. } => {
+                        if mode == "source-dies" {
+                            std::process::exit(9);
+                        }
+                        if mode == "source-hangs" {
+                            std::thread::sleep(std::time::Duration::from_secs(3600));
+                        }
+                        if mode == "source-refuses" {
+                            reply(
+                                &mut output,
+                                id,
+                                ResponseBody::Error {
+                                    code: ErrorCode::PagesNotAllowed,
+                                    message: "the document does not allow its pages to be copied"
+                                        .into(),
+                                },
+                            );
+                            continue;
+                        }
                         let asked = list.len() as u32;
                         reply(
                             &mut output,

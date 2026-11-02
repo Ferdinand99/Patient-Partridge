@@ -95,7 +95,13 @@ impl EngineClient {
                     snapshot,
                     count,
                     form_fields,
-                }) if usable_sizes(&pages) && count as usize <= partridge_protocol::MAX_PAGES => {
+                    // A document of no pages is never a result: the engine refuses to delete the
+                    // last page, and a document that reads back with none is not the one that was
+                    // open.
+                }) if !pages.is_empty()
+                    && usable_sizes(&pages)
+                    && count as usize <= partridge_protocol::MAX_PAGES =>
+                {
                     Ok(PagesChanged {
                         pages,
                         snapshot,
