@@ -75,6 +75,22 @@ pub fn enter_isolation() -> Result<(), String> {
     }
 }
 
+/// Linux: puts the process under Landlock where the kernel has it. Call it after
+/// [`enter_isolation`] and before any thread of the engine is started: Landlock holds for the
+/// thread that applies it and the threads started after that, not for a thread that already runs.
+/// An error says why it is not in force; the engine goes on, and [`lock_down`] does not name the
+/// layer. Elsewhere there is nothing to do.
+pub fn restrict_files() -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::restrict_files()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(())
+    }
+}
+
 /// Locks the process in. Call it once, after PDFium and everything else is loaded and before any
 /// byte of a document is read. On success every layer has been checked to work.
 pub fn lock_down() -> Result<Applied, String> {

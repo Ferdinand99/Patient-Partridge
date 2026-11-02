@@ -16,8 +16,7 @@ use partridge_fuzz::{
 };
 use partridge_protocol::{
     ErrorCode, FontScript, LinkTarget, OutlineItem, PageLink, PageSize, Request, RequestBody,
-    Response,
-    ResponseBody, TextMatch, MAX_FRAME_LEN, MAX_LINKS_PER_PAGE, MAX_MATCHES_PER_PAGE,
+    Response, ResponseBody, TextMatch, MAX_FRAME_LEN, MAX_LINKS_PER_PAGE, MAX_MATCHES_PER_PAGE,
     MAX_OUTLINE_DEPTH, MAX_OUTLINE_ITEMS, MAX_OUTLINE_TITLE, MAX_QUERY_LEN, MAX_SAVE_BYTES,
     MAX_SAVE_CHUNK, MAX_URI_LEN, PROTOCOL_VERSION,
 };
@@ -35,13 +34,7 @@ fn requests() -> Vec<(&'static str, Request)> {
                 },
             ),
         ),
-        (
-            "open",
-            b(
-                2,
-                RequestBody::Open { password: None },
-            ),
-        ),
+        ("open", b(2, RequestBody::Open { password: None })),
         (
             "open_password",
             b(
@@ -72,6 +65,16 @@ fn requests() -> Vec<(&'static str, Request)> {
         ),
         ("font_report", b(10, RequestBody::FontReport)),
         (
+            "signatures",
+            b(
+                11,
+                RequestBody::Signatures {
+                    doc: 1,
+                    now: 1_781_524_800,
+                },
+            ),
+        ),
+        (
             "search",
             b(
                 9,
@@ -98,6 +101,46 @@ fn requests() -> Vec<(&'static str, Request)> {
         ("save_end", b(13, RequestBody::SaveEnd { doc: 1 })),
         ("fingerprint", b(14, RequestBody::Fingerprint { doc: 1 })),
     ]
+}
+
+fn signature_report() -> partridge_protocol::SignatureReport {
+    use partridge_protocol::{
+        CertificateTime, SignatureInfo, SignatureReason, SignatureReport, SignatureState,
+    };
+    let item = |index: u32, reason: SignatureReason, signer: &str| SignatureInfo {
+        index,
+        state: reason.state(),
+        reason,
+        certificate_time: CertificateTime::Valid,
+        sub_filter: "adbe.pkcs7.detached".into(),
+        byte_range: vec![0, 100, 300, 50],
+        file_len: 350,
+        doc_mdp: 2,
+        certificates: 2,
+        signer: Some(signer.into()),
+        organisation: Some("Example Ltd".into()),
+        issuer: Some("Example CA".into()),
+        serial: Some("01ab".into()),
+        fingerprint: Some("ab".repeat(32)),
+        valid_from: Some("2026-01-31 12:00 UTC".into()),
+        valid_to: Some("2027-01-31 12:00 UTC".into()),
+        key: Some("ECDSA P-256".into()),
+        digest: Some("SHA-256".into()),
+        claimed_time: Some("2026-02-01 08:00:00 +01:00".into()),
+        stated_reason: Some("I approve".into()),
+        stated_location: Some("Oslo".into()),
+        trust_anchor: None,
+    };
+    let _ = SignatureState::Broken;
+    SignatureReport {
+        total: 2,
+        unlisted: 1,
+        trust_anchors: 0,
+        items: vec![
+            item(0, SignatureReason::NoTrustList, "Test Signer"),
+            item(1, SignatureReason::DataAfterSignature, "Second Signer"),
+        ],
+    }
 }
 
 fn responses() -> Vec<(&'static str, Response)> {
@@ -226,6 +269,15 @@ fn responses() -> Vec<(&'static str, Response)> {
             ),
         ),
         (
+            "signatures",
+            b(
+                13,
+                ResponseBody::Signatures {
+                    report: signature_report(),
+                },
+            ),
+        ),
+        (
             "error",
             b(
                 9,
@@ -248,7 +300,10 @@ fn responses() -> Vec<(&'static str, Response)> {
                 },
             ),
         ),
-        ("save_ready", b(11, ResponseBody::SaveReady { size: 70_000 })),
+        (
+            "save_ready",
+            b(11, ResponseBody::SaveReady { size: 70_000 }),
+        ),
         (
             "save_data",
             b(
@@ -260,7 +315,10 @@ fn responses() -> Vec<(&'static str, Response)> {
             ),
         ),
         ("save_ended", b(13, ResponseBody::SaveEnded)),
-        ("progress", b(15, ResponseBody::Progress { done: 1_048_576 })),
+        (
+            "progress",
+            b(15, ResponseBody::Progress { done: 1_048_576 }),
+        ),
         (
             "fingerprint",
             b(
@@ -456,7 +514,7 @@ fn main() {
     );
 
     // Round trips: one input per kind of message.
-    for kind in 0..14u8 {
+    for kind in 0..15u8 {
         write(
             &dir,
             "protocol_roundtrip_request",
@@ -464,7 +522,7 @@ fn main() {
             &generator_input(kind, kind as u32),
         );
     }
-    for kind in 0..16u8 {
+    for kind in 0..17u8 {
         write(
             &dir,
             "protocol_roundtrip_response",

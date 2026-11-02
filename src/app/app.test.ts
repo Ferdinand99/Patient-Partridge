@@ -2,6 +2,7 @@
 import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenedDocument, SavedFile, SavedPosition } from "../lib/api";
+import type { SignatureItem, SignaturesInfo } from "../lib/signatures";
 import { THEME_KEY } from "../lib/theme";
 import { App } from "./app";
 
@@ -110,6 +111,8 @@ function make(
     reopenTabs?: boolean;
     /** How long a tab of the last session may take to open at the start. */
     sessionOpenLimitMs?: number;
+    /** What the engine says about the signatures of every document; none is asked for without it. */
+    signatures?: SignaturesInfo;
   } = {},
 ) {
   let nextDoc = 1;
@@ -163,6 +166,9 @@ function make(
     ),
     quitApp: vi.fn(() => Promise.resolve()),
     stayOpen: vi.fn(() => Promise.resolve()),
+    ...(options.signatures
+      ? { getSignatures: vi.fn((_doc: number) => Promise.resolve(options.signatures as SignaturesInfo)) }
+      : {}),
   };
   const storage = options.storage ?? new MemoryStorage();
   const deps = {
@@ -176,6 +182,7 @@ function make(
     findDebounceMs: 5,
     linkAnswerDelayMs: options.realLinkDelay ? undefined : 0,
     sessionOpenLimitMs: options.sessionOpenLimitMs,
+    signaturesDelayMs: 0,
     viewLimits: options.viewLimits,
     print: {
       encode: vi.fn(() => Promise.resolve(new Blob(["jpeg"]))),
@@ -2843,5 +2850,165 @@ describe("App: a save that cannot replace the file", () => {
     await flush();
     expect(m.api.saveAs).not.toHaveBeenCalled();
     expect(m.app.unsavedCount).toBe(1);
+  });
+});
+describe("App: the verdict on a signature belongs to the bytes it was made from", () => {
+  const intact: SignatureItem = {
+    index: 0,
+    state: "unknown_signer",
+    reason: "no_trust_list",
+    certificateTime: "valid",
+    subFilter: "adbe.pkcs7.detached",
+    byteRange: [0, 100, 300, 50],
+    fileLen: 350,
+    docMdp: 0,
+    certificates: 1,
+    signer: "Test Signer",
+    organisation: null,
+    issuer: null,
+    serial: null,
+    fingerprint: null,
+    validFrom: null,
+    validTo: null,
+    key: null,
+    digest: null,
+    claimedTime: null,
+    statedReason: null,
+    statedLocation: null,
+    trustAnchor: null,
+  };
+  const signed: SignaturesInfo = { total: 1, unlisted: 0, trustAnchors: 0, items: [intact] };
+  const badge = () => q<HTMLButtonElement>("#signature-badge");
+  const INTACT = "Signature intact; signer not verified";
+  const STALE = "Not checked for this version";
+
+  async function openSigned(path = "/docs/signed.pdf") {
+    const m = make({ signatures: signed });
+    await m.app.openPath(path);
+    await flush();
+    expect(badge().textContent).toBe(INTACT);
+    return m;
+  }
+
+  it("drops the verdict when a copy is saved, and does not ask again", async () => {
+    const { api } = await openSigned();
+    key("S", { ctrlKey: true, shiftKey: true });
+    await flush();
+    // The tab now names the copy, and the copy is a file nobody has checked.
+    expect(tabTitles()).toEqual(["copy.pdf"]);
+    expect(badge().hidden).toBe(false);
+    expect(badge().textContent).toBe(STALE);
+    expect(badge().textContent).not.toContain("intact");
+    expect(badge().classList.contains("sig-stale")).toBe(true);
+    badge().click();
+    expect(q("#signature-panel").textContent).toContain("has not been checked");
+    expect(q("#signature-panel").textContent).toContain("close this tab and open the file again");
+    expect(q("#signature-panel").textContent).not.toContain("Signature intact");
+    // Nothing offers to check again (the engine would answer for the file it opened), and
+    // coming back to the tab asks nothing.
+    expect(q("#signature-panel").querySelector("button.btn:not(.btn-icon)")).toBeNull();
+    await new Promise((r) => setTimeout(r, 20));
+    expect((api as unknown as { getSignatures: ReturnType<typeof vi.fn> }).getSignatures).toHaveBeenCalledTimes(1);
+  });
+
+  it("drops the verdict when the document is saved in place", async () => {
+    const m = await openSigned();
+    m.app.recordEdit({ label: "Change", undo: () => undefined, redo: () => undefined });
+    // The change is in memory only; the verdict was about the file as it was opened.
+    expect(badge().textContent).toBe(STALE);
+    key("s", { ctrlKey: true });
+    await flush();
+    expect(m.api.save).toHaveBeenCalledTimes(1);
+    expect(badge().textContent).toBe(STALE);
+  });
+
+  it("drops the verdict as soon as the document changes in memory, before any save", async () => {
+    const m = await openSigned();
+    m.app.recordEdit({ label: "Change", undo: () => undefined, redo: () => undefined });
+    expect(badge().textContent).toBe(STALE);
+    // Undoing the change does not bring the verdict back: it was dropped for this tab.
+    key("z", { ctrlKey: true });
+    await flush();
+    expect(badge().textContent).toBe(STALE);
+  });
+
+  it("does not make a badge for a document that has no signatures", async () => {
+    const m = make({ signatures: { total: 0, unlisted: 0, trustAnchors: 0, items: [] } });
+    await m.app.openPath("/docs/plain.pdf");
+    await flush();
+    expect(badge().hidden).toBe(true);
+    key("S", { ctrlKey: true, shiftKey: true });
+    await flush();
+    expect(badge().hidden).toBe(true);
+  });
+
+  it("drops the verdict at once when the engine refuses to draw from a file that changed", async () => {
+    const m = make({ signatures: signed });
+    // The first page is drawn from other bytes than the ones that were checked: the engine says
+    // so, whatever the check had found before.
+    m.api.render.mockRejectedValue({ code: "source_changed", message: "the file has changed" });
+    await m.app.openPath("/docs/signed.pdf");
+    await flush();
+    expect(badge().hidden).toBe(false);
+    expect(badge().textContent).toBe(STALE);
+    expect(badge().textContent).not.toContain("intact");
+    badge().click();
+    const text = q("#signature-panel").textContent ?? "";
+    expect(text).toContain("The file on the disk has been changed");
+    expect(text).not.toContain("Signature intact");
+    expect(q("#signature-panel").querySelector("button.btn:not(.btn-icon)")).toBeNull();
+    // It stays dropped, and nothing asked the engine for a second verdict.
+    await new Promise((r) => setTimeout(r, 20));
+    expect((m.api as unknown as { getSignatures: ReturnType<typeof vi.fn> }).getSignatures).toHaveBeenCalledTimes(1);
+  });
+
+  it("drops the verdict when a read of the file failed after the check, and says the file may be unchanged", async () => {
+    const m = make({ signatures: signed });
+    // A page lost a part of what was signed to a read that failed: the file was not changed, and
+    // the page would have been shown under the badge of an intact signature.
+    m.api.render.mockRejectedValue({ code: "source_unreadable", message: "a part could not be read" });
+    await m.app.openPath("/docs/signed.pdf");
+    await flush();
+    expect(badge().textContent).toBe(STALE);
+    expect(badge().textContent).not.toContain("intact");
+    badge().click();
+    const text = q("#signature-panel").textContent ?? "";
+    expect(text).toContain("could not be read");
+    expect(text).toContain("missing content");
+    expect(text).not.toContain("has been changed");
+    expect(text).not.toContain("Signature intact");
+    expect(q("#signature-panel").querySelector("button.btn:not(.btn-icon)")).toBeNull();
+  });
+
+  it("drops the verdict of a tab whose file was replaced by a save in another tab", async () => {
+    const m = await openSigned("/docs/one.pdf");
+    await m.app.openPath("/docs/two.pdf");
+    await flush();
+    expect(badge().textContent).toBe(INTACT);
+    // The second tab saves a copy over the file the first one is open on (the app process says
+    // which documents were open on the file it replaced).
+    m.api.saveAs.mockResolvedValueOnce({ path: "/docs/target.pdf", name: "target.pdf", replaced: [1] });
+    key("S", { ctrlKey: true, shiftKey: true });
+    await flush();
+    tab("one.pdf").click();
+    await flush();
+    expect(badge().textContent).toBe(STALE);
+    badge().click();
+    expect(q("#signature-panel").textContent).toContain("The file on the disk has been changed");
+    expect(q("#signature-panel").textContent).not.toContain("Signature intact");
+  });
+
+  it("keeps the verdict of another tab", async () => {
+    const m = await openSigned("/docs/one.pdf");
+    await m.app.openPath("/docs/two.pdf");
+    await flush();
+    expect(badge().textContent).toBe(INTACT);
+    // Save a copy of the second tab only.
+    key("S", { ctrlKey: true, shiftKey: true });
+    await flush();
+    expect(badge().textContent).toBe(STALE);
+    tab("one.pdf").click();
+    await flush();
+    expect(badge().textContent).toBe(INTACT);
   });
 });

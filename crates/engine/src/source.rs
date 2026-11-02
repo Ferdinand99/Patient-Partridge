@@ -83,6 +83,8 @@ pub enum Problem {
     Unreadable,
     /// The file is not what it was when parts of it were read.
     Changed,
+    /// The look at the file was not done in time. This is no mark against the file.
+    TimedOut,
 }
 
 /// FNV-1a over 64 bits: not a defence against an attacker (the one who changes the file is a
@@ -130,10 +132,45 @@ impl SourceGuard {
         })
     }
 
+    /// The size of the file when the guard started to watch it.
+    pub fn file_len(&self) -> u64 {
+        self.len
+    }
+
     /// True when the time of change moved while parts of the file were unread: the bytes that were
     /// read are as they were, but the rest of the file cannot be said to be.
     pub fn touched(&self) -> bool {
         self.touched || self.late
+    }
+
+    /// True when the file is known not to be what it was: a block that was read twice had other
+    /// bytes the second time (the guard still handed those bytes to PDFium), or the size is not
+    /// the one it started with. Cheap: it reads no block. A change in a block nobody read is not
+    /// seen (see the module comment), so this being false does not say that the file is unchanged.
+    pub fn has_changed(&mut self) -> bool {
+        if self.changed {
+            return true;
+        }
+        if matches!(self.file.state(), Ok((len, _)) if len != self.len) {
+            self.changed = true;
+        }
+        self.changed
+    }
+
+    /// What is known to be wrong with the file without looking at it again: other bytes than the
+    /// first time or another size ([`Problem::Changed`], see [`SourceGuard::has_changed`]), or a
+    /// read for PDFium that failed ([`Problem::Unreadable`]). A failed read stays on record for
+    /// good: PDFium leaves out what it cannot read and goes on, and it may keep the hole in
+    /// memory, so a later read that works does not make what it parsed whole again. Reads
+    /// nothing.
+    pub fn known_problem(&mut self) -> Option<Problem> {
+        if self.has_changed() {
+            Some(Problem::Changed)
+        } else if self.failures > 0 {
+            Some(Problem::Unreadable)
+        } else {
+            None
+        }
     }
 
     /// How many reads failed so far.
@@ -204,6 +241,16 @@ impl SourceGuard {
     /// new try. `progress` is told how many blocks are read, about every
     /// MiB.
     pub fn verify(&mut self, progress: &mut dyn FnMut(u32)) -> Result<(), Problem> {
+        self.verify_until(None, progress)
+    }
+
+    /// As [`SourceGuard::verify`], but gives up with [`Problem::TimedOut`] when `deadline` passes
+    /// before every block was looked at. Nothing is marked against the file then.
+    pub fn verify_until(
+        &mut self,
+        deadline: Option<std::time::Instant>,
+        progress: &mut dyn FnMut(u32),
+    ) -> Result<(), Problem> {
         if self.failures > 0 {
             return Err(Problem::Unreadable);
         }
@@ -224,6 +271,9 @@ impl SourceGuard {
         known.sort_unstable();
         let mut data = vec![0u8; BLOCK as usize];
         for (count, (index, digest)) in known.into_iter().enumerate() {
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                return Err(Problem::TimedOut);
+            }
             if count as u64 % REPORT_BLOCKS == REPORT_BLOCKS - 1 {
                 progress(count as u32 + 1);
             }
@@ -283,6 +333,75 @@ impl SourceGuard {
             tail = window[window.len() - keep..].to_vec();
             if (block.len() as u64) < BLOCK {
                 return Ok(false);
+            }
+            index += 1;
+            if index.is_multiple_of(REPORT_BLOCKS) {
+                progress(index as u32);
+            }
+        }
+    }
+}
+
+impl SourceGuard {
+    /// Reads exactly `buf.len()` bytes at `pos`, for the engine's own checks of the file (the
+    /// signatures). Every block read is noted like any other. An error when the file ends first.
+    pub fn read_exact_at(&mut self, pos: u64, buf: &mut [u8]) -> io::Result<()> {
+        let mut done = 0;
+        while done < buf.len() {
+            let at = pos
+                .checked_add(done as u64)
+                .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
+            self.load(at / BLOCK, false)?;
+            let (_, block) = self.cache.as_ref().expect("just loaded");
+            let from = (at % BLOCK) as usize;
+            if from >= block.len() {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            let n = (block.len() - from).min(buf.len() - done);
+            buf[done..done + n].copy_from_slice(&block[from..from + n]);
+            done += n;
+        }
+        Ok(())
+    }
+
+    /// How many times `needle` is in the file (matches do not overlap). Reads the whole file.
+    /// `progress` is told how many blocks are read, about every MiB. When `deadline` passes before
+    /// the end of the file, the error is `TimedOut`.
+    pub fn count_occurrences(
+        &mut self,
+        needle: &[u8],
+        deadline: Option<std::time::Instant>,
+        progress: &mut dyn FnMut(u32),
+    ) -> io::Result<u32> {
+        if needle.is_empty() {
+            return Ok(0);
+        }
+        let mut tail: Vec<u8> = Vec::new();
+        let mut index = 0u64;
+        let mut count = 0u32;
+        loop {
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            self.load(index, false)?;
+            let (_, block) = self.cache.as_ref().expect("just loaded");
+            if block.is_empty() {
+                return Ok(count);
+            }
+            let mut window = std::mem::take(&mut tail);
+            window.extend_from_slice(block);
+            // The tail holds fewer bytes than the needle, so no match lies wholly inside it and
+            // none is counted twice.
+            let mut at = 0;
+            while let Some(found) = window[at..].windows(needle.len()).position(|w| w == needle) {
+                count = count.saturating_add(1);
+                at += found + needle.len();
+            }
+            let keep = (needle.len() - 1).min(window.len());
+            // Bytes of a match already counted do not start another one.
+            tail = window[(window.len() - keep).max(at)..].to_vec();
+            if (block.len() as u64) < BLOCK {
+                return Ok(count);
             }
             index += 1;
             if index.is_multiple_of(REPORT_BLOCKS) {
@@ -436,8 +555,86 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_look_at_the_file_that_runs_out_of_time_marks_nothing_against_it() {
+        let rig = rig(100_000);
+        let mut reader = GuardedReader::new(rig.guard.clone());
+        let mut buf = vec![0u8; 100_000];
+        reader.read_exact(&mut buf).unwrap();
+        let past = std::time::Instant::now();
+        assert_eq!(
+            lock(&rig.guard).verify_until(Some(past), &mut |_| {}),
+            Err(Problem::TimedOut)
+        );
+        // Not changed, not unreadable: the next look, with time, passes.
+        assert!(!lock(&rig.guard).has_changed());
+        assert_eq!(lock(&rig.guard).verify(&mut |_| {}), Ok(()));
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        assert_eq!(
+            lock(&rig.guard).verify_until(Some(later), &mut |_| {}),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_block_that_differs_the_second_time_is_known_as_changed_without_a_new_look() {
+        let rig = rig(100_000);
+        let mut reader = GuardedReader::new(rig.guard.clone());
+        let mut buf = [0u8; 10];
+        reader.read_exact(&mut buf).unwrap();
+        assert!(!lock(&rig.guard).has_changed());
+        // The guard's own look clears the block it holds, so the next read comes from the file.
+        assert_eq!(lock(&rig.guard).verify(&mut |_| {}), Ok(()));
+        rig.data.lock().unwrap()[3] ^= 0xff;
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        reader.read_exact(&mut buf).unwrap();
+        // PDFium got the new bytes, and the guard says so at once, reading nothing more.
+        assert!(lock(&rig.guard).has_changed());
+
+        // A file that grew is known the same way.
+        let grown = rig_len_changed();
+        assert!(lock(&grown).has_changed());
+    }
+
+    fn rig_len_changed() -> Arc<Mutex<SourceGuard>> {
+        let rig = rig(100_000);
+        rig.data.lock().unwrap().push(1);
+        rig.guard
+    }
+
     fn later(secs: u64) -> Option<SystemTime> {
         Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+    }
+
+    #[test]
+    fn a_failed_read_is_a_known_problem_without_a_new_look_and_stays_one() {
+        let rig = rig(100_000);
+        let mut reader = GuardedReader::new(rig.guard.clone());
+        let mut buf = [0u8; 10];
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(lock(&rig.guard).known_problem(), None);
+        rig.broken.store(true, Ordering::SeqCst);
+        reader.seek(SeekFrom::Start(60_000)).unwrap();
+        assert!(reader.read(&mut buf).is_err());
+        assert_eq!(lock(&rig.guard).known_problem(), Some(Problem::Unreadable));
+        // The share comes back: what PDFium parsed may have a hole, so the problem stays.
+        rig.broken.store(false, Ordering::SeqCst);
+        reader.seek(SeekFrom::Start(60_000)).unwrap();
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(lock(&rig.guard).known_problem(), Some(Problem::Unreadable));
+        // Other bytes are the stronger fact, and come first.
+        rig.data.lock().unwrap().push(1);
+        assert_eq!(lock(&rig.guard).known_problem(), Some(Problem::Changed));
+    }
+
+    #[test]
+    fn a_read_of_the_guards_own_that_failed_is_not_a_known_problem() {
+        let rig = rig(100_000);
+        rig.broken.store(true, Ordering::SeqCst);
+        assert!(lock(&rig.guard)
+            .contains_any(&[b"/ByteRange"], &mut |_| {})
+            .is_err());
+        assert_eq!(lock(&rig.guard).known_problem(), None);
     }
 
     #[test]

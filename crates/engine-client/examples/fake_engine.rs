@@ -15,6 +15,11 @@
 //! - `save-signed`: like `save-good`, but the document holds two signatures.
 //! - `save-touched`: like `save-good`, but the description says the file was touched while parts of
 //!   it were unread.
+//! - `sig-good`, `sig-trusted-no-list`, `sig-trusted-no-name`, `sig-no-list-with-list`,
+//!   `sig-wrong-order`, `sig-count`: answer `Signatures` with a report that is fine, or with one that
+//!   cannot be true (a trusted signature without a trust list or without the name of the
+//!   certificate it leads to, "no trust list" with a list, signatures out of order, more
+//!   signatures than the total).
 //! - `save-short`, `save-wrong-offset`, `save-big`, `save-error`, `save-lies`: like `save-good`
 //!   but a piece is a byte too short, a piece comes from the wrong offset, a piece is a 10 MiB
 //!   frame, the save fails with an error, or the end of the file is missing (the last piece is
@@ -27,8 +32,9 @@ use std::io::{self, BufReader, BufWriter};
 use std::path::Path;
 
 use partridge_protocol::{
-    read_frame, write_frame, write_response, ErrorCode, PageSize, Request, RequestBody, Response,
-    ResponseBody, PROTOCOL_VERSION,
+    read_frame, write_frame, write_response, CertificateTime, ErrorCode, PageSize, Request,
+    RequestBody, Response, ResponseBody, SignatureInfo, SignatureReason, SignatureReport,
+    SignatureState, PROTOCOL_VERSION,
 };
 
 /// The size of the file the stand-in saves.
@@ -280,6 +286,69 @@ fn main() {
                 }
             }
             RequestBody::SaveEnd { .. } => reply(&mut output, id, ResponseBody::SaveEnded),
+            RequestBody::Signatures { .. } => {
+                let item = |index: u32, state, reason, anchor: Option<&str>| SignatureInfo {
+                    index,
+                    state,
+                    reason,
+                    certificate_time: CertificateTime::Valid,
+                    sub_filter: "adbe.pkcs7.detached".into(),
+                    byte_range: vec![0, 10, 20, 30],
+                    file_len: 50,
+                    doc_mdp: 0,
+                    certificates: 1,
+                    signer: Some("Test Signer".into()),
+                    organisation: None,
+                    issuer: None,
+                    serial: None,
+                    fingerprint: None,
+                    valid_from: None,
+                    valid_to: None,
+                    key: None,
+                    digest: None,
+                    claimed_time: None,
+                    stated_reason: None,
+                    stated_location: None,
+                    trust_anchor: anchor.map(str::to_string),
+                };
+                let unknown = |index| {
+                    item(
+                        index,
+                        SignatureState::UnknownSigner,
+                        SignatureReason::NoTrustList,
+                        None,
+                    )
+                };
+                let trusted = |index, anchor| {
+                    item(
+                        index,
+                        SignatureState::Trusted,
+                        SignatureReason::Verified,
+                        anchor,
+                    )
+                };
+                let (total, anchors, items) = match mode.as_str() {
+                    "sig-trusted-no-list" => (1, 0, vec![trusted(0, Some("Root"))]),
+                    "sig-trusted-no-name" => (1, 1, vec![trusted(0, None)]),
+                    "sig-no-list-with-list" => (1, 1, vec![unknown(0)]),
+                    "sig-wrong-order" => (2, 0, vec![unknown(1), unknown(0)]),
+                    "sig-count" => (1, 0, vec![unknown(0), unknown(1)]),
+                    "sig-good" => (2, 0, vec![unknown(0), unknown(1)]),
+                    _ => (0, 0, vec![]),
+                };
+                reply(
+                    &mut output,
+                    id,
+                    ResponseBody::Signatures {
+                        report: SignatureReport {
+                            total,
+                            unlisted: 0,
+                            trust_anchors: anchors,
+                            items,
+                        },
+                    },
+                );
+            }
             RequestBody::Fingerprint { .. } => reply(
                 &mut output,
                 id,

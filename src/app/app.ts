@@ -3,6 +3,7 @@
 // storage) comes in through `AppDeps`, so tests can run the whole flow with fakes.
 
 import type { OpenedDocument, OutlineEntry, SavedFile, SavedPosition } from "../lib/api";
+import type { SignaturesInfo, StaleReason } from "../lib/signatures";
 import { describeError, fileNameOf, isEngineLost, toAppError, type AppErrorLike } from "../lib/errors";
 import { classifyUri, visibleAddress } from "../lib/linkPolicy";
 import { parsePageInput } from "../lib/pageInput";
@@ -31,6 +32,7 @@ import {
   type PrintDeps,
 } from "./print";
 import { showNotice } from "./notice";
+import { SignaturePanel } from "./signatures";
 import { Sidebar, type SidebarDocument } from "./sidebar";
 import { TabStrip } from "./tabs";
 
@@ -47,6 +49,8 @@ export interface AppDeps {
     getOutline(doc: number): Promise<OutlineEntry[]>;
     getPageText(doc: number, page: number): Promise<{ text: string; rects: number[] }>;
     getPageLinks(doc: number, page: number): Promise<PageLinkInfo[]>;
+    /** The digital signatures of a document, checked by its engine. */
+    getSignatures?(doc: number): Promise<SignaturesInfo>;
     searchPage(doc: number, page: number, query: string): Promise<[number, number][]>;
     openLink(doc: number, url: string): Promise<void>;
     /** The scripts the engine of a document had no font for when PDFium asked. */
@@ -83,6 +87,8 @@ export interface AppDeps {
    * SESSION_OPEN_LIMIT_MS.
    */
   sessionOpenLimitMs?: number;
+  /** How long after a document is shown its signatures are asked for, in milliseconds. Default: 1200. */
+  signaturesDelayMs?: number;
   /** Limits on the text kept for each document. For tests; the defaults are meant for the app. */
   viewLimits?: ViewerOptions["limits"];
 }
@@ -176,6 +182,33 @@ function byId<T extends HTMLElement>(root: Document, id: string): T {
   return el as T;
 }
 
+/**
+ * The commands of the app process, with every read from the file behind a document watched. When
+ * the engine refuses one because the file now has other bytes than the ones it was checked on
+ * (`source_changed`), or because a read of the file failed after the check, so that a page may have
+ * lost content (`source_unreadable`), `told` hears which document it was and why, and the error
+ * goes on to the caller as it would have without this.
+ */
+function watchReads(api: AppDeps["api"], told: (doc: number, why: StaleReason) => void): AppDeps["api"] {
+  const watch = <T>(call: Promise<T>, doc: number): Promise<T> =>
+    call.catch((error: unknown) => {
+      const code = toAppError(error).code;
+      if (code === "source_changed") told(doc, "file_changed");
+      else if (code === "source_unreadable") told(doc, "read_failed");
+      throw error;
+    });
+  const watched = {
+    render: (doc: number, page: number, width: number, height: number) =>
+      watch(api.render(doc, page, width, height), doc),
+    getOutline: (doc: number) => watch(api.getOutline(doc), doc),
+    getPageText: (doc: number, page: number) => watch(api.getPageText(doc, page), doc),
+    getPageLinks: (doc: number, page: number) => watch(api.getPageLinks(doc, page), doc),
+    searchPage: (doc: number, page: number, query: string) => watch(api.searchPage(doc, page, query), doc),
+  };
+  // Everything else is the original, looked up when it is called.
+  return Object.assign(Object.create(api) as AppDeps["api"], watched);
+}
+
 export class App {
   private tabs: Tab[] = [];
   private activeId: number | null = null;
@@ -210,6 +243,9 @@ export class App {
   private readonly menu: MenuController;
   private readonly sidebar: Sidebar;
   private readonly find: FindBar;
+  private readonly signatures: SignaturePanel;
+  /** The commands of the app process, with the reads of a document watched (see `watchReads`). */
+  private readonly api: AppDeps["api"];
   private readonly selectionProxy: HTMLElement;
   private readonly copyStatus: HTMLElement;
   /** The line of each running copy (copies of different tabs can run together) shows in one place. */
@@ -235,6 +271,7 @@ export class App {
     this.zoomIn = byId(root, "zoom-in");
     this.zoomOut = byId(root, "zoom-out");
     this.positionDelay = deps.positionDelayMs ?? DEFAULT_POSITION_DELAY_MS;
+    this.api = watchReads(deps.api, (doc, why) => this.sourceChanged(doc, why));
     this.tabStrip = new TabStrip(byId(root, "tabs"), {
       select: (id) => this.activate(id),
       close: (id) => void this.requestClose(id),
@@ -244,7 +281,7 @@ export class App {
     this.copyStatus = byId(root, "copy-status");
     this.printRoot = byId(root, "print-root");
     this.find = new FindBar(root, {
-      searchPage: (doc, page, query) => deps.api.searchPage(doc, page, query),
+      searchPage: (doc, page, query) => this.api.searchPage(doc, page, query),
       onEngineLost: (target, error) => {
         const lost = this.tabs.find((t) => t.view === target.view);
         if (lost) void this.documentLost(lost, error);
@@ -252,10 +289,11 @@ export class App {
       debounceMs: deps.findDebounceMs,
     });
     this.sidebar = new Sidebar(root, {
-      api: deps.api,
+      api: this.api,
       storage: deps.storage ?? null,
       thumbs: deps.thumbSettleMs === undefined ? undefined : { settleMs: deps.thumbSettleMs },
     });
+    this.signatures = new SignaturePanel(root, { api: deps.api, delayMs: deps.signaturesDelayMs });
   }
 
   init(): void {
@@ -653,7 +691,7 @@ export class App {
     };
     tab.view = new DocumentView(
       { doc: opened.doc, pages: opened.pages },
-      this.deps.api,
+      this.api,
       {
         onPageChange: (page) => {
           if (this.active !== tab) return;
@@ -903,6 +941,7 @@ export class App {
     this.find.forget(tab.view);
     tab.view.destroy();
     this.sidebar.forget(tab.doc);
+    this.signatures.forget(tab.doc);
     void this.deps.api.close(tab.doc).catch(() => undefined);
     if (this.activeId === id) {
       this.activeId = null;
@@ -929,11 +968,23 @@ export class App {
     if (answer.button === "retry") await this.openPath(tab.path);
   }
 
+  /**
+   * The engine of a document found that the file it reads from has other bytes than the ones the
+   * signatures were checked on, or that a read of it failed, and refused to draw or read from it.
+   * What was found is dropped at once, whatever the tab shows.
+   */
+  private sourceChanged(doc: number, why: StaleReason): void {
+    if (this.tabs.some((t) => t.doc === doc)) this.signatures.invalidate(doc, why);
+  }
+
   // ---- changes that are not saved ---------------------------------------------
 
   /** The history of a tab changed: tell the app process if the document turned dirty or clean. */
   private historyChanged(tab: Tab): void {
     if (!this.tabs.includes(tab)) return;
+    // Any change of the document (an edit, an undo, a save) means the tab no longer holds the
+    // file whose signatures were checked.
+    this.signatures.invalidate(tab.doc);
     const dirty = tab.history.dirty;
     if (dirty !== tab.dirtyTold) {
       tab.dirtyTold = dirty;
@@ -1001,6 +1052,13 @@ export class App {
     const began = tab.history.revision;
     const saved = asCopy ? await this.runSaveAs(tab, false) : await this.runSave(tab);
     if (!saved) return false;
+    // The file that was written is not the one the signatures were checked on, whatever the tab
+    // shows from now on. This comes before anything else is done with the tab.
+    this.signatures.invalidate(tab.doc);
+    // So is the verdict of any other tab that was open on the file this save replaced.
+    for (const other of saved.replaced ?? []) {
+      if (other !== tab.doc && this.tabs.some((t) => t.doc === other)) this.signatures.invalidate(other, "file_changed");
+    }
     tab.history.markSaved(began);
     if (saved.path !== tab.path || saved.name !== tab.name) {
       tab.path = saved.path;
@@ -1337,6 +1395,7 @@ export class App {
     this.empty.hidden = this.tabs.length > 0;
     this.setControlsEnabled(active !== null);
     this.sidebar.setDocument(active?.sidebarDoc ?? null);
+    this.signatures.setDocument(active?.doc ?? null);
     this.find.setTarget(active ? { doc: active.doc, view: active.view } : null);
     this.selectionProxy.textContent = "";
     if (!active) {
@@ -1530,7 +1589,7 @@ export class App {
       });
       if (!choice || choice.pages.length === 0) return;
       const job = (this.printJob ??= new PrintJob(this.printRoot, {
-        render: (doc, page, width, height) => this.deps.api.render(doc, page, width, height),
+        render: (doc, page, width, height) => this.api.render(doc, page, width, height),
         encode: this.deps.print?.encode ?? encodeJpeg,
         createUrl: this.deps.print?.createUrl ?? ((blob) => URL.createObjectURL(blob)),
         revokeUrl: this.deps.print?.revokeUrl ?? ((url) => URL.revokeObjectURL(url)),

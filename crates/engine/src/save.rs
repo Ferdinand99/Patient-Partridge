@@ -133,6 +133,11 @@ pub fn source_failure(problem: Problem) -> Failure {
             ErrorCode::SourceUnreadable,
             "a part of the file this document is read from could not be read".to_string(),
         ),
+        Problem::TimedOut => (
+            ErrorCode::Internal,
+            "looking at the file this document is read from took longer than its time limit"
+                .to_string(),
+        ),
     }
 }
 

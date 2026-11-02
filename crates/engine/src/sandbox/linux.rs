@@ -8,6 +8,12 @@
 //! Landlock adds a second wall for the file system (no read, write, execute or create anywhere) and
 //! on newer kernels for TCP and for signals and abstract sockets. It is only a second layer: a
 //! kernel without it still has the seccomp filter, which already refuses to open any file.
+//!
+//! Landlock holds for the thread that applies it and the threads that thread starts afterwards,
+//! and for no thread that already runs. So it is applied (`restrict_files`) while the process has
+//! one thread, before the threads of the engine are started, and the seccomp filter, which is put
+//! on every thread at once, comes last. The greeting names Landlock only when it holds for every
+//! thread.
 
 use std::mem::size_of;
 
@@ -528,9 +534,66 @@ pub fn enter_empty_root() -> Result<(), String> {
     Ok(())
 }
 
+/// Set once [`restrict_files`] was called, so that [`lock_down`] does not do it a second time.
+static LANDLOCK_TRIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True when Landlock is in force for every thread of the process: it was applied while the
+/// process had one thread, so each thread started after it has it too.
+static LANDLOCK_ON_ALL_THREADS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// True when the process runs one thread only. In an empty root the answer is known without a look
+/// (a process with more than one thread cannot get one, and nothing has started a thread since);
+/// otherwise the threads are counted. When that cannot be done the answer is no.
+fn single_threaded() -> bool {
+    if EMPTY_ROOT.load(std::sync::atomic::Ordering::SeqCst) {
+        return true;
+    }
+    std::fs::read_dir("/proc/self/task").is_ok_and(|tasks| tasks.count() == 1)
+}
+
+/// Puts the process under Landlock where the kernel has it (no file system access at all, no TCP,
+/// no signals or abstract sockets to other domains). Call it while the process runs one thread, so
+/// that every thread it starts later is under it too: `landlock_restrict_self` acts on the calling
+/// thread and on the threads that thread starts afterwards, and on no other thread that already
+/// runs (the seccomp filter has `TSYNC` for that; Landlock has no such flag). So this comes before
+/// the threads of the engine are started, and after [`enter_empty_root`], because a process under
+/// Landlock may not change its mounts. Starting a thread needs no file access.
+///
+/// The layer is reported (see [`lock_down`]) only when it is in force for every thread: when the
+/// process already ran more than one thread, Landlock is still applied (to this thread and the
+/// ones started later), and it is not reported.
+pub fn restrict_files() -> Result<(), String> {
+    LANDLOCK_TRIED.store(true, std::sync::atomic::Ordering::SeqCst);
+    // Core files could hold pages of the document; and nobody should attach to the engine. Landlock
+    // needs no_new_privs, and the capabilities are gone after the empty root.
+    // SAFETY: plain call.
+    unsafe {
+        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+            return Err(errno_text("no_new_privs"));
+        }
+    }
+    #[cfg(debug_assertions)]
+    {
+        if std::env::var_os("PARTRIDGE_TEST_NO_LANDLOCK").is_some() {
+            return Err("switched off by a test".to_string());
+        }
+    }
+    let alone = single_threaded();
+    apply_landlock()?;
+    LANDLOCK_ON_ALL_THREADS.store(alone, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
+}
+
 /// Locks the process in and checks that it worked. Returns the layers that are in force.
 pub fn lock_down() -> Result<Vec<&'static str>, String> {
     let mut layers = Vec::new();
+    // Landlock is normally in force already (see `restrict_files`). Where nobody asked for it yet
+    // it is applied now, and then it cannot be in force for every thread.
+    if !LANDLOCK_TRIED.load(std::sync::atomic::Ordering::SeqCst) {
+        let _ = restrict_files();
+    }
     // Core files could hold pages of the document; and nobody should attach to the engine.
     // SAFETY: plain call.
     unsafe {
@@ -539,15 +602,8 @@ pub fn lock_down() -> Result<Vec<&'static str>, String> {
             return Err(errno_text("no_new_privs"));
         }
     }
-    // Landlock first, while the system calls it needs are still allowed.
-    #[cfg(debug_assertions)]
-    let try_landlock = std::env::var_os("PARTRIDGE_TEST_NO_LANDLOCK").is_none();
-    #[cfg(not(debug_assertions))]
-    let try_landlock = true;
-    if try_landlock {
-        if let Ok(name) = apply_landlock() {
-            layers.push(name);
-        }
+    if LANDLOCK_ON_ALL_THREADS.load(std::sync::atomic::Ordering::SeqCst) {
+        layers.push("landlock");
     }
     apply_seccomp()?;
     layers.insert(0, "seccomp");
