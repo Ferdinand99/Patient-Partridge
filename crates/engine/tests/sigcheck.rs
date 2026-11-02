@@ -343,12 +343,30 @@ fn malformed_signed_attributes_do_not_hold() {
             },
             R::AttributesInvalid,
         ),
+        // Two digests that disagree, the right one last in the set: a reader that takes the last
+        // one would call this intact.
         (
             CmsOptions {
-                twice_digest: true,
+                digest_conflict: true,
                 ..CmsOptions::default()
             },
-            R::Unreadable,
+            R::AttributesInvalid,
+        ),
+        // A content type that is not id-data.
+        (
+            CmsOptions {
+                content_type_value: Some("1.2.840.113549.1.7.2".into()),
+                ..CmsOptions::default()
+            },
+            R::AttributesInvalid,
+        ),
+        // The binding to the certificate with two values, the right one first.
+        (
+            CmsOptions {
+                binding_two_values: true,
+                ..CmsOptions::default()
+            },
+            R::CertificateMismatch,
         ),
         (
             CmsOptions {
@@ -1118,4 +1136,310 @@ fn text_from_the_file_is_plain_and_cut() {
     let signer = p256("Mallory");
     let info = run(&sign(&signer, &spoof), &spoof);
     assert_eq!(info.signer.as_deref(), Some("Mallory"));
+}
+
+#[test]
+fn attributes_written_in_another_order_than_the_one_signed_are_not_checked() {
+    // The signature is over the attributes in the order DER wants; the file has them in the
+    // reverse order. Both are the same set, and the signature holds for the first. A reader that
+    // does not look at what was written would call this intact; this one does not check it.
+    let signer = p256("Test Signer");
+    let options = SignOptions {
+        cms: CmsOptions {
+            attributes_out_of_order: true,
+            ..CmsOptions::default()
+        },
+        ..SignOptions::default()
+    };
+    expect(
+        &run(&sign(&signer, &options), &options),
+        S::Unsupported,
+        R::EncodingUnsupported,
+    );
+}
+
+#[test]
+fn a_structure_the_parser_refuses_is_not_checked_and_not_called_broken() {
+    // None of these is a signature that was shown to be false: the reader could not read it.
+    let signer = p256("Test Signer");
+    for (what, cms, reason) in [
+        // The same attribute twice, equal: a set may not hold the same element twice.
+        (
+            "the same attribute twice",
+            CmsOptions {
+                twice_digest: true,
+                ..CmsOptions::default()
+            },
+            R::Unreadable,
+        ),
+        // The signer's certificate twice in the set of certificates, as some signers write it.
+        (
+            "a certificate twice",
+            CmsOptions {
+                extra_certs: vec![signer.cert.clone()],
+                ..CmsOptions::default()
+            },
+            R::Unreadable,
+        ),
+        // A length in the indefinite form below a definite outer element (BER).
+        (
+            "BER below the outer element",
+            CmsOptions {
+                indefinite_inner: true,
+                ..CmsOptions::default()
+            },
+            R::EncodingUnsupported,
+        ),
+        (
+            "BER outer element",
+            CmsOptions {
+                indefinite: true,
+                ..CmsOptions::default()
+            },
+            R::EncodingUnsupported,
+        ),
+    ] {
+        let options = SignOptions {
+            cms,
+            ..SignOptions::default()
+        };
+        let info = run(&sign(&signer, &options), &options);
+        assert_eq!(
+            (info.state, info.reason),
+            (S::Unsupported, reason),
+            "{what}: {:?}/{:?}",
+            info.state,
+            info.reason
+        );
+    }
+}
+
+#[test]
+fn what_the_reader_proved_false_stays_broken() {
+    // The other side of the test above: a signature that was read and found false, a byte range
+    // that does not hold and a digest that does not match are not softened.
+    let signer = p256("Test Signer");
+    let damaged = SignOptions {
+        cms: CmsOptions {
+            damage_signature: true,
+            ..CmsOptions::default()
+        },
+        ..SignOptions::default()
+    };
+    expect(
+        &run(&sign(&signer, &damaged), &damaged),
+        S::Broken,
+        R::SignatureInvalid,
+    );
+    let options = SignOptions::default();
+    let file = sign(&signer, &options);
+    assert_eq!(ranged(&file, &options, [0, 10, 20, 30]).state, S::Broken);
+    let changed = SignOptions {
+        cms: CmsOptions {
+            digest_override: Some(Hash::Sha256.of(b"other")),
+            ..CmsOptions::default()
+        },
+        ..SignOptions::default()
+    };
+    expect(
+        &run(&sign(&signer, &changed), &changed),
+        S::Changed,
+        R::ContentChanged,
+    );
+}
+
+// ---- hostile structures --------------------------------------------------------------------------
+
+/// A file whose signature is a hostile set of `count` elements.
+fn hostile_file(set: HostileSet, count: usize) -> (SignedFile, SignOptions) {
+    let signer = p256("Hostile");
+    let options = SignOptions {
+        contents_size: 1024 * 1024 - 64,
+        ..SignOptions::default()
+    };
+    let mut file = sign(&signer, &options);
+    replace_signature(&mut file, &hostile_set_signature(set, count));
+    (file, options)
+}
+
+#[test]
+fn a_set_of_very_many_elements_is_refused_at_once() {
+    // The `der` crate sorts a set with an insertion sort: some tens of thousands of elements in
+    // reverse order took over a minute, and 200,000 in a megabyte took minutes. The reader looks
+    // at the shape first and does not decode such a signature.
+    for set in [HostileSet::Values, HostileSet::Attributes] {
+        for count in [257usize, 30_000] {
+            let (file, options) = hostile_file(set, count);
+            let started = std::time::Instant::now();
+            let info = run(&file, &options);
+            let took = started.elapsed();
+            assert_eq!(
+                (info.state, info.reason),
+                (S::Unsupported, R::TooLarge),
+                "{set:?} {count}"
+            );
+            assert!(
+                took < std::time::Duration::from_secs(5),
+                "{set:?} {count}: {took:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_set_within_the_limit_is_still_read() {
+    // 256 elements are allowed; the structure is then read and judged like any other, here as a
+    // signature that does not hold together.
+    let (file, options) = hostile_file(HostileSet::Values, 256);
+    let info = run(&file, &options);
+    assert_ne!(info.reason, R::TooLarge);
+    assert!(!matches!(info.state, S::Trusted | S::UnknownSigner));
+}
+
+#[test]
+fn the_time_for_the_check_is_kept() {
+    // When the time is up before the file is hashed, the signature is not checked to the end, and
+    // that is told as such: not as intact, and not as broken.
+    let signer = p256("Test Signer");
+    let options = SignOptions::default();
+    let file = sign(&signer, &options);
+    let raw = raw_of(&file, &options);
+    let trust = TrustList::empty();
+    let mut progress = |_: u32| {};
+    let mut work = Work::new(HASH_BUDGET, &mut progress).with_deadline(std::time::Instant::now());
+    let mut source: &[u8] = &file.bytes;
+    let info = check(
+        0,
+        &raw,
+        &mut source,
+        file.bytes.len() as u64,
+        &Settings {
+            trust: &trust,
+            now: NOW,
+        },
+        &mut work,
+    )
+    .unwrap();
+    expect(&info, S::Unsupported, R::TooLarge);
+}
+
+// ---- the chain -----------------------------------------------------------------------------------
+
+/// Root, intermediate (issued by the root) and a leaf (issued by the intermediate).
+fn chain_with(root_spec: CertSpec, inter_spec: CertSpec) -> (Identity, Identity, Identity) {
+    let root = Identity::self_signed(KeyKind::P256, &root_spec);
+    let inter = Identity::issued_by(&root, KeyKind::P256, &inter_spec);
+    let leaf = Identity::issued_by(
+        &inter,
+        KeyKind::P256,
+        &CertSpec {
+            serial: 3,
+            ..CertSpec::new("Leaf Signer")
+        },
+    );
+    (root, inter, leaf)
+}
+
+fn run_chain(leaf: &Identity, carried: &[&Identity], trust: &TrustList) -> SignatureInfo {
+    let options = SignOptions {
+        cms: CmsOptions {
+            extra_certs: carried.iter().map(|i| i.cert.clone()).collect(),
+            ..CmsOptions::default()
+        },
+        ..SignOptions::default()
+    };
+    let file = sign(leaf, &options);
+    run_at(&file.bytes, &raw_of(&file, &options), trust, NOW)
+}
+
+#[test]
+fn an_intermediate_that_did_not_sign_the_leaf_leads_nowhere() {
+    // The leaf names the intermediate as its issuer, with the right name, but it was signed by
+    // another key. Taking the name for the proof would make a stranger a signer of the list.
+    let root = Identity::self_signed(KeyKind::P256, &CertSpec::ca("Root CA"));
+    let inter = Identity::issued_by(
+        &root,
+        KeyKind::P256,
+        &CertSpec {
+            serial: 2,
+            ..CertSpec::ca("Intermediate CA")
+        },
+    );
+    let rogue = Identity::self_signed(KeyKind::P256, &CertSpec::ca("Intermediate CA"));
+    let leaf = Identity::issued_by(
+        &rogue,
+        KeyKind::P256,
+        &CertSpec {
+            serial: 3,
+            ..CertSpec::new("Leaf Signer")
+        },
+    );
+    let info = run_chain(&leaf, &[&inter], &trust_of(&[&root]));
+    expect(&info, S::UnknownSigner, R::NotInTrustList);
+    // The same chain with the real intermediate does lead to the root.
+    let (root, inter, leaf) = chain_with(
+        CertSpec::ca("Root CA"),
+        CertSpec {
+            serial: 2,
+            ..CertSpec::ca("Intermediate CA")
+        },
+    );
+    expect(
+        &run_chain(&leaf, &[&inter], &trust_of(&[&root])),
+        S::Trusted,
+        R::Verified,
+    );
+}
+
+#[test]
+fn every_certificate_of_the_chain_is_judged_by_the_clock() {
+    // 2020-01-01, 2023-11-14 (before NOW) and 2033-05-18 (after NOW).
+    let (long_ago, expired, far_off) = (1_577_836_800, 1_700_000_000, 2_000_000_000);
+    // An intermediate that has expired.
+    let (root, inter, leaf) = chain_with(
+        CertSpec::ca("Root CA"),
+        CertSpec {
+            serial: 2,
+            not_before: long_ago,
+            not_after: expired,
+            ..CertSpec::ca("Intermediate CA")
+        },
+    );
+    let info = run_chain(&leaf, &[&inter], &trust_of(&[&root]));
+    expect(&info, S::UnknownSigner, R::CertificateExpired);
+    // The signer's own certificate is fine, and says so.
+    assert_eq!(info.certificate_time, CertificateTime::Valid);
+
+    // An intermediate that is not valid yet.
+    let (root, inter, leaf) = chain_with(
+        CertSpec::ca("Root CA"),
+        CertSpec {
+            serial: 2,
+            not_before: far_off,
+            ..CertSpec::ca("Intermediate CA")
+        },
+    );
+    expect(
+        &run_chain(&leaf, &[&inter], &trust_of(&[&root])),
+        S::UnknownSigner,
+        R::CertificateNotYetValid,
+    );
+
+    // A root on the list that has expired.
+    let (root, inter, leaf) = chain_with(
+        CertSpec {
+            not_before: long_ago,
+            not_after: expired,
+            ..CertSpec::ca("Root CA")
+        },
+        CertSpec {
+            serial: 2,
+            ..CertSpec::ca("Intermediate CA")
+        },
+    );
+    expect(
+        &run_chain(&leaf, &[&inter], &trust_of(&[&root])),
+        S::UnknownSigner,
+        R::CertificateExpired,
+    );
 }

@@ -10,8 +10,13 @@
 //!
 //! What the module promises:
 //! - [`parse`] reads exactly one DER encoded `SignedData` with one signer. Anything else is
-//!   refused with a reason. A signature with another encoding (BER with indefinite lengths) is
-//!   *unsupported*, never guessed at.
+//!   refused with a reason. A signature with another encoding (BER with indefinite lengths), one
+//!   that the parser refuses for any other reason, and one that is bigger or more tangled than the
+//!   limits below are *unsupported* ("not checked"), never guessed at and never called broken: the
+//!   reader stopped reading, it did not find the signature false.
+//! - Before the `der` crate sees a byte, [`check_shape`] walks the structure with limits on depth
+//!   and on the number of elements in a set. The crate sorts every set it decodes with an insertion
+//!   sort, so a set of some hundred thousand elements in a megabyte would take minutes.
 //! - [`Cms::verify`] checks the signature over the signed attributes with the key of the signer's
 //!   certificate, and the attributes themselves (content type, one message digest, the binding to
 //!   the signer's certificate when the signer wrote it). It does not look at the file.
@@ -62,6 +67,19 @@ const MAX_CERTIFICATES: usize = 64;
 
 /// Longest chain built from signer to trust list, the signer's certificate included.
 const MAX_CHAIN: usize = 8;
+
+/// Deepest nesting of constructed elements in a signature. A signature with certificates and
+/// revocation data is about a dozen deep.
+const MAX_DEPTH: usize = 32;
+
+/// Most elements in one set (a SET, or a context tag that may stand for one). The `der` crate sorts
+/// them with an insertion sort. A real signature has a handful; a bundle of certificates some tens.
+const MAX_SET_ELEMENTS: usize = 256;
+
+/// Most work the sorts of all sets of one signature may add up to: the sum, over all sets, of the
+/// number of elements added so far for every element read. About a million comparisons, which take
+/// a few milliseconds.
+const MAX_SET_WORK: u64 = 1 << 20;
 
 /// The digest algorithms that are checked. SHA-1 is known and refused: collisions are practical.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,12 +257,75 @@ fn tlv(data: &[u8]) -> Option<(u8, &[u8], &[u8])> {
     Some((data[0], &data[head..end], &data[end..]))
 }
 
+/// Walks the structure of a DER element without decoding it, and refuses what would take the
+/// decoder too long: nesting deeper than [`MAX_DEPTH`], a set with more than [`MAX_SET_ELEMENTS`]
+/// elements, and sets that together would cost more than [`MAX_SET_WORK`]. The walk is a loop, not
+/// a recursion, and takes time in proportion to the size of `der`.
+///
+/// The same strict reading of lengths as [`der_element_len`] is used all the way down: a length in
+/// the indefinite form (BER) is [`SignatureReason::EncodingUnsupported`], anything else that is not
+/// well formed is [`SignatureReason::Unreadable`], and a limit that is passed is
+/// [`SignatureReason::TooLarge`]. All three are "not checked".
+pub fn check_shape(der: &[u8]) -> Result<(), SignatureReason> {
+    use SignatureReason::*;
+    // One frame for each constructed element being walked: what is left of its content, how many
+    // elements it has had so far, and whether it is a set.
+    struct Frame<'a> {
+        rest: &'a [u8],
+        count: usize,
+        set: bool,
+    }
+    let mut stack = vec![Frame {
+        rest: der,
+        count: 0,
+        set: false,
+    }];
+    let mut work = 0u64;
+    while let Some(frame) = stack.last_mut() {
+        if frame.rest.is_empty() {
+            stack.pop();
+            continue;
+        }
+        let Some((tag, content, after)) = tlv(frame.rest) else {
+            // An indefinite length is the way BER writes an element; say so.
+            return Err(if frame.rest.get(1) == Some(&0x80) {
+                EncodingUnsupported
+            } else {
+                Unreadable
+            });
+        };
+        frame.rest = after;
+        frame.count += 1;
+        if frame.set {
+            work += frame.count as u64;
+            if frame.count > MAX_SET_ELEMENTS || work > MAX_SET_WORK {
+                return Err(TooLarge);
+            }
+        }
+        if tag & 0x20 != 0 {
+            if stack.len() >= MAX_DEPTH {
+                return Err(TooLarge);
+            }
+            // A SET, or a tag of the context: [0] and [1] stand for a set in a CMS (the
+            // certificates, the signed attributes), and an explicit tag has one element.
+            let set = tag == 0x31 || tag & 0xc0 == 0x80;
+            stack.push(Frame {
+                rest: content,
+                count: 0,
+                set,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Reads the CMS wrapper of a signature. `der` is exactly one element.
 pub fn parse(der: &[u8]) -> Result<Cms, SignatureReason> {
     use SignatureReason::*;
     if der_element_len(der) != Some(der.len()) {
         return Err(EncodingUnsupported);
     }
+    check_shape(der)?;
     let info = ContentInfo::from_der(der).map_err(|_| Unreadable)?;
     if info.content_type != ID_SIGNED_DATA {
         return Err(Unreadable);
@@ -863,6 +944,65 @@ mod tests {
         );
         assert_eq!(rsa_bits(&[0x30, 0x00]), None);
         assert_eq!(rsa_bits(&[]), None);
+    }
+
+    /// An element: tag, definite length, content.
+    fn element(tag: u8, content: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        if content.len() < 0x80 {
+            out.push(content.len() as u8);
+        } else {
+            out.extend([0x82, (content.len() >> 8) as u8, content.len() as u8]);
+        }
+        out.extend_from_slice(content);
+        out
+    }
+
+    #[test]
+    fn the_shape_of_a_signature_is_walked_with_limits() {
+        use SignatureReason::*;
+        let integer = |n: u8| element(0x02, &[n]);
+        // A set of 256 elements is allowed, 257 is not; the same for the context tags that stand
+        // for a set; a sequence has no such limit (it is not sorted).
+        let many = |tag: u8, count: usize| -> Vec<u8> {
+            let body: Vec<u8> = (0..count).flat_map(|i| integer(i as u8)).collect();
+            element(tag, &body)
+        };
+        assert_eq!(check_shape(&many(0x31, MAX_SET_ELEMENTS)), Ok(()));
+        assert_eq!(
+            check_shape(&many(0x31, MAX_SET_ELEMENTS + 1)),
+            Err(TooLarge)
+        );
+        assert_eq!(
+            check_shape(&many(0xA0, MAX_SET_ELEMENTS + 1)),
+            Err(TooLarge)
+        );
+        assert_eq!(check_shape(&many(0x30, 5_000)), Ok(()));
+        // Many sets that are each within the limit but together cost too much.
+        let sets: Vec<u8> = (0..40).flat_map(|_| many(0x31, MAX_SET_ELEMENTS)).collect();
+        assert_eq!(check_shape(&element(0x30, &sets)), Err(TooLarge));
+        // Nesting: 31 deep is allowed, 33 is not. A loop, so no stack is used up either way.
+        let nested = |depth: usize| {
+            let mut inner = integer(1);
+            for _ in 0..depth {
+                inner = element(0x30, &inner);
+            }
+            inner
+        };
+        assert_eq!(check_shape(&nested(MAX_DEPTH - 1)), Ok(()));
+        assert_eq!(check_shape(&nested(MAX_DEPTH + 1)), Err(TooLarge));
+        // A length in the indefinite form is BER; other damage is unreadable.
+        assert_eq!(
+            check_shape(&[0x30, 0x80, 0x02, 0x01, 0x01, 0, 0]),
+            Err(EncodingUnsupported)
+        );
+        assert_eq!(
+            check_shape(&[0x30, 0x05, 0x02, 0x01, 0x01]),
+            Err(Unreadable)
+        );
+        assert_eq!(check_shape(&[0x30, 0x81, 0x01, 0x00]), Err(Unreadable));
+        assert_eq!(check_shape(&[0x1f, 0x01, 0x00]), Err(Unreadable));
+        assert_eq!(check_shape(&[]), Ok(()));
     }
 
     #[test]

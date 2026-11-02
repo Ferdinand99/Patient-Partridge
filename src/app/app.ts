@@ -943,6 +943,9 @@ export class App {
   /** The history of a tab changed: tell the app process if the document turned dirty or clean. */
   private historyChanged(tab: Tab): void {
     if (!this.tabs.includes(tab)) return;
+    // Any change of the document (an edit, an undo, a save) means the tab no longer holds the
+    // file whose signatures were checked.
+    this.signatures.invalidate(tab.doc);
     const dirty = tab.history.dirty;
     if (dirty !== tab.dirtyTold) {
       tab.dirtyTold = dirty;
@@ -1010,6 +1013,9 @@ export class App {
     const began = tab.history.revision;
     const saved = asCopy ? await this.runSaveAs(tab, false) : await this.runSave(tab);
     if (!saved) return false;
+    // The file that was written is not the one the signatures were checked on, whatever the tab
+    // shows from now on. This comes before anything else is done with the tab.
+    this.signatures.invalidate(tab.doc);
     tab.history.markSaved(began);
     if (saved.path !== tab.path || saved.name !== tab.name) {
       tab.path = saved.path;

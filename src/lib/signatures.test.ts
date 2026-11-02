@@ -138,9 +138,23 @@ describe("the badge", () => {
     expect(summarise(info(["changed"], { unlisted: 1 }))?.kind).toBe("changed");
   });
 
+  it("is never better than the signatures that are listed and not described", () => {
+    // 64 are described and intact, and 5 more are listed: the five were never looked at.
+    const capped = info(Array(64).fill("unknown_signer"), { total: 69 });
+    expect(summarise(capped)).toEqual({ kind: "unsupported", label: "Signature not checked", count: 69 });
+    expect(summarise(info(Array(64).fill("trusted"), { total: 65 }))?.kind).toBe("unsupported");
+    // Nothing unseen: all 64 listed are described.
+    expect(summarise(info(Array(64).fill("unknown_signer"), { total: 64 }))?.kind).toBe("unknown_signer");
+    // A worse state that was seen is not hidden.
+    expect(summarise(info(["broken"], { total: 70 }))?.kind).toBe("broken");
+    expect(summarise(info(["changed"], { total: 70 }))?.kind).toBe("changed");
+    // Signatures listed and none described is not "no signature".
+    expect(summarise(info([], { total: 3 }))?.kind).toBe("unsupported");
+  });
+
   it("shows a file with marks of signatures that are not listed", () => {
     const summary = summarise(info([], { total: 0, unlisted: 1 }));
-    expect(summary).toEqual({ kind: "marks", label: "Signature not found", count: 1 });
+    expect(summary).toEqual({ kind: "marks", label: "Possible signature marks", count: 1 });
   });
 
   it("counts the signatures the library lists, also those not described", () => {

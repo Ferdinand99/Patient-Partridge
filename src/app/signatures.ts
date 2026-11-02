@@ -10,9 +10,17 @@
 //    ever made from it.
 // A picture of a signature on a page of the PDF is only a picture; this panel is the only place
 // that reports on a signature, and it says so.
+//
+// A result is about the bytes it was computed from, and only about those. The engine checks the
+// file the document was opened from. As soon as the tab holds anything else (a save, a copy saved
+// under another name, an edit in memory), `invalidate` drops the result and the tab shows
+// "Not checked for this version" until the file is opened again. A result is never kept, shown or
+// asked for again for such a tab.
 
 import {
   NOT_CHECKED,
+  STALE_LABEL,
+  STALE_TEXT,
   STATE_LABEL,
   STATE_MEANING,
   certificateTimeText,
@@ -37,12 +45,18 @@ export interface SignatureApi {
 type Entry =
   | { kind: "loading" }
   | { kind: "error" }
-  | { kind: "ready"; info: SignaturesInfo; summary: Summary | null };
+  | { kind: "ready"; info: SignaturesInfo; summary: Summary | null }
+  /**
+   * The tab no longer holds the bytes that were (or were being) checked. `shown` says whether the
+   * badge is there to say so: it is for a document that had signatures, and `null` while the answer
+   * that tells is still on its way (it is used for that and for nothing else).
+   */
+  | { kind: "stale"; shown: boolean | null };
 
 const SVG = "http://www.w3.org/2000/svg";
 
 /** One small mark for each state. Only a trusted signature has a tick. */
-const ICONS: Record<SignatureState | "marks" | "error", string> = {
+const ICONS: Record<SignatureState | "marks" | "error" | "stale", string> = {
   trusted: '<circle cx="12" cy="12" r="8.25"/><path d="M8.25 12.25l2.6 2.6 4.9-5.5"/>',
   unknown_signer: '<circle cx="12" cy="12" r="8.25"/><path d="M9.75 9.75a2.35 2.35 0 1 1 3.4 2.1c-.75.4-1.15.8-1.15 1.65M12 16.5v.01"/>',
   changed: '<path d="M12 4.25l8.25 14.5H3.75z"/><path d="M12 10v4M12 16.75v.01"/>',
@@ -50,6 +64,7 @@ const ICONS: Record<SignatureState | "marks" | "error", string> = {
   unsupported: '<circle cx="12" cy="12" r="8.25"/><path d="M8.5 12h7"/>',
   marks: '<circle cx="12" cy="12" r="8.25"/><path d="M12 7.75v5M12 16.25v.01"/>',
   error: '<circle cx="12" cy="12" r="8.25"/><path d="M8.5 12h7"/>',
+  stale: '<circle cx="12" cy="12" r="8.25"/><path d="M8.5 12h7"/>',
 };
 
 function el<K extends keyof HTMLElementTagNameMap>(
@@ -80,6 +95,20 @@ function fact(list: HTMLElement, label: string, value: string | null | undefined
   if (value === null || value === undefined || value === "") return;
   const doc = list.ownerDocument;
   list.append(el(doc, "dt", undefined, label), el(doc, "dd", mono ? "sig-mono" : undefined, value));
+}
+
+/** What the level of change a signer allows (DocMDP) permits, in words. */
+export function docMdpText(level: number): string {
+  switch (level) {
+    case 1:
+      return "none (level 1)";
+    case 2:
+      return "filling in forms and signing (level 2)";
+    case 3:
+      return "filling in forms, signing and annotations (level 3)";
+    default:
+      return `level ${level}`;
+  }
 }
 
 function formatBytes(n: number): string {
@@ -172,6 +201,38 @@ export class SignaturePanel {
     this.render();
   }
 
+  /**
+   * The tab of this document no longer holds the file the signatures are checked on: it was saved
+   * (in place or as a copy) or changed in memory. What was found is dropped and never shown again
+   * for this tab; the badge of a document that had signatures says that this version was not
+   * checked. Asking the engine again would not help: it goes on reading the file it opened.
+   */
+  invalidate(doc: number): void {
+    clearTimeout(this.timers.get(doc));
+    this.timers.delete(doc);
+    const entry = this.entries.get(doc);
+    let shown: boolean | null;
+    switch (entry?.kind) {
+      case "stale":
+        return;
+      case "loading":
+        // The answer on its way is about the old file. It only tells whether to say anything.
+        shown = null;
+        break;
+      case "ready":
+        shown = entry.summary !== null;
+        break;
+      case "error":
+        shown = true;
+        break;
+      default:
+        // Never asked, and now it will not be: nothing is known about this version.
+        shown = false;
+    }
+    this.entries.set(doc, { kind: "stale", shown });
+    if (this.current === doc) this.render();
+  }
+
   /** A document was closed: what is known about it goes. */
   forget(doc: number): void {
     clearTimeout(this.timers.get(doc));
@@ -223,13 +284,25 @@ export class SignaturePanel {
     this.entries.set(doc, { kind: "loading" });
     getSignatures.call(this.deps.api, doc).then(
       (info) => {
-        // The document may be gone by now.
-        if (this.entries.get(doc)?.kind !== "loading") return;
+        // The document may be gone by now, or its tab may hold other bytes than the ones checked.
+        const now = this.entries.get(doc);
+        if (now?.kind === "stale" && now.shown === null) {
+          this.entries.set(doc, { kind: "stale", shown: summarise(info) !== null });
+          if (this.current === doc) this.render();
+          return;
+        }
+        if (now?.kind !== "loading") return;
         this.entries.set(doc, { kind: "ready", info, summary: summarise(info) });
         if (this.current === doc) this.render();
       },
       () => {
-        if (this.entries.get(doc)?.kind !== "loading") return;
+        const now = this.entries.get(doc);
+        if (now?.kind === "stale" && now.shown === null) {
+          this.entries.set(doc, { kind: "stale", shown: false });
+          if (this.current === doc) this.render();
+          return;
+        }
+        if (now?.kind !== "loading") return;
         this.entries.set(doc, { kind: "error" });
         if (this.current === doc) this.render();
       },
@@ -256,11 +329,14 @@ export class SignaturePanel {
   private render(): void {
     const entry = this.current === null ? undefined : this.entries.get(this.current);
     // The badge: only for a document that has signatures (or marks of them), or whose check failed.
-    let kind: SignatureState | "marks" | "error" | null = null;
+    let kind: SignatureState | "marks" | "error" | "stale" | null = null;
     let label = "";
     if (entry?.kind === "ready" && entry.summary) {
       kind = entry.summary.kind;
       label = entry.summary.label;
+    } else if (entry?.kind === "stale" && entry.shown === true) {
+      kind = "stale";
+      label = STALE_LABEL;
     } else if (entry?.kind === "error") {
       kind = "error";
       label = "Signatures not checked";
@@ -271,7 +347,8 @@ export class SignaturePanel {
     if (kind !== null) {
       this.badge.append(icon(this.root, kind), this.badgeLabel);
       this.badgeLabel.textContent = label;
-      this.badge.title = "Show the digital signatures of this document";
+      // The whole label is in the title: a narrow window may cut the badge short.
+      this.badge.title = `${label}. Show the digital signatures of this document.`;
     }
     if (kind === null && this.open) this.close(false);
     if (this.open) this.renderBody(entry);
@@ -282,6 +359,13 @@ export class SignaturePanel {
     this.body.replaceChildren();
     if (!entry || entry.kind === "loading") {
       this.body.append(el(doc, "p", "sig-note", "Checking the signatures…"));
+      return;
+    }
+    if (entry.kind === "stale") {
+      this.body.append(
+        el(doc, "p", "sig-lead", "Only this panel reports on a signature. A picture of a signature on a page is only a picture."),
+        el(doc, "p", "sig-alert", STALE_TEXT),
+      );
       return;
     }
     if (entry.kind === "error") {
@@ -321,9 +405,17 @@ export class SignaturePanel {
     const head = el(doc, "div", "sig-state");
     head.append(icon(doc, state), el(doc, "strong", undefined, STATE_LABEL[state]));
     li.append(head, el(doc, "p", "sig-meaning", STATE_MEANING[state]), el(doc, "p", "sig-why", reasonText(item.reason)));
-    if (info.trustAnchors === 0 && state === "unknown_signer") {
+    if (state !== "trusted") {
+      // The name below is what a certificate says. Unless it led to the trust list, nothing ties it to a person.
       li.append(
-        el(doc, "p", "sig-why", "No signer is verified by this version; the name below is what the certificate says, not proof of who holds the key."),
+        el(
+          doc,
+          "p",
+          "sig-why",
+          info.trustAnchors === 0
+            ? "No signer is verified by this version; the name below is what the certificate says, not proof of who holds the key."
+            : "The name below is what the certificate says, not proof of who holds the key.",
+        ),
       );
     }
     const time = certificateTimeText(item.certificateTime);
@@ -362,7 +454,7 @@ export class SignaturePanel {
     fact(tech, "Covers", describeRange(item.byteRange, item.fileLen));
     fact(tech, "File size", formatBytes(item.fileLen));
     fact(tech, "Certificates in the signature", String(item.certificates));
-    if (item.docMdp > 0) fact(tech, "Changes allowed by the signer", `level ${item.docMdp}`);
+    if (item.docMdp > 0) fact(tech, "Changes allowed by the signer", docMdpText(item.docMdp));
     technical.append(tech);
     li.append(technical);
     return li;

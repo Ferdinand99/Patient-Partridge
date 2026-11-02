@@ -28,6 +28,7 @@
 use std::io;
 use std::os::raw::{c_char, c_int, c_ulong, c_void};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use partridge_protocol::{
     plain_text, CertificateTime, ErrorCode, SignatureInfo, SignatureReason, SignatureReport,
@@ -48,6 +49,12 @@ pub const MAX_CONTENTS: usize = 1024 * 1024;
 /// Most bytes of the file the engine hashes for the signatures of one document. A document with
 /// many signatures over a big file would otherwise take minutes.
 pub const HASH_BUDGET: u64 = 2 * 1024 * 1024 * 1024;
+
+/// The longest the check of the signatures of one document may take, in all. The engine of a
+/// document answers one request at a time, so drawing a page waits while this runs. What is not
+/// done when the time is up is reported as not checked, or (for the scan of the file) as a check
+/// that could not be made; it is never reported as good.
+pub const CHECK_TIME: Duration = Duration::from_secs(10);
 
 /// Most numbers of a byte range read from PDFium.
 const MAX_RAW_RANGE: usize = 64;
@@ -114,6 +121,7 @@ pub struct Work<'a> {
     pub budget: u64,
     hashed: u64,
     ticks: u32,
+    deadline: Option<Instant>,
     progress: &'a mut dyn FnMut(u32),
 }
 
@@ -123,8 +131,19 @@ impl<'a> Work<'a> {
             budget,
             hashed: 0,
             ticks: 0,
+            deadline: None,
             progress,
         }
+    }
+
+    /// The time after which no more of the file is hashed.
+    pub fn with_deadline(mut self, deadline: Instant) -> Work<'a> {
+        self.deadline = Some(deadline);
+        self
+    }
+
+    fn out_of_time(&self) -> bool {
+        self.deadline.is_some_and(|d| Instant::now() >= d)
     }
 
     fn add(&mut self, bytes: usize) {
@@ -152,7 +171,7 @@ pub fn check(
 ) -> io::Result<SignatureInfo> {
     let mut info = SignatureInfo {
         index,
-        state: SignatureState::Broken,
+        state: SignatureState::Unsupported,
         reason: SignatureReason::Unreadable,
         certificate_time: CertificateTime::Unknown,
         sub_filter: plain_text(&raw.sub_filter, MAX_SIG_SUBFILTER),
@@ -274,9 +293,6 @@ fn judge(
     if from_file != raw.contents {
         bail!(ContentsMismatch);
     }
-    if from_file.len() > MAX_CONTENTS {
-        bail!(TooLarge);
-    }
     let Some(der_len) = sigcheck::der_element_len(&from_file) else {
         bail!(EncodingUnsupported);
     };
@@ -306,8 +322,12 @@ fn judge(
     }
     work.budget -= covered;
     let mut context = digest::Context::new(alg.ring());
-    hash_range(file, &mut context, 0, first_len, work)?;
-    hash_range(file, &mut context, second_start, second_len, work)?;
+    if !hash_range(file, &mut context, 0, first_len, work)?
+        || !hash_range(file, &mut context, second_start, second_len, work)?
+    {
+        // The time is up: the signature may be fine, it was not looked at to the end.
+        bail!(TooLarge);
+    }
     if !cms.digest_matches(context.finish().as_ref()) {
         bail!(ContentChanged);
     }
@@ -346,17 +366,20 @@ fn hash_range(
     start: u64,
     len: u64,
     work: &mut Work<'_>,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let mut buf = vec![0u8; HASH_CHUNK];
     let mut done = 0u64;
     while done < len {
+        if work.out_of_time() {
+            return Ok(false);
+        }
         let n = (len - done).min(HASH_CHUNK as u64) as usize;
         file.read_exact_at(start + done, &mut buf[..n])?;
         context.update(&buf[..n]);
         work.add(n);
         done += n as u64;
     }
-    Ok(())
+    Ok(true)
 }
 
 /// The bytes of a hexadecimal string in angle brackets, which is all of `gap` or nothing: no
@@ -738,7 +761,8 @@ unsafe fn ascii(
 fn unreadable(index: u32, file_len: u64) -> SignatureInfo {
     SignatureInfo {
         index,
-        state: SignatureState::Broken,
+        // PDFium lists the signature and gives no handle for it: the reader could not look at it.
+        state: SignatureState::Unsupported,
         reason: SignatureReason::Unreadable,
         certificate_time: CertificateTime::Unknown,
         sub_filter: String::new(),
@@ -791,12 +815,22 @@ pub fn report(
     let total = unsafe { bindings.FPDF_GetSignatureCount(handle) }.max(0) as u32;
     let file_len = lock(source).file_len();
     // How many places look like the start of a signature, whatever PDFium lists.
+    let deadline = Instant::now() + CHECK_TIME;
     let marks = lock(source)
-        .count_occurrences(b"/ByteRange", progress)
-        .map_err(|e| read_failure(&e))?;
+        .count_occurrences(b"/ByteRange", Some(deadline), progress)
+        .map_err(|e| {
+            if e.kind() == io::ErrorKind::TimedOut {
+                (
+                    ErrorCode::Internal,
+                    "the check of the signatures took longer than its time limit".to_string(),
+                )
+            } else {
+                read_failure(&e)
+            }
+        })?;
     let settings = Settings { trust, now };
     let mut forward = |done: u32| progress(done);
-    let mut work = Work::new(HASH_BUDGET, &mut forward);
+    let mut work = Work::new(HASH_BUDGET, &mut forward).with_deadline(deadline);
     let mut items = Vec::new();
     for index in 0..total.min(MAX_SIGNATURES as u32) {
         // SAFETY: the index is below the count PDFium gave.

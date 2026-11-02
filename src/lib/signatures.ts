@@ -78,7 +78,8 @@ export const REASON_TEXT: Record<string, string> = {
     "The signature leaves out more of the file than the space for itself, so it cannot vouch for the whole file.",
   contents_mismatch: "The signature that the PDF library lists is not the one stored in the file at the signed place.",
   contents_padding: "Other data follows the signature inside the space made for it.",
-  unreadable: "The signature data cannot be read.",
+  unreadable:
+    "This version could not read the signature data, so it could not check whether the file was changed since. That says nothing for or against the file.",
   no_signer_certificate: "The signature does not carry the certificate of the signer.",
   certificate_mismatch: "The certificate in the signature is not the one the signer named.",
   attributes_invalid: "The signed attributes are missing, repeated or wrong.",
@@ -88,8 +89,10 @@ export const REASON_TEXT: Record<string, string> = {
   algorithm_unsupported: "The signature algorithm or the kind of key is not supported.",
   key_too_small: "The key is too short to be checked safely.",
   no_signed_attributes: "The signature has no signed attributes. That form is not checked.",
-  encoding_unsupported: "The signature is not encoded in the strict form (DER) that this version requires.",
-  too_large: "The signature or the file is too large for the limits of the check.",
+  encoding_unsupported:
+    "The signature is not encoded in the strict form (DER) that this version requires, so it could not be checked. That says nothing for or against the file.",
+  too_large:
+    "The signature or the file is too large for the limits of the check, or the check ran out of time. That says nothing for or against the file.",
   no_trust_list:
     "This version of Patient Partridge ships no trust list, so no signer can be verified. The signature itself is intact.",
   not_in_trust_list: "The signer's certificate does not lead to a certificate on the trust list.",
@@ -135,6 +138,13 @@ export const NOT_CHECKED: readonly string[] = [
   "Whether a change after signing was allowed by the signer. Any later content is reported as a change.",
 ];
 
+/** The badge for a tab whose document is no longer the file the signatures were checked on. */
+export const STALE_LABEL = "Not checked for this version";
+
+/** What the panel says about such a tab. */
+export const STALE_TEXT =
+  "The signatures were checked on the file as it was opened. This tab now shows a version that was saved or changed since, and that version has not been checked. Earlier results do not apply to it. Open the file again to check it.";
+
 /** What the badge shows for a document. */
 export interface Summary {
   /** "trusted" and the other states, or "marks" for a file with signature marks that are not listed. */
@@ -154,14 +164,20 @@ const SEVERITY: SignatureState[] = ["broken", "changed", "unsupported", "unknown
 export function summarise(info: SignaturesInfo): Summary | null {
   const states = info.items.map((i) => knownState(i.state));
   const worst = SEVERITY.find((s) => states.includes(s));
+  // Signatures that were never looked at: places that look like one but are not listed, and listed
+  // ones beyond the cap on how many are described.
+  const unseen = info.unlisted > 0 || info.total > info.items.length;
   if (!worst) {
+    if (info.total > 0) {
+      return { kind: "unsupported", label: STATE_LABEL.unsupported, count: info.total + info.unlisted };
+    }
     if (info.unlisted > 0) {
-      return { kind: "marks", label: "Signature not found", count: info.unlisted };
+      return { kind: "marks", label: "Possible signature marks", count: info.unlisted };
     }
     return null;
   }
-  // Marks that are not listed make the document at best "not checked".
-  if (info.unlisted > 0 && (worst === "trusted" || worst === "unknown_signer")) {
+  // Something that was not looked at makes the document at best "not checked".
+  if (unseen && (worst === "trusted" || worst === "unknown_signer")) {
     return { kind: "unsupported", label: STATE_LABEL.unsupported, count: info.total + info.unlisted };
   }
   return { kind: worst, label: STATE_LABEL[worst], count: Math.max(info.total, info.items.length) };

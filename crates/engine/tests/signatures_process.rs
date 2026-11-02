@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use partridge_engine_client::{
-    ClientError, EngineClient, EngineConfig, EnginePool, SandboxPolicy, SignatureReason,
-    SignatureState,
+    ClientError, EngineClient, EngineConfig, EnginePool, SandboxPolicy, SaveOptions,
+    SignatureReason, SignatureState,
 };
 use partridge_testkit as kit;
 use partridge_testkit::signed::*;
@@ -203,4 +203,101 @@ fn a_file_that_is_not_signed_has_no_signatures() {
         (report.total, report.unlisted, report.items.len()),
         (0, 0, 0)
     );
+}
+
+#[test]
+fn a_verdict_is_never_given_for_bytes_it_was_not_made_from() {
+    // Open a signed file, save a copy of it, and ask again. The engine goes on reading the file
+    // the document was opened from, so an answer would be about that file while the tab names the
+    // copy, and the copy is not that file: PDFium wrote the whole document again, and the
+    // signature no longer covers it. The pool refuses to answer once the document was saved, and
+    // the copy checked on its own is not intact.
+    let dir = Dir::new("saved");
+    let pool = EnginePool::new(config(), 4);
+    let file = signed_file(&signer(KeyKind::P256), &SignOptions::default());
+    let original = dir.write("signed.pdf", &file.bytes);
+    let (handle, _) = pool.open(&original, None).unwrap();
+    let before = pool.signatures(handle, NOW).unwrap();
+    assert_eq!(before.items[0].state, SignatureState::UnknownSigner);
+
+    let target = dir.0.join("copy.pdf");
+    let options = SaveOptions {
+        allow_signed: true,
+        overwrite_changed: false,
+    };
+    pool.save_as(handle, &target, options).unwrap();
+    match pool.signatures(handle, NOW) {
+        Err(ClientError::Engine { code, .. }) => {
+            assert_eq!(code, partridge_protocol::ErrorCode::SourceChanged)
+        }
+        other => panic!("a verdict for a document that was saved: {other:?}"),
+    }
+    // Asking again does not help, and the document itself is still there to be read.
+    assert!(pool.signatures(handle, NOW).is_err());
+    assert!(pool.render(handle, 0, 100, 130).is_ok());
+
+    // The copy opened as a file of its own gets its own verdict, and it is not "intact".
+    let (fresh, _) = pool.open(target.to_str().unwrap(), None).unwrap();
+    let copy = pool.signatures(fresh, NOW).unwrap();
+    assert!(copy.total + copy.unlisted > 0);
+    assert!(copy.items.iter().all(|i| !matches!(
+        i.state,
+        SignatureState::Trusted | SignatureState::UnknownSigner
+    )));
+}
+
+#[test]
+fn a_save_over_the_same_file_ends_the_verdict_too() {
+    let dir = Dir::new("saved-in-place");
+    let pool = EnginePool::new(config(), 4);
+    let file = signed_file(&signer(KeyKind::P256), &SignOptions::default());
+    let path = dir.write("signed.pdf", &file.bytes);
+    let (handle, _) = pool.open(&path, None).unwrap();
+    assert!(pool.signatures(handle, NOW).is_ok());
+    let options = SaveOptions {
+        allow_signed: true,
+        overwrite_changed: false,
+    };
+    pool.save(handle, options).unwrap();
+    assert!(pool.signatures(handle, NOW).is_err());
+    // Another document, not saved, is not affected.
+    let other = dir.write("other.pdf", &file.bytes);
+    let (second, _) = pool.open(&other, None).unwrap();
+    assert!(pool.signatures(second, NOW).is_ok());
+}
+
+#[test]
+fn a_hostile_signature_does_not_hold_up_the_pages() {
+    // A megabyte of signature data that is one signed attribute with tens of thousands of values:
+    // a decoder that sorts every set it reads takes minutes for it, and the pages of the document
+    // wait all that time. The check refuses the shape at once.
+    for set in [HostileSet::Values, HostileSet::Attributes] {
+        let dir = Dir::new("hostile-set");
+        let pool = EnginePool::new(config(), 4);
+        let options = SignOptions {
+            contents_size: 1024 * 1024 - 64,
+            ..SignOptions::default()
+        };
+        let mut file = signed_file(&signer(KeyKind::P256), &options);
+        replace_signature(&mut file, &hostile_set_signature(set, 30_000));
+        let path = dir.write("hostile.pdf", &file.bytes);
+        let (handle, _) = pool.open(&path, None).unwrap();
+        let started = std::time::Instant::now();
+        let report = pool.signatures(handle, NOW).unwrap();
+        let drawn = pool.render(handle, 0, 100, 130);
+        let took = started.elapsed();
+        assert!(drawn.is_ok(), "{set:?}");
+        assert!(
+            took < std::time::Duration::from_secs(20),
+            "{set:?}: the check and a page took {took:?}"
+        );
+        assert_eq!(report.items.len(), 1);
+        // Not checked: not intact, and not called broken either.
+        assert_eq!(
+            report.items[0].state,
+            SignatureState::Unsupported,
+            "{set:?}"
+        );
+        assert_eq!(report.items[0].reason, SignatureReason::TooLarge, "{set:?}");
+    }
 }

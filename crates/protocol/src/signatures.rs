@@ -111,7 +111,9 @@ pub enum SignatureReason {
     ContentsMismatch = 13,
     /// Data other than zeros follows the signature inside the space made for it.
     ContentsPadding = 14,
-    /// The signature data cannot be read as a signature.
+    /// The signature data cannot be read as a signature. This is not a result of the check: the
+    /// reader stopped reading, it did not find the signature false. It belongs to *unsupported*
+    /// (the number stays where it was), see [`SignatureReason::state`].
     Unreadable = 15,
     /// The signature does not hold or point to the certificate of the signer.
     NoSignerCertificate = 16,
@@ -191,12 +193,13 @@ impl SignatureReason {
             Verified => SignatureState::Trusted,
             DataAfterSignature | ContentChanged => SignatureState::Changed,
             SignatureInvalid | RangeInvalid | RangeLeavesGap | ContentsMismatch
-            | ContentsPadding | Unreadable | NoSignerCertificate | CertificateMismatch
-            | AttributesInvalid => SignatureState::Broken,
-            SubFilterUnsupported | DocumentTimestamp | DigestUnsupported | AlgorithmUnsupported
-            | KeyTooSmall | NoSignedAttributes | EncodingUnsupported | TooLarge => {
-                SignatureState::Unsupported
+            | ContentsPadding | NoSignerCertificate | CertificateMismatch | AttributesInvalid => {
+                SignatureState::Broken
             }
+            // A structure the parser refuses is not a signature that was shown to be false.
+            Unreadable | SubFilterUnsupported | DocumentTimestamp | DigestUnsupported
+            | AlgorithmUnsupported | KeyTooSmall | NoSignedAttributes | EncodingUnsupported
+            | TooLarge => SignatureState::Unsupported,
             NoTrustList
             | NotInTrustList
             | CertificateExpired
@@ -340,6 +343,17 @@ fn is_unsafe_char(c: char) -> bool {
                 | '\u{2060}'..='\u{2069}'
                 | '\u{FEFF}'
                 | '\u{FFF9}'..='\u{FFFB}'
+                // Marks that show nothing: the soft hyphen, the joiner that is no joiner, the
+                // fillers of Hangul and Khmer, the selectors of variants of letters, and the tag
+                // characters.
+                | '\u{00AD}'
+                | '\u{034F}'
+                | '\u{115F}'..='\u{1160}'
+                | '\u{17B4}'..='\u{17B5}'
+                | '\u{180B}'..='\u{180F}'
+                | '\u{3164}'
+                | '\u{FE00}'..='\u{FE0F}'
+                | '\u{E0000}'..='\u{E0FFF}'
         )
 }
 

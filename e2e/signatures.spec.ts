@@ -90,7 +90,7 @@ test("a change after signing is told in words and with its own colour", async ({
 
 test("a signature that is hidden is told", async ({ page }) => {
   await open(page, "/docs/signed-hidden.pdf");
-  await expect(badge(page)).toHaveText("Signature not found");
+  await expect(badge(page)).toHaveText("Possible signature marks");
   await badge(page).click();
   await expect(panel(page)).toContainText("looks like a signature");
 });

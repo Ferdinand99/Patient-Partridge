@@ -24,6 +24,10 @@ struct Source {
     /// The file the document was opened from, which the engine keeps reading. Never changes.
     original: PathBuf,
     stamp: Option<FileStamp>,
+    /// True once a save has written this document out. The engine goes on reading the file the
+    /// document was opened from, so what it can say about the signatures is about that file, not
+    /// about the one that was written.
+    saved: bool,
 }
 
 struct Entry {
@@ -135,6 +139,7 @@ impl EnginePool {
             path: PathBuf::from(path),
             original: PathBuf::from(path),
             stamp,
+            saved: false,
         };
         let handle = self.register(
             client,
@@ -273,6 +278,7 @@ impl EnginePool {
         // file off): it equals no real state, so the next save asks.
         source.stamp =
             Some(FileStamp::read(&outcome.path).unwrap_or_else(|_| FileStamp::unknown()));
+        source.saved = true;
         Ok(outcome)
     }
 
@@ -307,8 +313,26 @@ impl EnginePool {
     }
 
     /// The digital signatures of the document, checked at the time `now` (seconds since 1970).
+    ///
+    /// The answer is about the file the document was opened from, the only one the engine reads.
+    /// Once a save has written the document out, that is no longer the file the document stands
+    /// for, and a verdict about it would be a verdict about other bytes: the request is refused
+    /// (with `SourceChanged`) and the file that was written has to be opened to be checked.
     pub fn signatures(&self, handle: u64, now: i64) -> Result<crate::SignatureReport, ClientError> {
         let (client, doc) = self.entry(handle)?;
+        let saved = {
+            let st = state(&self.state);
+            let entry = st.docs.get(&handle).ok_or_else(unknown)?;
+            let source = entry.source.lock().unwrap_or_else(|e| e.into_inner());
+            source.saved
+        };
+        if saved {
+            return Err(ClientError::Engine {
+                code: ErrorCode::SourceChanged,
+                message: "the document was saved after it was opened; the signatures of the                           file it was opened from say nothing about the file that was written"
+                    .to_string(),
+            });
+        }
         client.signatures(doc, now)
     }
 
@@ -403,6 +427,7 @@ mod tests {
             path: PathBuf::from("a.pdf"),
             original: PathBuf::from("a.pdf"),
             stamp: None,
+            saved: false,
         }
     }
 

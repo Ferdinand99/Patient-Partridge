@@ -394,3 +394,47 @@ fn a_report_cut_short_anywhere_is_refused_and_extra_bytes_too() {
         Err(ProtocolError::TrailingBytes(1))
     ));
 }
+
+#[test]
+fn a_signature_the_reader_could_not_read_is_not_called_broken() {
+    // "Broken" is for a signature that was read and found false (or a byte range that does not
+    // hold). A structure the parser refuses says nothing for or against the signature.
+    assert_eq!(
+        SignatureReason::Unreadable.state(),
+        SignatureState::Unsupported
+    );
+    let mut unread = info(0);
+    unread.state = SignatureState::Unsupported;
+    unread.reason = SignatureReason::Unreadable;
+    assert!(Response::decode(response(report(vec![unread]))).is_ok());
+    let mut broken = info(0);
+    broken.state = SignatureState::Broken;
+    broken.reason = SignatureReason::Unreadable;
+    assert!(Response::decode(response(report(vec![broken]))).is_err());
+}
+
+#[test]
+fn marks_that_show_nothing_are_not_plain_text() {
+    for hidden in [
+        '\u{00AD}',
+        '\u{034F}',
+        '\u{115F}',
+        '\u{1160}',
+        '\u{17B4}',
+        '\u{17B5}',
+        '\u{180B}',
+        '\u{180F}',
+        '\u{3164}',
+        '\u{FE00}',
+        '\u{FE0F}',
+        '\u{E0001}',
+        '\u{E0020}',
+        '\u{E0FFF}',
+    ] {
+        let text = format!("Bank{hidden}Name");
+        assert!(!is_plain_text(&text), "U+{:04X}", hidden as u32);
+        assert_eq!(plain_text(&text, 64), "BankName", "U+{:04X}", hidden as u32);
+    }
+    // Ordinary letters, also from other scripts, stay.
+    assert!(is_plain_text("Åse Müller 山田 العربية"));
+}

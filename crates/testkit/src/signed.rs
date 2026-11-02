@@ -657,8 +657,21 @@ pub struct CmsOptions {
     pub without_attributes: bool,
     /// Leave out the content type attribute.
     pub without_content_type: bool,
-    /// Write the message digest attribute twice.
+    /// Write the message digest attribute twice, the same both times (a set may not hold the same
+    /// element twice, so a parser may refuse this before anything is checked).
     pub twice_digest: bool,
+    /// Write the message digest attribute twice with two different values: one that is not the
+    /// digest of the file, and, sorting after it, the right one.
+    pub digest_conflict: bool,
+    /// Use this object identifier (such as `1.2.840.113549.1.7.2`) as the value of the content type
+    /// attribute instead of `id-data`.
+    pub content_type_value: Option<String>,
+    /// Give the signing-certificate attribute two values: the right one and, sorting after it, a
+    /// wrong one. Implies `signing_certificate`.
+    pub binding_two_values: bool,
+    /// Write the signed attributes in the signature in another order than the DER one the
+    /// signature is made over (the order in the file is the reverse).
+    pub attributes_out_of_order: bool,
     /// Sign this digest instead of the real one.
     pub digest_override: Option<Vec<u8>>,
     /// Embed this content in the CMS (a signature that is not detached).
@@ -669,6 +682,9 @@ pub struct CmsOptions {
     pub without_signer_cert: bool,
     /// Write the length of the outer element in the indefinite form (BER).
     pub indefinite: bool,
+    /// Write the length of the `[0]` below the outer element in the indefinite form, and leave the
+    /// outer element definite.
+    pub indefinite_inner: bool,
     /// Flip one bit of the signature value.
     pub damage_signature: bool,
     /// Two signers.
@@ -686,11 +702,16 @@ impl Default for CmsOptions {
             without_attributes: false,
             without_content_type: false,
             twice_digest: false,
+            digest_conflict: false,
+            content_type_value: None,
+            binding_two_values: false,
+            attributes_out_of_order: false,
             digest_override: None,
             embed_content: false,
             extra_certs: Vec::new(),
             without_signer_cert: false,
             indefinite: false,
+            indefinite_inner: false,
             damage_signature: false,
             two_signers: false,
         }
@@ -710,22 +731,43 @@ pub fn cms(signer: &Identity, options: &CmsOptions, data_digest: &[u8]) -> Vec<u
         .unwrap_or_else(|| data_digest.to_vec());
     let mut attrs = Vec::new();
     if !options.without_content_type {
-        attrs.push(attribute(
-            "1.2.840.113549.1.9.3",
-            oid("1.2.840.113549.1.7.1"),
-        ));
+        let value = options
+            .content_type_value
+            .as_deref()
+            .unwrap_or("1.2.840.113549.1.7.1");
+        attrs.push(attribute("1.2.840.113549.1.9.3", oid(value)));
     }
     attrs.push(attribute("1.2.840.113549.1.9.4", octets(&digest_value)));
     if options.twice_digest {
         attrs.push(attribute("1.2.840.113549.1.9.4", octets(&digest_value)));
     }
-    if options.signing_certificate {
+    if options.digest_conflict {
+        // A value that sorts before the right one, so the right one is the last in the set.
+        let mut other = digest_value.clone();
+        let at = other
+            .iter()
+            .position(|b| *b > 0)
+            .expect("a digest is not all zeros");
+        other[at] -= 1;
+        attrs.push(attribute("1.2.840.113549.1.9.4", octets(&other)));
+    }
+    if options.signing_certificate || options.binding_two_values {
         let named = options
             .signing_certificate_of
             .as_ref()
             .unwrap_or(&signer.cert);
-        let id = seq(&[octets(&Hash::Sha256.of(named))]);
-        attrs.push(attribute("1.2.840.113549.1.9.16.2.47", seq(&[seq(&[id])])));
+        let hash = Hash::Sha256.of(named);
+        let id_of = |hash: &[u8]| seq(&[seq(&[octets(hash)])]);
+        let value = seq(&[id_of(&hash)]);
+        let mut values = vec![value];
+        if options.binding_two_values {
+            // A hash that sorts after the right one: the first byte that can go up does.
+            let mut other = hash.clone();
+            let at = other.iter().position(|b| *b < 0xff).expect("not all ones");
+            other[at] += 1;
+            values.push(seq(&[id_of(&other)]));
+        }
+        attrs.push(seq(&[oid("1.2.840.113549.1.9.16.2.47"), set_of(&values)]));
     }
     let attrs_set = set_of(&attrs);
     let mut signature = if options.without_attributes {
@@ -757,6 +799,12 @@ pub fn cms(signer: &Identity, options: &CmsOptions, data_digest: &[u8]) -> Vec<u
         // [0] IMPLICIT: the same bytes as the SET, with the tag of the context.
         let mut written = attrs_set.clone();
         written[0] = 0xA0;
+        if options.attributes_out_of_order {
+            let mut sorted = attrs.clone();
+            sorted.sort();
+            sorted.reverse();
+            written = tlv(0xA0, &cat(&sorted));
+        }
         info_fields.push(written);
     }
     info_fields.push(
@@ -801,7 +849,15 @@ pub fn cms(signer: &Identity, options: &CmsOptions, data_digest: &[u8]) -> Vec<u
         }),
     ));
     let data = seq(&data_fields);
-    let outer = seq(&[oid("1.2.840.113549.1.7.2"), explicit(0, &data)]);
+    let wrapped = if options.indefinite_inner {
+        let mut again = vec![0xA0, 0x80];
+        again.extend_from_slice(&data);
+        again.extend_from_slice(&[0, 0]);
+        again
+    } else {
+        explicit(0, &data)
+    };
+    let outer = seq(&[oid("1.2.840.113549.1.7.2"), wrapped]);
     if options.indefinite {
         // The outer SEQUENCE with an indefinite length, closed by two zero bytes.
         let header = 1 + der::length(content_len(&outer)).len();
@@ -1228,4 +1284,67 @@ pub fn fake_signatures_pdf(count: usize) -> Vec<u8> {
         ));
     }
     write_file(&objects)
+}
+
+/// Where a hostile signature puts its very large set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostileSet {
+    /// One signed attribute with that many values (a SET OF).
+    Values,
+    /// That many signed attributes (the `[0]` that stands for a SET OF).
+    Attributes,
+}
+
+/// A `SignedData` for one signer whose set has `count` different elements, written in descending
+/// order, which is the worst case for a decoder that sorts a set with an insertion sort. The
+/// signature in it is not real: this is for the limits of the reader, not for its verdicts.
+pub fn hostile_set_signature(set: HostileSet, count: usize) -> Vec<u8> {
+    let element = |i: usize| {
+        // Different, and ordered by their bytes when written big endian after a length.
+        let bytes = (i as u32).to_be_bytes();
+        match set {
+            HostileSet::Values => octets(&bytes),
+            HostileSet::Attributes => {
+                seq(&[oid("1.2.840.113549.1.9.5"), tlv(0x31, &octets(&bytes))])
+            }
+        }
+    };
+    let mut elements: Vec<Vec<u8>> = (0..count).map(element).collect();
+    elements.reverse();
+    let body = cat(&elements);
+    let attrs = match set {
+        HostileSet::Values => tlv(0xA0, &seq(&[oid("1.2.840.113549.1.9.4"), tlv(0x31, &body)])),
+        HostileSet::Attributes => tlv(0xA0, &body),
+    };
+    let sha256 = seq(&[oid("2.16.840.1.101.3.4.2.1")]);
+    let sid = seq(&[seq(&[]), int(1)]);
+    let info = seq(&[
+        int(1),
+        sid,
+        sha256.clone(),
+        attrs,
+        sha256.clone(),
+        octets(&[0u8; 64]),
+    ]);
+    let data = seq(&[
+        int(1),
+        tlv(0x31, &sha256),
+        seq(&[oid("1.2.840.113549.1.7.1")]),
+        tlv(0x31, &info),
+    ]);
+    seq(&[oid("1.2.840.113549.1.7.2"), tlv(0xA0, &data)])
+}
+
+/// Puts `der`, padded with zeros, in the place of the signature of `file`.
+pub fn replace_signature(file: &mut SignedFile, der: &[u8]) {
+    let room = (file.contents_end - file.contents_at - 2) / 2;
+    assert!(
+        der.len() <= room,
+        "the signature ({}) does not fit ({room})",
+        der.len()
+    );
+    let mut padded = der.to_vec();
+    padded.resize(room, 0);
+    let hex: String = padded.iter().map(|b| format!("{b:02x}")).collect();
+    file.bytes[file.contents_at + 1..file.contents_end - 1].copy_from_slice(hex.as_bytes());
 }

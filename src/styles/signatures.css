@@ -45,6 +45,7 @@
 
 .sig-badge.sig-unknown_signer,
 .sig-badge.sig-unsupported,
+.sig-badge.sig-stale,
 .sig-badge.sig-error {
   background: var(--fill);
   color: var(--muted);
@@ -195,6 +196,8 @@
 
 .sig-facts dd {
   margin: 0;
+  /* Text from a file may hold letters that run right to left: they must not reorder what follows. */
+  unicode-bidi: isolate;
 }
 
 .sig-mono {

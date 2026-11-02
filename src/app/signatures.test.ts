@@ -2,7 +2,7 @@
 import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SignatureItem, SignatureState, SignaturesInfo } from "../lib/signatures";
-import { SignaturePanel, describeRange } from "./signatures";
+import { SignaturePanel, describeRange, docMdpText } from "./signatures";
 
 beforeEach(() => {
   const html = readFileSync("index.html", "utf8");
@@ -123,7 +123,7 @@ describe("the signature badge", () => {
     const { panel } = make(report([], { unlisted: 1 }));
     panel.setDocument(1);
     await flush();
-    expect(badge().textContent).toBe("Signature not found");
+    expect(badge().textContent).toBe("Possible signature marks");
     badge().click();
     expect(panelEl().textContent).toContain("looks like a signature");
     expect(panelEl().textContent).toContain("not listed as one");
@@ -364,5 +364,139 @@ describe("the signature panel", () => {
     expect(describeRange([0, 10, 20, 30], 50)).toBe("0–10 and 20–50 of 50");
     expect(describeRange([1, 2, 3], 9)).toBe("1 2 3");
     expect(describeRange([], 9)).toBe("");
+  });
+});
+
+describe("a verdict is only for the bytes it was made from", () => {
+  const STALE = "Not checked for this version";
+
+  it("is dropped by invalidate, and what was intact is no longer shown as intact", async () => {
+    const { panel, getSignatures } = make(report([item("unknown_signer")]));
+    panel.setDocument(1);
+    await flush();
+    expect(badge().textContent).toBe("Signature intact; signer not verified");
+    panel.invalidate(1);
+    expect(badge().hidden).toBe(false);
+    expect(badge().textContent).toBe(STALE);
+    expect(badge().classList.contains("sig-stale")).toBe(true);
+    expect(badge().classList.contains("sig-unknown_signer")).toBe(false);
+    expect(badge().title).toContain(STALE);
+    expect(panel.summary).toBeNull();
+    // Showing the tab again asks nothing.
+    panel.setDocument(null);
+    panel.setDocument(1);
+    await flush();
+    expect(getSignatures).toHaveBeenCalledOnce();
+    expect(badge().textContent).toBe(STALE);
+  });
+
+  it("makes an open panel say so, without a way to check again", async () => {
+    const { panel } = make(report([item("unknown_signer")]));
+    panel.setDocument(1);
+    await flush();
+    badge().click();
+    expect(panelEl().textContent).toContain("Signature intact");
+    panel.invalidate(1);
+    const text = panelEl().textContent ?? "";
+    expect(text).not.toContain("Signature intact");
+    expect(text).not.toContain("Test Signer");
+    expect(text).toContain("has not been checked");
+    expect(text).toContain("Open the file again");
+    expect(panelEl().querySelector("button.btn:not(.btn-icon)")).toBeNull();
+    expect(panelEl().hidden).toBe(false);
+  });
+
+  it("covers a check that was still on its way: the answer only says whether to speak", async () => {
+    const releases: ((info: SignaturesInfo) => void)[] = [];
+    const getSignatures = vi.fn(() => new Promise<SignaturesInfo>((resolve) => releases.push(resolve)));
+    const panel = new SignaturePanel(document, { api: { getSignatures }, delayMs: 0 });
+    panel.setDocument(1);
+    panel.invalidate(1);
+    expect(badge().hidden).toBe(true);
+    releases[0](report([item("unknown_signer")]));
+    await flush();
+    // It had signatures, so the tab says that this version was not checked; it never says intact.
+    expect(badge().textContent).toBe(STALE);
+    expect(panel.summary).toBeNull();
+
+    // A document without signatures stays without a badge.
+    panel.setDocument(2);
+    panel.invalidate(2);
+    releases[1](report([]));
+    await flush();
+    expect(badge().hidden).toBe(true);
+  });
+
+  it("does not let a scheduled check run for a tab that was invalidated", async () => {
+    vi.useFakeTimers();
+    const { panel, getSignatures } = make(report([item("unknown_signer")]), 1200);
+    panel.setDocument(1);
+    panel.invalidate(1);
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(getSignatures).not.toHaveBeenCalled();
+    expect(badge().hidden).toBe(true);
+  });
+
+  it("covers a check that failed, and does not offer to try again", async () => {
+    const { panel } = make(new Error("gone"));
+    panel.setDocument(1);
+    await flush();
+    expect(badge().textContent).toBe("Signatures not checked");
+    panel.invalidate(1);
+    expect(badge().textContent).toBe(STALE);
+    badge().click();
+    expect(panelEl().querySelector("button.btn:not(.btn-icon)")).toBeNull();
+  });
+
+  it("leaves other documents alone, and stays dropped when asked twice", async () => {
+    const { panel } = make(report([item("changed")]));
+    panel.setDocument(1);
+    await flush();
+    panel.setDocument(2);
+    await flush();
+    panel.invalidate(2);
+    panel.invalidate(2);
+    expect(badge().textContent).toBe(STALE);
+    panel.setDocument(1);
+    expect(badge().textContent).toBe("Changed after signing");
+  });
+
+  it("is told for a document that was never asked about", () => {
+    const { panel, getSignatures } = make(report([item("unknown_signer")]));
+    panel.invalidate(5);
+    panel.setDocument(5);
+    expect(getSignatures).not.toHaveBeenCalled();
+    expect(badge().hidden).toBe(true);
+  });
+});
+
+describe("what the panel says about the name of a signer", () => {
+  function freshPage(): void {
+    const html = readFileSync("index.html", "utf8");
+    const body = /<body>([\s\S]*)<\/body>/.exec(html)?.[1] ?? "";
+    document.body.innerHTML = body.replace(/<script[\s\S]*?<\/script>/g, "");
+  }
+
+  it("says that the name is not proof for every state except a trusted one", async () => {
+    for (const state of ["unknown_signer", "changed", "broken", "unsupported"] as const) {
+      freshPage();
+      const made = make(report([item(state)]));
+      made.panel.setDocument(1);
+      await flush();
+      badge().click();
+      expect(panelEl().textContent, state).toContain("not proof of who holds the key");
+    }
+    freshPage();
+    const made = make(report([item("trusted", { reason: "verified", trustAnchor: "Test Root" })], { trustAnchors: 1 }));
+    made.panel.setDocument(1);
+    await flush();
+    badge().click();
+    expect(panelEl().textContent).not.toContain("not proof of who holds the key");
+  });
+
+  it("says in words what a level of change allows", () => {
+    expect(docMdpText(1)).toContain("none");
+    expect(docMdpText(2)).toContain("forms");
+    expect(docMdpText(3)).toContain("annotations");
   });
 });

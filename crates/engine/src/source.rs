@@ -320,10 +320,12 @@ impl SourceGuard {
     }
 
     /// How many times `needle` is in the file (matches do not overlap). Reads the whole file.
-    /// `progress` is told how many blocks are read, about every MiB.
+    /// `progress` is told how many blocks are read, about every MiB. When `deadline` passes before
+    /// the end of the file, the error is `TimedOut`.
     pub fn count_occurrences(
         &mut self,
         needle: &[u8],
+        deadline: Option<std::time::Instant>,
         progress: &mut dyn FnMut(u32),
     ) -> io::Result<u32> {
         if needle.is_empty() {
@@ -333,6 +335,9 @@ impl SourceGuard {
         let mut index = 0u64;
         let mut count = 0u32;
         loop {
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
             self.load(index, false)?;
             let (_, block) = self.cache.as_ref().expect("just loaded");
             if block.is_empty() {
