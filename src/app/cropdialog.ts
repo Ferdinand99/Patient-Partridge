@@ -69,6 +69,7 @@ export function askCrop(request: CropRequest): Promise<CropAnswer | null> {
 
     const form = document.createElement("form");
     form.className = "sheet notice crop-sheet";
+    form.noValidate = true;
     form.setAttribute("role", "dialog");
     form.setAttribute("aria-modal", "true");
     form.setAttribute("aria-labelledby", "crop-title");
@@ -121,7 +122,7 @@ export function askCrop(request: CropRequest): Promise<CropAnswer | null> {
       const input = document.createElement("input");
       input.type = "number";
       input.min = "0";
-      input.step = "0.5";
+      input.step = "any";
       input.className = "field-input";
       input.id = `crop-${key}`;
       wrap.append(span, input);

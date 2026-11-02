@@ -195,16 +195,22 @@ export class PageOps {
     const first = at;
     let where = at;
     let count = 0;
-    const result = await this.run(t, "Adding pages", async () => {
+    return this.run(t, "Adding pages", async () => {
       for (const path of files) {
-        const inserted = await this.insertOne(t, where, path);
+        let inserted: number | null;
+        try {
+          inserted = await this.insertOne(t, where, path);
+        } catch (e) {
+          // What came before stays; the files after the one that failed are not tried.
+          await this.fail(t, e);
+          break;
+        }
         if (inserted === null) break;
         where += inserted;
         count += inserted;
       }
       return count > 0 ? { select: Array.from({ length: count }, (_, i) => first + i), show: first } : null;
     });
-    return result;
   }
 
   /** Copies pages into a new file the user chooses. Resolves with the file, or null when stopped. */

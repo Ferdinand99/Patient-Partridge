@@ -52,7 +52,7 @@ export class PagePanel {
   private readonly buttons: Record<"left" | "right" | "delete" | "crop" | "extract" | "blank" | "insert", HTMLButtonElement>;
 
   constructor(
-    root: Document,
+    private readonly root: Document,
     private readonly ops: PageOps,
     private readonly host: PagePanelHost,
   ) {
@@ -373,6 +373,9 @@ export class PagePanel {
   // ---- the tools -------------------------------------------------------------------------------
 
   private async apply(work: Promise<OpResult | null>): Promise<void> {
+    // The list is made again when the pages change, and a thumbnail that had the focus is gone with
+    // it: the focus goes back to the page the keyboard is on, so that the next key press works.
+    const hadFocus = this.listRoot?.contains(this.root.activeElement) ?? false;
     const result = await work;
     if (result) {
       this.pick(result.select);
@@ -381,6 +384,8 @@ export class PagePanel {
     } else {
       this.sync();
     }
+    const cursor = this.current()?.cursor ?? -1;
+    if (hadFocus && cursor >= 0 && !this.listRoot?.contains(this.root.activeElement)) this.focusCursor(cursor);
   }
 
   private async moveBy(by: -1 | 1): Promise<void> {

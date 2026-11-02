@@ -212,7 +212,7 @@ export class ThumbnailList {
     else if (clientY > rect.bottom - edge) by = Math.ceil((clientY - (rect.bottom - edge)) / 3);
     if (by === 0) return false;
     const before = this.root.scrollTop;
-    this.root.scrollTop = before + by;
+    this.root.scrollTop = Math.max(0, before + by);
     this.refresh();
     return this.root.scrollTop !== before;
   }

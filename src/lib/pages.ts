@@ -214,10 +214,11 @@ export function marginsToArray(m: Margins): [number, number, number, number] {
 
 /** Keeps margins from being negative or leaving less than the smallest side. */
 export function clampMargins(m: Margins, width: number, height: number): Margins {
-  const left = Math.min(Math.max(0, m.left), Math.max(0, width - MIN_CROP_SIDE));
-  const right = Math.min(Math.max(0, m.right), Math.max(0, width - MIN_CROP_SIDE - left));
-  const top = Math.min(Math.max(0, m.top), Math.max(0, height - MIN_CROP_SIDE));
-  const bottom = Math.min(Math.max(0, m.bottom), Math.max(0, height - MIN_CROP_SIDE - top));
+  const num = (v: number) => (Number.isFinite(v) ? v : 0);
+  const left = Math.min(Math.max(0, num(m.left)), Math.max(0, width - MIN_CROP_SIDE));
+  const right = Math.min(Math.max(0, num(m.right)), Math.max(0, width - MIN_CROP_SIDE - left));
+  const top = Math.min(Math.max(0, num(m.top)), Math.max(0, height - MIN_CROP_SIDE));
+  const bottom = Math.min(Math.max(0, num(m.bottom)), Math.max(0, height - MIN_CROP_SIDE - top));
   return { left, top, right, bottom };
 }
 
