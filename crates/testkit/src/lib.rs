@@ -569,17 +569,20 @@ pub fn foreign_annots_pdf() -> Vec<u8> {
     build(&specs, "", "", extras)
 }
 
-/// A one page document with two highlights from a file whose appearance is drawn through a form
-/// inside the form, as some programs write it (objects 6 and 9 are the annotations):
+/// A one page document with annotations from a file whose appearance is not a plain filled path
+/// (objects 6, 9, 11 and 13 are the annotations):
 /// - 6: a red highlight (`NESTEDONE`); the red is in the form that the appearance draws.
 /// - 9: a highlight (`NESTEDTWO`) with a blue `/C` whose appearance draws nothing a colour can be
 ///   read from (it holds the comment `NOCOLOURAP`).
+/// - 11: a highlight (`STROKEDHL`) whose appearance strokes a thick red line instead of filling a
+///   box, after a path that paints nothing (a green one that ends in `n`).
+/// - 13: an underline (`FILLEDUL`) whose appearance fills a thin red box instead of stroking a line.
 pub fn nested_appearance_pdf() -> Vec<u8> {
     let specs = [PageSpec {
         width: 612,
         height: 792,
         content: Some(demo_content(1, 612, 792)),
-        extra: "/Annots [6 0 R 9 0 R]".into(),
+        extra: "/Annots [6 0 R 9 0 R 11 0 R 13 0 R]".into(),
     }];
     let quad = "/Rect [72 700 200 720] /QuadPoints [72 720 200 720 72 700 200 700]";
     let extras: Vec<Vec<u8>> = vec![
@@ -608,6 +611,50 @@ pub fn nested_appearance_pdf() -> Vec<u8> {
             "/Type /XObject /Subtype /Form /BBox [72 700 200 720]",
             b"% NOCOLOURAP\nq Q",
         ),
+        // 11
+        format!(
+            "<< /Type /Annot /Subtype /Highlight {quad} /C [1 0 0] /Contents (STROKEDHL) /F 4 /AP << /N 12 0 R >> >>"
+        )
+        .into_bytes(),
+        // 12
+        binary_stream(
+            "/Type /XObject /Subtype /Form /BBox [72 700 200 720]",
+            b"0 1 0 RG 72 690 m 200 690 l n 1 0 0 RG 18 w 72 710 m 200 710 l S",
+        ),
+        // 13
+        format!(
+            "<< /Type /Annot /Subtype /Underline {quad} /C [1 0 0] /Contents (FILLEDUL) /F 4 /AP << /N 14 0 R >> >>"
+        )
+        .into_bytes(),
+        // 14
+        binary_stream(
+            "/Type /XObject /Subtype /Form /BBox [72 700 200 720]",
+            b"1 0 0 rg 72 700 128 2 re f",
+        ),
+    ];
+    build(&specs, "", "", extras)
+}
+
+/// A one page document with a highlight whose `/Popup` names a locked stamp, not a popup
+/// (objects 6 and 7; the stamp holds `STAMPSTAYS`), and a note that a file puts partly outside
+/// its page, at `/Rect [-10 600 10 620]` (object 8, `EDGENOTE`).
+pub fn odd_links_pdf() -> Vec<u8> {
+    let specs = [PageSpec {
+        width: 612,
+        height: 792,
+        content: Some(demo_content(1, 612, 792)),
+        extra: "/Annots [6 0 R 7 0 R 8 0 R]".into(),
+    }];
+    let extras: Vec<Vec<u8>> = vec![
+        // 6
+        b"<< /Type /Annot /Subtype /Highlight /Rect [72 700 200 720] /QuadPoints [72 720 200 720 72 700 200 700] /C [1 1 0] /Contents (OWNERWORDS) /Popup 7 0 R /F 4 >>"
+            .to_vec(),
+        // 7
+        b"<< /Type /Annot /Subtype /Stamp /Rect [400 600 500 650] /Name /Approved /Contents (STAMPSTAYS) /F 132 >>"
+            .to_vec(),
+        // 8
+        b"<< /Type /Annot /Subtype /Text /Rect [-10 600 10 620] /Name /Note /Contents (EDGENOTE) /F 4 >>"
+            .to_vec(),
     ];
     build(&specs, "", "", extras)
 }

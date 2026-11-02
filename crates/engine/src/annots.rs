@@ -111,6 +111,9 @@ pub struct DocAnnots {
     /// change of its text, so that a change that is taken back writes the file's own data again
     /// (line ends written as CR, formatting in the rich text).
     originals: HashMap<u32, Original>,
+    /// The box (on the drawn page, not cut) an annotation had before it was first moved. A box a
+    /// file puts partly outside its page may be moved back to where it was, never further out.
+    reach: HashMap<u32, [f32; 4]>,
     /// Annotations that were removed, oldest first: `(page, id, what it was)`.
     removed: VecDeque<(u32, u32, Snapshot)>,
 }
@@ -219,8 +222,11 @@ fn quads_of(annotation: &PdfPageAnnotation) -> Vec<[f32; 8]> {
 const COLOR_OBJECTS: usize = 64;
 const COLOR_DEPTH: usize = 4;
 
-/// The colour of the first path in `object`, or in the form it is (an appearance often draws
-/// through a form inside the form): the fill of a highlight, the stroke of the other kinds.
+/// The colour of the first painted path in `object`, or in the form it is (an appearance often
+/// draws through a form inside the form). A path paints with its fill, its stroke or both; the
+/// side the kind of annotation normally uses is read when it is painted (the fill of a highlight,
+/// the stroke of the other kinds), otherwise the other side. A path that paints neither is
+/// passed over: PDFium answers black for a colour that was never set.
 fn path_color(
     object: &PdfPageObject,
     kind: AnnotKind,
@@ -232,11 +238,18 @@ fn path_color(
     }
     *budget -= 1;
     if let Some(path) = object.as_path_object() {
-        let color = match kind {
-            AnnotKind::Highlight => path.fill_color(),
-            _ => path.stroke_color(),
+        let filled = path
+            .fill_mode()
+            .is_ok_and(|mode| mode != PdfPathFillMode::None);
+        let stroked = path.is_stroked().unwrap_or(false);
+        let fill = || path.fill_color().ok();
+        let stroke = || path.stroke_color().ok();
+        let color = match (kind, filled, stroked) {
+            (_, false, false) => None,
+            (AnnotKind::Highlight, true, _) | (_, true, false) => fill(),
+            _ => stroke(),
         };
-        return color.ok().map(|c| [c.red(), c.green(), c.blue(), 255]);
+        return color.map(|c| [c.red(), c.green(), c.blue(), 255]);
     }
     if depth < COLOR_DEPTH {
         if let Some(form) = object.as_x_object_form_object() {
@@ -761,10 +774,32 @@ impl DocAnnots {
             }
             if wants_move {
                 let from = mapper.to_page(&page, 0.0, 0.0);
-                // The box stays on the page: a note cannot be pushed out of reach.
+                // The box stays on the page: a note cannot be pushed out of reach. A box that a
+                // file put partly outside its page is measured as it is (the list shows it cut),
+                // and may go back to where it was, so that a move can always be taken back.
                 let (width, height) = (page.width().value, page.height().value);
-                let dx = keep_within(dx, -info.rect[0], width - info.rect[2]);
-                let dy = keep_within(dy, -info.rect[1], height - info.rect[3]);
+                let shown = annotation
+                    .bounds()
+                    .ok()
+                    .and_then(|b| mapper.rect(&page, &b))
+                    .filter(|r| r.iter().all(|n| n.is_finite()));
+                let Some(shown) = shown else {
+                    return fail(
+                        ErrorCode::AnnotationRefused,
+                        "that place is not on the page",
+                    );
+                };
+                let reach = *self.reach.entry(id).or_insert(shown);
+                let dx = keep_within(
+                    dx,
+                    reach[0].min(0.0) - shown[0],
+                    reach[2].max(width) - shown[2],
+                );
+                let dy = keep_within(
+                    dy,
+                    reach[1].min(0.0) - shown[1],
+                    reach[3].max(height) - shown[3],
+                );
                 let to = mapper.to_page(&page, dx, dy);
                 let (Some(from), Some(to), Some(bounds)) = (from, to, bounds_of(&annotation))
                 else {
@@ -867,9 +902,11 @@ impl DocAnnots {
             None
         };
         let before = page.annotations().len();
-        // PDFium takes the annotation off the page but leaves its dictionary in the document, and
-        // a save writes it as an object nobody refers to. What the person wrote is overwritten
-        // first, with the rich text, the subject, the appearance and the popup of the annotation.
+        // PDFium takes the annotation off the page but leaves its dictionary in the document. A
+        // save leaves out the dictionary of a loaded file that nothing refers to, but writes one
+        // made in this session as an object nobody refers to. What the person wrote is
+        // overwritten first, with the rich text, the subject, the appearance and the popup of the
+        // annotation, so that nothing readable is left in the second kind.
         let gone = remove_raw(document, page_index, position)?;
         let ids = self.ids(page_index, before);
         for place in gone.iter().rev() {
@@ -878,6 +915,7 @@ impl DocAnnots {
             }
         }
         self.originals.remove(&id);
+        self.reach.remove(&id);
         if let Some(snapshot) = snapshot {
             self.remember(page_index, id, snapshot);
         } else {
@@ -918,6 +956,7 @@ impl DocAnnots {
         self.removed.clear();
         self.settled.clear();
         self.originals.clear();
+        self.reach.clear();
     }
 }
 
@@ -1211,8 +1250,9 @@ unsafe fn blank(bindings: &dyn PdfiumLibraryBindings, annotation: FPDF_ANNOTATIO
 
 /// Takes the annotation at `position` off the page, with the popup it owns, after overwriting
 /// what the person wrote and detaching the appearance. Returns the places that were taken off,
-/// lowest first. PDFium still writes the dictionaries (and the old appearance streams, which no
-/// call can overwrite) as objects that nothing refers to.
+/// lowest first. A save writes the dictionaries of annotations made in the session (and any
+/// appearance stream PDFium made, which no call can overwrite) as objects that nothing refers
+/// to; those of a loaded file are left out.
 fn remove_raw(
     document: &PdfDocument<'static>,
     page_index: u32,

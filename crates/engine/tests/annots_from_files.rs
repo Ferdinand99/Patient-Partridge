@@ -561,6 +561,99 @@ fn a_highlight_whose_colour_cannot_be_read_is_not_recoloured() {
     assert!(kit::text_in_file(&saved, "NOCOLOURAP"));
 }
 
+#[test]
+fn a_stroked_highlight_and_a_filled_underline_list_in_the_colour_they_are_drawn_in() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let doc = open(e, &kit::nested_appearance_pdf(), None).unwrap();
+    let items = list(e, doc, 0);
+    for words in ["STROKEDHL", "FILLEDUL"] {
+        let item = by_text(&items, words);
+        // Drawn in red; PDFium answers black for the side that is not painted.
+        assert!(
+            item.color[0] > 200 && item.color[1] < 60 && item.color[2] < 60,
+            "{words}: {:?}",
+            item.color
+        );
+        assert!(item.abilities & ability::RECOLOUR != 0, "{words}");
+        // Recolour, then take it back with the colour the list gave.
+        let green = annot(update(e, doc, 0, item.id, None, Some(GREEN), 0.0, 0.0));
+        assert!(green.color[1] > 150 && green.color[0] < 80, "{words}");
+        let back = annot(update(e, doc, 0, item.id, None, Some(item.color), 0.0, 0.0));
+        assert!(
+            back.color[0] > 200 && back.color[1] < 60 && back.color[2] < 60,
+            "{words}: {:?}",
+            back.color
+        );
+    }
+}
+
+// ---- a popup that is not a popup --------------------------------------------------------------------------
+
+#[test]
+fn a_highlight_whose_popup_names_another_annotation_does_not_take_it_along() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let doc = open(e, &kit::odd_links_pdf(), None).unwrap();
+    let items = list(e, doc, 0);
+    let highlight = by_text(&items, "OWNERWORDS");
+    let stamp = by_text(&items, "STAMPSTAYS");
+    assert!(stamp.abilities & ability::LOCKED != 0);
+    assert_eq!(annotation_count(e, doc), 3);
+    assert!(matches!(
+        remove(e, doc, highlight.id),
+        ResponseBody::AnnotRemoved
+    ));
+    // The locked stamp is still on the page, with its words.
+    assert_eq!(annotation_count(e, doc), 2);
+    let left = list(e, doc, 0);
+    assert!(left.iter().any(|i| i.text == "STAMPSTAYS"));
+    assert!(kit::text_in_file(&save_all(e, doc), "STAMPSTAYS"));
+}
+
+// ---- a note that a file puts partly outside its page -----------------------------------------------------
+
+/// The left edge of the box of the note, as the document holds it (not cut to the page).
+fn left_edge(e: &mut partridge_engine::Engine, doc: u32) -> f32 {
+    e.edit_for_tests(doc, |document| {
+        let page = document.pages().get(0).unwrap();
+        for annotation in page.annotations().iter() {
+            if annotation.contents().as_deref() == Some("EDGENOTE") {
+                return annotation.bounds().unwrap().left().value;
+            }
+        }
+        panic!("no EDGENOTE");
+    })
+    .expect("the document is open")
+}
+
+#[test]
+fn a_move_of_a_note_cut_at_the_page_edge_is_taken_back_to_where_it_was() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let doc = open(e, &kit::odd_links_pdf(), None).unwrap();
+    let note = by_text(&list(e, doc, 0), "EDGENOTE");
+    // The list shows the box cut to the page; the file has it 10 points further out.
+    assert_eq!(note.rect[0], 0.0);
+    assert!((left_edge(e, doc) + 10.0).abs() < 0.01);
+    // It cannot be pushed further out.
+    update(e, doc, 0, note.id, None, None, -4.0, 0.0);
+    assert!((left_edge(e, doc) + 10.0).abs() < 0.01);
+    // A move in, twice (as two quick key presses), and the same distances back.
+    let moved = annot(update(e, doc, 0, note.id, None, None, 4.0, 0.0));
+    assert!((moved.rect[2] - note.rect[2] - 4.0).abs() < 0.01);
+    update(e, doc, 0, note.id, None, None, 4.0, 0.0);
+    assert!((left_edge(e, doc) + 2.0).abs() < 0.01);
+    update(e, doc, 0, note.id, None, None, -4.0, 0.0);
+    let back = annot(update(e, doc, 0, note.id, None, None, -4.0, 0.0));
+    assert!(
+        (left_edge(e, doc) + 10.0).abs() < 0.01,
+        "{}",
+        left_edge(e, doc)
+    );
+    assert!((back.rect[2] - note.rect[2]).abs() < 0.01);
+}
+
 // ---- the owner of a document -----------------------------------------------------------------------------
 
 #[test]

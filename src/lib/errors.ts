@@ -194,6 +194,13 @@ export function describeError(error: AppErrorLike, fileName?: string): Described
         detail: "The annotation was changed or removed already, so this change was not made. Nothing was lost.",
         action: "none",
       };
+    case "annotation_partial":
+      return {
+        title: "Only some of the text was marked",
+        detail:
+          "The pages that were done first are marked, and a later page was refused. The marks that were made stay, and Undo takes all of them back. The document is marked as changed.",
+        action: "none",
+      };
     case "annotation_refused":
       return {
         title: "The annotation was not changed",

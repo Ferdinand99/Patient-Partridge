@@ -486,6 +486,61 @@ test("a change that fails says so, makes no mark, and leaves the document as it 
   await expect(page.locator(".annot")).toHaveCount(1);
 });
 
+test("an undo that fails says so, and the document and the mark stay as the notice says", async ({ page }) => {
+  await openBook(page);
+  await openBar(page);
+  await page.locator("#tool-highlight").click();
+  await drag(page, await onPage(page, 0, 84.5, 123), await onPage(page, 0, 113.5, 123));
+  await expect(page.locator(".annot")).toHaveCount(1);
+  const failNext = (code: string) =>
+    page.evaluate((c) => {
+      (window as unknown as { __E2E__: Stand }).__E2E__.annotFailure = { cmd: "remove_annotation", error: { code: c, message: "x" }, once: true };
+    }, code);
+
+  // A clean refusal: nothing was changed, and the notice says so.
+  await failNext("annotation_refused");
+  await page.keyboard.press("Control+z");
+  const sheet = page.getByRole("alertdialog");
+  await expect(sheet).toContainText("The change could not be taken back");
+  await expect(sheet).toContainText("Nothing was lost");
+  await sheet.getByRole("button", { name: "OK" }).click();
+  await expect(page.locator(".annot")).toHaveCount(1);
+  await expect(page.locator(".tab-dirty")).toHaveCount(1);
+
+  // A failure that leaves it unknown what was done: the notice says that, and the document counts as changed.
+  await failNext("internal");
+  await page.keyboard.press("Control+z");
+  await expect(sheet).toContainText("The change could not be taken back");
+  await expect(sheet).toContainText("Part of the change may have been made");
+  await sheet.getByRole("button", { name: "OK" }).click();
+  await expect(page.locator(".tab-dirty")).toHaveCount(1);
+
+  // The undo still works afterwards.
+  await page.keyboard.press("Control+z");
+  await expect(page.locator(".annot")).toHaveCount(0);
+  // The failure of unknown effect keeps the document marked as changed until it is saved.
+  await expect(page.locator(".tab-dirty")).toHaveCount(1);
+});
+
+test("an engine that is lost during an undo ends the tab and says the changes are lost", async ({ page }) => {
+  await openBook(page);
+  await openBar(page);
+  await page.locator("#tool-highlight").click();
+  await drag(page, await onPage(page, 0, 84.5, 123), await onPage(page, 0, 113.5, 123));
+  await expect(page.locator(".tab-dirty")).toHaveCount(1);
+  await page.evaluate(() => {
+    (window as unknown as { __E2E__: Stand }).__E2E__.annotFailure = { cmd: "remove_annotation", error: { code: "engine_stopped", message: "gone" }, once: true };
+  });
+  await page.keyboard.press("Control+z");
+  const sheet = page.getByRole("alertdialog");
+  await expect(sheet).toContainText("The PDF engine stopped");
+  await expect(sheet).toContainText("The changes that were not saved are lost");
+  // The undo notice is not shown instead.
+  await expect(sheet).not.toContainText("could not be taken back");
+  await sheet.getByRole("button", { name: "Close" }).click();
+  await expect(page.locator(".tab-title")).toHaveCount(0);
+});
+
 test("toolbar buttons, the stamp menu and the note box work in the dark theme and at a narrow width", async ({ page }) => {
   await page.setViewportSize({ width: 560, height: 700 });
   await openBook(page);

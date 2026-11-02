@@ -6,9 +6,12 @@
 // Each change asks the engine first, and only then is it put in the history, so the history never
 // holds a change that did not happen. Changes, undo and redo run one after the other in one queue;
 // the box for the text of a note is not in the queue, it is waited for outside it. A change that
-// fails in the middle leaves the document marked as changed, whatever the history says. A change that was taken back is put back by the engine with
-// the same id (`restoreAnnotation`), so the edits can name annotations by id for as long as the
-// document is open.
+// fails in the middle leaves the document marked as changed, whatever the history says.
+//
+// An annotation that was removed and taken back is put back by the engine with the same id
+// (`restoreAnnotation`), so the edits can name annotations by id for as long as the document is
+// open. One that came with the file cannot be put back; the edits made to it before it was deleted
+// are skipped when they are undone or done again, so that they do not stop the ones below them.
 
 import {
   type Annotation,
@@ -23,7 +26,7 @@ import {
   kindName,
   stampSize,
 } from "../lib/annotations";
-import { isEngineLost, toAppError } from "../lib/errors";
+import { describeError, isEngineLost, toAppError, type AppErrorLike } from "../lib/errors";
 import type { AnnotLayerEvents } from "../viewer/annotlayer";
 import { MAX_SELECTION_RANGES } from "../viewer/overlays";
 import type { DocumentView } from "../viewer/viewer";
@@ -71,6 +74,19 @@ export interface AnnotatorHost {
 /** Answers of the engine that say it changed nothing. */
 export const CLEAN_REFUSALS = new Set(["annotation_refused", "no_such_annotation", "annotations_not_allowed"]);
 
+/** What the person is told when a change of an annotation failed. */
+export function annotationNotice(error: AppErrorLike, fileName?: string): { title: string; detail: string } {
+  const text = describeError(error, fileName);
+  // A change that was made on some pages only says so itself.
+  if (error.code === "annotation_partial") return { title: text.title, detail: text.detail };
+  return {
+    title: text.title === "Something went wrong" ? "The annotation was not changed" : text.title,
+    detail: CLEAN_REFUSALS.has(error.code)
+      ? `${text.detail} The document is as it was before this change.`
+      : `${text.detail} Part of the change may have been made, so the document is marked as changed.`,
+  };
+}
+
 /** Refusals after which the text typed in a box is shown again. */
 const REFUSALS_THAT_KEEP_TEXT = new Set(["annotation_refused", "annotations_not_allowed"]);
 
@@ -83,6 +99,34 @@ const RECOLOUR_REASON = "The colour of this annotation cannot be changed here: i
 /** Distance, in points, an arrow key moves a picked note; with Shift it moves further. */
 const NUDGE = 4;
 const NUDGE_FAR = 24;
+
+/** How near to the asked distance a measured one is taken for it (the engine rounds boxes to 1/16 point). */
+const SAME_DISTANCE = 0.1;
+
+/**
+ * The distance, in points, a note really moved when its box went from `before` to `after` after a
+ * move of `dx`, `dy` was asked for. The boxes the engine gives are cut to the page, so one edge
+ * may not have moved when the other did: of the two edges of each axis the one that changed more
+ * is the true measure. A distance within rounding of the asked one is the asked one, so that undo
+ * returns the note exactly; a smaller one is the page edge stopping the note.
+ */
+export function movedDistance(
+  before: Annotation["rect"],
+  after: Annotation["rect"],
+  dx: number,
+  dy: number,
+): [number, number] {
+  const axis = (low: number, high: number, asked: number): number => {
+    const a = after[low] - before[low];
+    const b = after[high] - before[high];
+    const measured = Math.abs(a) >= Math.abs(b) ? a : b;
+    if (!Number.isFinite(measured)) return asked;
+    if (Math.abs(measured - asked) <= SAME_DISTANCE) return asked;
+    // Less than a hundredth of a point is no move.
+    return Math.abs(measured) < 0.01 ? 0 : measured;
+  };
+  return [axis(0, 2, dx), axis(1, 3, dy)];
+}
 
 export class Annotator implements AnnotLayerEvents {
   tool: Tool = "select";
@@ -103,6 +147,14 @@ export class Annotator implements AnnotLayerEvents {
   private reading = false;
   /** Changes wait for this before they start (a save is being written). */
   private gate: Promise<unknown> = Promise.resolve();
+  /**
+   * The box each annotation had in the last answer of the engine, by `page:id`. A move is measured
+   * from this, not from the list of the layer, which is only brought up to date some time after a
+   * change: two moves in a row would else both be measured from the same old box.
+   */
+  private readonly boxes = new Map<string, Annotation["rect"]>();
+  /** Annotations deleted for good (they came with the file): their earlier edits do nothing. */
+  private readonly gone = new Set<string>();
 
   constructor(
     private readonly doc: number,
@@ -272,6 +324,28 @@ export class Annotator implements AnnotLayerEvents {
     this.host.pageChanged(page);
   }
 
+  /** Asks the engine to change an annotation and remembers the box it answers with. */
+  private async change(
+    page: number,
+    id: number,
+    change: { text?: string; color?: Rgba; dx?: number; dy?: number },
+  ): Promise<Annotation> {
+    const a = await this.api.updateAnnotation(this.doc, page, id, change);
+    this.boxes.set(`${page}:${id}`, a.rect);
+    return a;
+  }
+
+  /** Undo or redo of a change: skipped for an annotation that has been deleted for good. */
+  private async replay(
+    page: number,
+    id: number,
+    change: { text?: string; color?: Rgba; dx?: number; dy?: number },
+  ): Promise<void> {
+    if (this.gone.has(`${page}:${id}`)) return;
+    await this.change(page, id, change);
+    this.refresh(page);
+  }
+
   private syncLayer(): void {
     this.view.setAnnotationTool(this.tool);
     this.view.annotationLayer.setInk(this.color, this.penWidth);
@@ -418,13 +492,15 @@ export class Annotator implements AnnotLayerEvents {
       const order = [...made].reverse();
       for (; removed < order.length; removed++) {
         await this.api.removeAnnotation(this.doc, order[removed].page, order[removed].id);
+        this.boxes.delete(`${order[removed].page}:${order[removed].id}`);
       }
       removed = 0;
       for (const m of made) this.refresh(m.page);
     };
     const on = async () => {
       for (; restored < made.length; restored++) {
-        await this.api.restoreAnnotation(this.doc, made[restored].page, made[restored].id);
+        const back = await this.api.restoreAnnotation(this.doc, made[restored].page, made[restored].id);
+        this.boxes.set(`${made[restored].page}:${made[restored].id}`, back.rect);
       }
       restored = 0;
       for (const m of made) this.refresh(m.page);
@@ -560,23 +636,19 @@ export class Annotator implements AnnotLayerEvents {
     const a = this.view.annotationLayer.find(page, id);
     if (!a?.can.move || (dx === 0 && dy === 0)) return Promise.resolve();
     return this.queued(async () => {
-      const moved = await this.api.updateAnnotation(this.doc, page, id, { dx, dy });
+      // The box before this move is the one the last answer gave, when there was one: the list of
+      // the layer may not have caught up with the moves asked for just before this one.
+      const from = this.boxes.get(`${page}:${id}`) ?? a.rect;
+      const moved = await this.change(page, id, { dx, dy });
       this.refresh(page);
       // The engine keeps a note on its page, so it may move less than asked: undo and redo use
       // the distance it really moved.
-      const [rx, ry] = [moved.rect[0] - a.rect[0], moved.rect[1] - a.rect[1]];
-      const [mx, my] = Number.isFinite(rx + ry) ? [rx, ry] : [dx, dy];
-      if (Math.abs(mx) < 0.005 && Math.abs(my) < 0.005) return;
+      const [mx, my] = movedDistance(from, moved.rect, dx, dy);
+      if (mx === 0 && my === 0) return;
       this.push({
         label: "Move",
-        undo: async () => {
-          await this.api.updateAnnotation(this.doc, page, id, { dx: -mx, dy: -my });
-          this.refresh(page);
-        },
-        redo: async () => {
-          await this.api.updateAnnotation(this.doc, page, id, { dx: mx, dy: my });
-          this.refresh(page);
-        },
+        undo: () => this.replay(page, id, { dx: -mx, dy: -my }),
+        redo: () => this.replay(page, id, { dx: mx, dy: my }),
       });
     });
   }
@@ -606,18 +678,12 @@ export class Annotator implements AnnotLayerEvents {
       editor,
       async (text) => {
         if (text === before) return;
-        await this.api.updateAnnotation(this.doc, page, id, { text });
+        await this.change(page, id, { text });
         this.refresh(page);
         this.push({
           label: "Edit text",
-          undo: async () => {
-            await this.api.updateAnnotation(this.doc, page, id, { text: before });
-            this.refresh(page);
-          },
-          redo: async () => {
-            await this.api.updateAnnotation(this.doc, page, id, { text });
-            this.refresh(page);
-          },
+          undo: () => this.replay(page, id, { text: before }),
+          redo: () => this.replay(page, id, { text }),
         });
         this.host.announce("Text saved.");
       },
@@ -630,18 +696,12 @@ export class Annotator implements AnnotLayerEvents {
     if (before[0] === color[0] && before[1] === color[1] && before[2] === color[2]) return Promise.resolve();
     const id = a.id;
     return this.queued(async () => {
-      await this.api.updateAnnotation(this.doc, page, id, { color });
+      await this.change(page, id, { color });
       this.refresh(page);
       this.push({
         label: "Change colour",
-        undo: async () => {
-          await this.api.updateAnnotation(this.doc, page, id, { color: before });
-          this.refresh(page);
-        },
-        redo: async () => {
-          await this.api.updateAnnotation(this.doc, page, id, { color });
-          this.refresh(page);
-        },
+        undo: () => this.replay(page, id, { color: before }),
+        redo: () => this.replay(page, id, { color }),
       });
     });
   }
@@ -674,6 +734,7 @@ export class Annotator implements AnnotLayerEvents {
     const { page, id } = sel;
     await this.queued(async () => {
       await this.api.removeAnnotation(this.doc, page, id);
+      this.boxes.delete(`${page}:${id}`);
       this.refresh(page);
       this.select(page, null);
       if (a.can.restore) {
@@ -681,7 +742,8 @@ export class Annotator implements AnnotLayerEvents {
       } else {
         // Undo cannot bring this back, so there is no edit to take back: an entry whose undo is
         // always refused would stop every earlier edit from being undone. The document counts as
-        // changed until it is saved.
+        // changed until it is saved. What was done to it before is skipped when it is undone.
+        this.gone.add(`${page}:${id}`);
         this.history.markUnsaved();
       }
       this.host.announce(`${kindName(a.kind)} deleted.`);
@@ -750,17 +812,16 @@ export class Annotator implements AnnotLayerEvents {
 /**
  * What is said before an annotation that came with the file is deleted. Saving writes a new file in
  * which the comment, the author, the rich text and the subject are not kept; it is not redaction,
- * and the old file and its copies keep everything. A free text box may keep its words.
+ * and copies and backups made before the save keep everything. A free text box may keep its words.
  */
 function deleteWarning(kind: Annotation["kind"]): string {
   const base =
     "This annotation came with the file, and Undo cannot bring it back. If you delete it and save, the new file does not hold its comment or author. " +
-    "This is not redaction: the old file and any copy of it still hold the text.";
+    "This is not redaction: copies and backups made before the save still hold the text.";
   return kind === "other" ? `${base} The words of a text box can stay in the saved file.` : base;
 }
 
 function pagesText(pages: number[]): string {
-
   const unique = [...new Set(pages)].map((p) => p + 1);
   return unique.length === 1 ? `page ${unique[0]}` : `pages ${unique.join(", ")}`;
 }

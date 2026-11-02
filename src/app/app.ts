@@ -22,7 +22,7 @@ import type { CopyResult, PageLinkInfo } from "../viewer/overlays";
 import { DocumentView, type ViewPosition, type ViewerOptions } from "../viewer/viewer";
 import { zoomLabel, type ZoomMode } from "../viewer/zoom";
 import { FindBar } from "./find";
-import { Annotator, CLEAN_REFUSALS, type AnnotatorApi } from "./annotator";
+import { Annotator, CLEAN_REFUSALS, annotationNotice, type AnnotatorApi } from "./annotator";
 import { AnnotBar } from "./annotbar";
 import { EditHistory, type Edit } from "./history";
 import { MenuController } from "./menu";
@@ -1010,12 +1010,10 @@ export class App {
       await this.documentLost(tab, app);
       return;
     }
-    const text = describeError(app, tab.name);
+    const text = annotationNotice(app, tab.name);
     await showNotice(this.noticeLayer, {
-      title: text.title === "Something went wrong" ? "The annotation was not changed" : text.title,
-      detail: CLEAN_REFUSALS.has(app.code)
-        ? `${text.detail} The document is as it was before this change.`
-        : `${text.detail} Part of the change may have been made, so the document is marked as changed.`,
+      title: text.title,
+      detail: text.detail,
       buttons: [{ id: "ok", label: "OK", primary: true }],
     });
   }

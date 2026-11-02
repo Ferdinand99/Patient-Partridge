@@ -2,7 +2,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Annotation, Rgba } from "../lib/annotations";
 import type { DocumentView } from "../viewer/viewer";
-import { Annotator, type AnnotatorApi, type AnnotatorHost } from "./annotator";
+import { Annotator, annotationNotice, movedDistance, type AnnotatorApi, type AnnotatorHost } from "./annotator";
 import { EditHistory } from "./history";
 
 const YELLOW: Rgba = [255, 235, 59, 255];
@@ -850,5 +850,171 @@ describe("what the engine refuses or holds back", () => {
     t.annotator.setColor([126, 217, 87, 255]);
     expect(t.host.told.at(-1)).toContain("colour");
     expect(t.calls).toEqual([]);
+  });
+});
+
+describe("moves that follow each other, and notes cut at the page edge", () => {
+  const key = (k: string, extra: KeyboardEventInit = {}) => new KeyboardEvent("keydown", { key: k, ...extra });
+  const movable = (rect: Annotation["rect"]) =>
+    annotation({
+      id: 5,
+      kind: "note",
+      rect,
+      can: { editText: true, recolour: false, move: true, remove: true, restore: true, locked: false },
+    });
+
+  /**
+   * An engine that holds the true box of the note, answers with the box cut to the page, and moves
+   * a note no further out of the page than it was. The list of the layer is NOT brought up to date,
+   * as in the window, where it comes some time after the change.
+   */
+  function lateList(shown: Annotation["rect"], truth: Annotation["rect"]) {
+    const t = setup([movable(shown)]);
+    const box = { l: truth[0], t: truth[1], r: truth[2], b: truth[3] };
+    const floor = Math.min(0, box.l);
+    vi.mocked(t.api.updateAnnotation).mockImplementation((_d, page, id, change) => {
+      t.calls.push(`update ${page} ${id} ${JSON.stringify(change)}`);
+      const dx = Math.min(Math.max(change.dx ?? 0, floor - box.l), 612 - box.r);
+      box.l += dx;
+      box.r += dx;
+      return Promise.resolve(movable([Math.max(box.l, 0), box.t, Math.min(box.r, 612), box.b]));
+    });
+    return { t, box };
+  }
+
+  it("undoes two quick arrow presses by 4 each, so the note ends where it began", async () => {
+    const { t, box } = lateList([10, 20, 30, 40], [10, 20, 30, 40]);
+    t.annotator.select(0, 5);
+    // Both presses come before the layer has heard of the first move.
+    expect(t.annotator.handleKey(key("ArrowRight"))).toBe(true);
+    expect(t.annotator.handleKey(key("ArrowRight"))).toBe(true);
+    await t.annotator.idle();
+    expect(box.l).toBe(18);
+    await t.history.undo();
+    await t.history.undo();
+    expect(t.calls.slice(2)).toEqual(['update 0 5 {"dx":-4,"dy":0}', 'update 0 5 {"dx":-4,"dy":0}']);
+    expect(box.l).toBe(10);
+    expect(t.history.dirty).toBe(false);
+    await t.history.redo();
+    await t.history.redo();
+    expect(box.l).toBe(18);
+  });
+
+  it("makes an edit for a note cut by the page edge, and undo puts it back to where the file has it", async () => {
+    // The file has the note 10 points outside the page; the list shows it cut at 0.
+    const { t, box } = lateList([0, 20, 10, 40], [-10, 20, 10, 40]);
+    t.annotator.select(0, 5);
+    await t.annotator.moveBy(0, 5, 4, 0);
+    expect(box.l).toBe(-6);
+    // The left edge did not move in the answer; the right edge did. The move counts.
+    expect(t.history.canUndo).toBe(true);
+    expect(t.history.dirty).toBe(true);
+    await t.annotator.moveBy(0, 5, 24, 0);
+    expect(box.l).toBe(18);
+    await t.history.undo();
+    await t.history.undo();
+    expect(t.calls.slice(2)).toEqual(['update 0 5 {"dx":-24,"dy":0}', 'update 0 5 {"dx":-4,"dy":0}']);
+    expect(box.l).toBe(-10);
+    expect(t.history.dirty).toBe(false);
+  });
+
+  it("measures the move by the edge that changed most", () => {
+    // Cut at the left: only the right edge tells.
+    expect(movedDistance([0, 20, 10, 40], [0, 20, 14, 40], 4, 0)).toEqual([4, 0]);
+    // Stopped by the right edge of the page: asked for 12, moved 2.
+    expect(movedDistance([590, 20, 610, 40], [592, 20, 612, 40], 12, 0)).toEqual([2, 0]);
+    // Within rounding of what was asked: exactly what was asked.
+    expect(movedDistance([10, 20, 30, 40], [14.0625, 20, 34.0625, 40], 4, 0)).toEqual([4, 0]);
+    // Nothing moved.
+    expect(movedDistance([10, 20, 30, 40], [10, 20, 30, 40], 4, 0)).toEqual([0, 0]);
+    // No number to go by: what was asked.
+    expect(movedDistance([10, 20, 30, 40], [Number.NaN, 20, Number.NaN, 40], 4, 0)).toEqual([4, 0]);
+  });
+});
+
+describe("edits of an annotation that was deleted for good", () => {
+  it("undo skips the earlier edits of a file's annotation that was deleted, and goes on to the ones below", async () => {
+    const file = annotation({
+      id: 7,
+      kind: "highlight",
+      text: "old",
+      can: { editText: true, recolour: true, move: false, remove: true, restore: false, locked: false },
+    });
+    const t = setup([file]);
+    const below = vi.fn();
+    t.history.push({ label: "Earlier", undo: below, redo: vi.fn() });
+    t.history.markSaved();
+    // An edit of the comment of the annotation, then its deletion.
+    const done = t.annotator.editText(0, 7);
+    const area = t.host.popovers.querySelector("textarea") as HTMLTextAreaElement;
+    area.value = "new";
+    (t.host.popovers.querySelector("form") as HTMLFormElement).dispatchEvent(new Event("submit", { cancelable: true }));
+    await done;
+    await t.annotator.idle();
+    t.annotator.select(0, 7);
+    await t.annotator.removeSelected();
+    expect(t.calls).toEqual(['update 0 7 {"text":"new"}', "remove 0 7"]);
+    // Undo reaches the edit of the text, which has nothing left to change, and does not ask the engine.
+    expect(t.history.undoLabel).toBe("Edit text");
+    await t.history.undo();
+    expect(t.calls).toHaveLength(2);
+    // The edit below it can be undone, and the document stays marked as changed.
+    expect(t.history.undoLabel).toBe("Earlier");
+    await t.history.undo();
+    expect(below).toHaveBeenCalled();
+    expect(t.history.dirty).toBe(true);
+    // Redo skips it the same way.
+    await t.history.redo();
+    await t.history.redo();
+    expect(t.calls).toHaveLength(2);
+  });
+
+  it("an edit of another annotation is still undone through the engine", async () => {
+    const other = annotation({
+      id: 8,
+      kind: "highlight",
+      can: { editText: true, recolour: true, move: false, remove: true, restore: false, locked: false },
+    });
+    const t = setup([other]);
+    t.annotator.select(0, 8);
+    t.annotator.setColor([126, 217, 87, 255]);
+    await t.annotator.idle();
+    await t.history.undo();
+    expect(t.calls.at(-1)).toContain('"color":[255,235,59,255]');
+  });
+});
+
+describe("markup that is done on some pages only", () => {
+  it("leaves the marks that were made, as one edit that Undo takes back, and says so", async () => {
+    const t = setup();
+    t.setRanges([
+      { page: 0, start: 0, end: 4 },
+      { page: 1, start: 0, end: 4 },
+    ]);
+    vi.mocked(t.api.addMarkup).mockImplementationOnce(() => Promise.resolve(annotation({ id: 50 })));
+    vi.mocked(t.api.addMarkup).mockRejectedValueOnce({ code: "annotation_refused", message: "no" });
+    await t.annotator.markSelection("highlight");
+    // The outcome: page 0 is marked, the document counts as changed and Undo takes the mark off.
+    expect(t.history.dirty).toBe(true);
+    expect(t.history.undoLabel).toBe("Highlight");
+    await t.history.undo();
+    expect(t.calls.filter((c) => c.startsWith("remove"))).toEqual(["remove 0 50"]);
+    // The notice that the person reads says that it was done in part, not the opposite.
+    const error = t.host.failures[0] as { code: string; message: string };
+    const notice = annotationNotice(error, "book.pdf");
+    expect(notice.title).toBe("Only some of the text was marked");
+    expect(notice.title).not.toContain("not changed");
+    expect(notice.detail).toContain("are marked");
+    expect(notice.detail).toContain("Undo takes all of them back");
+    expect(notice.detail).not.toContain("as it was before");
+    expect(notice.detail).not.toContain("may have been made");
+  });
+
+  it("tells a clean refusal as one, and anything else as of unknown effect", () => {
+    const clean = annotationNotice({ code: "annotation_refused", message: "x" }, "book.pdf");
+    expect(clean.detail).toContain("The document is as it was before this change.");
+    const unknown = annotationNotice({ code: "internal", message: "x" }, "book.pdf");
+    expect(unknown.title).toBe("The annotation was not changed");
+    expect(unknown.detail).toContain("Part of the change may have been made");
   });
 });
