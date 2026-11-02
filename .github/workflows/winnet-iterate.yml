@@ -30,15 +30,16 @@ jobs:
           mkdir -p dist
           echo '<!doctype html><title>stub</title>' > dist/index.html
       - name: Build
-        run: cargo test -p partridge-engine --locked --no-run
-      - name: How starts end with layers taken away
+        run: cargo test -p partridge-engine -p partridge-engine-client --locked --no-run
+      - name: Starts
+        timeout-minutes: 6
         continue-on-error: true
-        run: cargo test -p partridge-engine --locked --test windows_start_variants -- --ignored --nocapture
-      - name: Access lists after the run
+        run: cargo test -p partridge-engine --locked --test windows_start -- --nocapture
+      - name: Sandbox proof
+        timeout-minutes: 5
+        continue-on-error: true
+        run: cargo test -p partridge-engine --locked --test sandbox -- --nocapture --test-threads 1
+      - name: The other engine tests
         if: always()
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          icacls target\debug
-          icacls target\debug\partridge-engine.exe
-          icacls vendor\pdfium\win-x64
+        timeout-minutes: 8
+        run: cargo test -p partridge-engine -p partridge-engine-client --locked --no-fail-fast

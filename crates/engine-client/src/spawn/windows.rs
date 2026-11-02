@@ -31,6 +31,7 @@ use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::ptr::{null, null_mut};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows_sys::Win32::Foundation::{
@@ -50,7 +51,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicUIRestrictions,
     JobObjectExtendedLimitInformation, SetInformationJobObject, JOBOBJECT_BASIC_UI_RESTRICTIONS,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_AFFINITY,
     JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOB_OBJECT_UILIMIT_DESKTOP,
     JOB_OBJECT_UILIMIT_DISPLAYSETTINGS, JOB_OBJECT_UILIMIT_EXITWINDOWS,
@@ -63,7 +64,8 @@ use windows_sys::Win32::System::StationsAndDesktops::{
 };
 use windows_sys::Win32::System::Threading::{
     CreateProcessAsUserW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
-    InitializeProcThreadAttributeList, OpenProcessToken, ResumeThread, SetThreadToken,
+    GetProcessAffinityMask, InitializeProcThreadAttributeList, OpenProcessToken, ResumeThread,
+    SetProcessAffinityMask, SetThreadToken,
     TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NO_WINDOW,
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
     LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
@@ -395,17 +397,10 @@ fn make_tokens() -> io::Result<(Owned, Owned)> {
             }
         }
         let mut nobody = null_sid();
-        let mut aap: Vec<u8> = vec![1, 2, 0, 0, 0, 0, 0, 15, 2, 0, 0, 0, 1, 0, 0, 0];
-        let mut restricting = vec![SID_AND_ATTRIBUTES {
+        let restricting = [SID_AND_ATTRIBUTES {
             Sid: nobody.as_mut_ptr().cast(),
             Attributes: 0,
         }];
-        if diag("rs") {
-            restricting.push(SID_AND_ATTRIBUTES {
-                Sid: aap.as_mut_ptr().cast(),
-                Attributes: 0,
-            });
-        }
 
         let mut restricted: HANDLE = null_mut();
         check(
@@ -448,21 +443,6 @@ fn make_tokens() -> io::Result<(Owned, Owned)> {
         // The AppContainer: the same two tokens, as tokens of a package that has no capabilities.
         // The start identity has to be one of the same package, or the system lowers it to
         // "identification" and the loader fails.
-        if diag("nolowbox") {
-            let mut plain: HANDLE = null_mut();
-            check(
-                DuplicateTokenEx(
-                    start_token.raw(),
-                    TOKEN_ALL_ACCESS,
-                    null(),
-                    SecurityImpersonation,
-                    TokenImpersonation,
-                    &mut plain,
-                ),
-                "DuplicateTokenEx (plain)",
-            )?;
-            return Ok((lockdown, Owned::new(plain)?));
-        }
         let lockdown = container::lowbox(&lockdown)?;
         let start_box = container::lowbox(&start_token)?;
         let mut imp: HANDLE = null_mut();
@@ -482,31 +462,77 @@ fn make_tokens() -> io::Result<(Owned, Owned)> {
     }
 }
 
-/// The job: one process, a memory limit, no UI access, ended when the handle closes.
-fn make_job(memory_limit: u64) -> io::Result<Owned> {
-    // SAFETY: documented Win32 calls with live, correctly sized structures.
-    unsafe {
-        let job = Owned::new(CreateJobObjectW(null(), null()))?;
-        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_ACTIVE_PROCESS
-            | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-            | JOB_OBJECT_LIMIT_PROCESS_MEMORY
-            | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
-        limits.BasicLimitInformation.ActiveProcessLimit = 1;
-        limits.ProcessMemoryLimit = memory_limit as usize;
-        if diag("affinity") {
-            limits.BasicLimitInformation.LimitFlags |= 0x10; // JOB_OBJECT_LIMIT_AFFINITY
-            limits.BasicLimitInformation.Affinity = 1;
-        }
-        check(
+/// The processors the engine may run on while it starts. A process that starts with a locked-down
+/// token cannot let the system's loader use its helper threads: the loader hands the loading of
+/// libraries to threads of the process that do not have the start identity (only the first
+/// thread has), and the load then fails at random with "library not found". The loader starts
+/// those helpers only where the process may run on more than one processor, so the engine starts
+/// on one processor and is given its full set again once it has said hello (see `started`).
+/// `one` is a single processor of the app's own set, the next one for each engine; `all` is the
+/// whole set.
+struct Processors {
+    one: usize,
+    all: usize,
+}
+
+fn startup_processors() -> io::Result<Processors> {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let (mut all, mut system) = (0usize, 0usize);
+    // SAFETY: documented call with live out parameters; the pseudo handle needs no closing.
+    check(
+        unsafe { GetProcessAffinityMask(GetCurrentProcess(), &mut all, &mut system) },
+        "GetProcessAffinityMask",
+    )?;
+    if all == 0 {
+        return Err(io::Error::other("the app has no processor to run on"));
+    }
+    let wanted = NEXT.fetch_add(1, Ordering::Relaxed) % all.count_ones() as usize;
+    let one = (0..usize::BITS)
+        .map(|bit| 1usize << bit)
+        .filter(|bit| all & bit != 0)
+        .nth(wanted)
+        .unwrap_or(all);
+    Ok(Processors { one, all })
+}
+
+/// The limits of the job: one process, a memory limit, ended when the handle closes, and the
+/// processors it may run on.
+fn job_limits(memory_limit: u64, processors: usize) -> JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+    // SAFETY: a plain structure of numbers; all zeros is a valid value.
+    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+        | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        | JOB_OBJECT_LIMIT_PROCESS_MEMORY
+        | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION
+        | JOB_OBJECT_LIMIT_AFFINITY;
+    limits.BasicLimitInformation.ActiveProcessLimit = 1;
+    limits.BasicLimitInformation.Affinity = processors;
+    limits.ProcessMemoryLimit = memory_limit as usize;
+    limits
+}
+
+fn set_job_limits(job: &Owned, limits: &JOBOBJECT_EXTENDED_LIMIT_INFORMATION) -> io::Result<()> {
+    // SAFETY: documented call with a live, correctly sized structure.
+    check(
+        unsafe {
             SetInformationJobObject(
                 job.raw(),
                 JobObjectExtendedLimitInformation,
-                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                (limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
                 size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            ),
-            "SetInformationJobObject (limits)",
-        )?;
+            )
+        },
+        "SetInformationJobObject (limits)",
+    )
+}
+
+/// The job: one process on one processor, a memory limit, no UI access, ended when the handle
+/// closes.
+fn make_job(memory_limit: u64, processors: usize) -> io::Result<Owned> {
+    // SAFETY: documented Win32 calls with live, correctly sized structures.
+    unsafe {
+        let job = Owned::new(CreateJobObjectW(null(), null()))?;
+        set_job_limits(&job, &job_limits(memory_limit, processors))?;
         let ui = JOBOBJECT_BASIC_UI_RESTRICTIONS {
             UIRestrictionsClass: JOB_OBJECT_UILIMIT_DESKTOP
                 | JOB_OBJECT_UILIMIT_DISPLAYSETTINGS
@@ -608,7 +634,10 @@ struct WindowsProcess {
     process: Owned,
     id: u32,
     /// Closing the job ends the engine: it must outlive it, and it goes with it.
-    _job: Option<Owned>,
+    job: Owned,
+    memory_limit: u64,
+    /// The processors the engine may use once it has started.
+    processors: usize,
 }
 
 impl EngineProcess for WindowsProcess {
@@ -624,6 +653,16 @@ impl EngineProcess for WindowsProcess {
         // SAFETY: the process handle is valid.
         unsafe { WaitForSingleObject(self.process.raw(), u32::MAX) };
         Ok(())
+    }
+    fn started(&mut self) {
+        // The engine has said hello, so it has loaded everything: it may use all the processors of
+        // the app now. The job first (it limits the process), then the process itself. Failing
+        // here leaves the engine on its one processor, which is slower and not unsafe.
+        let wide_open = job_limits(self.memory_limit, self.processors);
+        if set_job_limits(&self.job, &wide_open).is_ok() {
+            // SAFETY: the process handle is valid.
+            unsafe { SetProcessAffinityMask(self.process.raw(), self.processors) };
+        }
     }
     fn try_wait(&mut self) -> io::Result<Option<String>> {
         // SAFETY: the process handle is valid.
@@ -651,7 +690,9 @@ pub(super) fn spawn(request: &SpawnRequest<'_>) -> io::Result<SpawnedEngine> {
     let _only_one = START.lock().unwrap_or_else(|e| e.into_inner());
     container::allow_files(request.program, request.args)?;
     let (lockdown, initial) = make_tokens()?;
-    let job = make_job(request.memory_limit.unwrap_or(DEFAULT_MEMORY_LIMIT))?;
+    let memory_limit = request.memory_limit.unwrap_or(DEFAULT_MEMORY_LIMIT);
+    let processors = startup_processors()?;
+    let job = make_job(memory_limit, processors.one)?;
     let (child_in, parent_in) = make_pipe(true)?;
     let (child_out, parent_out) = make_pipe(false)?;
     let nul = open_nul()?;
@@ -682,7 +723,7 @@ pub(super) fn spawn(request: &SpawnRequest<'_>) -> io::Result<SpawnedEngine> {
     let program = wide(request.program.as_os_str());
 
     // The attribute list: handles to inherit, mitigation policies, no child processes.
-    let mut mitigations: u64 = if diag("nomit") { 0 } else { MITIGATIONS };
+    let mut mitigations: u64 = MITIGATIONS;
     let mut child_policy: u32 = PROCESS_CREATION_CHILD_PROCESS_RESTRICTED;
     let mut size = 0usize;
     // SAFETY: the first call only asks how large the list is.
@@ -746,7 +787,7 @@ pub(super) fn spawn(request: &SpawnRequest<'_>) -> io::Result<SpawnedEngine> {
             startup.lpAttributeList = list;
             // The engine shows nothing, so it gets a desktop of its own: it cannot see the windows
             // of the user, read the screen, or put a window of its own over theirs.
-            let mut desktop = if diag("nodesk") { None } else { engine_desktop().cloned() };
+            let mut desktop = engine_desktop().cloned();
             if let Some(name) = desktop.as_mut() {
                 startup.StartupInfo.lpDesktop = name.as_mut_ptr();
             }
@@ -782,12 +823,10 @@ pub(super) fn spawn(request: &SpawnRequest<'_>) -> io::Result<SpawnedEngine> {
                     SetThreadToken(&thread_handle, initial.raw()),
                     "SetThreadToken",
                 )?;
-                if !diag("nojob") {
-                    check(
-                        AssignProcessToJobObject(job.raw(), process.raw()),
-                        "AssignProcessToJobObject",
-                    )?;
-                }
+                check(
+                    AssignProcessToJobObject(job.raw(), process.raw()),
+                    "AssignProcessToJobObject",
+                )?;
                 if ResumeThread(thread.raw()) == u32::MAX {
                     return Err(io::Error::last_os_error());
                 }
@@ -810,7 +849,9 @@ pub(super) fn spawn(request: &SpawnRequest<'_>) -> io::Result<SpawnedEngine> {
         process: Box::new(WindowsProcess {
             process,
             id,
-            _job: Some(job),
+            job,
+            memory_limit,
+            processors: processors.all,
         }),
         stdin: Box::new(pipe_file(parent_in)) as Box<dyn Write + Send>,
         stdout: Box::new(pipe_file(parent_out)) as Box<dyn Read + Send>,
@@ -874,12 +915,4 @@ pub(super) fn spawn_plain(request: &SpawnRequest<'_>) -> io::Result<SpawnedEngin
         stdin: Box::new(stdin),
         stdout: Box::new(stdout),
     })
-}
-
-/// Switches for taking layers away one at a time, to find which one breaks a start. Debug builds.
-fn diag(name: &str) -> bool {
-    cfg!(debug_assertions)
-        && std::env::var("PARTRIDGE_DIAG")
-            .map(|v| v.split(',').any(|x| x == name))
-            .unwrap_or(false)
 }

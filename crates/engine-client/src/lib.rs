@@ -869,6 +869,14 @@ impl EngineClient {
                         ),
                     });
                 }
+                // The engine is up. (Windows: it started on one processor, see the spawn code.)
+                if let Some(running) = inner.running.as_ref() {
+                    running
+                        .child
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .started();
+                }
                 inner.running.as_mut().expect("just started").info = EngineInfo {
                     engine_version,
                     pdfium_version,
