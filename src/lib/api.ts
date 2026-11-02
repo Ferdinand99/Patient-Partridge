@@ -27,6 +27,8 @@ export interface SavedTabs {
 export interface SavedFile {
   path: string;
   name: string;
+  /** The original was touched while it was open, with parts of it unread: this copy holds what was read. */
+  touched?: boolean;
 }
 
 export interface OpenedDocument {

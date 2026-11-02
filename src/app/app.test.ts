@@ -2683,6 +2683,32 @@ describe("App: a save that does not end", () => {
     expect(notice()).toBeNull();
   });
 
+  it("shows no box about the save beside a question that came up during it", async () => {
+    const m = make();
+    await m.app.openPath("/docs/book.pdf");
+    await flush();
+    m.app.recordEdit({ label: "Change", undo: () => undefined, redo: () => undefined });
+    let fail!: (error: unknown) => void;
+    m.api.save.mockImplementationOnce(() => new Promise<SavedFile>((_, reject) => (fail = reject)));
+    const asking = m.app.requestQuit();
+    await flush();
+    click(button("Save and quit"));
+    await flush();
+    // The save ends with a question before the box would come up.
+    fail({ code: "save_locked", message: "x" });
+    await flush();
+    expect(button("Save a copy…")).not.toBeNull();
+    await slow();
+    // The question is still open: it is the only box, and it has the focus.
+    expect(document.querySelectorAll(".notice")).toHaveLength(1);
+    expect(sheet()).toBeNull();
+    expect(document.activeElement?.textContent).toBe("Cancel");
+    click(button("Cancel"));
+    await flush();
+    await asking;
+    expect(m.api.quitApp).not.toHaveBeenCalled();
+  });
+
   it("answers a second request to close or quit at once, while the first still waits", async () => {
     const m = await stuck();
     const asking = m.app.requestQuit();
@@ -2786,6 +2812,24 @@ describe("App: a save that cannot replace the file", () => {
     await flush();
     expect(notice()?.textContent).not.toContain("read-only");
     expect(notice()?.textContent).toContain("USB stick or a network drive");
+  });
+
+  it("offers a copy when the file was touched, and the copy says so in one line", async () => {
+    const m = await openDirty();
+    m.api.save.mockRejectedValueOnce({ code: "save_source_touched", message: "x" });
+    m.api.saveAs.mockResolvedValueOnce({ path: "/docs/copy.pdf", name: "copy.pdf", touched: true });
+    key("s", { ctrlKey: true });
+    await flush();
+    expect(button("Save a copy…")).not.toBeNull();
+    click(button("Save a copy…"));
+    await flush();
+    expect(m.api.saveAs).toHaveBeenCalledWith(1, false);
+    expect(m.app.unsavedCount).toBe(0);
+    expect(notice()?.textContent).toContain("touched");
+    expect(notice()?.textContent).toContain("copy.pdf");
+    click(button("OK"));
+    await flush();
+    expect(notice()).toBeNull();
   });
 
   it("tells the user to open the file again when it changed in place, and offers no copy", async () => {

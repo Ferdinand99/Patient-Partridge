@@ -21,6 +21,8 @@ use crate::{
 /// The file a document belongs to, and how it looked when the document was opened (or last saved).
 struct Source {
     path: PathBuf,
+    /// The file the document was opened from, which the engine keeps reading. Never changes.
+    original: PathBuf,
     stamp: Option<FileStamp>,
 }
 
@@ -131,6 +133,7 @@ impl EnginePool {
         };
         let source = Source {
             path: PathBuf::from(path),
+            original: PathBuf::from(path),
             stamp,
         };
         let handle = self.register(
@@ -231,9 +234,13 @@ impl EnginePool {
         let _saving = saving
             .try_lock()
             .map_err(|_| ClientError::Save(SaveError::Busy))?;
-        let (current_path, current_stamp) = {
+        let (current_path, current_stamp, original) = {
             let source = source.lock().unwrap_or_else(|e| e.into_inner());
-            (source.path.clone(), source.stamp.clone())
+            (
+                source.path.clone(),
+                source.stamp.clone(),
+                source.original.clone(),
+            )
         };
         let (path, expected) = match target {
             None => (current_path, current_stamp),
@@ -257,6 +264,7 @@ impl EnginePool {
                 )
             },
             &|| state(&self.state).docs.contains_key(&handle),
+            Some(&original),
         )?;
         // The document belongs to the file it was saved to, which now looks different.
         let mut source = source.lock().unwrap_or_else(|e| e.into_inner());
@@ -380,7 +388,7 @@ impl EnginePool {
 }
 
 /// True when two paths lead to the same file.
-fn same_file(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
     if a == b {
         return true;
     }
@@ -412,6 +420,7 @@ mod tests {
     fn no_source() -> Source {
         Source {
             path: PathBuf::from("a.pdf"),
+            original: PathBuf::from("a.pdf"),
             stamp: None,
         }
     }

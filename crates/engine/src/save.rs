@@ -186,11 +186,13 @@ pub fn doc_info(
             .unwrap_or(true),
         None => false,
     };
+    let touched = source.is_some_and(|guard| crate::source::lock(guard).touched());
     ResponseBody::DocInfo {
         pages: document.pages().len() as u32,
         security: security_revision(document),
         signatures: found.max(widgets),
         maybe_signed,
+        touched,
     }
 }
 
