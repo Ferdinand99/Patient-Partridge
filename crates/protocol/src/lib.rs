@@ -2993,3 +2993,95 @@ mod font_script_tests {
         assert_eq!(FontScript::from_name("latin"), None);
     }
 }
+
+#[cfg(test)]
+mod tags {
+    use super::*;
+
+    /// The two lines of development that were merged each gave out tags and error codes, and no
+    /// tag may stand for two messages: the decoders tell messages apart by it alone.
+    #[test]
+    fn no_tag_or_error_code_stands_for_two_things() {
+        let requests: Vec<u8> = vec![
+            TAG_REQ_HELLO,
+            TAG_REQ_OPEN,
+            TAG_REQ_RENDER,
+            TAG_REQ_CLOSE,
+            TAG_REQ_OUTLINE,
+            TAG_REQ_PAGE_TEXT,
+            TAG_REQ_PAGE_LINKS,
+            TAG_REQ_SEARCH,
+            TAG_REQ_FONT_REPORT,
+            TAG_REQ_DOC_INFO,
+            TAG_REQ_SAVE_BEGIN,
+            TAG_REQ_SAVE_CHUNK,
+            TAG_REQ_SAVE_END,
+            TAG_REQ_FINGERPRINT,
+            TAG_REQ_SIGNATURES,
+            TAG_REQ_FORM_INFO,
+            TAG_REQ_LIST_FORM_FIELDS,
+            TAG_REQ_SET_FORM_FIELD,
+            TAG_REQ_LIST_ANNOTS,
+            TAG_REQ_ADD_MARKUP,
+            TAG_REQ_ADD_NOTE,
+            TAG_REQ_ADD_INK,
+            TAG_REQ_ADD_STAMP,
+            TAG_REQ_UPDATE_ANNOT,
+            TAG_REQ_REMOVE_ANNOT,
+            TAG_REQ_RESTORE_ANNOT,
+        ];
+        let responses: Vec<u8> = vec![
+            TAG_RES_HELLO,
+            TAG_RES_OPENED,
+            TAG_RES_RENDERED,
+            TAG_RES_CLOSED,
+            TAG_RES_OUTLINE,
+            TAG_RES_PAGE_TEXT,
+            TAG_RES_PAGE_LINKS,
+            TAG_RES_MATCHES,
+            TAG_RES_FONT_REPORT,
+            TAG_RES_DOC_INFO,
+            TAG_RES_SAVE_READY,
+            TAG_RES_SAVE_DATA,
+            TAG_RES_SAVE_ENDED,
+            TAG_RES_PROGRESS,
+            TAG_RES_FINGERPRINT,
+            TAG_RES_SIGNATURES,
+            TAG_RES_FORM_INFO,
+            TAG_RES_FORM_FIELDS,
+            TAG_RES_ANNOTS,
+            TAG_RES_ANNOT,
+            TAG_RES_ANNOT_REMOVED,
+            TAG_RES_ERROR,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for tag in &requests {
+            assert!(seen.insert(*tag), "request tag {tag} is used twice");
+            assert!(
+                !(pages::FIRST_REQUEST_TAG..=pages::LAST_REQUEST_TAG).contains(tag),
+                "request tag {tag} is in the range of the page tools"
+            );
+        }
+        let mut seen = std::collections::HashSet::new();
+        for tag in &responses {
+            assert!(seen.insert(*tag), "answer tag {tag} is used twice");
+            assert!(
+                !(pages::FIRST_RESPONSE_TAG..=pages::LAST_RESPONSE_TAG).contains(tag),
+                "answer tag {tag} is in the range of the page tools"
+            );
+        }
+        // Every error code reads back as itself and has a name of its own.
+        let mut names = std::collections::HashSet::new();
+        for raw in 0..=255u8 {
+            if let Some(code) = ErrorCode::from_u8(raw) {
+                assert_eq!(code as u8, raw);
+                assert!(names.insert(code.name()), "two error codes are called {}", code.name());
+            }
+        }
+        // The codes of the annotations and forms, and those of the page tools, are all there.
+        for raw in [18u8, 19, 20, 24, 25, 50, 51, 52, 53, 54, 55, 56] {
+            assert!(ErrorCode::from_u8(raw).is_some(), "error code {raw} is missing");
+        }
+        assert_eq!(PROTOCOL_VERSION, 9);
+    }
+}
