@@ -2657,6 +2657,7 @@ version = "0.1.0"
 name = "partridge-testkit"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "md-5",
 ]
 

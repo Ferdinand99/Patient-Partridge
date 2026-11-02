@@ -1,0 +1,104 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R  >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R 6 0 R ] /Count 2 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Resources << /Font << /F1 3 0 R >> >> /Annots [8 0 R 9 0 R 10 0 R 11 0 R 12 0 R 13 0 R] >>
+endobj
+5 0 obj
+<< /Length 164 >>
+stream
+BT /F1 24 Tf 72 740 Td (Hello Partridge) Tj ET
+BT /F1 12 Tf 72 400 Td 16 TL (A needle in a haystack.) Tj T* (Another NEEDLE here and quick) Tj T* (brown fox) Tj ET
+
+endstream
+endobj
+6 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 7 0 R /Resources << /Font << /F1 3 0 R >> >>  >>
+endobj
+7 0 obj
+<< /Length 2253 >>
+stream
+BT /F1 40 Tf 48 702 Td (Page 2) Tj ET
+BT /F1 11 Tf 48 662 Td 14 TL
+(Line 0 of page 2: the quick brown fox jumps over the lazy dog.) Tj T*
+(Line 1 of page 2: the quick brown fox jumps over the lazy dog.) Tj T*
+(Line 2 of page 2: the quick brown fox jumps over the lazy dog.) Tj T*
+(Line 3 of page 2: the quick brown fox jumps over the lazy dog.) Tj T*
+(Line 4 of page 2: the quick brown fox jumps over the lazy dog.) Tj T*
+(Line 5 of page 2: the quick brown fox jumps over the lazy dog.) Tj T*
+(Line 6 of page 2: the quick brown fox jumps over the lazy dog.) Tj T*
+(Line 7 of page 2: the quick brown fox jumps over the lazy dog.) Tj T*
+(Line 8 of page 2: the quick brown fox jumps over the lazy dog.) Tj T*
+(Line 9 of page 2: the quick brown fox jumps over the lazy dog.) Tj T*
+(Line 10 of page 2: the quick brown fox jumps over the lazy dog.) Tj T*
+(Line 11 of page 2: the quick brown fox jumps over the lazy dog.) Tj T*
+(Line 12 of page 2: the quick brown fox jumps over the lazy dog.) Tj T*
+(Line 13 of page 2: the quick brown fox jumps over the lazy dog.) Tj T*
+(Line 14 of page 2: the quick brown fox jumps over the lazy dog.) Tj T*
+(Line 15 of page 2: the quick brown fox jumps over the lazy dog.) Tj T*
+(Line 16 of page 2: the quick brown fox jumps over the lazy dog.) Tj T*
+(Line 17 of page 2: the quick brown fox jumps over the lazy dog.) Tj T*
+(Line 18 of page 2: the quick brown fox jumps over the lazy dog.) Tj T*
+(Line 19 of page 2: the quick brown fox jumps over the lazy dog.) Tj T*
+(Line 20 of page 2: the quick brown fox jumps over the lazy dog.) Tj T*
+(Line 21 of page 2: the quick brown fox jumps over the lazy dog.) Tj T*
+(Line 22 of page 2: the quick brown fox jumps over the lazy dog.) Tj T*
+(Line 23 of page 2: the quick brown fox jumps over the lazy dog.) Tj T*
+(Line 24 of page 2: the quick brown fox jumps over the lazy dog.) Tj T*
+(Line 25 of page 2: the quick brown fox jumps over the lazy dog.) Tj T*
+(Line 26 of page 2: the quick brown fox jumps over the lazy dog.) Tj T*
+(Line 27 of page 2: the quick brown fox jumps over the lazy dog.) Tj T*
+(Line 28 of page 2: the quick brown fox jumps over the lazy dog.) Tj T*
+(Line 29 of page 2: the quick brown fox jumps over the lazy dog.) Tj T*
+ET
+0.1 0.3 0.8 rg 36 36 540 24 re f
+
+endstream
+endobj
+8 0 obj
+<< /Type /Annot /Subtype /Highlight /Rect [72 735 200 765] /QuadPoints [72 765 200 765 72 735 200 735] /C [1 0 0] /Contents <FEFF0043006800650063006B002000740068006900730020007400690074006C0065> /T <FEFF0041006C006900630065> /F 4 >>
+endobj
+9 0 obj
+<< /Type /Annot /Subtype /Text /Rect [300 700 320 720] /C [1 1 0] /Name /Comment /Contents <FEFF00410020006E006F00740065002000660072006F006D0020007400680065002000660069006C006500202713> /T <FEFF0042006F0062> /F 4 >>
+endobj
+10 0 obj
+<< /Type /Annot /Subtype /Ink /Rect [100 300 200 350] /InkList [[100 300 150 350 200 300]] /C [0 0 1] /BS << /W 3 >> /Contents (Ink) /F 4 >>
+endobj
+11 0 obj
+<< /Type /Annot /Subtype /Stamp /Rect [400 600 500 650] /Name /Approved /Contents (Stamp) /F 4 >>
+endobj
+12 0 obj
+<< /Type /Annot /Subtype /FreeText /Rect [72 500 300 540] /Contents (A text box) /DA (/Helv 12 Tf 0 g) /F 4 >>
+endobj
+13 0 obj
+<< /Type /Annot /Subtype /Link /Rect [72 650 172 670] /Border [0 0 0] /A << /S /URI /URI (https://example.com/page) >> >>
+endobj
+xref
+0 14
+0000000000 65535 f 
+0000000015 00000 n 
+0000000065 00000 n 
+0000000129 00000 n 
+0000000199 00000 n 
+0000000375 00000 n 
+0000000590 00000 n 
+0000000717 00000 n 
+0000003022 00000 n 
+0000003270 00000 n 
+0000003501 00000 n 
+0000003658 00000 n 
+0000003772 00000 n 
+0000003899 00000 n 
+trailer
+<< /Size 14 /Root 1 0 R  >>
+startxref
+4037
+%%EOF

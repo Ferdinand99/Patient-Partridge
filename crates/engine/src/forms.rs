@@ -67,6 +67,7 @@ use partridge_protocol::{
 };
 use pdfium_render::prelude::*;
 
+use crate::annots::raw_document;
 use crate::source::SourceGuard;
 use crate::Failure;
 
@@ -153,29 +154,6 @@ impl Drop for FormEnv {
         // engine drops this before the document it belongs to.
         unsafe { self.bindings.FPDFDOC_ExitFormFillEnvironment(self.handle) };
     }
-}
-
-/// The handle PDFium has for a document, or `None` when it cannot be found out safely.
-pub fn document_handle(
-    bindings: &dyn PdfiumLibraryBindings,
-    document: &PdfDocument<'_>,
-) -> Option<FPDF_DOCUMENT> {
-    let text = format!("{document:?}");
-    let digits: String = text
-        .split("0x")
-        .nth(1)?
-        .chars()
-        .take_while(char::is_ascii_hexdigit)
-        .collect();
-    let address = usize::from_str_radix(&digits, 16).ok()?;
-    if address == 0 || address % std::mem::align_of::<usize>() != 0 {
-        return None;
-    }
-    let handle = address as FPDF_DOCUMENT;
-    // SAFETY: the pointer is the one the library holds for this document; the count is how it is
-    // checked, and it is only a read.
-    let count = unsafe { bindings.FPDF_GetPageCount(handle) };
-    (count >= 0 && count as usize == document.pages().len() as usize).then_some(handle)
 }
 
 /// True when `bytes` holds the PDF name `name` (such as `/Hide`) as a whole name: the byte after it
@@ -358,7 +336,7 @@ pub fn info(
 ) -> Result<ResponseBody, Failure> {
     let bindings = pdfium.bindings();
     // A document whose handle cannot be found out is not a document without a form: say so.
-    let Some(handle) = document_handle(bindings, document) else {
+    let Some(handle) = raw_document(document) else {
         return Err(unsupported("the form of this document cannot be reached"));
     };
     let kind = form_kind(bindings, handle);
@@ -403,7 +381,7 @@ impl FormEnv {
         progress: &mut dyn FnMut(u32),
     ) -> Result<FormEnv, Failure> {
         let bindings = pdfium.bindings();
-        let Some(handle) = document_handle(bindings, document) else {
+        let Some(handle) = raw_document(document) else {
             return Err(unsupported("the form of this document cannot be reached"));
         };
         match form_kind(bindings, handle) {
@@ -435,7 +413,7 @@ impl FormEnv {
             Box::pin(unsafe { std::mem::zeroed::<FPDF_FORMFILLINFO>() });
         info.version = 2;
         let info_ptr: *mut FPDF_FORMFILLINFO = &mut *info.as_mut();
-        // SAFETY: the document handle is valid (see `document_handle`), the structure is pinned.
+        // SAFETY: the document handle is valid (see `raw_document`), the structure is pinned.
         let form = unsafe { bindings.FPDFDOC_InitFormFillEnvironment(handle, info_ptr) };
         if form.is_null() {
             return Err(unsupported("the form of this document could not be opened"));

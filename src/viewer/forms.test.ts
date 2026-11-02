@@ -791,7 +791,7 @@ describe("the view of a document with a form", () => {
     expect(calls).toBe(2);
     expect(input?.classList.contains("form-pending")).toBe(false);
     // A page called out of date that is not on screen is left alone.
-    view.redrawPage(9);
+    view.invalidatePage(9);
     await flush();
     expect(calls).toBe(2);
   });

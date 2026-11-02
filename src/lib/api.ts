@@ -4,6 +4,7 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import type { PageSizePt } from "../viewer/layout";
 import type { FormFieldInfo, FormInfo, FormValueIn } from "../viewer/forms";
 import type { PageLinkInfo } from "../viewer/overlays";
+import type { Annotation, AnnotKind, Rgba, StampName } from "./annotations";
 
 /** Where the reader was in a file, as remembered on this computer. */
 export interface SavedPosition {
@@ -164,6 +165,67 @@ export const api = {
    */
   getPageText(doc: number, page: number): Promise<{ text: string; rects: number[] }> {
     return invoke<{ text: string; rects: number[] }>("get_page_text", { doc, page });
+  },
+
+  /**
+   * The annotations of a page that can be shown and changed. Their text and author come from the
+   * file: show them as text only.
+   */
+  listAnnotations(doc: number, page: number): Promise<Annotation[]> {
+    return invoke<Annotation[]>("list_annotations", { doc, page });
+  },
+
+  /** Marks the characters `start..end` of the page text (numbered as `getPageText` numbers them). */
+  addMarkup(
+    doc: number,
+    page: number,
+    kind: Extract<AnnotKind, "highlight" | "underline" | "strikeout">,
+    color: Rgba,
+    start: number,
+    end: number,
+  ): Promise<Annotation> {
+    return invoke<Annotation>("add_markup", { doc, page, kind, color, start, end });
+  },
+
+  /** A sticky note at a place of the page, in points from its top left as it is drawn. */
+  addNote(doc: number, page: number, x: number, y: number, color: Rgba, text: string): Promise<Annotation> {
+    return invoke<Annotation>("add_note", { doc, page, x, y, color, text });
+  },
+
+  /** A free drawing: strokes of points in points from the top left of the page as it is drawn. */
+  addInk(doc: number, page: number, color: Rgba, width: number, strokes: [number, number][][]): Promise<Annotation> {
+    return invoke<Annotation>("add_ink", { doc, page, color, width, strokes });
+  },
+
+  addStamp(doc: number, page: number, x: number, y: number, stamp: StampName): Promise<Annotation> {
+    return invoke<Annotation>("add_stamp", { doc, page, x, y, stamp });
+  },
+
+  /** Changes the text, the colour or the place (`dx`, `dy` in points on the drawn page). */
+  updateAnnotation(
+    doc: number,
+    page: number,
+    id: number,
+    change: { text?: string; color?: Rgba; dx?: number; dy?: number },
+  ): Promise<Annotation> {
+    return invoke<Annotation>("update_annotation", {
+      doc,
+      page,
+      id,
+      text: change.text ?? null,
+      color: change.color ?? null,
+      dx: change.dx ?? 0,
+      dy: change.dy ?? 0,
+    });
+  },
+
+  async removeAnnotation(doc: number, page: number, id: number): Promise<void> {
+    await invoke<void>("remove_annotation", { doc, page, id });
+  },
+
+  /** Puts back an annotation that was removed. It keeps its id. */
+  restoreAnnotation(doc: number, page: number, id: number): Promise<Annotation> {
+    return invoke<Annotation>("restore_annotation", { doc, page, id });
   },
 
   /**
