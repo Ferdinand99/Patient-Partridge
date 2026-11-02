@@ -663,6 +663,8 @@ fn the_files_for_other_tools_are_written() {
         7,
         "draws=inherited-original.pdf:6,5,4,3,2,1,0",
     );
+    // The pool holds six documents at most.
+    pool.close(h);
 
     // Two pages copied out in the other order.
     let (path, h) = open(&kit::marked_pdf(5));
