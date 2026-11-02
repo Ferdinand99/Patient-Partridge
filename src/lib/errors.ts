@@ -26,7 +26,7 @@ export function toAppError(error: unknown): AppErrorLike {
 
 /** Errors that mean the engine process was lost and the open document with it. */
 export function isEngineLost(error: AppErrorLike): boolean {
-  return error.code === "engine_stopped" || error.code === "unknown_document";
+  return error.code === "engine_stopped" || error.code === "unknown_document" || error.code === "save_took_too_long";
 }
 
 export function describeError(error: AppErrorLike, fileName?: string): Described {
@@ -66,6 +66,12 @@ export function describeError(error: AppErrorLike, fileName?: string): Described
       return {
         title: "The PDF engine stopped",
         detail: `The part of Patient Partridge that reads PDF files stopped while working on ${fileName ? file : "this file"}. The file may be damaged. The app is still running, so you can try again or open another file.`,
+        action: "retry",
+      };
+    case "save_took_too_long":
+      return {
+        title: "The save took too long",
+        detail: `The PDF engine was still working on ${fileName ? file : "this file"} when the time allowed for a file of that size ran out, so it was stopped. The file on the disk was not changed, but the changes made since it was opened are lost. A very slow drive or network connection can cause this. Open the file again, and save a copy to a local disk if it happens again.`,
         action: "retry",
       };
     case "unknown_document":
@@ -125,7 +131,7 @@ export function describeError(error: AppErrorLike, fileName?: string): Described
     case "save_source_unreadable":
       return {
         title: "The file could not be read",
-        detail: `A part of ${file} could not be read while saving (a drive or a network connection may have dropped), so the saved file would be missing parts. Nothing was saved, and the file on the disk was not touched. Close the tab, check the drive, and open the file again.`,
+        detail: `A part of ${file} could not be read while saving, so the saved file would be missing parts. A drive or a network connection may have dropped, or the file may be damaged in a place that only shows when it is saved. Nothing was saved, and the file on the disk was not touched. Close the tab, check the drive, and open the file again.`,
         action: "none",
       };
     case "save_locked":

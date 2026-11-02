@@ -1069,8 +1069,13 @@ fn joins(u: &[f32; 4], r: &[f32; 4]) -> bool {
     let (rw, rh) = (r[2] - r[0], r[3] - r[1]);
     let along_line = overlap(u[1], u[3], r[1], r[3]) > 0.5 * uh.min(rh)
         && overlap(u[0], u[2], r[0], r[2]) > -0.6 * uh.max(rh);
-    let down_column = overlap(u[0], u[2], r[0], r[2]) > 0.5 * uw.min(rw)
-        && overlap(u[1], u[3], r[1], r[3]) > -0.6 * uw.max(rw);
+    // A column is a stack of characters of the same width, one under the other, with hardly a gap.
+    // The run so far is as tall as it is wide or taller, and the new character is as wide as it.
+    // Two lines of text one under the other are not a column: their boxes differ in width.
+    let down_column = uh >= uw * 0.95
+        && (rw - uw).abs() <= 0.3 * uw.max(rw)
+        && overlap(u[0], u[2], r[0], r[2]) > 0.8 * uw.min(rw)
+        && overlap(u[1], u[3], r[1], r[3]) > -0.3 * uw.max(rw);
     along_line || down_column
 }
 

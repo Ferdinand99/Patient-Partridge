@@ -60,6 +60,18 @@ describe("describeError: saving", () => {
   });
 });
 
+describe("describeError: a save that took too long", () => {
+  it("says the time ran out, that the file is as it was and that the changes are lost, and counts as a lost engine", () => {
+    const error = { code: "save_took_too_long", message: "it was still working" };
+    expect(isEngineLost(error)).toBe(true);
+    const d = describeError(error, "tax.pdf");
+    expect(d.title).toBe("The save took too long");
+    expect(d.detail).toContain('"tax.pdf"');
+    expect(d.detail).toContain("was not changed");
+    expect(d.detail).toContain("changes made since it was opened are lost");
+  });
+});
+
 describe("describeError", () => {
   it("asks for a password when the file needs one", () => {
     const d = describeError({ code: "password_required", message: "" }, "tax.pdf");

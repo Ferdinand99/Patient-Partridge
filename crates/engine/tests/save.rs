@@ -418,12 +418,14 @@ fn c2_a_read_that_fails_before_a_save_makes_the_save_refuse() {
         error_code(ask(e, RequestBody::SaveBegin { doc })),
         ErrorCode::SourceUnreadable
     );
-    // The failure stays on record: coming back does not make the document whole again.
+    // The engine's own look failed, not a read of PDFium's, so nothing is missing from the
+    // document: when the share is back the save works. (A read of PDFium's that fails stays on
+    // record; the test below has one.)
     broken.store(false, Ordering::SeqCst);
-    assert_eq!(
-        error_code(ask(e, RequestBody::SaveBegin { doc })),
-        ErrorCode::SourceUnreadable
-    );
+    assert!(matches!(
+        ask(e, RequestBody::SaveBegin { doc }),
+        ResponseBody::SaveReady { .. }
+    ));
 }
 
 #[test]
@@ -505,6 +507,29 @@ fn i3_a_save_of_a_bigger_document_reports_its_progress() {
     assert!(!seen.is_empty(), "no sign of life");
     assert!(seen.windows(2).all(|w| w[0] < w[1]), "{seen:?}");
     assert!(*seen.last().unwrap() <= size);
+}
+
+#[test]
+fn n1_the_reads_of_the_guard_report_progress_too() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    // One page and 6 MiB of padding: the page loops report nothing, so every sign of life below
+    // comes from the engine reading the file through the guard.
+    let doc = open(e, &kit::padded_pdf(6 * 1024 * 1024), None).unwrap();
+    for (name, body) in [
+        ("DocInfo", RequestBody::DocInfo { doc }),
+        ("Fingerprint", RequestBody::Fingerprint { doc }),
+    ] {
+        let mut seen: Vec<u32> = Vec::new();
+        let response = e.handle_with_progress(Request { id: 9, body }, &mut |done| seen.push(done));
+        assert!(
+            !matches!(response.body, ResponseBody::Error { .. }),
+            "{name}: {response:?}"
+        );
+        // The first DocInfo reads the whole file, the others read it again to check it.
+        assert!(seen.len() >= 5, "{name}: too few signs of life: {seen:?}");
+        assert!(seen.windows(2).all(|w| w[0] < w[1]), "{name}: {seen:?}");
+    }
 }
 
 fn print_of(engine: &mut Engine, doc: u32) -> (u32, u32, u64) {

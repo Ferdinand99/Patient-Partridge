@@ -10,11 +10,15 @@
 //!    rename within one file system). The target is not touched. If anything fails from here on
 //!    (a full disk, the engine dying, an unreadable result), the new file is removed and the
 //!    target is as it was.
-//! 3. The new file is flushed to the disk (`fsync`), and given the permissions of the file it will
-//!    replace.
+//! 3. The new file is given the access rights of the file it will replace (permissions, owner,
+//!    group, ACL), or the save stops and a copy is offered. It is flushed (`fsync`), then read back
+//!    and compared with the bytes that were received. The read-back is served by the system's
+//!    cache as a rule, so it shows that what was written is what was sent, not that the disk
+//!    stored it: a fault of the media itself is beyond what any program can see this way.
 //! 4. The bytes are untrusted: a fresh, sandboxed engine opens the new file. It must open (with the
-//!    same password), have the pages the document has, be protected the way the document is, and
-//!    carry the same signatures. A file that does not pass is never put in place.
+//!    same password), have the pages the document has, be protected the way the document is, carry
+//!    the same signatures, and agree on a fingerprint of every page (size, text, number of objects
+//!    and annotations). A file that does not pass is never put in place.
 //! 5. If the target was changed by someone else since it was opened, the caller is asked first
 //!    (`SaveError::Changed`), unless it said to overwrite.
 //! 6. The new file replaces the target in one rename, and the folder is flushed.
@@ -259,13 +263,12 @@ fn is_disk_full(e: &io::Error) -> bool {
 }
 
 /// True for an error that says the file is in use in a way that blocks the step: a sharing or
-/// lock violation, or one of the errors that the replacing of a file gives on Windows.
+/// lock violation on Windows.
 fn is_locked(e: &io::Error) -> bool {
     #[cfg(windows)]
     {
-        // ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION, ERROR_UNABLE_TO_REMOVE_REPLACED,
-        // ERROR_UNABLE_TO_MOVE_REPLACEMENT, ERROR_UNABLE_TO_MOVE_REPLACEMENT_2
-        matches!(e.raw_os_error(), Some(32 | 33 | 1175 | 1176 | 1177))
+        // ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
+        matches!(e.raw_os_error(), Some(32 | 33))
     }
     #[cfg(not(windows))]
     {
@@ -425,26 +428,53 @@ fn check_target(target: &Path) -> Result<Option<fs::Metadata>, SaveError> {
             // The rename needs rights on the folder, not on the file, so a file the user may not
             // write would be replaced all the same. Whether they may is found out by trying to
             // open it for writing (nothing is written or cut off).
-            if let Err(e) = OpenOptions::new().write(true).open(target) {
-                return Err(match e.kind() {
-                    io::ErrorKind::PermissionDenied if !is_locked(&e) => SaveError::ReadOnly(
-                        "you may not change this file; save a copy under another name instead"
-                            .into(),
-                    ),
-                    _ => from_io(&e, "the file"),
-                });
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                if meta.nlink() > 1 {
-                    return Err(SaveError::HardLink);
+            let handle = match OpenOptions::new().write(true).open(target) {
+                Ok(handle) => handle,
+                Err(e) => {
+                    return Err(match e.kind() {
+                        io::ErrorKind::PermissionDenied if !is_locked(&e) => SaveError::ReadOnly(
+                            "you may not change this file; save a copy under another name instead"
+                                .into(),
+                        ),
+                        _ => from_io(&e, "the file"),
+                    });
                 }
+            };
+            // A file with a second name would be split from it by the replacement: the other
+            // name would keep the old content.
+            if link_count(&handle, &meta).map_err(|e| from_io(&e, "the file"))? > 1 {
+                return Err(SaveError::HardLink);
             }
             Ok(Some(meta))
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(from_io(&e, "the file")),
+    }
+}
+
+/// How many names the file has (hard links, the name used to open it included).
+#[cfg(unix)]
+fn link_count(_file: &File, meta: &fs::Metadata) -> io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(meta.nlink())
+}
+
+/// How many names the file has (hard links, the name used to open it included). The standard
+/// library does not give the number on Windows; the system does, for an open handle.
+#[cfg(windows)]
+fn link_count(file: &File, _meta: &fs::Metadata) -> io::Result<u64> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    // SAFETY: the handle is open for the whole call, and the structure is plain data that the
+    // call fills in.
+    unsafe {
+        let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+        if GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(u64::from(info.nNumberOfLinks))
     }
 }
 
@@ -631,13 +661,12 @@ pub(crate) fn save_document(
         .into());
     }
 
-    // What is on the disk is what was received: read it back and compare.
+    // Read the file back and compare it with what was received. The bytes were written a moment
+    // ago, so the system serves them from its cache and not from the disk: this catches a short
+    // or damaged write on the way to the cache, and it cannot show that the disk stored them.
     let back = digest_of_file(&temp.path).map_err(|e| from_io(&e, "the new file"))?;
     if back != sum.finish() {
-        return Err(SaveError::Write(
-            "what is on the disk is not what was written; the disk may be failing".into(),
-        )
-        .into());
+        return Err(SaveError::Write("the new file is not what was written to it".into()).into());
     }
 
     verify(&temp.path, info, &print)?;
@@ -699,8 +728,8 @@ fn sync_folder(target: &Path) {
 
 // ---- small helpers of the save ------------------------------------------------------------------------------------
 
-/// FNV-1a over 64 bits, to see that the bytes on the disk are the bytes that were received. It is
-/// a check against a failing disk, not against an adversary.
+/// FNV-1a over 64 bits, to see that the bytes in the new file are the bytes that were received.
+/// It is a check against a faulty write, not against an adversary.
 struct Fnv(u64);
 
 impl Fnv {
@@ -802,9 +831,18 @@ fn keep_owner(_file: &File, _old: &fs::Metadata) -> Result<(), SaveError> {
     Ok(())
 }
 
-/// Gives the new file the access rights (the DACL) of the old one, on Windows. A new file in a
-/// folder gets the folder's rights, which for a file that was shared with fewer people (or more)
-/// is not the same.
+/// Gives the new file the access rights of the old one. A new file in a folder gets the rights of
+/// the folder (and its owner is the user who saves), which for a file that was shared with fewer
+/// people or more is not the same.
+///
+/// - Windows: the owner, and the DACL with its protection from inheritance. When the owner cannot
+///   be given to the new file (it takes a privilege to make someone else the owner), the save stops
+///   with [`SaveError::OwnerWouldChange`].
+/// - Linux: the POSIX ACL (`system.posix_acl_access`).
+/// - macOS: the extended ACL.
+///
+/// Where the rights cannot be given, the save stops with [`SaveError::AccessNotKept`]: the caller
+/// offers a copy, and nobody gains or loses access without being told.
 #[cfg(windows)]
 fn keep_access(old: &Path, new: &Path) -> Result<(), SaveError> {
     use std::os::windows::ffi::OsStrExt;
@@ -814,22 +852,26 @@ fn keep_access(old: &Path, new: &Path) -> Result<(), SaveError> {
         GetNamedSecurityInfoW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
     };
     use windows_sys::Win32::Security::{
-        GetSecurityDescriptorControl, ACL, DACL_SECURITY_INFORMATION,
-        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
-        UNPROTECTED_DACL_SECURITY_INFORMATION,
+        EqualSid, GetSecurityDescriptorControl, ACL, DACL_SECURITY_INFORMATION,
+        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        PSID, SE_DACL_PROTECTED, UNPROTECTED_DACL_SECURITY_INFORMATION,
     };
     let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain(Some(0)).collect() };
     let (from, to) = (wide(old), wide(new));
     let mut dacl: *mut ACL = null_mut();
+    let mut owner: PSID = null_mut();
     let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+    let mut new_owner: PSID = null_mut();
+    let mut new_descriptor: PSECURITY_DESCRIPTOR = null_mut();
     // SAFETY: documented Win32 calls on paths that are valid, zero ended and live for the call;
-    // the descriptor that the first call allocates is freed with LocalFree after the second.
+    // the descriptors that the calls allocate are freed with LocalFree before the function ends,
+    // and the owners point into them, so they are used only before that.
     unsafe {
         let status = GetNamedSecurityInfoW(
             from.as_ptr(),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            null_mut(),
+            DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+            &mut owner,
             null_mut(),
             &mut dacl,
             null_mut(),
@@ -838,34 +880,201 @@ fn keep_access(old: &Path, new: &Path) -> Result<(), SaveError> {
         if status != ERROR_SUCCESS {
             return Err(SaveError::AccessNotKept);
         }
-        let mut control: u16 = 0;
-        let mut revision: u32 = 0;
-        let protected = GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) != 0
-            && control & SE_DACL_PROTECTED != 0;
-        let flags = DACL_SECURITY_INFORMATION
-            | if protected {
-                PROTECTED_DACL_SECURITY_INFORMATION
-            } else {
-                UNPROTECTED_DACL_SECURITY_INFORMATION
-            };
-        let status = SetNamedSecurityInfoW(
-            to.as_ptr(),
-            SE_FILE_OBJECT,
-            flags,
-            null_mut(),
-            null_mut(),
-            dacl,
-            null_mut(),
-        );
+        let result = (|| {
+            // The owner first: with it in place the user has the right to change the DACL.
+            let status = GetNamedSecurityInfoW(
+                to.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &mut new_owner,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                &mut new_descriptor,
+            );
+            if status != ERROR_SUCCESS {
+                return Err(SaveError::AccessNotKept);
+            }
+            if EqualSid(owner, new_owner) == 0 {
+                let status = SetNamedSecurityInfoW(
+                    to.as_ptr(),
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION,
+                    owner,
+                    null_mut(),
+                    null_mut(),
+                    null_mut(),
+                );
+                if status != ERROR_SUCCESS {
+                    return Err(SaveError::OwnerWouldChange);
+                }
+            }
+            let mut control: u16 = 0;
+            let mut revision: u32 = 0;
+            let protected = GetSecurityDescriptorControl(descriptor, &mut control, &mut revision)
+                != 0
+                && control & SE_DACL_PROTECTED != 0;
+            let flags = DACL_SECURITY_INFORMATION
+                | if protected {
+                    PROTECTED_DACL_SECURITY_INFORMATION
+                } else {
+                    UNPROTECTED_DACL_SECURITY_INFORMATION
+                };
+            let status = SetNamedSecurityInfoW(
+                to.as_ptr(),
+                SE_FILE_OBJECT,
+                flags,
+                null_mut(),
+                null_mut(),
+                dacl,
+                null_mut(),
+            );
+            if status != ERROR_SUCCESS {
+                return Err(SaveError::AccessNotKept);
+            }
+            Ok(())
+        })();
+        LocalFree(new_descriptor);
         LocalFree(descriptor);
-        if status != ERROR_SUCCESS {
+        result
+    }
+}
+
+#[cfg(target_os = "linux")]
+const ACL_NAME: &[u8] = b"system.posix_acl_access\0";
+
+/// The POSIX ACL of a file on Linux, as the system stores it; `None` for a file with only the
+/// plain mode bits (or on a file system that has no ACLs).
+#[cfg(target_os = "linux")]
+pub(crate) fn read_acl(path: &Path) -> Result<Option<Vec<u8>>, SaveError> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| SaveError::AccessNotKept)?;
+    for _ in 0..4 {
+        // SAFETY: a plain system call on a zero ended string; with size 0 it only tells how big
+        // the value is.
+        let size = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                ACL_NAME.as_ptr().cast(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if size < 0 {
+            return match io::Error::last_os_error().raw_os_error() {
+                Some(libc::ENODATA | libc::ENOTSUP) => Ok(None),
+                _ => Err(SaveError::AccessNotKept),
+            };
+        }
+        let mut value = vec![0u8; size as usize];
+        // SAFETY: as above, with a buffer of the size the system gave.
+        let got = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                ACL_NAME.as_ptr().cast(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+            )
+        };
+        if got >= 0 {
+            value.truncate(got as usize);
+            return Ok(Some(value));
+        }
+        // The value grew between the two calls: ask again.
+        if io::Error::last_os_error().raw_os_error() != Some(libc::ERANGE) {
             return Err(SaveError::AccessNotKept);
         }
     }
-    Ok(())
+    Err(SaveError::AccessNotKept)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn keep_access(old: &Path, new: &Path) -> Result<(), SaveError> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let Some(value) = read_acl(old)? else {
+        return Ok(());
+    };
+    let to = CString::new(new.as_os_str().as_bytes()).map_err(|_| SaveError::AccessNotKept)?;
+    // SAFETY: a plain system call on a zero ended string and a buffer that lives for the call.
+    let done = unsafe {
+        libc::setxattr(
+            to.as_ptr(),
+            ACL_NAME.as_ptr().cast(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    if done == 0 {
+        Ok(())
+    } else {
+        Err(SaveError::AccessNotKept)
+    }
+}
+
+/// The calls of macOS for access control lists (`<sys/acl.h>`).
+#[cfg(target_os = "macos")]
+mod macos_acl {
+    use std::ffi::{c_char, c_int, c_void};
+    /// The list that macOS shows with `ls -e`.
+    pub const ACL_TYPE_EXTENDED: c_int = 0x100;
+    extern "C" {
+        pub fn acl_get_file(path: *const c_char, kind: c_int) -> *mut c_void;
+        pub fn acl_set_file(path: *const c_char, kind: c_int, acl: *mut c_void) -> c_int;
+        pub fn acl_free(object: *mut c_void) -> c_int;
+    }
+}
+
+/// True when the file has an extended ACL (an entry beyond the mode bits) on macOS.
+#[cfg(all(target_os = "macos", test))]
+pub(crate) fn has_acl(path: &Path) -> Result<bool, SaveError> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| SaveError::AccessNotKept)?;
+    // SAFETY: a plain call on a zero ended string; the list it returns is freed again.
+    unsafe {
+        let acl = macos_acl::acl_get_file(path.as_ptr(), macos_acl::ACL_TYPE_EXTENDED);
+        if acl.is_null() {
+            return match io::Error::last_os_error().raw_os_error() {
+                // No list on this file, or a file system that has none.
+                Some(libc::ENOENT | libc::ENOTSUP) => Ok(false),
+                _ => Err(SaveError::AccessNotKept),
+            };
+        }
+        macos_acl::acl_free(acl);
+        Ok(true)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn keep_access(old: &Path, new: &Path) -> Result<(), SaveError> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let from = CString::new(old.as_os_str().as_bytes()).map_err(|_| SaveError::AccessNotKept)?;
+    let to = CString::new(new.as_os_str().as_bytes()).map_err(|_| SaveError::AccessNotKept)?;
+    // SAFETY: plain calls on zero ended strings; the list is freed again on every path.
+    unsafe {
+        let acl = macos_acl::acl_get_file(from.as_ptr(), macos_acl::ACL_TYPE_EXTENDED);
+        if acl.is_null() {
+            return match io::Error::last_os_error().raw_os_error() {
+                Some(libc::ENOENT | libc::ENOTSUP) => Ok(()),
+                _ => Err(SaveError::AccessNotKept),
+            };
+        }
+        let done = macos_acl::acl_set_file(to.as_ptr(), macos_acl::ACL_TYPE_EXTENDED, acl);
+        macos_acl::acl_free(acl);
+        if done == 0 {
+            Ok(())
+        } else {
+            Err(SaveError::AccessNotKept)
+        }
+    }
+}
+
+/// Other systems have no list that this code knows how to read, so there is nothing to keep.
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn keep_access(_old: &Path, _new: &Path) -> Result<(), SaveError> {
     Ok(())
 }
@@ -1471,5 +1680,276 @@ mod tests {
         assert_eq!(err, SaveError::DiskFull);
         assert_eq!(original, ORIGINAL);
         assert_eq!(names, vec!["report.pdf".to_string()]);
+    }
+
+    // ---- who may open the file (N3) -------------------------------------------------------
+
+    #[test]
+    fn a_file_with_two_names_is_not_saved_in_place_on_any_system() {
+        let dir = Dir::new("twonames");
+        let path = original_in(&dir);
+        let other = dir.file("other-name.pdf");
+        fs::hard_link(&path, &other).unwrap();
+        let (client, doc) = client("save-good");
+        let err = save_error(save(&client, doc, &path, None, SaveOptions::default()));
+        assert_eq!(err, SaveError::HardLink);
+        // Both names still have the file as it was, and nothing was left behind.
+        assert_eq!(fs::read(&path).unwrap(), ORIGINAL);
+        assert_eq!(fs::read(&other).unwrap(), ORIGINAL);
+        assert_eq!(
+            dir.names(),
+            vec!["other-name.pdf".to_string(), "report.pdf".to_string()]
+        );
+    }
+
+    /// The bytes of a POSIX ACL as Linux stores them: version 2, then entries of tag, permission
+    /// and id. User 1234 may read and write, the group and the mask may read and write.
+    #[cfg(target_os = "linux")]
+    fn sample_acl() -> Vec<u8> {
+        let mut value = 2u32.to_le_bytes().to_vec();
+        for (tag, perm, id) in [
+            (0x01u16, 6u16, u32::MAX), // the owner: read, write
+            (0x02, 6, 1234),           // user 1234: read, write
+            (0x04, 4, u32::MAX),       // the group: read
+            (0x10, 6, u32::MAX),       // the mask
+            (0x20, 0, u32::MAX),       // others: nothing
+        ] {
+            value.extend_from_slice(&tag.to_le_bytes());
+            value.extend_from_slice(&perm.to_le_bytes());
+            value.extend_from_slice(&id.to_le_bytes());
+        }
+        value
+    }
+
+    /// Puts the ACL on a file. False when the file system of the test folder has none.
+    #[cfg(target_os = "linux")]
+    fn set_acl(path: &Path, value: &[u8]) -> bool {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a plain system call on a zero ended string and a buffer that lives for the call.
+        let done = unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                ACL_NAME.as_ptr().cast(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            )
+        };
+        done == 0
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn n3_a_posix_acl_is_kept_by_a_save() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = Dir::new("acl");
+        let path = original_in(&dir);
+        if !set_acl(&path, &sample_acl()) {
+            // The file system of the temporary folder has no ACLs; nothing to see here.
+            eprintln!("skipped: no ACLs on this file system");
+            return;
+        }
+        let before = read_acl(&path).unwrap().expect("the ACL was set");
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let (client, doc) = client("save-good");
+        save(&client, doc, &path, None, SaveOptions::default()).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), fake_bytes());
+        assert_eq!(
+            read_acl(&path).unwrap().as_deref(),
+            Some(&before[..]),
+            "carol lost her access"
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            mode
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn n3_a_file_with_only_mode_bits_gets_no_acl() {
+        let dir = Dir::new("noacl");
+        let path = original_in(&dir);
+        let (client, doc) = client("save-good");
+        save(&client, doc, &path, None, SaveOptions::default()).unwrap();
+        assert_eq!(read_acl(&path).unwrap(), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn n3_an_extended_acl_is_kept_by_a_save() {
+        let dir = Dir::new("macacl");
+        let path = original_in(&dir);
+        let added = std::process::Command::new("chmod")
+            .args(["+a", "everyone allow read"])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(added.success(), "chmod +a failed");
+        assert!(has_acl(&path).unwrap());
+        let (client, doc) = client("save-good");
+        save(&client, doc, &path, None, SaveOptions::default()).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), fake_bytes());
+        assert!(has_acl(&path).unwrap(), "the ACL was lost");
+    }
+
+    /// What `icacls` says about a file, without the path and sorted, so that two files can be
+    /// compared. `(I)` marks a right that comes from the folder.
+    #[cfg(windows)]
+    fn rights_of(path: &Path) -> Vec<String> {
+        let out = std::process::Command::new("icacls")
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "icacls failed");
+        let shown = path.to_string_lossy().into_owned();
+        let mut lines: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.replace(&shown, "").trim().to_string())
+            .filter(|l| !l.is_empty() && !l.starts_with("Successfully processed"))
+            .collect();
+        lines.sort();
+        lines
+    }
+
+    /// A folder whose rights pass to the files made in it (all users may read them), like the
+    /// folders of a shared drive. Without it the folder of a test run hands down nothing, and a
+    /// file made there has only the default rights of the user's token, whether or not the rights
+    /// are protected from inheritance.
+    #[cfg(windows)]
+    fn share_with_users(dir: &Dir) {
+        assert!(
+            icacls(&dir.0, &["/grant", "*S-1-5-32-545:(OI)(CI)(R)"]),
+            "grant on the folder"
+        );
+    }
+
+    #[cfg(windows)]
+    fn icacls(path: &Path, args: &[&str]) -> bool {
+        std::process::Command::new("icacls")
+            .arg(path)
+            .args(args)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// The owner of a file as `dir /q` prints it.
+    #[cfg(windows)]
+    fn owner_line(path: &Path) -> String {
+        let out = std::process::Command::new("cmd")
+            .args(["/c", "dir", "/q"])
+            .arg(path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find(|l| l.contains("report.pdf"))
+            .unwrap_or("")
+            .to_string()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn n3_a_protected_dacl_is_kept_with_its_protection() {
+        let dir = Dir::new("dacl");
+        share_with_users(&dir);
+        let path = original_in(&dir);
+        let user = std::env::var("USERNAME").expect("the user's name");
+        // The folder hands its rights down: a new file there starts with them.
+        let probe = dir.file("probe.pdf");
+        fs::write(&probe, ORIGINAL).unwrap();
+        assert!(
+            rights_of(&probe).iter().any(|l| l.contains("(I)")),
+            "the folder passes nothing down: {:?}",
+            rights_of(&probe)
+        );
+        fs::remove_file(&probe).unwrap();
+        // Cut off from the folder's rights, with a short list of its own: the user, the system,
+        // and the group of all users (read only).
+        assert!(icacls(&path, &["/inheritance:r"]), "inheritance:r");
+        assert!(
+            icacls(
+                &path,
+                &[
+                    "/grant",
+                    &format!("{user}:(F)"),
+                    "/grant",
+                    "*S-1-5-18:(R)",
+                    "/grant",
+                    "*S-1-5-32-545:(R)",
+                ]
+            ),
+            "grant"
+        );
+        let before = rights_of(&path);
+        assert!(
+            before.iter().all(|l| !l.contains("(I)")),
+            "the test file inherits: {before:?}"
+        );
+        assert!(before.len() >= 3, "{before:?}");
+        let (client, doc) = client("save-good");
+        save(&client, doc, &path, None, SaveOptions::default()).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), fake_bytes());
+        // The new file has the same list, and none of the rights the folder would have given it.
+        assert_eq!(rights_of(&path), before);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn n3_an_unprotected_dacl_still_follows_the_folder() {
+        let dir = Dir::new("dacl-open");
+        share_with_users(&dir);
+        let path = original_in(&dir);
+        let before = rights_of(&path);
+        assert!(
+            before.iter().any(|l| l.contains("(I)")),
+            "the test file does not inherit: {before:?}"
+        );
+        let (client, doc) = client("save-good");
+        save(&client, doc, &path, None, SaveOptions::default()).unwrap();
+        assert_eq!(rights_of(&path), before);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn n3_the_owner_of_a_file_is_kept_or_the_save_stops() {
+        let dir = Dir::new("owner");
+        let path = original_in(&dir);
+        let user = std::env::var("USERNAME")
+            .expect("the user's name")
+            .to_lowercase();
+        let owned_by_user = |p: &Path| owner_line(p).to_lowercase().contains(&user);
+        // A new file is owned by whoever the system makes the owner by default. If that is the
+        // user already, or the system does not let the user be made the owner, there is no change
+        // of owner to look at.
+        if owned_by_user(&path) {
+            eprintln!("skipped: the user owns new files already");
+            return;
+        }
+        if !icacls(&path, &["/setowner", &user]) || !owned_by_user(&path) {
+            eprintln!("skipped: the owner could not be set");
+            return;
+        }
+        let (client, doc) = client("save-good");
+        match save(&client, doc, &path, None, SaveOptions::default()) {
+            Ok(_) => {
+                // The file was replaced: the new file has the owner of the old one.
+                assert_eq!(fs::read(&path).unwrap(), fake_bytes());
+                assert!(owned_by_user(&path), "the file changed hands");
+            }
+            Err(e) => {
+                // The owner could not be given to the new file: the save stopped before it wrote
+                // anything, and says why.
+                assert_eq!(
+                    save_error(Err::<SaveOutcome, _>(e)),
+                    SaveError::OwnerWouldChange
+                );
+                assert_eq!(fs::read(&path).unwrap(), ORIGINAL);
+                assert_eq!(dir.names(), vec!["report.pdf".to_string()]);
+            }
+        }
     }
 }

@@ -261,7 +261,10 @@ impl EnginePool {
         // The document belongs to the file it was saved to, which now looks different.
         let mut source = source.lock().unwrap_or_else(|e| e.into_inner());
         source.path = path;
-        source.stamp = FileStamp::read(&outcome.path).ok();
+        // A stamp that cannot be read is not "no stamp" (that would switch the check for a changed
+        // file off): it equals no real state, so the next save asks.
+        source.stamp =
+            Some(FileStamp::read(&outcome.path).unwrap_or_else(|_| FileStamp::unknown()));
         Ok(outcome)
     }
 
