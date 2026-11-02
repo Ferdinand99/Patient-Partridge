@@ -63,6 +63,8 @@ export class AnnotationLayer {
   private stroke: { page: number; pointerId: number; points: [number, number][] } | null = null;
   private placing: { page: number; pointerId: number; x: number; y: number } | null = null;
   private destroyed = false;
+  /** A change to the pages is under way: nothing is asked for and nothing is picked or drawn. */
+  private held = false;
 
   constructor(
     private readonly pages: PageSizePt[],
@@ -79,7 +81,7 @@ export class AnnotationLayer {
     root.dataset.tool = this.tool;
     const boxes = document.createElement("div");
     boxes.className = "annot-boxes";
-    boxes.inert = this.reading;
+    boxes.inert = this.reading || this.held;
     const svg = document.createElementNS(SVG_NS, "svg");
     svg.setAttribute("class", "annot-ink");
     svg.setAttribute("viewBox", `0 0 ${size.width} ${size.height}`);
@@ -92,6 +94,7 @@ export class AnnotationLayer {
     svg.append(line);
     const capture = document.createElement("div");
     capture.className = "annot-capture";
+    capture.inert = this.held;
     root.append(boxes, svg, capture);
     pageEl.append(root);
     const layer: PageLayer = { root, boxes, svg, line, capture, el: pageEl };
@@ -115,13 +118,13 @@ export class AnnotationLayer {
 
   /** The picture of a page was drawn: now the list of its annotations is asked for. */
   pageDrawn(page: number): void {
-    if (this.destroyed || !this.load || this.data.has(page) || this.loading.has(page)) return;
+    if (this.destroyed || this.held || !this.load || this.data.has(page) || this.loading.has(page)) return;
     void this.reload(page);
   }
 
   /** Asks for the list of a page again and shows it. Resolves when it is shown. */
   reload(page: number): Promise<void> {
-    if (!this.load || this.destroyed) return Promise.resolve();
+    if (!this.load || this.destroyed || this.held) return Promise.resolve();
     const load = this.load;
     const pending = load(page)
       .then((list) => {
@@ -181,10 +184,30 @@ export class AnnotationLayer {
     this.ink = from.ink;
   }
 
+  /**
+   * Lets the layer wait while the pages of the document are being changed: the boxes and the page
+   * take no pointer, a stroke in progress is dropped, and no list is asked for (page numbers may
+   * mean other pages by the time the engine answers). Going on asks for what was left.
+   */
+  setHeld(held: boolean): void {
+    if (this.held === held) return;
+    this.held = held;
+    for (const layer of this.layers.values()) {
+      layer.boxes.inert = this.reading || held;
+      layer.capture.inert = held;
+    }
+    if (held) {
+      if (this.stroke) this.cancelStroke();
+      this.placing = null;
+    } else {
+      for (const page of this.layers.keys()) this.pageDrawn(page);
+    }
+  }
+
   /** While reading, the boxes are inert: no pointer, no Tab stop, nothing for a screen reader to land on. */
   setReading(reading: boolean): void {
     this.reading = reading;
-    for (const layer of this.layers.values()) layer.boxes.inert = reading;
+    for (const layer of this.layers.values()) layer.boxes.inert = reading || this.held;
     if (reading && this.stroke) this.cancelStroke();
   }
 

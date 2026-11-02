@@ -57,6 +57,16 @@ export class EditHistory {
     return !this.busy && this.pos < this.edits.length;
   }
 
+  /** How many edits can be taken back. */
+  get undoDepth(): number {
+    return this.pos;
+  }
+
+  /** How many edits can be made again. */
+  get redoDepth(): number {
+    return this.edits.length - this.pos;
+  }
+
   /** What undo would take back, for a menu: null when there is nothing. */
   get undoLabel(): string | null {
     return this.pos > 0 ? this.edits[this.pos - 1].edit.label : null;

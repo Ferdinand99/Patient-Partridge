@@ -122,6 +122,10 @@ export const FORM_BLOCKED_NOTICE =
 /** What the form bar says when the form of a document cannot be read. */
 export const UNREADABLE_NOTICE = "The form of this document could not be read, so it cannot be filled in here.";
 
+/** What the form bar says while a change to the pages of the document is under way. */
+export const PAGES_BUSY_NOTICE =
+  "The pages of this document are being changed. The fields wait until that is done.";
+
 const CANNOT_CLEAR = "A drop-down list cannot be cleared once a choice is made. Pick another choice.";
 const CANNOT_UNCHECK = "A radio button cannot be turned off once it is on. Pick another one.";
 const CANNOT_CHANGE = "That field could not be changed.";
@@ -251,6 +255,10 @@ export class FormLayer {
   /** A field the reader asked to be taken to, for a page that is not there yet. */
   private wanted: { page: number; index: number } | null = null;
   private wantedTimer?: ReturnType<typeof setTimeout>;
+  /** The fields wait: the pages of the document are being changed (see `hold`). */
+  private held = false;
+  /** The layer that took over when the pages changed, if one did (see `retire`). */
+  private successor: FormLayer | null = null;
 
   constructor(
     private readonly doc: number,
@@ -270,6 +278,47 @@ export class FormLayer {
             }
           })
         : null;
+  }
+
+  /**
+   * Lets the fields wait while a change to the pages is under way, or lets them go on. What was typed
+   * and not sent yet is sent first, so that it is part of the document before the pages change. While
+   * the fields wait they take no pointer and no key, no field is asked for, and the bar says why.
+   */
+  hold(on: boolean): void {
+    if (this.destroyed || this.held === on) return;
+    if (on) {
+      for (const view of [...this.typed]) this.commitText(view.page, view);
+      this.held = true;
+      this.tell(PAGES_BUSY_NOTICE, false);
+    } else {
+      this.held = false;
+      const at = this.messages.findIndex((m) => m.text === PAGES_BUSY_NOTICE);
+      if (at >= 0) this.messages.splice(at, 1);
+      this.showBar();
+    }
+    for (const state of this.pages.values()) state.layer.inert = this.held;
+    if (!on && this.enabled) {
+      for (const [page, state] of this.pages) {
+        if (!state.list && !state.loading) this.load(page, state);
+      }
+    }
+  }
+
+  /**
+   * The pages changed and a new layer takes over. This one sends nothing any more (what it held was
+   * sent before the change, and its page numbers mean other pages now), but the undo and redo of the
+   * changes it made go through the layer that took over, so that its boxes show the result.
+   */
+  retire(successor: FormLayer | null): void {
+    this.typed.clear();
+    this.refused.clear();
+    this.successor = successor;
+  }
+
+  /** The layer that shows the pages now: this one, or the one that took over from it. */
+  private live(): FormLayer {
+    return this.successor ? this.successor.live() : this;
   }
 
   /** Asks what kind of form the document has. Call once. */
@@ -390,6 +439,7 @@ export class FormLayer {
     layer.className = "form-layer";
     layer.dataset.page = String(page);
     pageEl.append(layer);
+    layer.inert = this.held;
     const state: PageState = {
       layer,
       size: this.sizes[page],
@@ -448,6 +498,9 @@ export class FormLayer {
   }
 
   private load(page: number, state: PageState): void {
+    // Nothing is asked for while the pages change: the numbers may mean other pages by the time the
+    // engine answers. The fields are asked for when the fields go on (see `hold`).
+    if (this.held) return;
     state.loading = true;
     this.api
       .getFormFields(this.doc, page)
@@ -915,6 +968,12 @@ export class FormLayer {
   private commitText(page: number, view: FieldView): void {
     const el = view.el as HTMLInputElement | HTMLTextAreaElement;
     this.typed.delete(view);
+    if (this.held) {
+      // Nothing is sent while the pages change; the box shows what the document has.
+      el.value = view.field.value;
+      this.updatePending();
+      return;
+    }
     if (view.field.readOnly || view.field.valueCut) {
       el.value = view.field.value;
       this.updatePending();
@@ -931,6 +990,10 @@ export class FormLayer {
 
   /** Sends a value, then shows what the engine made of it and records the change for undo. */
   private commit(page: number, view: FieldView, value: FormValueIn): Promise<void> {
+    if (this.held) {
+      this.sync(view, view.field, true);
+      return Promise.resolve();
+    }
     const before = view.field;
     const state = this.pages.get(page);
     const previous = state?.list ?? [];
@@ -1079,19 +1142,22 @@ export class FormLayer {
           if (before.kind === "combo" && selectedOf(before).length === 0) cannotBack = CANNOT_UNDO_LIST;
         }
     }
+    // The pages may have been changed and changed back since: the layer that shows them now is the
+    // one that is told, whichever layer made the change.
     const run = (step: Step): Promise<void> =>
-      this.enqueue(async () => {
-        const list = await this.api.setFormField(this.doc, page, step.index, step.name, step.value);
-        this.accept(page, list, true);
-        this.events.onRedraw(page);
-        await this.refreshGroup(page, before);
+      this.live().enqueue(async () => {
+        const live = this.live();
+        const list = await live.api.setFormField(live.doc, page, step.index, step.name, step.value);
+        live.accept(page, list, true);
+        live.events.onRedraw(page);
+        await live.refreshGroup(page, before);
       });
     const label = `Fill in "${fieldLabel(before).slice(0, 60)}"`;
     return {
       label,
       undo: async () => {
         if (cannotBack) {
-          this.tell(cannotBack);
+          this.live().tell(cannotBack);
           // The engine is not asked, so nothing changed: a clean refusal, as the engine's own.
           throw Object.assign(new Error(cannotBack), { code: "form_field_refused" });
         }

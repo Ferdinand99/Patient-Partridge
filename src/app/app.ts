@@ -225,6 +225,56 @@ function byId<T extends HTMLElement>(root: Document, id: string): T {
   return el as T;
 }
 
+/** The errors that only the page tools give when a change to the pages is taken back or made again. */
+const PAGE_TOOL_CODES = new Set([
+  "snapshot_gone",
+  "undo_unavailable",
+  "busy",
+  "save_busy",
+  "pages_not_allowed",
+  "page_change_failed",
+  "import_failed",
+  "too_many_pages",
+]);
+
+/** The codes after which the step cannot be tried again, whatever the user does: the copy is gone. */
+const NO_WAY_BACK = new Set(["snapshot_gone", "undo_unavailable"]);
+
+/**
+ * What to tell the user when taking a change back (or making it again) failed. The history keeps the
+ * order of all the changes (pages, annotations, form fields), so the edits `behind` the one that
+ * failed cannot be reached either, and that is said when it is true.
+ */
+export function undoFailure(
+  error: AppErrorLike,
+  direction: "undo" | "redo",
+  name: string,
+  behind = 0,
+): { title: string; detail: string; buttons: { id: string; label: string; primary: boolean }[] } {
+  const buttons = [{ id: "ok", label: "OK", primary: true }];
+  const generic = direction === "undo" ? "The change could not be taken back" : "The change could not be made again";
+  if (PAGE_TOOL_CODES.has(error.code)) {
+    const text = describePageError(error, name);
+    const known = ["snapshot_gone", "undo_unavailable", "busy", "save_busy", "pages_not_allowed"].includes(error.code);
+    let detail = known
+      ? text.detail
+      : `${error.message ? `${error.message.charAt(0).toUpperCase()}${error.message.slice(1)}. ` : ""}The document is as it was before.`;
+    if (NO_WAY_BACK.has(error.code) && behind > 0) {
+      detail += ` The ${behind === 1 ? "change" : `${behind} changes`} before it in the history (pages, annotations or form fields) ${
+        direction === "undo" ? "cannot be taken back" : "cannot be made again"
+      } either, because the history goes one step at a time. Save the document to keep it as it is, or close it without saving to go back to the file.`;
+    }
+    return { title: known ? text.title : generic, detail, buttons };
+  }
+  return {
+    title: generic,
+    detail: CLEAN_REFUSALS.has(error.code)
+      ? "The document is as it was before. Nothing was lost."
+      : "Part of the change may have been made. The document is marked as changed; close it without saving to go back to the file.",
+    buttons,
+  };
+}
+
 /**
  * The commands of the app process, with every read from the file behind a document watched. When
  * the engine refuses one because the file now has other bytes than the ones it was checked on
@@ -296,6 +346,8 @@ export class App {
   private readonly pagePanel: PagePanel | null;
   private readonly pageAnnounce: HTMLElement;
   private pageAnnounceFlip = false;
+  /** The document whose annotations and fields wait for a page tool (see `holdEdits`). */
+  private heldDoc: number | null = null;
   private readonly find: FindBar;
   private readonly signatures: SignaturePanel;
   /** The commands of the app process, with the reads of a document watched (see `watchReads`). */
@@ -390,6 +442,7 @@ export class App {
           const tab = this.tabs.find((t) => t.doc === doc);
           if (tab) await this.documentLost(tab, error);
         },
+        settle: (doc) => this.settleBeforePages(doc),
         pickFiles: () => deps.pickFiles(),
         announce: (text) => this.announcePages(text),
         layer: this.noticeLayer,
@@ -399,7 +452,10 @@ export class App {
         render: (doc, page, width, height) => deps.api.render(doc, page, width, height),
       };
       const ops = new PageOps(deps.pages, host, {
-        busyChanged: (busy) => this.pagePanel?.setBusy(busy),
+        busyChanged: (busy) => {
+          this.pagePanel?.setBusy(busy);
+          this.holdEdits(busy);
+        },
         busyDelayMs: deps.pageBusyDelayMs,
       });
       this.pageOps = ops;
@@ -424,6 +480,8 @@ export class App {
     if (!tab) return;
     tab.sidebarDoc.pages = pages;
     tab.view.replacePages(pages, show);
+    // What the annotations of the tab keep by page number and by id means other things now.
+    tab.annotator?.pagesChanged();
     this.find.forget(tab.view);
     if (this.active === tab) {
       this.find.setTarget(null);
@@ -432,6 +490,40 @@ export class App {
       this.showCurrentPage();
     }
     this.sidebar.pagesChanged(doc);
+  }
+
+  /**
+   * A page tool (or taking one back) works on the document `busyDoc`: its annotation tools, the box
+   * for the text of a note and the fields of its form wait until it is done, and say so. A change
+   * begun meanwhile would run after the pages changed, with page numbers that mean other pages.
+   */
+  private holdEdits(busy: boolean): void {
+    const doc = busy ? (this.pageOps?.busyDoc ?? null) : this.heldDoc;
+    this.heldDoc = busy ? doc : null;
+    const tab = doc === null ? undefined : this.tabs.find((t) => t.doc === doc);
+    if (!tab) return;
+    tab.view.holdEdits(busy);
+    tab.annotator?.setHeld(busy);
+    if (this.active === tab) this.syncAnnotBar();
+  }
+
+  /**
+   * Before a page tool begins: what was typed in a field is sent, the box of a note is saved or
+   * closed and the changes under way are made, so that they are part of the document first. Text a
+   * field refused is not in the document and would be lost with the pages it was typed on: the tool
+   * does not begin until the reader has dealt with it.
+   */
+  private async settleBeforePages(doc: number): Promise<boolean> {
+    const tab = this.tabs.find((t) => t.doc === doc);
+    if (!tab) return true;
+    await tab.view.flushForms().catch(() => undefined);
+    await tab.annotator?.flush();
+    if (!this.tabs.includes(tab)) return false;
+    if (tab.view.hasRefusedFormInput) {
+      await this.tellRefusedField(tab, "pages");
+      return false;
+    }
+    return true;
   }
 
   private announcePages(text: string): void {
@@ -1567,7 +1659,7 @@ export class App {
     return !this.isDirty(tab);
   }
 
-  private async tellRefusedField(tab: Tab): Promise<void> {
+  private async tellRefusedField(tab: Tab, action: "save" | "pages" = "save"): Promise<void> {
     const [first, ...others] = tab.view.refusedFormFields;
     const where = first ? `The field "${first.label}" on page ${first.page + 1}` : "A field";
     const more =
@@ -1576,7 +1668,7 @@ export class App {
         : ` ${others.length === 1 ? "One other field has" : `${others.length} other fields have`} the same problem.`;
     const answer = await showNotice(this.noticeLayer, {
       title: "A field has text that could not be added",
-      detail: `"${tab.name}" was not saved. ${where} holds text that is too long for the document, so that text is not in it.${more} Shorten the text, or press Escape in the field to put back what the document has, then save again.`,
+      detail: `${action === "save" ? `"${tab.name}" was not saved.` : `The pages of "${tab.name}" were not changed.`} ${where} holds text that is too long for the document, so that text is not in it.${more} Shorten the text, or press Escape in the field to put back what the document has, then ${action === "save" ? "save" : "change the pages"} again.`,
       buttons: first
         ? [
             { id: "ok", label: "OK" },
@@ -1814,7 +1906,8 @@ export class App {
         await this.documentLost(tab, error);
         return;
       }
-      await showNotice(this.noticeLayer, undoFailure(error, direction, tab.name));
+      const behind = direction === "undo" ? tab.history.undoDepth - 1 : tab.history.redoDepth - 1;
+      await showNotice(this.noticeLayer, undoFailure(error, direction, tab.name, Math.max(0, behind)));
     }
   }
 

@@ -121,6 +121,8 @@ export class DocumentView {
   private overlays: PageOverlays;
   /** True while a tool of the annotation bar that takes the pointer is picked (see `setAnnotationTool`). */
   private pointerTool = false;
+  /** True while the pages of the document are being changed: the fields and the annotations wait. */
+  private editsHeld = false;
   private forms: FormLayer | null;
   private annots: AnnotationLayer;
   /** How many times the picture of a page was asked to be drawn afresh (see `invalidatePage`). */
@@ -219,6 +221,17 @@ export class DocumentView {
     });
   }
 
+  /**
+   * Lets the fields of the form and the annotations wait while the pages of the document are being
+   * changed, or go on. Text typed in a field and not sent yet is sent first.
+   */
+  holdEdits(held: boolean): void {
+    this.editsHeld = held;
+    if (this.destroyed) return;
+    this.forms?.hold(held);
+    this.annots.setHeld(held);
+  }
+
   /** The layer of the annotations for the pages now in the view. */
   private makeAnnots(): AnnotationLayer {
     const { events, api } = this;
@@ -257,7 +270,9 @@ export class DocumentView {
     // old pages (a field with typed text, a picked annotation, a list of annotations) goes. The code
     // that changed the pages has sent typed text and waited for the changes of the form before it
     // asked for the change (see `flushForms`).
-    this.forms?.destroy();
+    const replacedForms = this.forms;
+    replacedForms?.retire(null);
+    replacedForms?.destroy();
     const replaced = this.annots;
     replaced.destroy();
     this.versions = new Map();
@@ -269,8 +284,11 @@ export class DocumentView {
     this.overlays.setSuspended(this.pointerTool);
     this.forms = this.makeForms();
     this.forms?.start();
+    replacedForms?.retire(this.forms);
     this.annots = this.makeAnnots();
     this.annots.inherit(replaced);
+    this.forms?.hold(this.editsHeld);
+    this.annots.setHeld(this.editsHeld);
     this.lastPage = -1;
     const page = pages.length === 0 ? 0 : Math.min(Math.max(0, show ?? had), pages.length - 1);
     this.hiddenAnchor = { page, fraction: 0 };

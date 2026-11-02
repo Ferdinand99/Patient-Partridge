@@ -71,6 +71,10 @@ export interface AnnotatorHost {
   pageChanged(page: number): void;
 }
 
+/** What is said when an annotation tool is used while the pages of the document are being changed. */
+export const PAGES_BUSY_NOTICE =
+  "The pages of this document are being changed. Annotations wait until that is done.";
+
 /** Answers of the engine that say it changed nothing. */
 export const CLEAN_REFUSALS = new Set([
   "annotation_refused",
@@ -148,6 +152,8 @@ export class Annotator implements AnnotLayerEvents {
   private flow: Promise<void> | null = null;
   private destroyed = false;
   private blocked = false;
+  /** The pages of the document are being changed: no annotation is begun (see `setHeld`). */
+  private held = false;
   /** The bar is closed: the pages read as they do without annotations, and no key is taken. */
   private reading = false;
   /** Changes wait for this before they start (a save is being written). */
@@ -216,9 +222,53 @@ export class Annotator implements AnnotLayerEvents {
     } while (this.inflight > 0);
   }
 
-  /** Why the annotations cannot be changed, if the document says so; otherwise null. */
+  /** Why the annotations cannot be changed, if the document says so or its pages are changing; otherwise null. */
   get blockedReason(): string | null {
+    if (this.held) return PAGES_BUSY_NOTICE;
     return this.blocked ? "This PDF does not allow annotations." : null;
+  }
+
+  /** True while the pages of the document are being changed. */
+  get isHeld(): boolean {
+    return this.held;
+  }
+
+  /**
+   * Lets the annotations wait while the pages of the document are being changed (a change that
+   * would run after it would name pages that are not there any more), or go on. Nothing that is
+   * under way is lost: the box of a note keeps its text until it is saved by `flush`, and a stroke
+   * that was being drawn is dropped. Every way to begin a change says why it does nothing.
+   */
+  setHeld(held: boolean): void {
+    if (this.held === held) return;
+    this.held = held;
+    if (held) {
+      this.view.annotationLayer.abort();
+      this.host.announce(PAGES_BUSY_NOTICE);
+    }
+    this.host.changed();
+  }
+
+  /** True, and says so, when the pages are changing and no annotation may be begun. */
+  private refuseWhileHeld(): boolean {
+    if (!this.held) return false;
+    this.host.announce(PAGES_BUSY_NOTICE);
+    return true;
+  }
+
+  /**
+   * The pages of the document changed (some were deleted, moved, turned, cropped or added): what is
+   * kept by page number and by id means other things now. The pick goes, and so do the boxes the
+   * engine last answered with (a turned page has other boxes) and the annotations deleted for good.
+   */
+  pagesChanged(): void {
+    this.boxes.clear();
+    this.gone.clear();
+    if (this.selected) {
+      this.selected = null;
+      this.view.annotationLayer.setSelected(null);
+    }
+    this.host.changed();
   }
 
   /** A short line about the annotation that is picked when it cannot be changed, or null. */
@@ -361,6 +411,7 @@ export class Annotator implements AnnotLayerEvents {
 
   setTool(tool: Tool): void {
     if (this.tool === tool) return;
+    if (tool !== "select" && this.refuseWhileHeld()) return;
     this.view.annotationLayer.abort();
     this.tool = tool;
     this.syncLayer();
@@ -445,6 +496,7 @@ export class Annotator implements AnnotLayerEvents {
 
   /** Marks the text that is selected. Several pages of it make one edit. */
   async markSelection(kind: "highlight" | "underline" | "strikeout"): Promise<void> {
+    if (this.refuseWhileHeld()) return;
     const { ranges, truncated } = await this.view.selectedRanges();
     if (truncated) {
       await this.host.ask({
@@ -522,7 +574,7 @@ export class Annotator implements AnnotLayerEvents {
 
   /** `draft` is text typed in an earlier box that the engine refused: the box comes back with it. */
   private placeNote(page: number, x: number, y: number, client: { x: number; y: number }, draft = ""): Promise<void> {
-    if (this.editor) return Promise.resolve();
+    if (this.editor || this.refuseWhileHeld()) return Promise.resolve();
     // The note starts where it was clicked, its middle under the pointer.
     const at = { x: x - 10, y: y - 10 };
     const editor = openNoteEditor(this.host.popovers, {
@@ -582,6 +634,7 @@ export class Annotator implements AnnotLayerEvents {
   }
 
   private placeStamp(page: number, x: number, y: number): Promise<void> {
+    if (this.refuseWhileHeld()) return Promise.resolve();
     const size = stampSize(this.stamp);
     const pageSize = this.view.pageSizeOf(page);
     const [left, top] = keepOnPage(x - size.width / 2, y - size.height / 2, size, pageSize);
@@ -619,6 +672,10 @@ export class Annotator implements AnnotLayerEvents {
   }
 
   private drawStroke(page: number, points: [number, number][]): Promise<void> {
+    if (this.refuseWhileHeld()) {
+      this.view.annotationLayer.endStroke(page);
+      return Promise.resolve();
+    }
     const { color, penWidth } = this;
     return this.queued(async () => {
       try {
@@ -638,6 +695,7 @@ export class Annotator implements AnnotLayerEvents {
 
   /** Moves a note by `dx`, `dy` points on the page as it is drawn. */
   moveBy(page: number, id: number, dx: number, dy: number): Promise<void> {
+    if (this.refuseWhileHeld()) return Promise.resolve();
     const a = this.view.annotationLayer.find(page, id);
     if (!a?.can.move || (dx === 0 && dy === 0)) return Promise.resolve();
     return this.queued(async () => {
@@ -660,6 +718,7 @@ export class Annotator implements AnnotLayerEvents {
 
   /** Opens the box for the text of an annotation and saves what the person writes. */
   editText(page: number, id: number, draft?: string): Promise<void> {
+    if (this.refuseWhileHeld()) return Promise.resolve();
     const a = this.view.annotationLayer.find(page, id);
     if (a && !a.can.editText) {
       this.host.announce(
@@ -697,6 +756,7 @@ export class Annotator implements AnnotLayerEvents {
   }
 
   private recolour(page: number, a: Annotation, color: Rgba): Promise<void> {
+    if (this.refuseWhileHeld()) return Promise.resolve();
     const before = a.color;
     if (before[0] === color[0] && before[1] === color[1] && before[2] === color[2]) return Promise.resolve();
     const id = a.id;
@@ -713,6 +773,7 @@ export class Annotator implements AnnotLayerEvents {
 
   /** Takes the picked annotation off the page. One that cannot be put back asks first. */
   async removeSelected(): Promise<void> {
+    if (this.refuseWhileHeld()) return;
     const sel = this.selected;
     const a = this.current;
     if (!sel || !a) {

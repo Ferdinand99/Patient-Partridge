@@ -43,6 +43,9 @@ const FLAG_LOCKED_CONTENTS: i32 = 1 << 9;
 
 /// The number PDFium gives the popup subtype (`FPDF_ANNOT_POPUP`).
 const SUBTYPE_POPUP: u32 = 16;
+/// The numbers it gives the link and the widget subtypes (`FPDF_ANNOT_LINK`, `FPDF_ANNOT_WIDGET`).
+const SUBTYPE_LINK: u32 = 2;
+const SUBTYPE_WIDGET: u32 = 20;
 
 /// Colour of a highlight, an underline or a strike-out that came without one.
 const DEFAULT_COLOR: [u8; 4] = [255, 235, 59, 255];
@@ -1248,6 +1251,43 @@ unsafe fn blank(bindings: &dyn PdfiumLibraryBindings, annotation: FPDF_ANNOTATIO
             bindings.FPDFAnnot_SetStringValue_str(annotation, key, "");
         }
     }
+}
+
+/// Overwrites the text of every annotation of a page that is about to be deleted: the comment, the
+/// author, the rich text and the subject (also of pop-ups). A save leaves out the dictionaries of a
+/// loaded file that nothing refers to any more, but writes those made in this session as objects
+/// nobody refers to, so the words of a note written in this session would stay in the file with a
+/// page that was deleted. Form fields are not touched (the form refers to them, and the page tools
+/// deal with them), and neither are links. Returns how many annotations were overwritten.
+pub fn scrub_page(document: &PdfDocument<'_>, page_index: u32) -> usize {
+    let Some(handle) = raw_document(document) else {
+        return 0;
+    };
+    let bindings = document.bindings();
+    let mut done = 0;
+    // SAFETY: `handle` is the live document's; the page and every annotation handle are opened and
+    // closed here, and PDFium only gets handles it gave out.
+    unsafe {
+        let page = bindings.FPDF_LoadPage(handle, page_index as c_int);
+        if page.is_null() {
+            return 0;
+        }
+        let count = bindings.FPDFPage_GetAnnotCount(page).max(0);
+        for position in 0..count {
+            let annotation = bindings.FPDFPage_GetAnnot(page, position);
+            if annotation.is_null() {
+                continue;
+            }
+            let subtype = bindings.FPDFAnnot_GetSubtype(annotation) as u32;
+            if subtype != SUBTYPE_WIDGET && subtype != SUBTYPE_LINK {
+                blank(bindings, annotation);
+                done += 1;
+            }
+            bindings.FPDFPage_CloseAnnot(annotation);
+        }
+        bindings.FPDF_ClosePage(page);
+    }
+    done
 }
 
 /// Takes the annotation at `position` off the page, with the popup it owns, after overwriting

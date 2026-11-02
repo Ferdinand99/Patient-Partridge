@@ -39,6 +39,12 @@ export interface PageHost {
   notice(options: NoticeOptions): Promise<NoticeResult>;
   /** The engine of a document was lost, and the document with it. */
   lost(doc: number, error: AppErrorLike): Promise<void>;
+  /**
+   * Gets what is under way on a document done before a tool changes its pages (text typed in a field
+   * is sent, the box of a note is saved, running changes are made). Resolves with false, after saying
+   * why, when the tool must not begin.
+   */
+  settle?(doc: number): Promise<boolean>;
   /** The system's dialog for picking PDF files; empty when it is cancelled. */
   pickFiles(): Promise<string[]>;
   /** Says something to a screen reader. */
@@ -493,6 +499,7 @@ export class PageOps {
       this.showBox();
     }, this.delay);
     try {
+      if (this.host.settle && !(await this.host.settle(t.doc))) return null;
       return await work();
     } catch (e) {
       await this.fail(t, e);

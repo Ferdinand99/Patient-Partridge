@@ -1167,6 +1167,8 @@ fn delete(
         let mut pace = Pace::new();
         for &index in &sorted {
             form_fields += clear_form_fields(document, index);
+            // The words of the notes and other annotations of the page go as well.
+            crate::annots::scrub_page(document, index);
             pace.step(progress);
         }
         for (i, &index) in sorted.iter().rev().enumerate() {
