@@ -117,25 +117,8 @@ const TOKEN_ALL_ACCESS_RIGHTS: u32 = 0x000F_01FF;
 pub(super) fn lowbox(source: &Owned) -> io::Result<Owned> {
     let sid = package_sid()?;
     let mut token: HANDLE = null_mut();
-    // Tests only (debug builds): the less privileged variant, to see what it does.
-    #[cfg(debug_assertions)]
-    let less_privileged = std::env::var_os("PARTRIDGE_TEST_LPAC").is_some_and(|v| !v.is_empty());
-    #[cfg(not(debug_assertions))]
-    let less_privileged = false;
-    // The capability "WIN://NOALLAPPPKG" (S-1-15-3-1024-...): takes "all application packages" out
-    // of the token. Revision 1, ten sub-authorities, authority 15.
-    let mut no_all_packages: Vec<u8> = vec![1, 10, 0, 0, 0, 0, 0, 15];
-    for part in [
-        3u32, 1024, 2302894289, 466761758, 1166120688, 1039016420, 2430351297, 4240214049,
-        4028510897, 3317428798,
-    ] {
-        no_all_packages.extend_from_slice(&part.to_le_bytes());
-    }
-    let capability = windows_sys::Win32::Security::SID_AND_ATTRIBUTES {
-        Sid: no_all_packages.as_mut_ptr().cast(),
-        Attributes: 4, // SE_GROUP_ENABLED
-    };
-    // SAFETY: documented native call; the SIDs outlive it, and no attributes or handle is passed.
+    // SAFETY: documented native call; the SID outlives it, and no attributes, capability or handle
+    // is passed.
     let status = unsafe {
         NtCreateLowBoxToken(
             &mut token,
@@ -143,12 +126,8 @@ pub(super) fn lowbox(source: &Owned) -> io::Result<Owned> {
             TOKEN_ALL_ACCESS_RIGHTS,
             null(),
             sid.as_ptr().cast(),
-            u32::from(less_privileged),
-            if less_privileged {
-                (&capability as *const windows_sys::Win32::Security::SID_AND_ATTRIBUTES).cast()
-            } else {
-                null()
-            },
+            0,
+            null(),
             0,
             null(),
         )

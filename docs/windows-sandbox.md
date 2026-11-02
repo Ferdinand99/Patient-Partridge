@@ -19,7 +19,7 @@ A restricted token does not stop the network on Windows: a process with such a t
 The options that were looked at:
 
 - **AppContainer with no capabilities, on top of the restricted token** (what is built). Both access checks apply: an object has to be open to the restricting SID *and* to the package. The restricted token keeps its job: after the engine has locked itself in it cannot open any file, not even its own program, which the package is allowed to read.
-- **Less privileged AppContainer.** Takes "all application packages" out of the token, so the engine could reach even less. Not built: the plain AppContainer already blocks the network, and the restricted token already keeps the engine away from files, so it would reduce the reach to objects that only "all application packages" can open, and each start-up problem described below would have to be solved again. A debug build can be started in this variant (`PARTRIDGE_TEST_LPAC`) to see what it does; the result is in the next section.
+- **Less privileged AppContainer.** Takes "all application packages" out of the token, so the engine could reach even less. Not built: the plain AppContainer already blocks the network, and the restricted token already keeps the engine away from files, so it would reduce the reach to objects that only "all application packages" can open, and each start-up problem described below would have to be solved again. It was tried once in CI, in a debug build that added the capability `WIN://NOALLAPPPKG` to the token (and then removed again): the engine started and passed the sandbox proof and the start tests, and a raw socket could still send. So it does not close the raw socket either.
 - **A firewall rule** is out, as said above.
 
 ## What it does to the other layers
@@ -81,7 +81,6 @@ What was tried, on Windows Server 2025 (`windows-latest`) and, where marked, als
 | A loopback exemption for the package (`CheckNetIsolation`) | The same |
 | Firewall service (`MpsSvc`) or filtering engine (`BFE`) stopped | **Not tried**: the runner refuses to stop either, to an administrator and to the system account alike (`Access is denied`); the log of the job shows each attempt |
 | An engine told, in a debug build, to take the answer of its check as one that does not prove the block | The engine opened the document, named `network-not-proved`, the window path works; this is the path a state we could not create would take |
-| The less privileged AppContainer, in a debug build | See the log of the job; this variant is not part of the product |
 
 In every state the TCP connection to the loopback address was refused with `WSAEACCES`, so the test's own answer for a blocked network held in each. The states that a hosted runner cannot create (a stopped firewall service or filtering engine, a third-party firewall product registered with Security Center, a VPN with a kill switch) have not been tried. They are on the list `before-first-release`.
 

@@ -486,7 +486,6 @@ jobs:
   windows-firewall:
     name: Windows, firewall state (${{ matrix.state }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.experiment == true }}
     timeout-minutes: 40
     strategy:
       fail-fast: false
@@ -510,9 +509,6 @@ jobs:
           # A debug engine told to take the answer of the network check as one that is not "blocked":
           # the whole path after it (greeting, client, document) must work and say so.
           - { os: windows-latest, state: simulated-answer, expect: not-proved }
-          # The less privileged AppContainer, tried to see whether it closes the raw socket (a
-          # debug build switch). Nothing is asserted about it beyond the tests' own checks.
-          - { os: windows-latest, state: less-privileged, expect: any, experiment: true }
     defaults:
       run:
         shell: pwsh
@@ -541,21 +537,18 @@ jobs:
           PARTRIDGE_FIREWALL_STATE: ${{ matrix.state }}
           PARTRIDGE_NETWORK_EXPECT: ${{ matrix.expect }}
           PARTRIDGE_TEST_NETWORK_UNPROVED: ${{ matrix.state == 'simulated-answer' && '1' || '' }}
-          PARTRIDGE_TEST_LPAC: ${{ matrix.state == 'less-privileged' && '1' || '' }}
         run: |
           cargo test -p partridge-engine --locked --test windows_network_states -- --nocapture 2>&1 | Tee-Object -FilePath logs/engine.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: The sandbox proof in this state
         if: matrix.state != 'simulated-answer'
         env:
-          PARTRIDGE_TEST_LPAC: ${{ matrix.state == 'less-privileged' && '1' || '' }}
         run: |
           cargo test -p partridge-engine --locked --test sandbox -- --nocapture --test-threads 1 2>&1 | Tee-Object -FilePath logs/sandbox.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Many starts in this state
         env:
           PARTRIDGE_TEST_NETWORK_UNPROVED: ${{ matrix.state == 'simulated-answer' && '1' || '' }}
-          PARTRIDGE_TEST_LPAC: ${{ matrix.state == 'less-privileged' && '1' || '' }}
         run: |
           cargo test -p partridge-engine --locked --test windows_start -- --nocapture 2>&1 | Tee-Object -FilePath logs/starts.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
