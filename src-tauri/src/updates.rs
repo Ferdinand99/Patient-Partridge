@@ -146,6 +146,16 @@ pub fn detect() -> InstallMethod {
     })
 }
 
+/// True on macOS when the app was started through a symbolic link. Tauri refuses the path of the
+/// running program then (a link can be pointed somewhere else), so the update plugin ends in an I/O
+/// error and a restart after an update would quit without starting the app again. The app itself
+/// works. The owner decided to keep Tauri's check; the window tells the person once.
+pub fn runs_through_symlink() -> bool {
+    cfg!(target_os = "macos")
+        && tauri::utils::platform::current_exe().is_err()
+        && std::env::current_exe().is_ok()
+}
+
 // ---- no new engine while an update is installed --------------------------------------------
 
 #[derive(Debug, PartialEq, Eq)]
@@ -481,6 +491,8 @@ pub enum FailureKind {
     Busy,
     /// This copy cannot install by itself (a deb package).
     Manual,
+    /// The app was started through a symbolic link (macOS): updates are not possible from there.
+    Location,
     Other,
 }
 
@@ -580,6 +592,8 @@ pub struct UpdateState {
     restored: Mutex<Vec<String>>,
     restore_file: Option<PathBuf>,
     method: InstallMethod,
+    /// The app runs through a symbolic link (see [`runs_through_symlink`]).
+    symlinked: bool,
 }
 
 impl UpdateState {
@@ -597,6 +611,7 @@ impl UpdateState {
             restored: Mutex::new(Vec::new()),
             restore_file: data_dir.map(|d| d.join("restore-after-update.json")),
             method,
+            symlinked: runs_through_symlink(),
         }
     }
 
@@ -683,6 +698,18 @@ pub fn updating_error() -> CommandError {
     }
 }
 
+/// Refuses an update check from a place where the app cannot update itself, with a kind of its own
+/// so that the window can say it in one calm sentence instead of showing an I/O error.
+fn location_allows_update(symlinked: bool) -> Result<(), UpdateFailure> {
+    if symlinked {
+        return Err(failure(
+            FailureKind::Location,
+            "the app was started through a symbolic link",
+        ));
+    }
+    Ok(())
+}
+
 pub async fn check(
     app: &AppHandle,
     state: &UpdateState,
@@ -694,6 +721,7 @@ pub async fn check(
     if state.installing.load(Ordering::SeqCst) || state.gate.is_closed() {
         return Err(failure(FailureKind::Busy, "an update is being installed"));
     }
+    location_allows_update(state.symlinked)?;
     let found = app
         .updater()
         .map_err(from_updater)?
@@ -1388,6 +1416,17 @@ mod tests {
             cfg!(feature = "update-driver")
         );
         assert!(!download_allowed(&url("http://example.com/x")));
+    }
+
+    #[test]
+    fn an_app_started_through_a_symbolic_link_does_not_check_for_updates() {
+        assert!(location_allows_update(false).is_ok());
+        let refused = location_allows_update(true).unwrap_err();
+        assert_eq!(refused.kind, FailureKind::Location);
+        assert!(!refused.engines_stopped);
+        // Only macOS asks, and a normal start is never taken for a link.
+        assert!(!runs_through_symlink() || cfg!(target_os = "macos"));
+        assert!(!UpdateState::new(None, InstallMethod::Manual).symlinked || cfg!(target_os = "macos"));
     }
 
     #[test]

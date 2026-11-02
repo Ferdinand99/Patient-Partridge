@@ -65,6 +65,7 @@ export type UpdateFailureKind =
   | "disabled"
   | "busy"
   | "manual"
+  | "location"
   | "other";
 
 export interface UpdateFailure {

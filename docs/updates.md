@@ -38,6 +38,10 @@ The setting is kept in `settings.json` in the app's data folder, next to the fil
 | Linux, **AppImage** | the new `.AppImage` | The AppImage file you started is replaced and the app restarts from it. |
 | Linux, **deb** | none | A deb package cannot update itself. The pill opens a notice with the release notes and a button that opens the releases page (https://github.com/Ferdinand99/Patient-Partridge/releases/latest) in the browser. |
 
+### A macOS copy that is started through a symbolic link
+
+Tauri refuses the path of the running program on macOS when it went through a symbolic link (a link can be pointed somewhere else), so the update plugin could only end in an I/O error, and a restart after an update would quit without starting the app again. The app keeps working. `updates.rs` (`runs_through_symlink`) notices this, the check answers with the kind `location` instead of an error, and the window says, once for an automatic check and every time for a check from the menu: "Automatic updates aren't available from this location. Move Patient Partridge to the Applications folder." Tauri's check is kept on.
+
 ### How a deb or other copy is recognised
 
 `src-tauri/src/updates.rs` (`install_method`) decides, and errs on the side of "manual". A copy installs updates by itself only where it is positively recognised:
