@@ -44,6 +44,13 @@ foreach ($sub in 'in', 'docs', 'pdfium', 'scripts', 'build', 'out') {
 }
 & icacls $Root /grant "*${sid}:(OI)(CI)(RX)" | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'icacls failed on the root folder.' }
+# The engine runs in an AppContainer, which can open only what is open to "all application
+# packages" or to its own package. A program in Program Files already is; the test programs built
+# here are owned by the administrator, which the standard user cannot change, so they get the
+# entry that Program Files has. (An app installed by the user itself, as in step 2 of the checks,
+# is owned by the user, and the app adds the entry for its package itself.)
+& icacls $Root /grant '*S-1-15-2-1:(OI)(CI)(RX)' | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'icacls failed to allow the application packages to read the root folder.' }
 & icacls (Join-Path $Root 'out') /grant "*${sid}:(OI)(CI)(M)" | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'icacls failed on the output folder.' }
 

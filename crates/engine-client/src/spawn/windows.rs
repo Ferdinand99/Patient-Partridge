@@ -31,7 +31,6 @@ use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows_sys::Win32::Foundation::{
@@ -52,9 +51,9 @@ use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicUIRestrictions,
     JobObjectExtendedLimitInformation, SetInformationJobObject, JOBOBJECT_BASIC_UI_RESTRICTIONS,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
-    JOB_OBJECT_LIMIT_AFFINITY, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
-    JOB_OBJECT_UILIMIT_DESKTOP, JOB_OBJECT_UILIMIT_DISPLAYSETTINGS, JOB_OBJECT_UILIMIT_EXITWINDOWS,
+    JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOB_OBJECT_UILIMIT_DESKTOP,
+    JOB_OBJECT_UILIMIT_DISPLAYSETTINGS, JOB_OBJECT_UILIMIT_EXITWINDOWS,
     JOB_OBJECT_UILIMIT_GLOBALATOMS, JOB_OBJECT_UILIMIT_HANDLES, JOB_OBJECT_UILIMIT_READCLIPBOARD,
     JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS, JOB_OBJECT_UILIMIT_WRITECLIPBOARD,
 };
@@ -64,11 +63,10 @@ use windows_sys::Win32::System::StationsAndDesktops::{
 };
 use windows_sys::Win32::System::Threading::{
     CreateProcessAsUserW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
-    GetProcessAffinityMask, InitializeProcThreadAttributeList, OpenProcessToken, ResumeThread,
-    SetProcessAffinityMask, SetThreadToken, TerminateProcess, UpdateProcThreadAttribute,
-    WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
-    EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    InitializeProcThreadAttributeList, OpenProcessToken, ResumeThread, SetThreadToken,
+    TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NO_WINDOW,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
+    LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
 
 use partridge_protocol::FontScript;
@@ -462,80 +460,27 @@ fn make_tokens() -> io::Result<(Owned, Owned)> {
     }
 }
 
-/// The processors the engine may run on while it starts. A process that starts with a locked-down
-/// token cannot let the system's loader use its helper threads: the loader hands the loading of
-/// libraries to threads of the process that do not have the start identity (only the first
-/// thread has), and the load then fails at random with "library not found". The loader starts
-/// those helpers only where the process may run on more than one processor, so the engine starts
-/// on one processor and is given its full set again once it has said hello (see `started`).
-/// `one` is a single processor of the app's own set, the next one for each engine; `all` is the
-/// whole set.
-struct Processors {
-    one: usize,
-    all: usize,
-}
-
-fn startup_processors() -> io::Result<Processors> {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let (mut all, mut system) = (0usize, 0usize);
-    // SAFETY: documented call with live out parameters; the pseudo handle needs no closing.
-    check(
-        unsafe { GetProcessAffinityMask(GetCurrentProcess(), &mut all, &mut system) },
-        "GetProcessAffinityMask",
-    )?;
-    if all == 0 {
-        return Err(io::Error::other("the app has no processor to run on"));
-    }
-    let wanted = NEXT.fetch_add(1, Ordering::Relaxed) % all.count_ones() as usize;
-    let one = (0..usize::BITS)
-        .map(|bit| 1usize << bit)
-        .filter(|bit| all & bit != 0)
-        .nth(wanted)
-        .unwrap_or(all);
-    if cfg!(debug_assertions) && std::env::var_os("PARTRIDGE_DIAG_NO_PIN").is_some() {
-        return Ok(Processors { one: all, all });
-    }
-    Ok(Processors { one, all })
-}
-
-/// The limits of the job: one process, a memory limit, ended when the handle closes, and the
-/// processors it may run on.
-fn job_limits(memory_limit: u64, processors: usize) -> JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
-    // SAFETY: a plain structure of numbers; all zeros is a valid value.
-    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_ACTIVE_PROCESS
-        | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        | JOB_OBJECT_LIMIT_PROCESS_MEMORY
-        | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION
-        | JOB_OBJECT_LIMIT_AFFINITY;
-    limits.BasicLimitInformation.ActiveProcessLimit = 1;
-    limits.BasicLimitInformation.Affinity = processors;
-    limits.ProcessMemoryLimit = memory_limit as usize;
-    limits
-}
-
-fn set_job_limits(job: &Owned, limits: &JOBOBJECT_EXTENDED_LIMIT_INFORMATION) -> io::Result<()> {
-    // SAFETY: documented call with a live, correctly sized structure.
-    check(
-        unsafe {
-            SetInformationJobObject(
-                job.raw(),
-                JobObjectExtendedLimitInformation,
-                (limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-        },
-        "SetInformationJobObject (limits)",
-    )
-}
-
-/// The job: one process on one processor, a memory limit, no UI access, ended when the handle
-/// closes.
-fn make_job(memory_limit: u64, processors: usize) -> io::Result<Owned> {
+/// The job: one process, a memory limit, no UI access, ended when the handle closes.
+fn make_job(memory_limit: u64) -> io::Result<Owned> {
     // SAFETY: documented Win32 calls with live, correctly sized structures.
     unsafe {
         let job = Owned::new(CreateJobObjectW(null(), null()))?;
-        set_job_limits(&job, &job_limits(memory_limit, processors))?;
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+            | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            | JOB_OBJECT_LIMIT_PROCESS_MEMORY
+            | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+        limits.BasicLimitInformation.ActiveProcessLimit = 1;
+        limits.ProcessMemoryLimit = memory_limit as usize;
+        check(
+            SetInformationJobObject(
+                job.raw(),
+                JobObjectExtendedLimitInformation,
+                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ),
+            "SetInformationJobObject (limits)",
+        )?;
         let ui = JOBOBJECT_BASIC_UI_RESTRICTIONS {
             UIRestrictionsClass: JOB_OBJECT_UILIMIT_DESKTOP
                 | JOB_OBJECT_UILIMIT_DISPLAYSETTINGS
@@ -637,10 +582,7 @@ struct WindowsProcess {
     process: Owned,
     id: u32,
     /// Closing the job ends the engine: it must outlive it, and it goes with it.
-    job: Owned,
-    memory_limit: u64,
-    /// The processors the engine may use once it has started.
-    processors: usize,
+    _job: Option<Owned>,
 }
 
 impl EngineProcess for WindowsProcess {
@@ -656,16 +598,6 @@ impl EngineProcess for WindowsProcess {
         // SAFETY: the process handle is valid.
         unsafe { WaitForSingleObject(self.process.raw(), u32::MAX) };
         Ok(())
-    }
-    fn started(&mut self) {
-        // The engine has said hello, so it has loaded everything: it may use all the processors of
-        // the app now. The job first (it limits the process), then the process itself. Failing
-        // here leaves the engine on its one processor, which is slower and not unsafe.
-        let wide_open = job_limits(self.memory_limit, self.processors);
-        if set_job_limits(&self.job, &wide_open).is_ok() {
-            // SAFETY: the process handle is valid.
-            unsafe { SetProcessAffinityMask(self.process.raw(), self.processors) };
-        }
     }
     fn try_wait(&mut self) -> io::Result<Option<String>> {
         // SAFETY: the process handle is valid.
@@ -693,9 +625,7 @@ pub(super) fn spawn(request: &SpawnRequest<'_>) -> io::Result<SpawnedEngine> {
     let _only_one = START.lock().unwrap_or_else(|e| e.into_inner());
     container::allow_files(request.program, request.args)?;
     let (lockdown, initial) = make_tokens()?;
-    let memory_limit = request.memory_limit.unwrap_or(DEFAULT_MEMORY_LIMIT);
-    let processors = startup_processors()?;
-    let job = make_job(memory_limit, processors.one)?;
+    let job = make_job(request.memory_limit.unwrap_or(DEFAULT_MEMORY_LIMIT))?;
     let (child_in, parent_in) = make_pipe(true)?;
     let (child_out, parent_out) = make_pipe(false)?;
     let nul = open_nul()?;
@@ -852,9 +782,7 @@ pub(super) fn spawn(request: &SpawnRequest<'_>) -> io::Result<SpawnedEngine> {
         process: Box::new(WindowsProcess {
             process,
             id,
-            job,
-            memory_limit,
-            processors: processors.all,
+            _job: Some(job),
         }),
         stdin: Box::new(pipe_file(parent_in)) as Box<dyn Write + Send>,
         stdout: Box::new(pipe_file(parent_out)) as Box<dyn Read + Send>,

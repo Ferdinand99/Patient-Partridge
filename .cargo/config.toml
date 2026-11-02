@@ -1,0 +1,15 @@
+# Windows: link the C runtime into the programs instead of loading the Visual C++ runtime DLLs.
+#
+# The PDF engine runs in an AppContainer with a locked-down token. The system's loader hands the
+# loading of the libraries a program imports to helper threads of the process, and those threads
+# have only the locked-down token: they may not open a library file, so a program that imports
+# `vcruntime140.dll` and the `api-ms-win-crt-*.dll` family (which are not on the system's list of
+# known libraries, so they have to be opened as files) failed to start about nine times in ten
+# with "library not found". Without the runtime DLLs what is left are libraries on the system's
+# list, which are mapped without opening a file. The programs also no longer need the Visual C++
+# redistributable to be installed.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

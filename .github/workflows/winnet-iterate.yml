@@ -29,21 +29,15 @@ jobs:
       - run: |
           mkdir -p dist
           echo '<!doctype html><title>stub</title>' > dist/index.html
-      - name: Dynamic CRT, no pinning, starts under load
+      - name: Starts under load
         continue-on-error: true
         timeout-minutes: 8
-        env:
-          PARTRIDGE_DIAG_NO_PIN: "1"
         run: cargo test -p partridge-engine --locked --test windows_start -- --nocapture --test-threads 2
-      - name: Static CRT, no pinning, starts under load
+      - name: Sandbox proof
+        timeout-minutes: 5
         continue-on-error: true
-        timeout-minutes: 10
-        env:
-          PARTRIDGE_DIAG_NO_PIN: "1"
-          RUSTFLAGS: "-C target-feature=+crt-static"
-          CARGO_TARGET_DIR: target-static
-        run: |
-          cargo test -p partridge-engine --locked --test windows_start --no-run
-          DUMPBIN=$(find "/c/Program Files/Microsoft Visual Studio" -name dumpbin.exe -path "*Hostx64*x64*" | head -1)
-          "$DUMPBIN" //dependents target-static/debug/partridge-engine.exe || true
-          cargo test -p partridge-engine --locked --test windows_start -- --nocapture --test-threads 2
+        run: cargo test -p partridge-engine --locked --test sandbox -- --nocapture --test-threads 1
+      - name: The other engine tests
+        if: always()
+        timeout-minutes: 8
+        run: cargo test -p partridge-engine -p partridge-engine-client --locked --no-fail-fast

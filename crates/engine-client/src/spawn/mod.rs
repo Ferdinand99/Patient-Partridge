@@ -68,9 +68,6 @@ pub trait EngineProcess: Send {
     fn wait(&mut self) -> io::Result<()>;
     /// Says how the process ended, or `None` when it still runs.
     fn try_wait(&mut self) -> io::Result<Option<String>>;
-    /// Called when the engine has answered its greeting, so it has started up. Windows lets the
-    /// engine use all the processors of the app from here on (it starts on one, see `windows`).
-    fn started(&mut self) {}
 }
 
 /// An engine and its two pipes.

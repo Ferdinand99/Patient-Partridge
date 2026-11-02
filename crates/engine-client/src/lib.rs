@@ -783,7 +783,29 @@ impl EngineClient {
         self.start(inner, None)
     }
 
+    /// Starts an engine. On Windows a start that ends before the greeting because the system's
+    /// loader could not find a library (exit code `0xC0000135`) is tried again, up to three times
+    /// in all: the loader hands library loading to helper threads that have no rights in the
+    /// engine's locked-down token, and although the engine links the C runtime statically so that
+    /// nothing but the system's own libraries is left to load, a system that keeps one of them
+    /// outside its list of known libraries could still lose that race now and then. A start that
+    /// fails for another reason, or every time, is reported as it was. Nothing is relaxed by trying
+    /// again: every attempt starts the engine with all its restrictions.
     fn start(&self, inner: &mut Inner, document: Option<&File>) -> Result<(), ClientError> {
+        let mut attempt = 1;
+        loop {
+            match self.start_once(inner, document) {
+                Err(ClientError::EngineStopped(why))
+                    if attempt < 3 && cfg!(windows) && why.contains("exit code: 3221225781") =>
+                {
+                    attempt += 1;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    fn start_once(&self, inner: &mut Inner, document: Option<&File>) -> Result<(), ClientError> {
         // The fonts are opened for this engine only and closed again when it has them.
         let fonts = if document.is_none() {
             // An engine that only says what it is has no document and needs no fonts.
@@ -870,14 +892,6 @@ impl EngineClient {
                             }
                         ),
                     });
-                }
-                // The engine is up. (Windows: it started on one processor, see the spawn code.)
-                if let Some(running) = inner.running.as_ref() {
-                    running
-                        .child
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .started();
                 }
                 inner.running.as_mut().expect("just started").info = EngineInfo {
                     engine_version,
