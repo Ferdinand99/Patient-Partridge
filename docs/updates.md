@@ -33,7 +33,8 @@ The setting is kept in `settings.json` in the app's data folder, next to the fil
 
 | System | Update file | What happens |
 |---|---|---|
-| Windows | NSIS installer (`…-setup.exe`) | The installer runs in "passive" mode (a progress bar, no questions) and starts the new version. The app ends when the installer starts. |
+| Windows, **NSIS** installer | NSIS installer (`…-setup.exe`) | The installer runs in "passive" mode (a progress bar, no questions) and starts the new version. The app ends when the installer starts. |
+| Windows, **MSI** installer | the new `.msi` | Windows Installer runs the package and starts the new version. |
 | macOS | `….app.tar.gz` (a universal app, Apple silicon and Intel) | The app bundle is replaced and the app restarts. |
 | Linux, **AppImage** | the new `.AppImage` | The AppImage file you started is replaced and the app restarts from it. |
 | Linux, **deb** | none | A deb package cannot update itself. The pill opens a notice with the release notes and a button that opens the releases page (https://github.com/Ferdinand99/Patient-Partridge/releases/latest) in the browser. |
