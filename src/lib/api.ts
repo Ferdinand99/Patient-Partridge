@@ -41,6 +41,11 @@ export interface OpenedDocument {
   name: string;
   /** Where this file was left the last time, if it was. */
   position?: SavedPosition | null;
+  /**
+   * Windows: the PDF reader runs in its sandbox, but this computer did not confirm that the network
+   * is blocked for it (a firewall setting can be the reason). The window says so once.
+   */
+  networkNotProved?: boolean;
 }
 
 /** One entry of the table of contents, in reading order. */
@@ -96,6 +101,7 @@ interface OpenedWire {
   pages: [number, number][];
   name: string;
   position: SavedPosition | null;
+  network_not_proved?: boolean;
 }
 
 export const api = {
@@ -106,6 +112,7 @@ export const api = {
       name: wire.name,
       pages: wire.pages.map(([width, height]) => ({ width, height })),
       position: wire.position,
+      networkNotProved: wire.network_not_proved === true,
     };
   },
 

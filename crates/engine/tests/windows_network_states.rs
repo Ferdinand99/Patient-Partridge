@@ -1,0 +1,71 @@
+//! What the real engine does on a Windows machine whose firewall is in an unusual state: a profile
+//! switched off, the firewall service stopped, the filtering engine stopped. CI runs this once per
+//! state (the job "Windows, firewall states") and sets `PARTRIDGE_NETWORK_EXPECT`:
+//!
+//! - `record`: print what happened and assert nothing (used to find out what a state does).
+//! - `proved`: the engine must report `no-network` (TCP, UDP and raw sockets all refused) and no
+//!   privilege in the token.
+//! - `not-proved`: the engine must report `network-not-proved` and no `no-network`.
+//! - `any`: either, but never a refusal of the document.
+//!
+//! In every state except `record` the document must open, because the engine's fail-closed
+//! condition is the AppContainer token, not the answer of the firewall to a probe.
+
+#![cfg(windows)]
+
+use partridge_engine_client::{EngineClient, EngineConfig, EnginePool, SandboxPolicy};
+use partridge_testkit as kit;
+
+fn config() -> EngineConfig {
+    let mut config = EngineConfig::new(env!("CARGO_BIN_EXE_partridge-engine"));
+    config.args = vec!["--pdfium-dir".into(), kit::pdfium_dir().into_os_string()];
+    config.sandbox = SandboxPolicy::Required;
+    config
+}
+
+#[test]
+fn the_engine_in_this_firewall_state() {
+    let expect = std::env::var("PARTRIDGE_NETWORK_EXPECT").unwrap_or_else(|_| "any".to_string());
+    let state = std::env::var("PARTRIDGE_FIREWALL_STATE").unwrap_or_else(|_| "unknown".to_string());
+    println!("firewall state: {state}, expectation: {expect}");
+
+    let started = EngineClient::new(config()).info();
+    println!("engine greeting: {started:?}");
+
+    let file = kit::TempFile::new("states.pdf", &kit::simple_pdf(2));
+    let opened = EngineClient::new(config()).open(&file.path_str(), None);
+    println!("document: {opened:?}");
+
+    // The pool, which the app uses, learns from the greeting whether the block was proved.
+    let pool = EnginePool::new(config(), 1);
+    let pooled = pool.open(&file.path_str(), None);
+    println!(
+        "pool: opened {:?}, network_not_proved {}",
+        pooled.as_ref().map(|(handle, _)| handle),
+        pool.network_not_proved()
+    );
+
+    if expect == "record" {
+        return;
+    }
+    pooled.unwrap_or_else(|e| panic!("the pool did not open the document: {e:?}"));
+    let info = started.unwrap_or_else(|e| panic!("the engine did not start: {e:?}"));
+    opened.unwrap_or_else(|e| panic!("the document was not opened: {e:?}"));
+    assert!(info.sandbox.contains("appcontainer"), "{info:?}");
+    let proved = info.sandbox.split('+').any(|l| l == "no-network");
+    let unproved = info.sandbox.contains("network-not-proved");
+    assert!(proved != unproved, "exactly one of the two: {info:?}");
+    assert_eq!(
+        pool.network_not_proved(),
+        unproved,
+        "the pool and the greeting disagree: {info:?}"
+    );
+    match expect.as_str() {
+        "proved" => {
+            assert!(proved, "{info:?}");
+            assert!(info.sandbox.contains("no-privileges"), "{info:?}");
+        }
+        "not-proved" => assert!(unproved, "{info:?}"),
+        _ => {}
+    }
+}

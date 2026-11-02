@@ -4,7 +4,15 @@
 //!   privilege removed, every group (and the user) turned into deny-only, and one restricting SID,
 //!   the null SID, which no object grants access to. With such a token almost no securable object
 //!   can be opened: no file, no registry key, no named pipe, no other process. It does not stop the
-//!   network: a process with this token can still make a socket and connect.
+//!   network by itself: a process with only this token can still make a socket and connect.
+//! - **AppContainer without capabilities** (see `container`). The same two tokens (the engine's
+//!   and the one its first thread starts with) are turned into tokens of a package that holds no
+//!   capability. Windows refuses a TCP connection and the making of a datagram socket for such a
+//!   process, and a name lookup fails, loopback included. The restricted token stays under it:
+//!   an object must be open to the restricting SID and to the package.
+//! - **No privilege.** `SeChangeNotifyPrivilege`, the one privilege the restricted token keeps, is
+//!   taken out of the engine's token (not out of its first thread's start identity). Without it
+//!   the engine cannot open the socket device, so it cannot make any socket, raw ones included.
 //! - **Untrusted integrity level**, below everything the user owns (set by the engine on its own
 //!   token just before it gives up the start identity).
 //! - **A job object of its own** (so no race with another job): a single process, no child
@@ -17,7 +25,8 @@
 //!   and the document, and nothing else of the app's handles.
 //!
 //! A process with that token cannot load its own DLLs, so the first thread of the engine starts out
-//! impersonating the app's own (full) token. The engine loads PDFium with that, then calls
+//! impersonating a copy of the app's own token (the user's rights) that is an AppContainer token of
+//! the same package. The engine loads PDFium with that, then calls
 //! `RevertToSelf` (see `partridge-engine`), after which the thread has the restricted token like the
 //! rest of the process. The engine reads nothing of the document before that.
 //!
@@ -38,10 +47,11 @@ use windows_sys::Win32::Foundation::{
     HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::{
-    CreateRestrictedToken, DuplicateTokenEx, GetTokenInformation, SecurityImpersonation,
-    TokenGroups, TokenImpersonation, TokenPrimary, TokenUser, DISABLE_MAX_PRIVILEGE,
-    SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES, TOKEN_ADJUST_DEFAULT, TOKEN_ALL_ACCESS,
-    TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER,
+    AdjustTokenPrivileges, CreateRestrictedToken, DuplicateTokenEx, GetTokenInformation,
+    LookupPrivilegeValueW, SecurityImpersonation, TokenGroups, TokenImpersonation, TokenPrimary,
+    TokenUser, DISABLE_MAX_PRIVILEGE, LUID_AND_ATTRIBUTES, SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES,
+    TOKEN_ADJUST_DEFAULT, TOKEN_ALL_ACCESS, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_GROUPS,
+    TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE,
@@ -70,6 +80,8 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use partridge_protocol::FontScript;
+
+mod container;
 
 use super::{engine_args, EngineProcess, SpawnRequest, SpawnedEngine};
 
@@ -146,6 +158,10 @@ fn engine_desktop() -> Option<&'static Vec<u16>> {
                 let desktop =
                     CreateDesktopW(own.as_ptr(), null(), null(), 0, GENERIC_ALL_ACCESS, null());
                 if desktop.is_null() {
+                    return None;
+                }
+                // The package of the engine needs access to it, or the engine cannot start.
+                if container::allow_desktop(desktop).is_err() {
                     return None;
                 }
                 Some(wide(OsStr::new(&format!("{station}\\{desktop_name}"))))
@@ -374,20 +390,6 @@ fn make_tokens() -> io::Result<(Owned, Owned)> {
             "CreateRestrictedToken (start)",
         )?;
         let start_token = Owned::new(start_token)?;
-        let mut imp: HANDLE = null_mut();
-        check(
-            DuplicateTokenEx(
-                start_token.raw(),
-                TOKEN_ALL_ACCESS,
-                null(),
-                SecurityImpersonation,
-                TokenImpersonation,
-                &mut imp,
-            ),
-            "DuplicateTokenEx",
-        )?;
-        let initial = Owned::new(imp)?;
-
         // The user and every group become deny-only, except the integrity entry, which cannot.
         let mut disable: Vec<SID_AND_ATTRIBUTES> = vec![SID_AND_ATTRIBUTES {
             Sid: user.User.Sid,
@@ -439,14 +441,76 @@ fn make_tokens() -> io::Result<(Owned, Owned)> {
             "DuplicateTokenEx (primary)",
         )?;
         let lockdown = Owned::new(primary)?;
+        // Debug builds only: the packet capture job keeps the privilege on purpose, to show what a
+        // raw echo does on a computer where the token has it. Release builds have no such switch.
+        #[cfg(debug_assertions)]
+        let keep_privilege = std::env::var_os("PARTRIDGE_TEST_KEEP_TRAVERSE_PRIVILEGE")
+            .is_some_and(|v| !v.is_empty());
+        #[cfg(not(debug_assertions))]
+        let keep_privilege = false;
+        if !keep_privilege {
+            remove_bypass_traverse_checking(&lockdown)?;
+        }
 
         // The integrity level stays the app's own for now. The system lets the first thread
         // impersonate a token only if its integrity level is not above that of the process, so
         // the two start out equal, and the engine lowers its own level to untrusted just before
         // it gives up the start identity (see `partridge-engine`).
         drop(nobody);
+
+        // The AppContainer: the same two tokens, as tokens of a package that has no capabilities.
+        // The start identity has to be one of the same package, or the system lowers it to
+        // "identification" and the loader fails.
+        let lockdown = container::lowbox(&lockdown)?;
+        let start_box = container::lowbox(&start_token)?;
+        let mut imp: HANDLE = null_mut();
+        check(
+            DuplicateTokenEx(
+                start_box.raw(),
+                TOKEN_ALL_ACCESS,
+                null(),
+                SecurityImpersonation,
+                TokenImpersonation,
+                &mut imp,
+            ),
+            "DuplicateTokenEx (start, AppContainer)",
+        )?;
+        let initial = Owned::new(imp)?;
         Ok((lockdown, initial))
     }
+}
+
+/// `SE_PRIVILEGE_REMOVED`: the privilege is taken out of the token for good.
+const SE_PRIVILEGE_REMOVED: u32 = 0x0000_0004;
+
+/// Takes `SeChangeNotifyPrivilege` ("bypass traverse checking") out of the token of the engine.
+/// `DISABLE_MAX_PRIVILEGE` keeps exactly that one privilege. Without it a process cannot open an
+/// object whose path runs through directories it has no traverse right on, and with the null SID as
+/// restricting SID it has none. Opening `\Device\Afd\Endpoint`, which is the first thing creating
+/// any socket does, is such an open. The first thread's start identity keeps the privilege, so
+/// loading PDFium and the fonts is not affected.
+fn remove_bypass_traverse_checking(token: &Owned) -> io::Result<()> {
+    let name = wide(OsStr::new("SeChangeNotifyPrivilege"));
+    // SAFETY: documented Win32 calls with live, correctly sized structures.
+    unsafe {
+        let mut privilege: TOKEN_PRIVILEGES = zeroed();
+        privilege.PrivilegeCount = 1;
+        check(
+            LookupPrivilegeValueW(null(), name.as_ptr(), &mut privilege.Privileges[0].Luid),
+            "LookupPrivilegeValue",
+        )?;
+        privilege.Privileges[0] = LUID_AND_ATTRIBUTES {
+            Luid: privilege.Privileges[0].Luid,
+            Attributes: SE_PRIVILEGE_REMOVED,
+        };
+        check(
+            AdjustTokenPrivileges(token.raw(), 0, &privilege, 0, null_mut(), null_mut()),
+            "AdjustTokenPrivileges",
+        )?;
+        // The call succeeds with `ERROR_NOT_ALL_ASSIGNED` when the privilege was not in the token.
+        // That is the wanted state, so it is not an error; the engine checks the result itself.
+    }
+    Ok(())
 }
 
 /// The job: one process, a memory limit, no UI access, ended when the handle closes.
@@ -612,6 +676,7 @@ fn pipe_file(handle: Owned) -> File {
 /// Starts the engine with all restrictions.
 pub(super) fn spawn(request: &SpawnRequest<'_>) -> io::Result<SpawnedEngine> {
     let _only_one = START.lock().unwrap_or_else(|e| e.into_inner());
+    container::allow_files(request.program, request.args)?;
     let (lockdown, initial) = make_tokens()?;
     let job = make_job(request.memory_limit.unwrap_or(DEFAULT_MEMORY_LIMIT))?;
     let (child_in, parent_in) = make_pipe(true)?;
@@ -834,4 +899,10 @@ pub(super) fn spawn_plain(request: &SpawnRequest<'_>) -> io::Result<SpawnedEngin
         stdin: Box::new(stdin),
         stdout: Box::new(stdout),
     })
+}
+
+/// See [`allow_stand_in_to_use`](super::allow_stand_in_to_use).
+#[cfg(debug_assertions)]
+pub(super) fn allow_read_write(path: &std::path::Path) -> io::Result<()> {
+    container::allow_read_write(path)
 }

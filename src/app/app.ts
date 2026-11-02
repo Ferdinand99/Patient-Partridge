@@ -282,6 +282,8 @@ export class App {
   private readonly empty: HTMLElement;
   private readonly dropOverlay: HTMLElement;
   private readonly noticeLayer: HTMLElement;
+  private readonly protectionLine: HTMLElement;
+  private protectionTold = false;
   private readonly pageInput: HTMLInputElement;
   private readonly pageTotal: HTMLElement;
   private readonly zoomSelect: HTMLSelectElement;
@@ -330,6 +332,7 @@ export class App {
     this.empty = byId(root, "empty");
     this.dropOverlay = byId(root, "drop-overlay");
     this.noticeLayer = byId(root, "notice-layer");
+    this.protectionLine = byId(root, "protection-line");
     this.pageInput = byId(root, "page-input");
     this.pageTotal = byId(root, "page-total");
     this.zoomSelect = byId(root, "zoom-select");
@@ -437,6 +440,9 @@ export class App {
   }
 
   init(): void {
+    byId(this.root, "protection-dismiss").addEventListener("click", () => {
+      this.protectionLine.hidden = true;
+    });
     byId(this.root, "open-button").addEventListener("click", () => void this.openDialog());
     byId(this.root, "print-button").addEventListener("click", () => void this.printActive());
     for (const [id, asCopy] of [
@@ -796,6 +802,19 @@ export class App {
     this.addTab(opened, path, started, activate);
   }
 
+  /**
+   * Windows: the PDF reader is locked into its sandbox, but the computer did not confirm that the
+   * network is blocked for it. One calm line, once; the user can dismiss it. (The reason is in the
+   * engine's greeting, not shown here.)
+   */
+  private tellAboutNetworkBlock(opened: OpenedDocument): void {
+    if (!opened.networkNotProved || this.protectionTold) return;
+    this.protectionTold = true;
+    byId(this.root, "protection-text").textContent =
+      "Windows did not confirm that network access is blocked for the PDF reader on this computer. It still runs in its protective sandbox.";
+    this.protectionLine.hidden = false;
+  }
+
   private async openFailed(
     path: string,
     name: string,
@@ -844,6 +863,7 @@ export class App {
     activate: boolean,
     rank = Infinity,
   ): void {
+    this.tellAboutNetworkBlock(opened);
     // A file named at the start that was in the last session's list goes back to its old place.
     if (rank === Infinity) rank = this.sessionRanks.get(path) ?? Infinity;
     const openedAfter = this.deps.now() - started;

@@ -156,6 +156,13 @@ fn killing_the_engine_frees_a_request_that_waits_for_it() {
 fn an_engine_that_exits_while_idle_is_replaced_quietly() {
     let marker = std::env::temp_dir().join(format!("partridge-fake-{}", std::process::id()));
     let _ = std::fs::remove_file(&marker);
+    // The stand-in engine cannot create a file in its AppContainer, so on Windows the test makes
+    // the file and lets the container write to it.
+    #[cfg(all(windows, debug_assertions))]
+    {
+        std::fs::write(&marker, b"").unwrap();
+        partridge_engine_client::allow_stand_in_to_use(&marker).unwrap();
+    }
     let client = client_with("exit-once", &[marker.to_str().unwrap()]);
     client.info().unwrap();
     std::thread::sleep(Duration::from_millis(500));

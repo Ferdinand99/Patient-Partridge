@@ -2,7 +2,8 @@
 //!
 //! The app opens the document and gives the engine an inherited, read-only handle to it. The engine
 //! gets exactly four things: standard input and output for the protocol, a null device for standard
-//! error, and the document. On Windows the engine is also started with a restricted token, the
+//! error, and the document. On Windows the engine is also started in an AppContainer without
+//! capabilities (which blocks the network) made from a restricted token, with the
 //! untrusted integrity level, its own job object and process mitigation policies (see `windows`).
 //! On Unix the engine locks itself in after it has loaded what it needs (see `partridge-engine`).
 
@@ -144,4 +145,12 @@ pub(crate) fn engine_environment() -> Vec<(OsString, OsString)> {
             allowed || (cfg!(debug_assertions) && name.starts_with("PARTRIDGE_TEST_"))
         })
         .collect()
+}
+
+/// Tests only (debug builds, Windows): lets the AppContainer the engines run in read and write one
+/// file. Stand-ins for the engine in the tests of the client do not lock themselves in, and
+/// without this a stand-in could not write the marker file some of the tests use.
+#[cfg(all(windows, debug_assertions))]
+pub fn allow_stand_in_to_use(path: &Path) -> io::Result<()> {
+    windows::allow_read_write(path)
 }

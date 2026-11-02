@@ -24,7 +24,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -39,6 +39,8 @@ use partridge_protocol::{
     PROTOCOL_VERSION, SAVE_DATA_HEADER_LEN,
 };
 
+#[cfg(all(windows, debug_assertions))]
+pub use spawn::allow_stand_in_to_use;
 pub use spawn::{spawn_engine, EngineProcess, SandboxPolicy, SpawnRequest, SpawnedEngine};
 
 pub use partridge_protocol::{
@@ -269,6 +271,9 @@ pub struct EngineClient {
     /// The running child, reachable without the request lock, so the engine can be killed while a
     /// request is waiting for it (when the app quits, or the user gives up).
     killer: Mutex<Option<SharedProcess>>,
+    /// How many times a start was tried again (see `start`). A start that works the first time does
+    /// not count.
+    start_retries: AtomicU64,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -284,12 +289,28 @@ impl EngineClient {
             config,
             inner: Mutex::new(Inner::default()),
             killer: Mutex::new(None),
+            start_retries: AtomicU64::new(0),
         }
+    }
+
+    /// How many starts of this client failed the first time and were tried again. The tests that
+    /// start the engine many times require zero: the new attempt hides a start that fails now and
+    /// then, which these tests exist to find.
+    pub fn start_retries(&self) -> u64 {
+        self.start_retries.load(Ordering::Relaxed)
     }
 
     /// How many engine processes this client has started. A jump tells that the engine was replaced.
     pub fn spawn_count(&self) -> u64 {
         lock(&self.inner).spawns
+    }
+
+    /// What the running engine said about its sandbox in the greeting, if there is an engine.
+    pub fn sandbox_report(&self) -> Option<String> {
+        lock(&self.inner)
+            .running
+            .as_ref()
+            .map(|r| r.info.sandbox.clone())
     }
 
     /// Process id of the running engine, if there is one. Used by the measurement tools.
@@ -969,7 +990,10 @@ impl EngineClient {
         // Anything waiting now was not asked for in this request.
         match running.events.try_recv() {
             Err(TryRecvError::Empty) => {}
-            Ok(Event::Closed) | Err(TryRecvError::Disconnected) => return Err("it exited".into()),
+            // With the exit code: a start that ends before the greeting is told from the code.
+            Ok(Event::Closed) | Err(TryRecvError::Disconnected) => {
+                return Err(exit_text(&running.child))
+            }
             Ok(Event::Failed(why)) => return Err(why),
             Ok(Event::Response(_)) => return Err("it sent an answer nobody asked for".into()),
         }
@@ -1105,7 +1129,30 @@ impl EngineClient {
         self.start(inner, None)
     }
 
+    /// Starts an engine. On Windows a start that ends before the greeting because the system's
+    /// loader could not find a library (exit code `0xC0000135`) is tried again, up to three times
+    /// in all: the loader hands library loading to helper threads that have no rights in the
+    /// engine's locked-down token, and although the engine links the C runtime statically so that
+    /// nothing but the system's own libraries is left to load, a system that keeps one of them
+    /// outside its list of known libraries could still lose that race now and then. A start that
+    /// fails for another reason, or every time, is reported as it was. Nothing is relaxed by trying
+    /// again: every attempt starts the engine with all its restrictions.
     fn start(&self, inner: &mut Inner, document: Option<&File>) -> Result<(), ClientError> {
+        let mut attempt = 1;
+        loop {
+            match self.start_once(inner, document) {
+                Err(ClientError::EngineStopped(why))
+                    if attempt < 3 && cfg!(windows) && why.contains("exit code: 3221225781") =>
+                {
+                    attempt += 1;
+                    self.start_retries.fetch_add(1, Ordering::Relaxed);
+                }
+                other => return other,
+            }
+        }
+    }
+
+    fn start_once(&self, inner: &mut Inner, document: Option<&File>) -> Result<(), ClientError> {
         // The fonts are opened for this engine only and closed again when it has them.
         let fonts = if document.is_none() {
             // An engine that only says what it is has no document and needs no fonts.
@@ -1302,6 +1349,14 @@ fn spawn_reader(
             }
         }
     });
+}
+
+/// True when the greeting says that the engine runs, but that it could not prove that the network
+/// is blocked (Windows: `network-not-proved`, followed by what the system answered). Elsewhere the
+/// block is the system call filter or the profile, which the engine does not probe, so this is
+/// never true there.
+pub fn network_not_proved(report: &str) -> bool {
+    report.contains("network-not-proved")
 }
 
 /// True when the engine's greeting names a sandbox. An engine without one says `none` and why.
