@@ -14,8 +14,8 @@ use partridge_protocol::{ErrorCode, PageSize};
 
 use crate::save::{save_document, verify_written, FileStamp};
 use crate::{
-    Bitmap, ClientError, EngineClient, EngineConfig, EngineInfo, OutlineItem, PageLink, PageText,
-    SaveError, SaveOptions, SaveOutcome, TextMatch,
+    Bitmap, ClientError, EngineClient, EngineConfig, EngineInfo, FontScript, OutlineItem, PageLink,
+    PageText, SaveError, SaveOptions, SaveOutcome, TextMatch,
 };
 
 /// The file a document belongs to, and how it looked when the document was opened (or last saved).
@@ -287,6 +287,12 @@ impl EnginePool {
     pub fn outline(&self, handle: u64) -> Result<Vec<OutlineItem>, ClientError> {
         let (client, doc) = self.entry(handle)?;
         client.outline(doc)
+    }
+
+    /// The scripts the engine of a document had no font for when PDFium asked.
+    pub fn font_report(&self, handle: u64) -> Result<Vec<FontScript>, ClientError> {
+        let (client, doc) = self.entry(handle)?;
+        client.font_report(doc)
     }
 
     pub fn page_text(&self, handle: u64, page: u32) -> Result<PageText, ClientError> {

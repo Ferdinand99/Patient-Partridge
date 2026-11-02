@@ -13,8 +13,8 @@ use std::io::{self, Read};
 
 use arbitrary::{Result, Unstructured};
 use partridge_protocol::{
-    ErrorCode, LinkTarget, OutlineItem, PageLink, PageSize, Request, RequestBody, Response,
-    ResponseBody, TextMatch, MAX_LINKS_PER_PAGE, MAX_MATCHES_PER_PAGE, MAX_OUTLINE_DEPTH,
+    ErrorCode, FontScript, LinkTarget, OutlineItem, PageLink, PageSize, Request, RequestBody,
+    Response, ResponseBody, TextMatch, MAX_LINKS_PER_PAGE, MAX_MATCHES_PER_PAGE, MAX_OUTLINE_DEPTH,
     MAX_OUTLINE_ITEMS, MAX_OUTLINE_TITLE, MAX_QUERY_LEN, MAX_SAVE_BYTES, MAX_SAVE_CHUNK,
     MAX_STRING_LEN, MAX_URI_LEN,
 };
@@ -78,7 +78,7 @@ pub fn sanitized(rect: [f32; 4]) -> [f32; 4] {
 /// A request that the encoder writes without cutting anything.
 pub fn arb_request(u: &mut Unstructured) -> Result<Request> {
     let id: u32 = u.arbitrary()?;
-    let body = match u.int_in_range(0..=12u8)? {
+    let body = match u.int_in_range(0..=13u8)? {
         0 => RequestBody::Hello {
             protocol_version: u.arbitrary()?,
         },
@@ -133,9 +133,10 @@ pub fn arb_request(u: &mut Unstructured) -> Result<Request> {
         11 => RequestBody::SaveEnd {
             doc: u.arbitrary()?,
         },
-        _ => RequestBody::Fingerprint {
+        12 => RequestBody::Fingerprint {
             doc: u.arbitrary()?,
         },
+        _ => RequestBody::FontReport,
     };
     Ok(Request { id, body })
 }
@@ -160,7 +161,7 @@ pub struct GeneratedResponse {
 
 pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
     let id: u32 = u.arbitrary()?;
-    let (sent, expected) = match u.int_in_range(0..=14u8)? {
+    let (sent, expected) = match u.int_in_range(0..=15u8)? {
         0 => {
             let b = ResponseBody::Hello {
                 protocol_version: u.arbitrary()?,
@@ -335,12 +336,23 @@ pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
             };
             (b.clone(), b)
         }
-        _ => {
+        14 => {
             let b = ResponseBody::Fingerprint {
                 pages: u.arbitrary()?,
                 failed: u.arbitrary()?,
                 digest: u.arbitrary()?,
             };
+            (b.clone(), b)
+        }
+        _ => {
+            // Any scripts, in the order of the list, as the engine reports them.
+            let mut missed = Vec::new();
+            for script in FontScript::ALL {
+                if u.arbitrary()? {
+                    missed.push(script);
+                }
+            }
+            let b = ResponseBody::FontReport { missed };
             (b.clone(), b)
         }
     };

@@ -7,8 +7,8 @@
       http-equiv="Content-Security-Policy"
       content="default-src 'none'; script-src 'self' 'sha256-WZRJfWvsnNCPcxzZwvyhovnZGqhZaC+8gPGPRbx6wTk='; style-src 'self'; img-src 'self'; font-src 'self'; manifest-src 'self'; base-uri 'self'; form-action 'none'"
     />
-    <title>Patient Partridge — an open source PDF reader and editor (in development)</title>
-    <meta name="description" content="Patient Partridge is an open source PDF reader and editor for Windows, macOS and Linux from the Hedgerow family. Reading PDFs works today and editing tools are planned. It is meant to be fast and small, with no account, no cloud, no advertising and no tracking. In development: nothing is released yet." />
+    <title>Patient Partridge — an open source PDF reader and editor (early release)</title>
+    <meta name="description" content="Patient Partridge is an open source PDF reader and editor for Windows, macOS and Linux from the Hedgerow family. Reading PDFs works today and editing tools are planned. It is meant to be fast and small, with no account, no cloud, no advertising and no tracking. Version 0.1.0 is an early release." />
     <script>document.documentElement.classList.add("js");</script>
     <link rel="canonical" href="https://hedgerow.tools/Patient-Partridge/" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
@@ -21,16 +21,16 @@
     <meta property="og:type" content="website" />
     <meta property="og:url" content="https://hedgerow.tools/Patient-Partridge/" />
     <meta property="og:site_name" content="Patient Partridge" />
-    <meta property="og:title" content="Patient Partridge — an open source PDF reader and editor (in development)" />
-    <meta property="og:description" content="A PDF reader and editor that needs no account, no cloud and no tracking. Reading works today; editing is planned. Open source, from the Hedgerow family. Nothing is released yet." />
+    <meta property="og:title" content="Patient Partridge — an open source PDF reader and editor (early release)" />
+    <meta property="og:description" content="A PDF reader and editor that needs no account, no cloud and no tracking. Reading works today; editing is planned. Open source, from the Hedgerow family. Version 0.1.0 is an early release." />
     <meta property="og:image" content="https://hedgerow.tools/Patient-Partridge/og-image.png" />
     <meta property="og:image:type" content="image/png" />
     <meta property="og:image:width" content="1200" />
     <meta property="og:image:height" content="630" />
     <meta property="og:image:alt" content="Patient Partridge: an amber partridge on a dark tile, next to the title, the tagline An open source PDF reader, and the note In development." />
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="Patient Partridge — an open source PDF reader and editor (in development)" />
-    <meta name="twitter:description" content="A PDF reader and editor that needs no account, no cloud and no tracking. Reading works today; editing is planned. Open source, from the Hedgerow family. Nothing is released yet." />
+    <meta name="twitter:title" content="Patient Partridge — an open source PDF reader and editor (early release)" />
+    <meta name="twitter:description" content="A PDF reader and editor that needs no account, no cloud and no tracking. Reading works today; editing is planned. Open source, from the Hedgerow family. Version 0.1.0 is an early release." />
     <meta name="twitter:image" content="https://hedgerow.tools/Patient-Partridge/og-image.png" />
     <link rel="preload" href="fonts/InterVariable.woff2" as="font" type="font/woff2" crossorigin />
     <link rel="stylesheet" href="styles.css" />
@@ -39,7 +39,7 @@
         "@context": "https://schema.org",
         "@type": "SoftwareApplication",
         "name": "Patient Partridge",
-        "description": "An open source PDF reader and editor for Windows, macOS and Linux. Reading works today; editing tools are planned. In development: nothing is released yet.",
+        "description": "An open source PDF reader and editor for Windows, macOS and Linux. Reading works today; editing tools are planned. Version 0.1.0 is an early release.",
         "url": "https://hedgerow.tools/Patient-Partridge/",
         "applicationCategory": "UtilitiesApplication",
         "operatingSystem": "Windows, macOS, Linux (planned)",
@@ -95,7 +95,7 @@
             </div>
             <a class="live-pill" href="#roadmap">
               <span class="dot" aria-hidden="true"></span>
-              <span>In development</span>
+              <span>Version 0.1.0</span>
               <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#chevron-right"></use></svg>
             </a>
             <h1 class="display" id="hero-title">A PDF reader and editor<br class="br-wide" /> that keeps to itself.</h1>
@@ -104,11 +104,11 @@
               Today it reads PDFs; the editing tools are planned. It is meant to be fast and small,
               and to work without an account, a cloud, advertising or tracking.
             </p>
-            <p class="hero-fine">Nothing is released yet, so there is nothing to download. Expect rough edges and missing features.</p>
+            <p class="hero-fine">Version 0.1.0 is out for Windows, macOS and Linux. It is an early release: reading works well, and editing tools are planned. Expect rough edges.</p>
             <div class="hero-actions">
-              <a class="btn btn-primary btn-lg" href="https://github.com/Ferdinand99/Patient-Partridge">
-                <svg class="gh-mark" aria-hidden="true"><use href="#gh"></use></svg>
-                <span>Follow on GitHub</span>
+              <a class="btn btn-primary btn-lg" href="https://github.com/Ferdinand99/Patient-Partridge/releases/latest">
+                <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#download"></use></svg>
+                <span>Download 0.1.0</span>
               </a>
               <a class="btn btn-ghost btn-lg" href="#today">
                 <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#check-circle"></use></svg>
@@ -189,8 +189,7 @@
             <p class="eyebrow">What works today</p>
             <h2 class="headline" id="today-title">Open a PDF and read it.</h2>
             <p class="sub">
-              This is everything that works now. It is not released: you can only run it by building
-              it from source.
+              This is what version 0.1.0 can do.
             </p>
           </header>
 
@@ -429,7 +428,7 @@
             <p class="eyebrow">Status</p>
             <h2 class="headline" id="roadmap-title">Where it stands.</h2>
             <p class="sub">
-              Patient Partridge is in development. Nothing is released and there are no dates. The
+              Version 0.1.0 is out, and there are no dates for what comes next. The
               steps show the order the work is planned in, and that order may change.
             </p>
           </header>
@@ -438,9 +437,9 @@
             <li class="milestone is-now reveal">
               <span class="ms-marker" aria-hidden="true"><span class="dot is-live"></span></span>
               <div class="ms-body">
-                <p class="ms-status"><span class="pill status-accent"><span class="dot"></span>In development</span></p>
+                <p class="ms-status"><span class="pill status-accent"><span class="dot"></span>Released: 0.1.0</span></p>
                 <h3>The reader</h3>
-                <p>Tabs, search, selecting and copying text, thumbnails, the table of contents, printing, dark mode and remembering your place all work. Nothing is released yet: the first release waits for testing.</p>
+                <p>Tabs, search, selecting and copying text, thumbnails, the table of contents, printing, dark mode and remembering your place all work.</p>
               </div>
             </li>
             <li class="milestone reveal">
@@ -499,14 +498,6 @@
                 <p>An optional, on-device feature for summaries and questions, planned after annotations and forms.</p>
               </div>
             </li>
-            <li class="milestone reveal">
-              <span class="ms-marker" aria-hidden="true"></span>
-              <div class="ms-body">
-                <p class="ms-status"><span class="pill">Before any release</span></p>
-                <h3>Testing on real computers</h3>
-                <p>The sandbox and automatic updates are built. The first release, 0.1.0, waits for testing on Windows, macOS and Linux.</p>
-              </div>
-            </li>
           </ol>
         </div>
       </section>
@@ -522,7 +513,7 @@
               <details>
                 <summary>Can I download it?<svg class="icon" aria-hidden="true"><use href="assets/icons.svg#chevron-down"></use></svg></summary>
                 <div class="faq-body">
-                  <p>Not yet. Nothing is released and there is no installer. If you want to try it, you can build it from source: the <a href="https://github.com/Ferdinand99/Patient-Partridge#building-from-source">README</a> explains how. Expect rough edges.</p>
+                  <p>Yes. Version 0.1.0 is on the <a href="https://github.com/Ferdinand99/Patient-Partridge/releases/latest">releases page</a>. The macOS build is signed and notarised. The Windows build is not signed yet, so SmartScreen warns the first time: choose More info, then Run anyway. The app updates itself after that.</p>
                 </div>
               </details>
             </li>
@@ -552,9 +543,9 @@
             </li>
             <li>
               <details>
-                <summary>When will it be released?<svg class="icon" aria-hidden="true"><use href="assets/icons.svg#chevron-down"></use></svg></summary>
+                <summary>What comes next?<svg class="icon" aria-hidden="true"><use href="assets/icons.svg#chevron-down"></use></svg></summary>
                 <div class="faq-body">
-                  <p>There is no date. Watch or star the <a href="https://github.com/Ferdinand99/Patient-Partridge">repository</a> to hear about progress.</p>
+                  <p>Fonts for more languages, then annotations and forms. There are no dates. Watch the <a href="https://github.com/Ferdinand99/Patient-Partridge">repository</a> to hear about progress.</p>
                 </div>
               </details>
             </li>
@@ -598,8 +589,7 @@
           a planned password manager.
         </p>
         <p>
-          Patient Partridge is open source under the GNU AGPL-3.0 and is in development: nothing is
-          released yet. This site uses no cookies and no analytics.
+          Patient Partridge is open source under the GNU AGPL-3.0. Version 0.1.0 is an early release. This site uses no cookies and no analytics.
         </p>
       </div>
     </footer>

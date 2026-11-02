@@ -2,7 +2,8 @@
 //!
 //! The order matters, and it is the same for the real engine and for the test-only mode:
 //!
-//! 1. Close every descriptor that is not the standard three and the document.
+//! 1. Close every descriptor that is not the standard three, the document and the system fonts
+//!    the app handed over (one handle each, from 4 up).
 //! 2. Take a private copy of the protocol output.
 //! 3. Set the memory limit.
 //! 4. Load PDFium, the fonts, and warm up the parts of PDFium that start lazily.
@@ -102,7 +103,16 @@ fn test_switch(_name: &str) -> bool {
 pub fn prepare(args: Args) -> Prepared {
     quiet_crashes();
     #[cfg(unix)]
-    crate::fds::close_all_above(args.document.map_or(2, |d| (d as i32).max(2)));
+    {
+        // Keep the three standard descriptors, the document and the fonts; close all the rest.
+        let kept = args
+            .document
+            .into_iter()
+            .chain(args.fonts.iter().map(|(_, n)| *n))
+            .map(|n| n as i32)
+            .fold(2, i32::max);
+        crate::fds::close_all_above(kept);
+    }
     let protocol = stdio::take_protocol_output();
     let limit_set = limits::limit_memory(args.memory_limit.unwrap_or(limits::MEMORY_LIMIT_BYTES));
 
@@ -111,7 +121,12 @@ pub fn prepare(args: Args) -> Prepared {
         .fonts_dir
         .clone()
         .unwrap_or_else(|| pdfium_dir.join("fonts"));
-    let mut engine = Engine::with_fonts(&pdfium_dir, &fonts_dir);
+    let system_fonts: Vec<_> = args
+        .fonts
+        .iter()
+        .filter_map(|(script, number)| take_document(*number).map(|file| (*script, file)))
+        .collect();
+    let mut engine = Engine::with_system_fonts(&pdfium_dir, &fonts_dir, system_fonts);
 
     // Everything is loaded. The empty root needs a process with one thread, so it comes before the
     // helper thread that watches the parent.

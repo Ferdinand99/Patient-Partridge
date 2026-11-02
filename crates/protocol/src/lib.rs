@@ -17,7 +17,7 @@ use std::fmt;
 use std::io::{self, Read, Write};
 
 /// Version of this protocol. Both sides check it in the `Hello` exchange.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Largest frame (payload) either side accepts: 128 MiB, enough for the biggest allowed bitmap.
 pub const MAX_FRAME_LEN: usize = 128 * 1024 * 1024;
@@ -79,11 +79,12 @@ const TAG_REQ_OUTLINE: u8 = 5;
 const TAG_REQ_PAGE_TEXT: u8 = 6;
 const TAG_REQ_PAGE_LINKS: u8 = 7;
 const TAG_REQ_SEARCH: u8 = 8;
-const TAG_REQ_DOC_INFO: u8 = 9;
-const TAG_REQ_SAVE_BEGIN: u8 = 10;
-const TAG_REQ_SAVE_CHUNK: u8 = 11;
-const TAG_REQ_SAVE_END: u8 = 12;
-const TAG_REQ_FINGERPRINT: u8 = 13;
+const TAG_REQ_FONT_REPORT: u8 = 9;
+const TAG_REQ_DOC_INFO: u8 = 10;
+const TAG_REQ_SAVE_BEGIN: u8 = 11;
+const TAG_REQ_SAVE_CHUNK: u8 = 12;
+const TAG_REQ_SAVE_END: u8 = 13;
+const TAG_REQ_FINGERPRINT: u8 = 14;
 
 const TAG_RES_HELLO: u8 = 129;
 const TAG_RES_OPENED: u8 = 130;
@@ -93,12 +94,13 @@ const TAG_RES_OUTLINE: u8 = 133;
 const TAG_RES_PAGE_TEXT: u8 = 134;
 const TAG_RES_PAGE_LINKS: u8 = 135;
 const TAG_RES_MATCHES: u8 = 136;
-const TAG_RES_DOC_INFO: u8 = 137;
-const TAG_RES_SAVE_READY: u8 = 138;
-const TAG_RES_SAVE_DATA: u8 = 139;
-const TAG_RES_SAVE_ENDED: u8 = 140;
-const TAG_RES_PROGRESS: u8 = 141;
-const TAG_RES_FINGERPRINT: u8 = 142;
+const TAG_RES_FONT_REPORT: u8 = 137;
+const TAG_RES_DOC_INFO: u8 = 138;
+const TAG_RES_SAVE_READY: u8 = 139;
+const TAG_RES_SAVE_DATA: u8 = 140;
+const TAG_RES_SAVE_ENDED: u8 = 141;
+const TAG_RES_PROGRESS: u8 = 142;
+const TAG_RES_FINGERPRINT: u8 = 143;
 const TAG_RES_ERROR: u8 = 255;
 
 /// What went wrong while reading or decoding a frame.
@@ -292,6 +294,10 @@ pub enum RequestBody {
     /// the number of objects and annotations. The app asks it of the engine that holds the
     /// document and of the engine that reads the saved file, and the two must agree.
     Fingerprint { doc: u32 },
+    /// The scripts for which PDFium asked the engine for a font and got none (no system font for
+    /// the script, a font that did not pass the check, or the budget of font data used up).
+    /// Text in those scripts that the PDF does not carry a font for is drawn as blanks.
+    FontReport,
 }
 
 /// One entry of the table of contents.
@@ -409,6 +415,10 @@ pub enum ResponseBody {
         data: Vec<u8>,
     },
     SaveEnded,
+    /// The answer to `FontReport`, in the fixed order of [`FontScript::ALL`].
+    FontReport {
+        missed: Vec<FontScript>,
+    },
     Error {
         code: ErrorCode,
         message: String,
@@ -553,6 +563,10 @@ impl Request {
                 put_u32(&mut out, self.id);
                 put_u32(&mut out, *doc);
             }
+            RequestBody::FontReport => {
+                out.push(TAG_REQ_FONT_REPORT);
+                put_u32(&mut out, self.id);
+            }
         }
         out
     }
@@ -602,6 +616,7 @@ impl Request {
             }
             TAG_REQ_SAVE_END => RequestBody::SaveEnd { doc: r.u32()? },
             TAG_REQ_FINGERPRINT => RequestBody::Fingerprint { doc: r.u32()? },
+            TAG_REQ_FONT_REPORT => RequestBody::FontReport,
             other => return Err(ProtocolError::UnknownTag(other)),
         };
         r.finish()?;
@@ -762,6 +777,15 @@ impl Response {
             ResponseBody::SaveEnded => {
                 out.push(TAG_RES_SAVE_ENDED);
                 put_u32(&mut out, self.id);
+            }
+            ResponseBody::FontReport { missed } => {
+                out.push(TAG_RES_FONT_REPORT);
+                put_u32(&mut out, self.id);
+                let missed = &missed[..missed.len().min(FontScript::ALL.len())];
+                out.push(missed.len() as u8);
+                for script in missed {
+                    out.push(script.code());
+                }
             }
             ResponseBody::Error { code, message } => {
                 out.push(TAG_RES_ERROR);
@@ -973,6 +997,19 @@ impl Response {
                 });
             }
             TAG_RES_SAVE_ENDED => ResponseBody::SaveEnded,
+            TAG_RES_FONT_REPORT => {
+                let count = r.u8()? as usize;
+                if count > FontScript::ALL.len() {
+                    return Err(ProtocolError::InvalidLength);
+                }
+                let mut missed = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let raw = r.u8()?;
+                    missed
+                        .push(FontScript::from_code(raw).ok_or(ProtocolError::UnknownValue(raw))?);
+                }
+                ResponseBody::FontReport { missed }
+            }
             TAG_RES_ERROR => {
                 let raw = r.u8()?;
                 let code = ErrorCode::from_u8(raw).ok_or(ProtocolError::UnknownValue(raw))?;
@@ -1191,6 +1228,10 @@ mod tests {
                 body: RequestBody::Outline { doc: 7 },
             },
             Request {
+                id: 40,
+                body: RequestBody::FontReport,
+            },
+            Request {
                 id: 7,
                 body: RequestBody::PageText { doc: 7, page: 12 },
             },
@@ -1254,6 +1295,12 @@ mod tests {
             Response {
                 id: 5,
                 body: ResponseBody::Closed,
+            },
+            Response {
+                id: 41,
+                body: ResponseBody::FontReport {
+                    missed: vec![FontScript::Korean, FontScript::Thai],
+                },
             },
             Response {
                 id: 6,
@@ -2087,5 +2134,285 @@ mod tests {
         assert_eq!(ErrorCode::from_u8(17).unwrap().name(), "source_unreadable");
         assert_eq!(ErrorCode::from_u8(14).unwrap().name(), "save_failed");
         assert_eq!(ErrorCode::from_u8(15).unwrap().name(), "save_too_large");
+    }
+}
+
+/// The scripts for which the app can hand the engine a system font. PDFium asks for a font by
+/// character set, and these are the character sets it can ask for that the fonts built into PDFium
+/// do not cover. The app chooses the files; the PDF only decides which script it needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum FontScript {
+    Japanese,
+    Korean,
+    ChineseSimplified,
+    ChineseTraditional,
+    Arabic,
+    Hebrew,
+    Thai,
+}
+
+impl FontScript {
+    /// Every script, in a fixed order.
+    pub const ALL: [FontScript; 7] = [
+        FontScript::Japanese,
+        FontScript::Korean,
+        FontScript::ChineseSimplified,
+        FontScript::ChineseTraditional,
+        FontScript::Arabic,
+        FontScript::Hebrew,
+        FontScript::Thai,
+    ];
+
+    /// A short stable name, used on the engine's command line and in the window.
+    pub fn name(self) -> &'static str {
+        match self {
+            FontScript::Japanese => "japanese",
+            FontScript::Korean => "korean",
+            FontScript::ChineseSimplified => "chinese-simplified",
+            FontScript::ChineseTraditional => "chinese-traditional",
+            FontScript::Arabic => "arabic",
+            FontScript::Hebrew => "hebrew",
+            FontScript::Thai => "thai",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<FontScript> {
+        FontScript::ALL.into_iter().find(|s| s.name() == name)
+    }
+
+    /// The number of the script on the wire: its place in [`FontScript::ALL`].
+    pub fn code(self) -> u8 {
+        FontScript::ALL
+            .iter()
+            .position(|s| *s == self)
+            .expect("every script is in the list") as u8
+    }
+
+    pub fn from_code(code: u8) -> Option<FontScript> {
+        FontScript::ALL.get(code as usize).copied()
+    }
+}
+
+/// How many bytes of a font file the check needs to see: the table directory of a font with up to
+/// 128 tables, or of a collection whose first font is near the start.
+pub const FONT_HEAD_BYTES: usize = 8 * 1024;
+
+/// Most tables in the directory of a font that the check accepts. Real fonts have 10 to 30.
+const MAX_FONT_TABLES: usize = 128;
+
+/// Checks that `head` (the first [`FONT_HEAD_BYTES`] bytes, or the whole file if it is shorter) and
+/// the length of the file are those of an intact TrueType or OpenType font, or of a collection
+/// whose first font is intact: the table directory is there, every table lies inside the file, and
+/// the tables a font needs to draw text (`cmap` and outlines) are present. This is cheap and
+/// catches the damage that is common in practice (a file cut short, a download that stopped, a
+/// file that is not a font at all); it does not make a damaged file safe, which only the sandbox
+/// does.
+pub fn check_font(head: &[u8], file_len: u64) -> Result<(), &'static str> {
+    fn u16_at(data: &[u8], at: usize) -> Option<usize> {
+        data.get(at..at + 2)
+            .map(|b| u16::from_be_bytes([b[0], b[1]]) as usize)
+    }
+    fn u32_at(data: &[u8], at: usize) -> Option<u64> {
+        data.get(at..at + 4)
+            .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as u64)
+    }
+    let tag = head
+        .get(..4)
+        .ok_or("the file is shorter than a font header")?;
+    let start = if tag == b"ttcf" {
+        let fonts = u32_at(head, 8).ok_or("the collection header is cut off")?;
+        if fonts == 0 {
+            return Err("the collection has no font");
+        }
+        let first = u32_at(head, 12).ok_or("the collection header is cut off")?;
+        if first + 12 > file_len {
+            return Err("the first font of the collection lies outside the file");
+        }
+        first as usize
+    } else if tag == [0, 1, 0, 0] || tag == b"OTTO" || tag == b"true" {
+        0
+    } else {
+        return Err("the file is not a TrueType or OpenType font");
+    };
+    let tables = u16_at(head, start + 4).ok_or("the table directory is cut off")?;
+    if tables == 0 || tables > MAX_FONT_TABLES {
+        return Err("the number of tables is not that of a font");
+    }
+    let (mut cmap, mut outlines, mut head_table) = (false, false, false);
+    for i in 0..tables {
+        let at = start + 12 + 16 * i;
+        let record = head
+            .get(at..at + 16)
+            .ok_or("the table directory is cut off")?;
+        let offset = u32::from_be_bytes([record[8], record[9], record[10], record[11]]) as u64;
+        let length = u32::from_be_bytes([record[12], record[13], record[14], record[15]]) as u64;
+        if offset + length > file_len {
+            return Err("a table lies outside the file (the file is cut short)");
+        }
+        match &record[..4] {
+            b"cmap" => cmap = true,
+            b"head" => head_table = true,
+            b"glyf" | b"CFF " | b"CFF2" => outlines = true,
+            _ => {}
+        }
+    }
+    if !cmap || !outlines || !head_table {
+        return Err("the font has no character map, no outlines or no header table");
+    }
+    Ok(())
+}
+
+/// Where a table of the first font lies, as (offset, length) from the start of the file, read from
+/// the table directory in `head`. `None` when the directory is not there or has no such table.
+pub fn font_table(head: &[u8], tag: &[u8; 4]) -> Option<(u64, u64)> {
+    let start = if head.get(..4)? == b"ttcf" {
+        u32::from_be_bytes(head.get(12..16)?.try_into().ok()?) as usize
+    } else {
+        0
+    };
+    let tables = u16::from_be_bytes(head.get(start + 4..start + 6)?.try_into().ok()?) as usize;
+    (0..tables.min(MAX_FONT_TABLES)).find_map(|i| {
+        let at = start + 12 + 16 * i;
+        let record = head.get(at..at + 16)?;
+        (&record[..4] == tag).then(|| {
+            (
+                u32::from_be_bytes([record[8], record[9], record[10], record[11]]) as u64,
+                u32::from_be_bytes([record[12], record[13], record[14], record[15]]) as u64,
+            )
+        })
+    })
+}
+
+/// How many bytes of the `head` table [`check_head_table`] needs.
+pub const FONT_HEAD_TABLE_BYTES: usize = 54;
+
+/// Checks the `head` table of a font: its length, the magic number every intact one has
+/// (0x5F0F3CF5) and a sane units-per-em. A font whose tables were overwritten fails here, which
+/// the table directory alone does not show, and FreeType refuses it too.
+pub fn check_head_table(table: &[u8]) -> Result<(), &'static str> {
+    if table.len() < FONT_HEAD_TABLE_BYTES {
+        return Err("the header table is too short");
+    }
+    if table[12..16] != [0x5F, 0x0F, 0x3C, 0xF5] {
+        return Err("the header table has the wrong magic number");
+    }
+    let units_per_em = u16::from_be_bytes([table[18], table[19]]);
+    if !(16..=16384).contains(&units_per_em) {
+        return Err("the header table has a units-per-em that is not that of a font");
+    }
+    Ok(())
+}
+
+/// [`check_font`] and [`check_head_table`] on a font file held whole in memory.
+pub fn check_font_data(data: &[u8]) -> Result<(), &'static str> {
+    let head = &data[..data.len().min(FONT_HEAD_BYTES)];
+    check_font(head, data.len() as u64)?;
+    let (offset, length) = font_table(head, b"head").ok_or("the font has no header table")?;
+    let table = usize::try_from(offset)
+        .ok()
+        .and_then(|o| data.get(o..o.checked_add(usize::try_from(length).ok()?)?))
+        .ok_or("the header table lies outside the file")?;
+    check_head_table(table)
+}
+
+#[cfg(test)]
+mod font_script_tests {
+    use super::*;
+
+    #[test]
+    fn codes_round_trip() {
+        for script in FontScript::ALL {
+            assert_eq!(FontScript::from_code(script.code()), Some(script));
+        }
+        assert_eq!(FontScript::from_code(7), None);
+    }
+
+    /// A font header with the given tables, each (tag, offset, length). With `start` above zero it
+    /// is the first font of a collection and sits at that offset.
+    fn header(start: usize, tables: &[(&[u8; 4], u32, u32)]) -> Vec<u8> {
+        let mut out = vec![0u8; start];
+        if start > 0 {
+            out[..4].copy_from_slice(b"ttcf");
+            out[8..12].copy_from_slice(&1u32.to_be_bytes());
+            out[12..16].copy_from_slice(&(start as u32).to_be_bytes());
+        }
+        out.extend_from_slice(&[0, 1, 0, 0]);
+        out.extend_from_slice(&(tables.len() as u16).to_be_bytes());
+        out.extend_from_slice(&[0; 6]);
+        for (tag, offset, length) in tables {
+            out.extend_from_slice(*tag);
+            out.extend_from_slice(&[0; 4]);
+            out.extend_from_slice(&offset.to_be_bytes());
+            out.extend_from_slice(&length.to_be_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn an_intact_font_header_passes_and_a_cut_file_does_not() {
+        let tables: [(&[u8; 4], u32, u32); 3] =
+            [(b"cmap", 100, 50), (b"glyf", 150, 800), (b"head", 950, 50)];
+        let ok = header(0, &tables);
+        assert_eq!(check_font(&ok, 1000), Ok(()));
+        // The same header on a file that was cut short.
+        assert!(check_font(&ok, 600).is_err());
+        // A collection whose first font is near the start.
+        assert_eq!(check_font(&header(16, &tables), 1000), Ok(()));
+        assert!(check_font(&header(16, &tables), 400).is_err());
+    }
+
+    #[test]
+    fn the_header_table_must_be_a_real_one() {
+        let mut head = vec![0u8; 54];
+        head[12..16].copy_from_slice(&[0x5F, 0x0F, 0x3C, 0xF5]);
+        head[18..20].copy_from_slice(&1000u16.to_be_bytes());
+        assert_eq!(check_head_table(&head), Ok(()));
+        assert!(check_head_table(&head[..53]).is_err());
+        head[12] = 0;
+        assert!(check_head_table(&head).is_err());
+        head[12] = 0x5F;
+        head[18..20].copy_from_slice(&0u16.to_be_bytes());
+        assert!(check_head_table(&head).is_err());
+    }
+
+    #[test]
+    fn a_whole_font_is_checked_down_to_its_header_table() {
+        // cmap and glyf at 100 and 104, head at 108 (54 bytes), 162 bytes in all.
+        let tables: [(&[u8; 4], u32, u32); 3] =
+            [(b"cmap", 100, 4), (b"glyf", 104, 4), (b"head", 108, 54)];
+        let mut font = header(0, &tables);
+        font.resize(162, 0);
+        font[108 + 12..108 + 16].copy_from_slice(&[0x5F, 0x0F, 0x3C, 0xF5]);
+        font[108 + 18..108 + 20].copy_from_slice(&2048u16.to_be_bytes());
+        assert_eq!(check_font_data(&font), Ok(()));
+        assert_eq!(font_table(&font, b"head"), Some((108, 54)));
+        assert_eq!(font_table(&font, b"nope"), None);
+        // The directory is the same, the contents are not.
+        font[108..162].fill(0xA5);
+        assert!(check_font_data(&font).is_err());
+        assert!(check_font_data(&font[..120]).is_err());
+    }
+
+    #[test]
+    fn what_is_not_a_font_does_not_pass() {
+        assert!(check_font(b"", 0).is_err());
+        assert!(check_font(b"%PDF-1.7 not a font at all......", 100).is_err());
+        assert!(check_font(&[0; 64], 64).is_err());
+        // No outlines, or no character map.
+        assert!(check_font(&header(0, &[(b"cmap", 50, 10), (b"head", 60, 54)]), 1000).is_err());
+        assert!(check_font(&header(0, &[(b"glyf", 50, 10), (b"head", 60, 54)]), 1000).is_err());
+        assert!(check_font(&header(0, &[(b"cmap", 50, 10), (b"glyf", 60, 10)]), 1000).is_err());
+        // Wildly many tables.
+        let mut many = header(0, &[]);
+        many[4..6].copy_from_slice(&60_000u16.to_be_bytes());
+        assert!(check_font(&many, 1000).is_err());
+    }
+
+    #[test]
+    fn names_round_trip() {
+        for script in FontScript::ALL {
+            assert_eq!(FontScript::from_name(script.name()), Some(script));
+        }
+        assert_eq!(FontScript::from_name("latin"), None);
     }
 }

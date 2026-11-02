@@ -15,7 +15,8 @@ use partridge_fuzz::{
     over_cap_request_case, over_cap_response_case, OVER_CAP_REQUESTS, OVER_CAP_RESPONSES,
 };
 use partridge_protocol::{
-    ErrorCode, LinkTarget, OutlineItem, PageLink, PageSize, Request, RequestBody, Response,
+    ErrorCode, FontScript, LinkTarget, OutlineItem, PageLink, PageSize, Request, RequestBody,
+    Response,
     ResponseBody, TextMatch, MAX_FRAME_LEN, MAX_LINKS_PER_PAGE, MAX_MATCHES_PER_PAGE,
     MAX_OUTLINE_DEPTH, MAX_OUTLINE_ITEMS, MAX_OUTLINE_TITLE, MAX_QUERY_LEN, MAX_SAVE_BYTES,
     MAX_SAVE_CHUNK, MAX_URI_LEN, PROTOCOL_VERSION,
@@ -69,6 +70,7 @@ fn requests() -> Vec<(&'static str, Request)> {
             "page_links",
             b(8, RequestBody::PageLinks { doc: 1, page: 2 }),
         ),
+        ("font_report", b(10, RequestBody::FontReport)),
         (
             "search",
             b(
@@ -211,6 +213,15 @@ fn responses() -> Vec<(&'static str, Response)> {
                         TextMatch { start: 2, len: 6 },
                         TextMatch { start: 40, len: 6 },
                     ],
+                },
+            ),
+        ),
+        (
+            "font_report",
+            b(
+                11,
+                ResponseBody::FontReport {
+                    missed: vec![FontScript::Japanese, FontScript::Thai],
                 },
             ),
         ),
@@ -444,7 +455,7 @@ fn main() {
     );
 
     // Round trips: one input per kind of message.
-    for kind in 0..13u8 {
+    for kind in 0..14u8 {
         write(
             &dir,
             "protocol_roundtrip_request",
@@ -452,7 +463,7 @@ fn main() {
             &generator_input(kind, kind as u32),
         );
     }
-    for kind in 0..15u8 {
+    for kind in 0..16u8 {
         write(
             &dir,
             "protocol_roundtrip_response",

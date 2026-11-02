@@ -9,7 +9,7 @@
 
 use arbitrary::{Result, Unstructured};
 use partridge_protocol::{
-    LinkTarget, Request, RequestBody, Response, ResponseBody, MAX_LINKS_PER_PAGE,
+    FontScript, LinkTarget, Request, RequestBody, Response, ResponseBody, MAX_LINKS_PER_PAGE,
     MAX_MATCHES_PER_PAGE, MAX_OUTLINE_DEPTH, MAX_OUTLINE_ITEMS, MAX_OUTLINE_TITLE, MAX_PAGE_CHARS,
     MAX_PAGE_TEXT_BYTES, MAX_QUERY_LEN, MAX_RENDER_PIXELS, MAX_RENDER_SIDE, MAX_SAVE_BYTES,
     MAX_SAVE_CHUNK, MAX_STRING_LEN, MAX_URI_LEN,
@@ -124,6 +124,9 @@ pub fn check_response_caps(response: &Response) {
                 matches.len()
             );
         }
+        ResponseBody::FontReport { missed } => {
+            assert!(missed.len() <= FontScript::ALL.len(), "{} scripts", missed.len());
+        }
         ResponseBody::Error { message, .. } => {
             assert!(message.len() <= MAX_STRING_LEN);
         }
@@ -176,7 +179,7 @@ pub fn over_cap_request_case(case: usize, id: u32) -> (&'static str, Vec<u8>) {
         }
         _ => {
             // A request for a piece of the saved file that is one byte longer than a piece may be.
-            let mut p = header(11, id);
+            let mut p = header(12, id);
             push_u32(&mut p, 1);
             push_u32(&mut p, 0);
             push_u32(&mut p, MAX_SAVE_CHUNK as u32 + 1);
@@ -314,18 +317,18 @@ pub fn over_cap_response_case(case: usize, id: u32) -> (&'static str, Vec<u8>, b
             ("bitmap one pixel too high", p, false)
         }
         13 => {
-            let mut p = header(138, id);
+            let mut p = header(139, id);
             push_u32(&mut p, MAX_SAVE_BYTES as u32 + 1);
             ("save size one byte over the biggest file", p, false)
         }
         14 => {
-            let mut p = header(138, id);
+            let mut p = header(139, id);
             push_u32(&mut p, MAX_SAVE_BYTES as u32);
             ("save size of the biggest file", p, true)
         }
         15 => {
             // The last byte of the biggest file is the last byte this piece may reach.
-            let mut p = header(139, id);
+            let mut p = header(140, id);
             push_u32(&mut p, MAX_SAVE_BYTES as u32 - 4);
             push_u32(&mut p, 4);
             p.extend_from_slice(b"tail");
@@ -336,7 +339,7 @@ pub fn over_cap_response_case(case: usize, id: u32) -> (&'static str, Vec<u8>, b
             )
         }
         16 => {
-            let mut p = header(139, id);
+            let mut p = header(140, id);
             push_u32(&mut p, MAX_SAVE_BYTES as u32 - 4);
             push_u32(&mut p, 5);
             p.extend_from_slice(b"tail!");
@@ -352,7 +355,7 @@ pub fn over_cap_response_case(case: usize, id: u32) -> (&'static str, Vec<u8>, b
             } else {
                 MAX_SAVE_CHUNK
             };
-            let mut p = header(139, id);
+            let mut p = header(140, id);
             push_u32(&mut p, 0);
             push_u32(&mut p, len as u32);
             p.resize(p.len() + len, b'a');
@@ -364,7 +367,7 @@ pub fn over_cap_response_case(case: usize, id: u32) -> (&'static str, Vec<u8>, b
         }
         19 => {
             // The length says 10, the piece holds 9.
-            let mut p = header(139, id);
+            let mut p = header(140, id);
             push_u32(&mut p, 0);
             push_u32(&mut p, 10);
             p.extend_from_slice(b"123456789");
