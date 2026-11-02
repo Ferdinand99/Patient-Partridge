@@ -932,7 +932,7 @@ impl State {
                     self.lost = false;
                     let now = self.tools(again, count, data);
                     if !self.lost && now != count {
-                        self.save(again, now, data, 1);
+                        self.save(again, now, &[], data, 1);
                     }
                 }
                 self.ask(RequestBody::Close { doc: again });
