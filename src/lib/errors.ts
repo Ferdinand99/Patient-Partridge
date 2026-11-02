@@ -26,7 +26,12 @@ export function toAppError(error: unknown): AppErrorLike {
 
 /** Errors that mean the engine process was lost and the open document with it. */
 export function isEngineLost(error: AppErrorLike): boolean {
-  return error.code === "engine_stopped" || error.code === "unknown_document" || error.code === "save_took_too_long";
+  return (
+    error.code === "engine_stopped" ||
+    error.code === "unknown_document" ||
+    error.code === "save_took_too_long" ||
+    error.code === "change_took_too_long"
+  );
 }
 
 export function describeError(error: AppErrorLike, fileName?: string): Described {
@@ -72,6 +77,12 @@ export function describeError(error: AppErrorLike, fileName?: string): Described
       return {
         title: "The save took too long",
         detail: `The PDF engine was still working on ${fileName ? file : "this file"} when the time allowed for a file of that size ran out, so it was stopped. The file on the disk was not changed, but the changes made since it was opened are lost. A very slow drive or network connection can cause this. Open the file again, and save a copy to a local disk if it happens again.`,
+        action: "retry",
+      };
+    case "change_took_too_long":
+      return {
+        title: "The change took too long",
+        detail: `The PDF engine was still working on a change to the pages of ${fileName ? file : "this file"} when the time allowed for it ran out, or it said nothing for too long, so it was stopped. The file on the disk was not changed, but the changes made since it was opened are lost. Open the file again; changing fewer pages at a time can be quicker.`,
         action: "retry",
       };
     case "unknown_document":

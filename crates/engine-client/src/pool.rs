@@ -8,8 +8,11 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
+
+mod pages;
+pub use pages::{Cancelled, ExtractOptions, InsertOptions, InsertOutcome, PageProgress};
 
 use partridge_protocol::{ErrorCode, PageSize};
 
@@ -40,6 +43,41 @@ struct Entry {
     password: Option<Arc<Secret>>,
     /// Held while the document is being saved: one save at a time.
     saving: Arc<Mutex<()>>,
+    /// What a page tool is doing to the document, and how to stop it.
+    ops: Arc<Ops>,
+}
+
+/// What a page tool is doing to a document right now.
+pub(crate) struct Ops {
+    /// Set by the user stopping the work; looked at between the pieces of a document.
+    cancel: AtomicBool,
+    /// 0 nothing, 1 a document is being handed from one engine to another, 2 the engine of the
+    /// document is working on a change.
+    phase: AtomicU8,
+    /// The engines that read other documents for an insert. They end with the document.
+    transients: Mutex<Vec<Arc<EngineClient>>>,
+}
+
+impl Ops {
+    fn new() -> Ops {
+        Ops {
+            cancel: AtomicBool::new(false),
+            phase: AtomicU8::new(0),
+            transients: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn kill_transients(&self) {
+        let all: Vec<Arc<EngineClient>> = self
+            .transients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect();
+        for client in all {
+            client.kill();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -203,6 +241,7 @@ impl EnginePool {
                 source: Arc::new(Mutex::new(source)),
                 password,
                 saving: Arc::new(Mutex::new(())),
+                ops: Arc::new(Ops::new()),
             },
         );
         Ok(handle)
@@ -423,6 +462,7 @@ impl EnginePool {
     pub fn close(&self, handle: u64) {
         let entry = state(&self.state).docs.remove(&handle);
         if let Some(entry) = entry {
+            entry.ops.kill_transients();
             entry.client.kill();
         }
     }
@@ -438,6 +478,7 @@ impl EnginePool {
             st.docs.drain().map(|(_, e)| e).collect()
         };
         for entry in all {
+            entry.ops.kill_transients();
             entry.client.kill();
         }
     }
@@ -507,6 +548,57 @@ mod tests {
             "{err:?}"
         );
         assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn page_changes_are_refused_while_the_document_is_being_saved() {
+        let pool = pool();
+        let handle = pool
+            .register(client(&pool), 1, epoch(&pool), no_source(), None)
+            .unwrap();
+        // The save holds this lock for as long as it runs.
+        let saving = state(&pool.state).docs.get(&handle).unwrap().saving.clone();
+        let _held = saving.lock().unwrap();
+        let busy = |r: Result<(), ClientError>| {
+            assert!(
+                matches!(r, Err(ClientError::Save(SaveError::Busy))),
+                "{r:?}"
+            );
+        };
+        busy(pool.pages_delete(handle, &[0]).map(|_| ()));
+        busy(pool.pages_reorder(handle, &[0]).map(|_| ()));
+        busy(pool.pages_rotate(handle, &[0], 1).map(|_| ()));
+        busy(pool.pages_crop(handle, &[0], [1.0; 4]).map(|_| ()));
+        busy(
+            pool.pages_set_boxes(handle, &[0], &[[0.0, 0.0, 9.0, 9.0]])
+                .map(|_| ()),
+        );
+        busy(pool.pages_insert_blank(handle, 0, 100.0, 100.0).map(|_| ()));
+        busy(pool.pages_restore(handle, 1).map(|_| ()));
+        busy(
+            pool.insert_pdf(handle, 0, "x.pdf", None, Default::default(), &|_, _| {})
+                .map(|_| ()),
+        );
+        busy(
+            pool.extract_pages(
+                handle,
+                &[0],
+                std::path::Path::new("y.pdf"),
+                Default::default(),
+                &|_, _| {},
+            )
+            .map(|_| ()),
+        );
+        // Nothing started an engine for any of them.
+        assert_eq!(
+            state(&pool.state)
+                .docs
+                .get(&handle)
+                .unwrap()
+                .client
+                .spawn_count(),
+            0
+        );
     }
 
     #[test]

@@ -16,13 +16,15 @@
 use std::fmt;
 use std::io::{self, Read, Write};
 
+mod pages;
+pub use pages::*;
 mod signatures;
 pub use signatures::*;
 #[cfg(test)]
 mod signatures_tests;
 
 /// Version of this protocol. Both sides check it in the `Hello` exchange.
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Largest frame (payload) either side accepts: 128 MiB, enough for the biggest allowed bitmap.
 pub const MAX_FRAME_LEN: usize = 128 * 1024 * 1024;
@@ -203,6 +205,23 @@ pub enum ErrorCode {
     /// Reading the file the document comes from failed at least once, so the document may be
     /// missing parts. Nothing is serialised.
     SourceUnreadable = 17,
+    /// The document has more pages than the page tools (or the reader) take.
+    TooManyPages = 50,
+    /// The copy of the document that a page change was to go back to is gone: the engine keeps
+    /// only a few, and the oldest are let go of.
+    SnapshotGone = 51,
+    /// The document to insert is not a usable PDF.
+    ImportFailed = 52,
+    /// PDFium refused a page change.
+    PageChangeFailed = 53,
+    /// A save, an insert or a copy of the document is under way.
+    Busy = 54,
+    /// The file to insert pages from could not be used: its engine stopped, took too long or could not
+    /// start, or the file does not allow its pages to be copied. The document itself is not affected.
+    InsertSourceFailed = 55,
+    /// The permissions of the document do not allow the change (inserting, deleting, moving or
+    /// turning pages, changing a page's boxes, or copying pages out).
+    PagesNotAllowed = 56,
 }
 
 impl ErrorCode {
@@ -225,6 +244,13 @@ impl ErrorCode {
             15 => ErrorCode::SaveTooLarge,
             16 => ErrorCode::SourceChanged,
             17 => ErrorCode::SourceUnreadable,
+            50 => ErrorCode::TooManyPages,
+            51 => ErrorCode::SnapshotGone,
+            52 => ErrorCode::ImportFailed,
+            53 => ErrorCode::PageChangeFailed,
+            54 => ErrorCode::Busy,
+            55 => ErrorCode::InsertSourceFailed,
+            56 => ErrorCode::PagesNotAllowed,
             _ => return None,
         })
     }
@@ -249,6 +275,13 @@ impl ErrorCode {
             ErrorCode::SaveTooLarge => "save_too_large",
             ErrorCode::SourceChanged => "source_changed",
             ErrorCode::SourceUnreadable => "source_unreadable",
+            ErrorCode::TooManyPages => "too_many_pages",
+            ErrorCode::SnapshotGone => "snapshot_gone",
+            ErrorCode::ImportFailed => "import_failed",
+            ErrorCode::PageChangeFailed => "page_change_failed",
+            ErrorCode::Busy => "busy",
+            ErrorCode::InsertSourceFailed => "insert_source_failed",
+            ErrorCode::PagesNotAllowed => "pages_not_allowed",
         }
     }
 }
@@ -310,6 +343,8 @@ pub enum RequestBody {
     /// the script, a font that did not pass the check, or the budget of font data used up).
     /// Text in those scripts that the PDF does not carry a font for is drawn as blanks.
     FontReport,
+    /// A page tool: delete, reorder, rotate, crop, insert, extract (see the `pages` module).
+    Pages(PagesRequest),
 }
 
 /// One entry of the table of contents.
@@ -439,6 +474,8 @@ pub enum ResponseBody {
     FontReport {
         missed: Vec<FontScript>,
     },
+    /// The answer to a page tool.
+    Pages(PagesResponse),
     Error {
         code: ErrorCode,
         message: String,
@@ -594,6 +631,7 @@ impl Request {
                 out.push(TAG_REQ_FONT_REPORT);
                 put_u32(&mut out, self.id);
             }
+            RequestBody::Pages(request) => request.encode(self.id, &mut out),
         }
         out
     }
@@ -652,6 +690,9 @@ impl Request {
                 RequestBody::Signatures { doc, now }
             }
             TAG_REQ_FONT_REPORT => RequestBody::FontReport,
+            t if (pages::FIRST_REQUEST_TAG..=pages::LAST_REQUEST_TAG).contains(&t) => {
+                RequestBody::Pages(PagesRequest::decode(t, &mut r)?)
+            }
             other => return Err(ProtocolError::UnknownTag(other)),
         };
         r.finish()?;
@@ -691,6 +732,7 @@ impl Response {
                 out.push(TAG_RES_OPENED);
                 put_u32(&mut out, self.id);
                 put_u32(&mut out, *doc);
+                let pages = &pages[..pages.len().min(MAX_PAGES)];
                 put_u32(&mut out, pages.len() as u32);
                 for p in pages {
                     put_f32(&mut out, p.width);
@@ -829,6 +871,7 @@ impl Response {
                     out.push(script.code());
                 }
             }
+            ResponseBody::Pages(response) => response.encode(self.id, &mut out),
             ResponseBody::Error { code, message } => {
                 out.push(TAG_RES_ERROR);
                 put_u32(&mut out, self.id);
@@ -877,6 +920,9 @@ impl Response {
                 // Each page takes 8 bytes: check before reserving anything.
                 if count > r.remaining() / 8 {
                     return Err(ProtocolError::Truncated);
+                }
+                if count > MAX_PAGES {
+                    return Err(ProtocolError::InvalidLength);
                 }
                 let mut pages = Vec::with_capacity(count);
                 for _ in 0..count {
@@ -1059,6 +1105,9 @@ impl Response {
                         .push(FontScript::from_code(raw).ok_or(ProtocolError::UnknownValue(raw))?);
                 }
                 ResponseBody::FontReport { missed }
+            }
+            t if (pages::FIRST_RESPONSE_TAG..=pages::LAST_RESPONSE_TAG).contains(&t) => {
+                ResponseBody::Pages(PagesResponse::decode(t, &mut r)?)
             }
             TAG_RES_ERROR => {
                 let raw = r.u8()?;
@@ -1622,6 +1671,50 @@ mod tests {
         for res in responses() {
             let decoded = Response::decode(res.encode()).unwrap();
             assert_eq!(decoded, res);
+        }
+    }
+
+    /// Several features add messages to this protocol on branches of their own. Their numbers
+    /// must not meet when the branches are put together: the compiler cannot see it, because the
+    /// page tools keep their tags in a module of their own and `decode` reaches them through a
+    /// range. The ranges below are those the other features use (annotations, forms, signatures);
+    /// no tag of the page tools may fall in them, and no tag of the reader may fall in the ranges of
+    /// the page tools.
+    #[test]
+    fn the_numbers_of_the_page_tools_meet_no_other_feature() {
+        let pages_requests = pages::FIRST_REQUEST_TAG..=pages::LAST_REQUEST_TAG;
+        let pages_answers = pages::FIRST_RESPONSE_TAG..=pages::LAST_RESPONSE_TAG;
+        let others_requests: [std::ops::RangeInclusive<u8>; 3] = [15..=22, 40..=42, 60..=60];
+        let others_answers: [std::ops::RangeInclusive<u8>; 3] = [144..=146, 170..=171, 190..=190];
+        for other in &others_requests {
+            assert!(
+                other.end() < pages_requests.start() || other.start() > pages_requests.end(),
+                "{other:?}"
+            );
+        }
+        for other in &others_answers {
+            assert!(
+                other.end() < pages_answers.start() || other.start() > pages_answers.end(),
+                "{other:?}"
+            );
+        }
+        // The error codes of the other features: annotations 18 to 20, forms 24 and 25.
+        for code in [18u8, 19, 20, 24, 25] {
+            assert!(!(50..=56).contains(&code));
+        }
+        for req in requests() {
+            assert!(!pages_requests.contains(&req.encode()[0]));
+        }
+        for res in responses() {
+            assert!(!pages_answers.contains(&res.encode()[0]));
+        }
+        // Every code of the reader and the save is below the ones of the page tools, and every
+        // code that has a number is known by name.
+        for raw in 0..=u8::MAX {
+            if let Some(code) = ErrorCode::from_u8(raw) {
+                assert_eq!(code as u8, raw);
+                assert!(!code.name().is_empty());
+            }
         }
     }
 

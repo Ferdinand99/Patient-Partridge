@@ -16,6 +16,7 @@
 //! - `save-signed`: like `save-good`, but the document holds two signatures.
 //! - `save-touched`: like `save-good`, but the description says the file was touched while parts of
 //!   it were unread.
+//! - `save-no-pages`: like `save-good`, but the document describes itself as one of no pages.
 //! - `sig-good`, `sig-trusted-no-list`, `sig-trusted-no-name`, `sig-no-list-with-list`,
 //!   `sig-wrong-order`, `sig-count`: answer `Signatures` with a report that is fine, or with one that
 //!   cannot be true (a trusted signature without a trust list or without the name of the
@@ -189,7 +190,7 @@ fn main() {
                 &mut output,
                 id,
                 ResponseBody::DocInfo {
-                    pages: 1,
+                    pages: if mode == "save-no-pages" { 0 } else { 1 },
                     security: 0,
                     signatures: if mode == "save-signed" { 2 } else { 0 },
                     maybe_signed: false,
@@ -354,9 +355,18 @@ fn main() {
                 &mut output,
                 id,
                 ResponseBody::Fingerprint {
-                    pages: 1,
+                    pages: if mode == "save-no-pages" { 0 } else { 1 },
                     failed: if mode == "save-unreadable" { 1 } else { 0 },
                     digest: 7,
+                },
+            ),
+            // The page tools have a stand-in of their own (fake_pages_engine).
+            RequestBody::Pages(_) => reply(
+                &mut output,
+                id,
+                ResponseBody::Error {
+                    code: ErrorCode::InvalidRequest,
+                    message: "this stand-in has no page tools".into(),
                 },
             ),
         }

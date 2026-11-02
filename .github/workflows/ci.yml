@@ -193,6 +193,56 @@ jobs:
       - name: THIRD-PARTY-NOTICES is up to date
         run: scripts/notices.sh --check
 
+  # Documents that the page tools changed and saved (a delete, a move, a turn, a crop, an insert and a
+  # copy of some pages) are handed to tools that are not PDFium: qpdf checks the structure, poppler
+  # reads the pages and draws them, and the bytes of a deleted page are searched for. See
+  # scripts/check-pages.sh.
+  pages-tools:
+    name: Changed pages read by other tools (qpdf, poppler)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: pages-tools
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+      - name: Install the tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qpdf poppler-utils
+      - name: Fetch PDFium
+        run: node scripts/fetch-pdfium.mjs
+      # The engine tests that use the sandbox need the same switch as the Rust job (see there).
+      - name: Allow user namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          echo "PARTRIDGE_TEST_REQUIRE_EMPTY_ROOT=1" >> "$GITHUB_ENV"
+      - name: Change and save the test documents
+        env:
+          PARTRIDGE_PAGES_OUT: ${{ runner.temp }}/pages
+        run: cargo test -p partridge-engine --locked --test pages_process
+      - name: Read them with other tools
+        run: scripts/check-pages.sh "$RUNNER_TEMP/pages"
+      # The check can fail: given a file that still holds the text of a page it was told is gone, it
+      # must say so.
+      - name: The check fails on a page that was not deleted
+        run: |
+          mkdir "$RUNNER_TEMP/negative"
+          cp "$RUNNER_TEMP/pages/original.pdf" "$RUNNER_TEMP/negative/deleted.pdf"
+          printf '%s\t%s\t%s\n' deleted.pdf 5 gone=1 > "$RUNNER_TEMP/negative/expected.txt"
+          if scripts/check-pages.sh "$RUNNER_TEMP/negative" >"$RUNNER_TEMP/negative.txt" 2>&1; then
+            cat "$RUNNER_TEMP/negative.txt"
+            echo "The check passed a page that was not deleted." >&2
+            exit 1
+          fi
+          grep -q "still has the text of deleted page 1" "$RUNNER_TEMP/negative.txt"
+
   # The real window code in a real browser (Chromium), with the content security policy of the app
   # and a stand-in for the Rust side. See e2e/.
   browser:

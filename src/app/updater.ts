@@ -32,6 +32,8 @@ export interface UpdaterDeps {
   openPaths(): string[];
   /** Closes the settings menu. */
   closeMenu(): void;
+  /** Resolves when no page tool is working: what a tool changes counts as unsaved only when it is done. */
+  settled?(): Promise<void>;
   /** How many open documents have changes that are not saved. */
   unsavedCount(): number;
   /** Saves every document that has changes. Resolves with true when all were saved. */
@@ -452,6 +454,7 @@ export class Updater {
    * (here, in one step) or puts the install off. Nothing is ever dropped.
    */
   private async finishInstall(info: UpdateInfo): Promise<void> {
+    await this.deps.settled?.();
     const unsaved = this.deps.unsavedCount();
     if (unsaved > 0) {
       this.state = { kind: "downloaded", info };

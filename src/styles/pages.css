@@ -1,0 +1,198 @@
+/* The page tools: the bar above the thumbnails, picked and dragged pages, the crop box, and the box
+   that shows while a tool works. */
+
+.pagetools {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px;
+  padding: var(--sp-1) var(--sp-2);
+  border-bottom: 1px solid var(--line);
+}
+
+.pagetools[hidden] {
+  display: none;
+}
+
+.pagetools[aria-busy="true"] {
+  opacity: 0.6;
+}
+
+/* A page that is picked: the colour of the brand around the paper, and a mark in the corner. */
+.thumb[aria-pressed="true"] .thumb-paper {
+  outline-color: var(--brand);
+  outline-width: 3px;
+}
+
+.thumb[aria-pressed="true"] {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.thumb[aria-pressed="true"] .thumb-label {
+  padding-inline: 0.5em;
+  border-radius: 999px;
+  background: var(--brand-fill);
+}
+
+/* While pages are dragged, the picked ones look lifted, and no text is selected. */
+.thumbs[data-dragging] {
+  cursor: grabbing;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.thumbs[data-dragging] .thumb[aria-pressed="true"] {
+  opacity: 0.55;
+}
+
+.thumbs[data-dragging] .thumb {
+  cursor: grabbing;
+}
+
+/* The line that says where dragged pages would go. */
+.thumb-drop {
+  position: absolute;
+  inset-inline: 8px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--brand);
+  pointer-events: none;
+}
+
+/* The box for cropping. */
+.crop-sheet {
+  width: min(30rem, calc(100vw - 32px));
+}
+
+.crop-note {
+  margin-bottom: var(--sp-1);
+}
+
+.crop-stage {
+  position: relative;
+  align-self: center;
+  overflow: hidden;
+  background: var(--paper);
+  box-shadow: var(--paper-shadow);
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.crop-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/* The frame is what stays; the shadow around it is what is hidden. */
+.crop-box {
+  position: absolute;
+  box-sizing: border-box;
+  border: 2px solid var(--brand);
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.45);
+  cursor: move;
+}
+
+.crop-handle {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  box-sizing: border-box;
+  border: 2px solid var(--brand);
+  border-radius: 3px;
+  background: var(--card-raised);
+}
+
+.crop-handle[data-handle="nw"] {
+  inset: -8px auto auto -8px;
+  cursor: nwse-resize;
+}
+
+.crop-handle[data-handle="n"] {
+  inset: -8px auto auto calc(50% - 7px);
+  cursor: ns-resize;
+}
+
+.crop-handle[data-handle="ne"] {
+  inset: -8px -8px auto auto;
+  cursor: nesw-resize;
+}
+
+.crop-handle[data-handle="e"] {
+  inset: calc(50% - 7px) -8px auto auto;
+  cursor: ew-resize;
+}
+
+.crop-handle[data-handle="se"] {
+  inset: auto -8px -8px auto;
+  cursor: nwse-resize;
+}
+
+.crop-handle[data-handle="s"] {
+  inset: auto auto -8px calc(50% - 7px);
+  cursor: ns-resize;
+}
+
+.crop-handle[data-handle="sw"] {
+  inset: auto auto -8px -8px;
+  cursor: nesw-resize;
+}
+
+.crop-handle[data-handle="w"] {
+  inset: calc(50% - 7px) auto auto -8px;
+  cursor: ew-resize;
+}
+
+.crop-fields {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--sp-2);
+  margin-top: var(--sp-3);
+}
+
+.crop-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.crop-field input {
+  width: 100%;
+  min-width: 0;
+}
+
+.crop-scopes {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: var(--sp-3) 0 0;
+  padding: 0;
+  border: 0;
+  font-size: 0.875rem;
+}
+
+.crop-scopes legend {
+  padding: 0;
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.crop-scope {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+/* The bar of the box that shows while a tool works, when it knows how far it has come. */
+.sheet-progress {
+  width: 100%;
+  height: 6px;
+  margin-top: var(--sp-3);
+  accent-color: var(--brand);
+}

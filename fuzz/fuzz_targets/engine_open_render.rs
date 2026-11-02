@@ -33,6 +33,12 @@
 //!   the end, or longer than a piece may be, is refused. The saved file opens again (with the
 //!   password, for the encrypted seed) with the same number of pages and the same kind of
 //!   protection. A document that PDFium cannot write fails only with `SaveFailed`.
+//! - The page tools, on the document as it was opened and on the saved file opened again: a turn, a
+//!   crop, a blank page, a delete and the copy it leaves (restore), a move of every page and the
+//!   copy it leaves, the copy of the first page into a new document (which opens with one page and
+//!   the digest the engine gave) and its insert. The number of pages after each is the number it
+//!   should be, a refusal is one of a short list of errors, and the document, saved after all of
+//!   it, opens again with the same pages and the same digest.
 //! - Every answer can be encoded and decoded by the app, and the encoder cuts nothing.
 //! - A page that exists fails only with `Corrupt` or `RenderFailed`; a page past the end gives
 //!   `PageOutOfRange`.
@@ -44,8 +50,8 @@ use libfuzzer_sys::fuzz_target;
 use partridge_engine::Engine;
 use partridge_fuzz::check_response_caps;
 use partridge_protocol::{
-    ErrorCode, LinkTarget, PageSize, Request, RequestBody, Response, ResponseBody, MAX_SAVE_BYTES,
-    MAX_SAVE_CHUNK, PROTOCOL_VERSION,
+    ErrorCode, LinkTarget, PageSize, PagesRequest, PagesResponse, Request, RequestBody, Response,
+    ResponseBody, MAX_SAVE_BYTES, MAX_SAVE_CHUNK, PROTOCOL_VERSION,
 };
 
 /// Longest side of the bitmaps the target draws. Small, so that an iteration is fast.
@@ -61,6 +67,9 @@ struct State {
     engine: Engine,
     file: PathBuf,
     next_id: u32,
+    /// A page tool failed half way and the engine closed the document (it answers `UnknownDocument`
+    /// from then on). Only the page tools do that, and only for a document they could not put back.
+    lost: bool,
 }
 
 thread_local! {
@@ -118,6 +127,7 @@ impl State {
             engine,
             file: std::env::temp_dir().join(format!("partridge-fuzz-{}.pdf", std::process::id())),
             next_id: 1,
+            lost: false,
         }
     }
 
@@ -216,7 +226,16 @@ impl State {
         });
 
         self.signatures(doc);
-        self.save(doc, count);
+        // The page tools work on the document as it was saved and opened again (see `save`), which
+        // is how PDFium wrote it, and then on the document as it was opened, which is how a person
+        // meets them: a file that PDFium reads only after repairing it is changed and written out as
+        // it is.
+        self.save(doc, count, data, 0);
+        self.lost = false;
+        let now = self.tools(doc, count, data);
+        if !self.lost && now > 0 {
+            self.save(doc, now, data, 1);
+        }
 
         match self.ask(RequestBody::Close { doc }) {
             ResponseBody::Closed => {}
@@ -229,6 +248,269 @@ impl State {
             } => {}
             other => panic!("a closed document answered: {other:?}"),
         }
+    }
+
+    /// Asks a page tool. A refusal must be one of the errors a tool may give; any other answer than
+    /// a page tool answer is a bug.
+    fn tool(&mut self, op: PagesRequest) -> Option<PagesResponse> {
+        if std::env::var_os("PARTRIDGE_FUZZ_TRACE").is_some() {
+            eprintln!("page tool: {op:?}");
+        }
+        match self.ask(RequestBody::Pages(op)) {
+            ResponseBody::Pages(answer) => Some(answer),
+            ResponseBody::Error { code, .. } => {
+                assert!(
+                    matches!(
+                        code,
+                        ErrorCode::InvalidRequest
+                            | ErrorCode::PageOutOfRange
+                            | ErrorCode::PageChangeFailed
+                            | ErrorCode::TooManyPages
+                            | ErrorCode::SaveTooLarge
+                            | ErrorCode::SourceChanged
+                            | ErrorCode::SourceUnreadable
+                            | ErrorCode::ImportFailed
+                            | ErrorCode::SnapshotGone
+                            | ErrorCode::SaveFailed
+                            | ErrorCode::UnknownDocument
+                    ),
+                    "a page tool gave {code:?}"
+                );
+                if code == ErrorCode::UnknownDocument {
+                    self.lost = true;
+                }
+                None
+            }
+            other => panic!("a page tool was answered with {other:?}"),
+        }
+    }
+
+    /// How many pages the document has now, as the engine says.
+    fn pages_now(&mut self, doc: u32) -> u32 {
+        match self.ask(RequestBody::DocInfo { doc }) {
+            ResponseBody::DocInfo { pages, .. } => pages,
+            // A document the page tools had to close.
+            ResponseBody::Error {
+                code: ErrorCode::UnknownDocument,
+                ..
+            } => {
+                self.lost = true;
+                0
+            }
+            other => panic!("unexpected answer to DocInfo: {other:?}"),
+        }
+    }
+
+    /// A page tool that changes the document: asks it, and checks that the answer names the pages
+    /// the document really has (as DocInfo says), that the number is the number it should be
+    /// (`expected`, when the change has one), and that every size is a size. Returns the number of
+    /// the copy to go back to, or None when the tool refused.
+    fn change(&mut self, doc: u32, op: PagesRequest, expected: Option<u32>) -> Option<u32> {
+        match self.tool(op) {
+            Some(PagesResponse::Changed {
+                pages: sizes,
+                snapshot,
+                ..
+            }) => {
+                if let Some(expected) = expected {
+                    assert_eq!(sizes.len() as u32, expected, "the number of pages after a change");
+                }
+                for s in &sizes {
+                    assert!(s.width.is_finite() && s.width > 0.0 && s.width <= 14_400.0);
+                    assert!(s.height.is_finite() && s.height > 0.0 && s.height <= 14_400.0);
+                }
+                assert_eq!(
+                    sizes.len() as u32,
+                    self.pages_now(doc),
+                    "a change reports other pages than the document has"
+                );
+                Some(snapshot)
+            }
+            None => None,
+            Some(other) => panic!("a change was answered with {other:?}"),
+        }
+    }
+
+    /// The page tools, one after the other. Returns the number of pages the document has at the
+    /// end (0 when it was closed). The pages and the places are taken from the bytes of the input,
+    /// so that the same input does the same. The number of pages is read from the engine before
+    /// each tool: a document whose copies PDFium cannot read again (a damaged one) may refuse to go
+    /// back, and the tools must still report what the document has.
+    fn tools(&mut self, doc: u32, count: u32, data: &[u8]) -> u32 {
+        let seed = data
+            .iter()
+            .fold(0x9E37_79B9u32, |a, b| a.wrapping_mul(31).wrapping_add(u32::from(*b)));
+        let pick = |n: u32, salt: u32| {
+            if n == 0 {
+                0
+            } else {
+                (seed ^ salt.wrapping_mul(0x85EB_CA6B)) % n
+            }
+        };
+        if count == 0 {
+            return 0;
+        }
+
+        // Turn one page; crop one page; add a blank page.
+        let pages = self.pages_now(doc);
+        let turned = self.change(
+            doc,
+            PagesRequest::Rotate {
+                doc,
+                pages: vec![pick(pages, 1)],
+                turns: 1 + (pick(3, 2) as u8),
+            },
+            Some(pages),
+        );
+        let _ = turned;
+        let pages = self.pages_now(doc);
+        match self.tool(PagesRequest::Crop {
+            doc,
+            pages: vec![pick(pages, 3)],
+            margins: [1.0, 2.0, 3.0, 4.0],
+        }) {
+            Some(PagesResponse::Cropped {
+                pages: sizes,
+                before,
+                after,
+            }) => {
+                assert_eq!(sizes.len() as u32, pages);
+                assert_eq!(before.len(), 1);
+                assert_eq!(after.len(), 1);
+            }
+            None => {}
+            Some(other) => panic!("a crop was answered with {other:?}"),
+        }
+        let pages = self.pages_now(doc);
+        self.change(
+            doc,
+            PagesRequest::InsertBlank {
+                doc,
+                at: pick(pages + 1, 4),
+                width: 200.0,
+                height: 300.0,
+            },
+            Some(pages + 1),
+        );
+
+        // Delete a page and take it back; move every page and take it back. (Going back may be
+        // refused for a document that PDFium cannot read again; then it stays as it is.)
+        let pages = self.pages_now(doc);
+        if pages >= 2 {
+            let deleted = self.change(
+                doc,
+                PagesRequest::Delete {
+                    doc,
+                    pages: vec![pick(pages, 5)],
+                },
+                Some(pages - 1),
+            );
+            if let Some(snapshot) = deleted.filter(|s| *s != 0) {
+                self.change(doc, PagesRequest::Restore { doc, snapshot }, None);
+            }
+        }
+        // A move of every page, and its copy.
+        let pages = self.pages_now(doc);
+        if (2..=40).contains(&pages) {
+            let moved = self.change(
+                doc,
+                PagesRequest::Reorder {
+                    doc,
+                    order: (0..pages).rev().collect(),
+                },
+                Some(pages),
+            );
+            if let Some(snapshot) = moved.filter(|s| *s != 0) {
+                self.change(doc, PagesRequest::Restore { doc, snapshot }, None);
+            }
+        }
+
+        // Copy the first page into a new document, and look at it.
+        if let Some(PagesResponse::Exported {
+            size,
+            pages: copied,
+            digest,
+            ..
+        }) = self.tool(PagesRequest::ExportBegin {
+            doc,
+            pages: vec![0],
+        }) {
+            assert_eq!(copied, 1);
+            let mut bytes: Vec<u8> = Vec::new();
+            while bytes.len() < size as usize {
+                let len = (size as usize - bytes.len()).min(MAX_SAVE_CHUNK);
+                match self.ask(RequestBody::SaveChunk {
+                    doc,
+                    offset: bytes.len() as u32,
+                    len: len as u32,
+                }) {
+                    ResponseBody::SaveData { data, .. } => bytes.extend_from_slice(&data),
+                    other => panic!("unexpected answer to SaveChunk: {other:?}"),
+                }
+            }
+            self.ask(RequestBody::SaveEnd { doc });
+            assert!(bytes.starts_with(b"%PDF-"), "a copy that is no PDF");
+            let copy = self.file.with_extension("copy.pdf");
+            std::fs::write(&copy, &bytes).expect("write the copy");
+            self.engine
+                .set_document(std::fs::File::open(&copy).expect("open the copy"));
+            if let ResponseBody::Opened { doc: other, pages: n } =
+                self.ask(RequestBody::Open { password: None })
+            {
+                assert_eq!(n.len(), 1, "the copy of one page has other pages");
+                if let ResponseBody::Fingerprint { failed: 0, digest: d, .. } =
+                    self.ask(RequestBody::Fingerprint { doc: other })
+                {
+                    assert_eq!(d, digest, "the copy is not the document the engine described");
+                }
+                self.ask(RequestBody::Close { doc: other });
+            }
+            // An insert that is given up, to try the pieces and the abort.
+            if let Some(PagesResponse::ImportReady) = self.tool(PagesRequest::ImportBegin {
+                doc,
+                size: bytes.len() as u32,
+            }) {
+                self.tool(PagesRequest::ImportChunk {
+                    doc,
+                    offset: 0,
+                    data: bytes[..bytes.len().min(3001)].to_vec(),
+                });
+                self.tool(PagesRequest::ImportAbort { doc });
+                // A piece after the abort has nothing to belong to.
+                assert!(self
+                    .tool(PagesRequest::ImportChunk {
+                        doc,
+                        offset: 0,
+                        data: vec![1],
+                    })
+                    .is_none());
+            }
+            // And put it in the document, in pieces of an odd size.
+            let pages = self.pages_now(doc);
+            if let Some(PagesResponse::ImportReady) = self.tool(PagesRequest::ImportBegin {
+                doc,
+                size: bytes.len() as u32,
+            }) {
+                let mut sent = 0usize;
+                while sent < bytes.len() {
+                    let end = (sent + 3001).min(bytes.len());
+                    match self.tool(PagesRequest::ImportChunk {
+                        doc,
+                        offset: sent as u32,
+                        data: bytes[sent..end].to_vec(),
+                    }) {
+                        Some(PagesResponse::ImportAck { received }) => {
+                            assert_eq!(received as usize, end);
+                        }
+                        other => panic!("a piece was answered with {other:?}"),
+                    }
+                    sent = end;
+                }
+                self.change(doc, PagesRequest::ImportEnd { doc, at: 0 }, Some(pages + 1));
+            }
+            let _ = std::fs::remove_file(&copy);
+        }
+        self.pages_now(doc)
     }
 
     /// The signatures of the file: a report inside the caps, in which nothing is called trusted
@@ -266,7 +548,11 @@ impl State {
     }
 
     /// The three requests of a save, and a look at the file that comes out.
-    fn save(&mut self, doc: u32, count: u32) {
+    ///
+    /// `level` 0 is the document as it was opened; the page tools are then tried on the saved file
+    /// opened again, which is how a document has been written out by PDFium. What the tools leave
+    /// is saved and checked again, at `level` 1.
+    fn save(&mut self, doc: u32, count: u32, data: &[u8], level: u8) {
         let (pages, security) = match self.ask(RequestBody::DocInfo { doc }) {
             ResponseBody::DocInfo {
                 pages, security, ..
@@ -356,7 +642,7 @@ impl State {
 
         // The saved file opens again. (A file that PDFium had to repair may not; then the app's
         // check would refuse the save. One that opens must be the same document.)
-        let saved = self.file.with_extension("saved.pdf");
+        let saved = self.file.with_extension(format!("saved{level}.pdf"));
         std::fs::write(&saved, &bytes).expect("write the saved file");
         for password in [None, Some(PASSWORD.to_string())] {
             self.engine
@@ -376,10 +662,20 @@ impl State {
                 if print.0 == 0 {
                     match self.ask(RequestBody::Fingerprint { doc: again }) {
                         ResponseBody::Fingerprint { failed, digest, .. } => {
-                            assert_eq!(failed, 0, "pages of the saved file cannot be read");
-                            assert_eq!(digest, print.1, "the saved file is another document");
+                            // A saved file with a page that cannot be read is one the check of the
+                            // save refuses (the app writes nothing then), which is not a finding.
+                            if failed == 0 {
+                                assert_eq!(digest, print.1, "the saved file is another document");
+                            }
                         }
                         other => panic!("unexpected answer to Fingerprint: {other:?}"),
+                    }
+                }
+                if level == 0 {
+                    self.lost = false;
+                    let now = self.tools(again, count, data);
+                    if !self.lost && now != count {
+                        self.save(again, now, data, 1);
                     }
                 }
                 self.ask(RequestBody::Close { doc: again });

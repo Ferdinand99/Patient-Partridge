@@ -11,9 +11,9 @@ use arbitrary::{Result, Unstructured};
 use partridge_protocol::{
     FontScript, LinkTarget, Request, RequestBody, Response, ResponseBody, MAX_BYTE_RANGE,
     MAX_LINKS_PER_PAGE, MAX_MATCHES_PER_PAGE, MAX_OUTLINE_DEPTH, MAX_OUTLINE_ITEMS,
-    MAX_OUTLINE_TITLE, MAX_PAGE_CHARS, MAX_PAGE_TEXT_BYTES, MAX_QUERY_LEN, MAX_RENDER_PIXELS,
-    MAX_RENDER_SIDE, MAX_SAVE_BYTES, MAX_SAVE_CHUNK, MAX_SIGNATURES, MAX_SIG_NAME, MAX_STRING_LEN,
-    MAX_UNIX_TIME, MAX_URI_LEN,
+    MAX_OUTLINE_TITLE, MAX_PAGES, MAX_PAGE_CHARS, MAX_PAGE_TEXT_BYTES, MAX_QUERY_LEN,
+    MAX_RENDER_PIXELS, MAX_RENDER_SIDE, MAX_SAVE_BYTES, MAX_SAVE_CHUNK, MAX_SIGNATURES,
+    MAX_SIG_NAME, MAX_STRING_LEN, MAX_UNIX_TIME, MAX_URI_LEN,
 };
 
 use crate::{chance, check_signature_report};
@@ -38,6 +38,7 @@ pub fn check_request_caps(request: &Request) {
         RequestBody::SaveChunk { len, .. } => {
             assert!(*len as usize <= MAX_SAVE_CHUNK, "piece of {len} bytes");
         }
+        RequestBody::Pages(request) => crate::pages::check_pages_request_caps(request),
         _ => {}
     }
 }
@@ -57,8 +58,11 @@ pub fn check_response_caps(response: &Response) {
             assert!(pdfium_version.len() <= MAX_STRING_LEN);
             assert!(sandbox.len() <= MAX_STRING_LEN);
         }
-        ResponseBody::Opened { .. }
-        | ResponseBody::Closed
+        ResponseBody::Opened { pages, .. } => {
+            assert!(pages.len() <= MAX_PAGES, "{} pages", pages.len());
+        }
+        ResponseBody::Pages(response) => crate::pages::check_pages_response_caps(response),
+        ResponseBody::Closed
         | ResponseBody::DocInfo { .. }
         | ResponseBody::Progress { .. }
         | ResponseBody::Fingerprint { .. }
@@ -164,12 +168,13 @@ fn header(tag: u8, id: u32) -> Vec<u8> {
 }
 
 /// How many cases `over_cap_request_case` has.
-pub const OVER_CAP_REQUESTS: usize = 4;
+pub const OVER_CAP_REQUESTS: usize = 4 + crate::pages::PAGES_OVER_REQUESTS;
 
 /// A request that is valid except that one string is one byte over its cap. Returns a name and
 /// the payload; the decoder must return an error.
 pub fn over_cap_request_case(case: usize, id: u32) -> (&'static str, Vec<u8>) {
     match case % OVER_CAP_REQUESTS {
+        n if n >= 4 => crate::pages::pages_over_cap_request_case(n - 4, id),
         0 => {
             let mut p = header(2, id);
             p.push(1);
@@ -204,7 +209,7 @@ pub fn over_cap_request_case(case: usize, id: u32) -> (&'static str, Vec<u8>) {
 }
 
 /// How many cases `over_cap_response_case` has.
-pub const OVER_CAP_RESPONSES: usize = 26;
+pub const OVER_CAP_RESPONSES: usize = 26 + crate::pages::PAGES_OVER_RESPONSES;
 
 /// The two cases that are 1.7 MB.
 const PAGE_TEXT_OVER: usize = 6;
@@ -212,12 +217,15 @@ const PAGE_TEXT_AT_CAP: usize = 11;
 /// The two cases that are 1 MiB.
 const SAVE_PIECE_OVER: usize = 17;
 const SAVE_PIECE_AT_CAP: usize = 18;
+/// The three cases of the page tools that are 800 KB, 320 KB and 800 KB.
+const PAGES_BIG: [usize; 3] = [26, 27, 28];
 
 /// A response that is valid except for one thing, which is one over a cap. Two cases sit exactly
 /// at a cap instead (the biggest page text, the widest bitmap) and must be accepted. Returns a
 /// name, the payload, and whether the decoder must accept it.
 pub fn over_cap_response_case(case: usize, id: u32) -> (&'static str, Vec<u8>, bool) {
     match case % OVER_CAP_RESPONSES {
+        n if n >= 26 => crate::pages::pages_over_cap_response_case(n - 26, id),
         0 => {
             let mut p = header(133, id);
             push_u32(&mut p, MAX_OUTLINE_ITEMS as u32 + 1);
@@ -481,7 +489,7 @@ pub fn over_cap_response(u: &mut Unstructured) -> Result<(&'static str, Vec<u8>,
     let big = matches!(
         case,
         PAGE_TEXT_OVER | PAGE_TEXT_AT_CAP | SAVE_PIECE_OVER | SAVE_PIECE_AT_CAP
-    );
+    ) || PAGES_BIG.contains(&case);
     if big && !chance(u, 16)? {
         case = 0;
     }
