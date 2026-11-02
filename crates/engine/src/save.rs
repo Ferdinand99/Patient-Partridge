@@ -182,7 +182,7 @@ pub fn doc_info(
     // When the file cannot be scanned, the document is treated as possibly signed.
     let maybe_signed = match source {
         Some(guard) => crate::source::lock(guard)
-            .contains_any(&SIGNATURE_WORDS)
+            .contains_any(&SIGNATURE_WORDS, progress)
             .unwrap_or(true),
         None => false,
     };

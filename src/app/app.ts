@@ -173,7 +173,12 @@ function samePlace(a: ViewPosition, b: ViewPosition): boolean {
   const sameZoom = a.zoom === b.zoom || (a.zoom !== null && b.zoom !== null && Math.abs(a.zoom - b.zoom) < 1e-6);
   return a.page === b.page && Math.abs(a.offset - b.offset) < 0.002 && sameZoom;
 }
+
 const APP_NAME = "Patient Partridge";
+/** How long a save is waited for before a box says that it is going on. */
+const SAVE_SHEET_DELAY_MS = 500;
+const SAVE_SLOW_DETAIL =
+  "A large file or a slow drive can take a while. You can wait, or give up the changes you made: the file on the disk stays as it is. Cancel keeps the program open and lets the save carry on.";
 
 function byId<T extends HTMLElement>(root: Document, id: string): T {
   const el = root.getElementById(id);
@@ -199,6 +204,8 @@ export class App {
   private kept: string[] = [];
   /** True while the question before the app quits is open, so that it is not asked twice. */
   private quitting = false;
+  /** What a second request to quit does while the first is still being dealt with. */
+  private quitReveal: (() => void) | null = null;
 
   private readonly stage: HTMLElement;
   private readonly empty: HTMLElement;
@@ -796,10 +803,77 @@ export class App {
       ],
     });
     if (answer.button === "cancel") return false;
-    if (answer.button === "save" && !(await this.saveTab(tab, false))) return false;
+    if (answer.button === "save") {
+      const ended = await this.waitForSave(() => this.saveTab(tab, false), {
+        title: `Saving "${tab.name}"…`,
+        detail: SAVE_SLOW_DETAIL,
+        leave: "Don't save",
+      });
+      if (ended === "stay" || ended === "unsaved") return false;
+    }
     // The tab may be gone already (its engine stopped while the question was open).
     if (this.tabs.includes(tab)) this.closeTab(tab.id);
     return true;
+  }
+
+  /**
+   * Waits for a save that the user asked for, and does not leave the window without an answer if
+   * it takes long: after a moment a box shows that the save is going on, and lets the user stop
+   * waiting (the save carries on, the program stays open) or give the changes up. A second request
+   * to close or quit shows the box at once. Resolves with "saved" or "unsaved" when the save ends
+   * (see `saveTab`), "stay" when the user stopped waiting, "leave" when the changes are given up.
+   * `work` is told when the user stops waiting, so that it saves no more documents.
+   */
+  private async waitForSave(
+    work: (halt: AbortSignal) => Promise<boolean>,
+    text: { title: string; detail: string; leave: string },
+  ): Promise<"saved" | "unsaved" | "stay" | "leave"> {
+    const halt = new AbortController();
+    const over = new AbortController();
+    let shown = false;
+    let choose!: (answer: "stay" | "leave") => void;
+    const chosen = new Promise<"stay" | "leave">((resolve) => (choose = resolve));
+    const reveal = () => {
+      if (over.signal.aborted) return;
+      if (!shown) {
+        shown = true;
+        void showNotice(this.noticeLayer, {
+          title: text.title,
+          detail: text.detail,
+          busy: true,
+          signal: over.signal,
+          buttons: [
+            { id: "stay", label: "Cancel", safe: true },
+            { id: "leave", label: text.leave },
+          ],
+        }).then((answer) => {
+          if (answer.button === "leave") choose("leave");
+          else if (answer.button !== "dismissed") choose("stay");
+        });
+      }
+      this.focusTopNotice();
+    };
+    const timer = setTimeout(reveal, SAVE_SHEET_DELAY_MS);
+    const before = this.quitReveal;
+    this.quitReveal = reveal;
+    const finished = work(halt.signal).then(
+      (ok) => (ok ? ("saved" as const) : ("unsaved" as const)),
+      () => "unsaved" as const,
+    );
+    try {
+      const ended = await Promise.race([finished, chosen]);
+      if (ended === "stay" || ended === "leave") halt.abort();
+      return ended;
+    } finally {
+      clearTimeout(timer);
+      over.abort();
+      this.quitReveal = before;
+    }
+  }
+
+  /** Moves the focus to the first button of the box that is on top, so that a key press reaches it. */
+  private focusTopNotice(): void {
+    this.noticeLayer.lastElementChild?.querySelector<HTMLElement>("button:not(:disabled)")?.focus();
   }
 
   /** Closes a tab at once, whatever it holds. The questions are asked by `requestClose`. */
@@ -875,8 +949,10 @@ export class App {
   }
 
   /** Saves every document that has changes. Resolves with true when all were saved. */
-  async saveAllChanges(): Promise<boolean> {
+  async saveAllChanges(halt?: AbortSignal): Promise<boolean> {
     for (const tab of this.tabs.filter((t) => t.history.dirty)) {
+      // The user stopped waiting: what is running finishes, but no other document is begun.
+      if (halt?.aborted) return false;
       if (!(await this.saveTab(tab, false))) return false;
     }
     return true;
@@ -1034,8 +1110,14 @@ export class App {
    * was saved or given up.
    */
   async requestQuit(): Promise<void> {
-    if (this.quitting) return;
+    if (this.quitting) {
+      // Asked again while the first request is still at work (a question, or a save that takes
+      // long): it must not look as if nothing happened, so the box that answers it is brought up.
+      this.quitReveal?.();
+      return;
+    }
     this.quitting = true;
+    this.quitReveal = () => this.focusTopNotice();
     try {
       const dirty = this.tabs.filter((t) => t.history.dirty);
       if (dirty.length === 0) {
@@ -1061,13 +1143,21 @@ export class App {
         await this.deps.api.quitApp();
         return;
       }
-      if (answer.button === "save" && (await this.saveAllChanges())) {
-        await this.deps.api.quitApp();
-        return;
+      if (answer.button === "save") {
+        const ended = await this.waitForSave((halt) => this.saveAllChanges(halt), {
+          title: dirty.length === 1 ? `Saving "${dirty[0].name}"…` : `Saving ${dirty.length} documents…`,
+          detail: SAVE_SLOW_DETAIL,
+          leave: "Quit without saving",
+        });
+        if (ended === "saved" || ended === "leave") {
+          await this.deps.api.quitApp();
+          return;
+        }
       }
       await this.deps.api.stayOpen().catch(() => undefined);
     } finally {
       this.quitting = false;
+      this.quitReveal = null;
     }
   }
 

@@ -529,7 +529,6 @@ fn i6_a_file_the_user_cannot_write_is_refused_although_its_folder_is_writable() 
     assert_eq!(dir.names(), vec!["a.pdf".to_string()]);
 }
 
-#[cfg(unix)]
 #[test]
 fn i8_a_file_with_two_names_is_not_silently_split_in_two() {
     let dir = Dir::new("i8h");

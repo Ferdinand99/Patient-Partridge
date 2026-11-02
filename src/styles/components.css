@@ -601,6 +601,34 @@
   font-size: 1rem;
 }
 
+/* A bar that moves while a save runs: nothing is known of how far it is. */
+.sheet-busy {
+  position: relative;
+  height: 4px;
+  margin-top: var(--sp-3);
+  overflow: hidden;
+  border-radius: 2px;
+  background: var(--fill);
+}
+
+.sheet-busy > span {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 35%;
+  border-radius: 2px;
+  background: var(--brand);
+  animation: sheet-busy 1.4s ease-in-out infinite alternate;
+}
+
+@keyframes sheet-busy {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(185%);
+  }
+}
+
 .sheet-foot {
   display: flex;
   flex-wrap: wrap;

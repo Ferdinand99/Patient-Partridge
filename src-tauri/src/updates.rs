@@ -681,6 +681,12 @@ impl UpdateState {
         self.close_blocked.load(Ordering::SeqCst)
     }
 
+    /// Lets a test of the close guard put the program in the state of an install.
+    #[cfg(test)]
+    pub fn block_close_for_tests(&self, blocked: bool) {
+        self.close_blocked.store(blocked, Ordering::SeqCst);
+    }
+
     fn auto_update(&self) -> bool {
         self.settings
             .lock()

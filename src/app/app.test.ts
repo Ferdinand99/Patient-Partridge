@@ -2470,6 +2470,109 @@ describe("App: a save that an edit overtakes", () => {
   });
 });
 
+describe("App: a save that does not end", () => {
+  /** A document with a change, and a save that stays stuck until the test lets it go. */
+  async function stuck() {
+    const m = make();
+    await m.app.openPath("/docs/book.pdf");
+    await flush();
+    m.app.recordEdit({ label: "Change", undo: () => undefined, redo: () => undefined });
+    let finish!: (file: SavedFile) => void;
+    m.api.save.mockImplementationOnce(() => new Promise<SavedFile>((resolve) => (finish = resolve)));
+    return { ...m, finish: (file: SavedFile) => finish(file) };
+  }
+  const slow = () => new Promise((r) => setTimeout(r, 600));
+  const sheet = () => document.querySelector<HTMLElement>(".notice .sheet-busy");
+
+  it("shows that the save goes on, with a way out, when Save and quit takes long", async () => {
+    const m = await stuck();
+    const asking = m.app.requestQuit();
+    await flush();
+    click(button("Save and quit"));
+    await flush();
+    // A quick save shows nothing.
+    expect(notice()).toBeNull();
+    await slow();
+    expect(notice()?.textContent).toContain('Saving "book.pdf"');
+    expect(sheet()).not.toBeNull();
+    expect(button("Cancel")).not.toBeNull();
+    click(button("Quit without saving"));
+    await asking;
+    expect(m.api.quitApp).toHaveBeenCalledTimes(1);
+    expect(notice()).toBeNull();
+  });
+
+  it("answers a second request to close or quit at once, while the first still waits", async () => {
+    const m = await stuck();
+    const asking = m.app.requestQuit();
+    await flush();
+    click(button("Save and quit"));
+    await flush();
+    expect(notice()).toBeNull();
+    // The close button or Cmd+Q again, long before the box would come up by itself.
+    void m.app.requestQuit();
+    await flush();
+    expect(notice()?.textContent).toContain('Saving "book.pdf"');
+    expect(document.querySelectorAll(".notice")).toHaveLength(1);
+    expect(document.activeElement?.textContent).toBe("Cancel");
+    click(button("Quit without saving"));
+    await asking;
+    expect(m.api.quitApp).toHaveBeenCalledTimes(1);
+  });
+
+  it("Cancel keeps the program open, and the save that was left running does not quit it", async () => {
+    const m = await stuck();
+    const asking = m.app.requestQuit();
+    await flush();
+    click(button("Save and quit"));
+    await flush();
+    void m.app.requestQuit();
+    await flush();
+    click(button("Cancel"));
+    await asking;
+    expect(m.api.quitApp).not.toHaveBeenCalled();
+    expect(m.api.stayOpen).toHaveBeenCalledTimes(1);
+    // The save ends later: nothing quits.
+    m.finish({ path: "/docs/book.pdf", name: "book.pdf" });
+    await flush();
+    expect(m.api.quitApp).not.toHaveBeenCalled();
+    expect(m.app.unsavedCount).toBe(0);
+    // And a new request works as a new request.
+    const again = m.app.requestQuit();
+    await flush();
+    await again;
+    expect(m.api.quitApp).toHaveBeenCalledTimes(1);
+  });
+
+  it("takes the box away by itself when the save ends", async () => {
+    const m = await stuck();
+    const asking = m.app.requestQuit();
+    await flush();
+    click(button("Save and quit"));
+    await flush();
+    void m.app.requestQuit();
+    await flush();
+    expect(sheet()).not.toBeNull();
+    m.finish({ path: "/docs/book.pdf", name: "book.pdf" });
+    await asking;
+    expect(notice()).toBeNull();
+    expect(m.api.quitApp).toHaveBeenCalledTimes(1);
+  });
+
+  it("does the same for Save when a tab is closed: the tab can be closed without waiting", async () => {
+    const m = await stuck();
+    click(q(".tab-close"));
+    await flush();
+    click(button("Save"));
+    await slow();
+    expect(notice()?.textContent).toContain('Saving "book.pdf"');
+    click(button("Don't save"));
+    await flush();
+    expect(tabTitles()).toEqual([]);
+    expect(m.api.close).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("App: a save that cannot replace the file", () => {
   async function openDirty() {
     const m = make();

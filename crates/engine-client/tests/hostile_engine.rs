@@ -244,3 +244,48 @@ fn i3_a_sign_of_life_that_shows_no_more_work_than_the_last_is_refused() {
         other => panic!("{other:?}"),
     }
 }
+
+#[test]
+fn n5_signs_of_life_do_not_keep_a_save_open_for_ever() {
+    // The engine reports more work every 0.1 s for a minute. Each sign renews the stall limit of
+    // 1 s, so only the overall limit (1 s for this small file) can end it.
+    let mut config = EngineConfig::new(fake_engine());
+    config.args = vec!["save-endless".into()];
+    config.timeout = Duration::from_millis(500);
+    config.save_stall = Duration::from_secs(1);
+    config.save_floor = Duration::from_secs(1);
+    config.save_slowest = u64::MAX;
+    let client = EngineClient::new(config);
+    let doc = client.open(&doc_path(), None).unwrap();
+    let started = Instant::now();
+    match client.save_to(doc.doc, &mut |_| Ok(())) {
+        Err(partridge_engine_client::SaveStreamError::Client(ClientError::EngineStopped(why))) => {
+            assert!(
+                why.starts_with(partridge_engine_client::TOOK_TOO_LONG),
+                "{why}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn n5_the_overall_limit_grows_with_the_size_of_the_file() {
+    // A file of 4 MiB at 1 MiB a second, four passes: 16 s more than the floor. A save that takes
+    // 1.8 s with signs of life every 0.3 s is far inside it, and a floor of 0 does not matter.
+    let mut config = EngineConfig::new(fake_engine());
+    config.args = vec!["save-progress".into()];
+    config.timeout = Duration::from_millis(500);
+    config.save_stall = Duration::from_secs(1);
+    config.save_floor = Duration::ZERO;
+    config.save_slowest = 1024 * 1024;
+    let client = EngineClient::new(config);
+    let big = partridge_testkit::TempFile::new("big.pdf", &vec![b'%'; 4 * 1024 * 1024]);
+    let doc = client.open(&big.path_str(), None).unwrap();
+    assert!(client.save_to(doc.doc, &mut |_| Ok(())).is_ok());
+}

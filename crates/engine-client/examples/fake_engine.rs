@@ -207,6 +207,15 @@ fn main() {
                     }
                     reply(&mut output, id, ResponseBody::SaveReady { size: SAVE_SIZE });
                 }
+                "save-endless" => {
+                    // Says it is working, more and more, for a minute: a hostile engine, or a
+                    // document whose pages take for ever.
+                    for step in 1..=600u32 {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        reply(&mut output, id, ResponseBody::Progress { done: step });
+                    }
+                    reply(&mut output, id, ResponseBody::SaveReady { size: SAVE_SIZE });
+                }
                 "save-stuck" => {
                     // Alive, but nothing to show for it: the same number again and again.
                     for _ in 0..8 {

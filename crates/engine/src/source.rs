@@ -18,7 +18,8 @@
 //!   digest, and whether any read failed.
 //!
 //! The digests catch a change in the parts that were read, also when the size and the time of
-//! change were put back. They cannot catch a change in a part that was never read (nothing of the
+//! change were put back. A new time of change with the same size is accepted once every block of
+//! the file has been read and still has its digest (a program that only touched the file). They cannot catch a change in a part that was never read (nothing of the
 //! document depends on it) or one made before the first read of that part, which the size and
 //! the time of change are there for.
 
@@ -30,6 +31,11 @@ use std::time::SystemTime;
 
 /// Size of the blocks the file is read in.
 pub const BLOCK: u64 = 32 * 1024;
+
+/// How many blocks the guard reads on its own between two signs of life (1 MiB). A read of the
+/// whole file on a slow link can take minutes, and the app takes an engine that says nothing for
+/// too long for hung.
+pub const REPORT_BLOCKS: u64 = 32;
 
 /// A file that can be read at a place. A plain file is the only kind the app hands over; the
 /// trait is there so that a test can make reads fail.
@@ -123,8 +129,11 @@ impl SourceGuard {
         Err(e)
     }
 
-    /// Makes block `index` the block in the cache, reading it if it is not there.
-    fn load(&mut self, index: u64) -> io::Result<()> {
+    /// Makes block `index` the block in the cache, reading it if it is not there. `for_pdfium`:
+    /// the read is one PDFium asked for, so a failure is on record for good (PDFium leaves out
+    /// what it cannot read and goes on). The guard's own reads (the scan for signatures) are
+    /// repeated by the next look, so a failure there is only an error.
+    fn load(&mut self, index: u64, for_pdfium: bool) -> io::Result<()> {
         if matches!(&self.cache, Some((i, _)) if *i == index) {
             return Ok(());
         }
@@ -133,7 +142,7 @@ impl SourceGuard {
             Ok(n) => n,
             Err(e) => {
                 self.cache = None;
-                return self.fail(e);
+                return if for_pdfium { self.fail(e) } else { Err(e) };
             }
         };
         data.truncate(got);
@@ -154,7 +163,7 @@ impl SourceGuard {
         let mut done = 0;
         while done < buf.len() {
             let at = pos + done as u64;
-            self.load(at / BLOCK)?;
+            self.load(at / BLOCK, true)?;
             let (_, block) = self.cache.as_ref().expect("just loaded");
             let from = (at % BLOCK) as usize;
             if from >= block.len() {
@@ -167,23 +176,25 @@ impl SourceGuard {
         Ok(done)
     }
 
-    /// Looks at the file again. `Ok` only if nothing is wrong: no read failed, the size and the
-    /// time of change are as they were, and every block read so far has the digest it had.
-    pub fn verify(&mut self) -> Result<(), Problem> {
+    /// Looks at the file again. `Ok` only if nothing is wrong: no read failed, the size is as it
+    /// was, every block read so far has the digest it had, and the time of change is as it was or
+    /// the whole file has been read (a program that only touched the file moved the time and
+    /// changed nothing). A failure of this look itself is an error for now, not a mark against the
+    /// file: the next look is a new try. `progress` is told how many blocks are read, about every
+    /// MiB.
+    pub fn verify(&mut self, progress: &mut dyn FnMut(u32)) -> Result<(), Problem> {
         if self.failures > 0 {
             return Err(Problem::Unreadable);
         }
-        match self.file.state() {
+        let time_moved = match self.file.state() {
             Ok((len, modified)) => {
-                if len != self.len || modified != self.modified {
+                if len != self.len {
                     return Err(Problem::Changed);
                 }
+                (modified != self.modified).then_some(modified)
             }
-            Err(_) => {
-                self.failures += 1;
-                return Err(Problem::Unreadable);
-            }
-        }
+            Err(_) => return Err(Problem::Unreadable),
+        };
         if self.changed {
             return Err(Problem::Changed);
         }
@@ -191,29 +202,42 @@ impl SourceGuard {
         let mut known: Vec<(u64, u64)> = self.blocks.iter().map(|(i, d)| (*i, *d)).collect();
         known.sort_unstable();
         let mut data = vec![0u8; BLOCK as usize];
-        for (index, digest) in known {
+        for (count, (index, digest)) in known.into_iter().enumerate() {
+            if count as u64 % REPORT_BLOCKS == REPORT_BLOCKS - 1 {
+                progress(count as u32 + 1);
+            }
             let got = match self.file.read_at(index * BLOCK, &mut data) {
                 Ok(n) => n,
-                Err(_) => {
-                    self.failures += 1;
-                    return Err(Problem::Unreadable);
-                }
+                Err(_) => return Err(Problem::Unreadable),
             };
             if fnv(&data[..got]) != digest {
                 self.changed = true;
                 return Err(Problem::Changed);
             }
         }
+        if let Some(modified) = time_moved {
+            // Every byte of the file is what was read once: nothing can be a mix of two versions.
+            let all_read = (0..self.len.div_ceil(BLOCK)).all(|i| self.blocks.contains_key(&i));
+            if !all_read {
+                return Err(Problem::Changed);
+            }
+            self.modified = modified;
+        }
         Ok(())
     }
 
     /// True when any of `needles` is in the file. Reads the whole file (and so notes every block).
-    pub fn contains_any(&mut self, needles: &[&[u8]]) -> io::Result<bool> {
+    /// `progress` is told how many blocks are read, about every MiB.
+    pub fn contains_any(
+        &mut self,
+        needles: &[&[u8]],
+        progress: &mut dyn FnMut(u32),
+    ) -> io::Result<bool> {
         let longest = needles.iter().map(|n| n.len()).max().unwrap_or(0);
         let mut tail: Vec<u8> = Vec::new();
         let mut index = 0u64;
         loop {
-            self.load(index)?;
+            self.load(index, false)?;
             let (_, block) = self.cache.as_ref().expect("just loaded");
             if block.is_empty() {
                 return Ok(false);
@@ -232,6 +256,9 @@ impl SourceGuard {
                 return Ok(false);
             }
             index += 1;
+            if index.is_multiple_of(REPORT_BLOCKS) {
+                progress(index as u32);
+            }
         }
     }
 }
@@ -363,19 +390,71 @@ mod tests {
         reader.seek(SeekFrom::Start(200_000)).unwrap();
         assert_eq!(reader.read(&mut buf).unwrap(), 0);
         assert!(reader.seek(SeekFrom::Current(-300_000)).is_err());
-        assert_eq!(lock(&rig.guard).verify(), Ok(()));
+        assert_eq!(lock(&rig.guard).verify(&mut |_| {}), Ok(()));
     }
 
     #[test]
     fn a_change_of_size_or_time_is_seen() {
-        let rig = rig(1000);
-        let mut reader = GuardedReader::new(rig.guard.clone());
+        let touched = rig(100_000);
+        let mut reader = GuardedReader::new(touched.guard.clone());
         let mut buf = [0u8; 10];
         reader.read_exact(&mut buf).unwrap();
-        assert_eq!(lock(&rig.guard).verify(), Ok(()));
+        assert_eq!(lock(&touched.guard).verify(&mut |_| {}), Ok(()));
+        // Most of the file was never read: a new time of change may hide anything.
+        *touched.modified.lock().unwrap() =
+            Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(5));
+        assert_eq!(
+            lock(&touched.guard).verify(&mut |_| {}),
+            Err(Problem::Changed)
+        );
+        // And so does a new size.
+        let longer = rig(100_000);
+        let mut reader = GuardedReader::new(longer.guard.clone());
+        reader.read_exact(&mut buf).unwrap();
+        longer.data.lock().unwrap().push(1);
+        assert_eq!(
+            lock(&longer.guard).verify(&mut |_| {}),
+            Err(Problem::Changed)
+        );
+    }
+
+    #[test]
+    fn n2_a_touch_that_changes_only_the_time_is_not_a_change_once_the_whole_file_is_known() {
+        let rig = read_through(40);
         *rig.modified.lock().unwrap() =
             Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(5));
-        assert_eq!(lock(&rig.guard).verify(), Err(Problem::Changed));
+        // Every block was read and has the digest it had: the file is what was read.
+        assert_eq!(lock(&rig.guard).verify(&mut |_| {}), Ok(()));
+        // The new time is the one to compare with from now on, and a real change is still seen.
+        assert_eq!(lock(&rig.guard).verify(&mut |_| {}), Ok(()));
+        rig.data.lock().unwrap()[100] ^= 0xff;
+        *rig.modified.lock().unwrap() =
+            Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(9));
+        assert_eq!(lock(&rig.guard).verify(&mut |_| {}), Err(Problem::Changed));
+    }
+
+    #[test]
+    fn n3_a_failure_of_the_guards_own_look_is_not_held_against_the_file() {
+        let rig = read_through(40);
+        rig.broken.store(true, Ordering::SeqCst);
+        // The look fails now ...
+        assert_eq!(
+            lock(&rig.guard).verify(&mut |_| {}),
+            Err(Problem::Unreadable)
+        );
+        let mut again = SourceGuard::new(Box::new(Memory {
+            data: rig.data.clone(),
+            broken: rig.broken.clone(),
+            modified: rig.modified.clone(),
+        }))
+        .unwrap();
+        assert!(again.contains_any(&[b"/ByteRange"], &mut |_| {}).is_err());
+        assert_eq!(again.failures(), 0);
+        // ... and works again when the share is back; PDFium lost nothing in between.
+        rig.broken.store(false, Ordering::SeqCst);
+        assert_eq!(lock(&rig.guard).failures(), 0);
+        assert_eq!(lock(&rig.guard).verify(&mut |_| {}), Ok(()));
+        assert!(!again.contains_any(&[b"/ByteRange"], &mut |_| {}).unwrap());
     }
 
     #[test]
@@ -387,9 +466,9 @@ mod tests {
         reader.read_exact(&mut buf).unwrap();
         // A block that was never read may change without anyone noticing: nothing depends on it.
         rig.data.lock().unwrap()[90_000] ^= 0xff;
-        assert_eq!(lock(&rig.guard).verify(), Ok(()));
+        assert_eq!(lock(&rig.guard).verify(&mut |_| {}), Ok(()));
         rig.data.lock().unwrap()[40_001] ^= 0xff;
-        assert_eq!(lock(&rig.guard).verify(), Err(Problem::Changed));
+        assert_eq!(lock(&rig.guard).verify(&mut |_| {}), Err(Problem::Changed));
     }
 
     #[test]
@@ -404,7 +483,7 @@ mod tests {
         rig.data.lock().unwrap()[3] ^= 0xff;
         reader.seek(SeekFrom::Start(0)).unwrap();
         reader.read_exact(&mut buf).unwrap();
-        assert_eq!(lock(&rig.guard).verify(), Err(Problem::Changed));
+        assert_eq!(lock(&rig.guard).verify(&mut |_| {}), Err(Problem::Changed));
     }
 
     #[test]
@@ -419,7 +498,10 @@ mod tests {
         assert_eq!(lock(&rig.guard).failures(), 1);
         // The share comes back: the failure stays on record.
         rig.broken.store(false, Ordering::SeqCst);
-        assert_eq!(lock(&rig.guard).verify(), Err(Problem::Unreadable));
+        assert_eq!(
+            lock(&rig.guard).verify(&mut |_| {}),
+            Err(Problem::Unreadable)
+        );
     }
 
     #[test]
@@ -437,8 +519,12 @@ mod tests {
             modified: rig.modified.clone(),
         }))
         .unwrap();
-        assert!(guard.contains_any(&[b"/DocMDP", b"/ByteRange"]).unwrap());
-        assert!(!guard.contains_any(&[b"/DocMDP", b"/SigFlags"]).unwrap());
+        assert!(guard
+            .contains_any(&[b"/DocMDP", b"/ByteRange"], &mut |_| {})
+            .unwrap());
+        assert!(!guard
+            .contains_any(&[b"/DocMDP", b"/SigFlags"], &mut |_| {})
+            .unwrap());
         // A file that is empty, or has a size that is a whole number of blocks, ends the scan.
         *rig.data.lock().unwrap() = vec![b'a'; BLOCK as usize * 2];
         let mut again = SourceGuard::new(Box::new(Memory {
@@ -447,7 +533,40 @@ mod tests {
             modified: rig.modified.clone(),
         }))
         .unwrap();
-        assert!(!again.contains_any(&[b"/ByteRange"]).unwrap());
+        assert!(!again.contains_any(&[b"/ByteRange"], &mut |_| {}).unwrap());
+    }
+
+    /// A file of `blocks` blocks, with every block read once.
+    fn read_through(blocks: usize) -> Rig {
+        let rig = rig(blocks * BLOCK as usize);
+        let mut guard = lock(&rig.guard);
+        // A word that is not in the file: the scan reads all of it.
+        assert!(!guard.contains_any(&[b"/ByteRange"], &mut |_| {}).unwrap());
+        drop(guard);
+        rig
+    }
+
+    #[test]
+    fn n1_checking_a_big_file_reports_progress_with_a_rising_count() {
+        let rig = read_through(200);
+        let mut seen: Vec<u32> = Vec::new();
+        assert_eq!(lock(&rig.guard).verify(&mut |done| seen.push(done)), Ok(()));
+        // 200 blocks are 6.25 MiB: a sign of life about every MiB.
+        assert!(seen.len() >= 5, "too few signs of life: {seen:?}");
+        assert!(seen.windows(2).all(|w| w[0] < w[1]), "{seen:?}");
+        assert!(*seen.last().unwrap() <= 200);
+    }
+
+    #[test]
+    fn n1_scanning_a_big_file_reports_progress_with_a_rising_count() {
+        let rig = rig(200 * BLOCK as usize);
+        let mut seen: Vec<u32> = Vec::new();
+        let found = lock(&rig.guard)
+            .contains_any(&[b"/ByteRange"], &mut |done| seen.push(done))
+            .unwrap();
+        assert!(!found);
+        assert!(seen.len() >= 5, "too few signs of life: {seen:?}");
+        assert!(seen.windows(2).all(|w| w[0] < w[1]), "{seen:?}");
     }
 
     #[test]
