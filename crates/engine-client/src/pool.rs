@@ -7,19 +7,32 @@
 //! document can never reach another one.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use partridge_protocol::{ErrorCode, PageSize};
 
+use crate::save::{save_document, verify_written, FileStamp};
 use crate::{
     Bitmap, ClientError, EngineClient, EngineConfig, EngineInfo, FontScript, OutlineItem, PageLink,
-    PageText, TextMatch,
+    PageText, SaveError, SaveOptions, SaveOutcome, TextMatch,
 };
+
+/// The file a document belongs to, and how it looked when the document was opened (or last saved).
+struct Source {
+    path: PathBuf,
+    stamp: Option<FileStamp>,
+}
 
 struct Entry {
     client: Arc<EngineClient>,
     /// The client's own handle for the document.
     doc: u64,
+    source: Arc<Mutex<Source>>,
+    /// The password the document was opened with, to check a saved file against it.
+    password: Option<Arc<Secret>>,
+    /// Held while the document is being saved: one save at a time.
+    saving: Arc<Mutex<()>>,
 }
 
 #[derive(Default)]
@@ -36,6 +49,28 @@ pub struct EnginePool {
     config: EngineConfig,
     max_documents: usize,
     state: Mutex<State>,
+}
+
+/// A password held in memory: overwritten when it is let go of, never copied (it is shared), and
+/// not shown by `Debug`.
+struct Secret(String);
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        // SAFETY: the bytes are overwritten with zeros in place; the string is dropped right after,
+        // so no one reads it as text again. The writes are volatile so that they are not removed.
+        unsafe {
+            for byte in self.0.as_bytes_mut() {
+                std::ptr::write_volatile(byte, 0);
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(..)")
+    }
 }
 
 fn state(m: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
@@ -84,6 +119,8 @@ impl EnginePool {
             });
         }
         let epoch = state(&self.state).epoch;
+        // How the file looks now, to notice later that someone else changed it.
+        let stamp = Some(FileStamp::read(Path::new(path)).unwrap_or_else(|_| FileStamp::unknown()));
         let client = Arc::new(EngineClient::new(self.config.clone()));
         let opened = match client.open(path, password) {
             Ok(opened) => opened,
@@ -92,7 +129,17 @@ impl EnginePool {
                 return Err(e);
             }
         };
-        let handle = self.register(client, opened.doc, epoch)?;
+        let source = Source {
+            path: PathBuf::from(path),
+            stamp,
+        };
+        let handle = self.register(
+            client,
+            opened.doc,
+            epoch,
+            source,
+            password.map(|p| Arc::new(Secret(p.to_string()))),
+        )?;
         Ok((handle, opened.pages))
     }
 
@@ -103,6 +150,8 @@ impl EnginePool {
         client: Arc<EngineClient>,
         doc: u64,
         epoch: u64,
+        source: Source,
+        password: Option<Arc<Secret>>,
     ) -> Result<u64, ClientError> {
         let mut st = state(&self.state);
         let refusal = if st.epoch != epoch {
@@ -122,8 +171,101 @@ impl EnginePool {
         }
         st.next += 1;
         let handle = st.next;
-        st.docs.insert(handle, Entry { client, doc });
+        st.docs.insert(
+            handle,
+            Entry {
+                client,
+                doc,
+                source: Arc::new(Mutex::new(source)),
+                password,
+                saving: Arc::new(Mutex::new(())),
+            },
+        );
         Ok(handle)
+    }
+
+    /// The file a document belongs to: where it was opened from, or last saved to.
+    pub fn source_path(&self, handle: u64) -> Option<PathBuf> {
+        let st = state(&self.state);
+        let entry = st.docs.get(&handle)?;
+        let source = entry.source.lock().unwrap_or_else(|e| e.into_inner());
+        Some(source.path.clone())
+    }
+
+    /// Saves the document to the file it was opened from, by way of a new file that replaces the
+    /// old one in a single step (see the `save` module). The file is as it was if anything fails.
+    pub fn save(&self, handle: u64, options: SaveOptions) -> Result<SaveOutcome, ClientError> {
+        self.save_to_path(handle, None, options)
+    }
+
+    /// Saves the document to `target`, a file that may exist already. When it works, the document
+    /// belongs to `target` from then on.
+    pub fn save_as(
+        &self,
+        handle: u64,
+        target: &Path,
+        options: SaveOptions,
+    ) -> Result<SaveOutcome, ClientError> {
+        self.save_to_path(handle, Some(target), options)
+    }
+
+    fn save_to_path(
+        &self,
+        handle: u64,
+        target: Option<&Path>,
+        options: SaveOptions,
+    ) -> Result<SaveOutcome, ClientError> {
+        let (client, doc, password, source, saving) = {
+            let st = state(&self.state);
+            let entry = st.docs.get(&handle).ok_or_else(unknown)?;
+            (
+                entry.client.clone(),
+                entry.doc,
+                entry.password.clone(),
+                entry.source.clone(),
+                entry.saving.clone(),
+            )
+        };
+        // One save at a time per document. No lock of the pool is held from here on: a document
+        // that is closed during the save ends it with its engine.
+        let _saving = saving
+            .try_lock()
+            .map_err(|_| ClientError::Save(SaveError::Busy))?;
+        let (current_path, current_stamp) = {
+            let source = source.lock().unwrap_or_else(|e| e.into_inner());
+            (source.path.clone(), source.stamp.clone())
+        };
+        let (path, expected) = match target {
+            None => (current_path, current_stamp),
+            Some(t) if same_file(t, &current_path) => (current_path, current_stamp),
+            // Another file: whatever is there now is what the user chose to replace.
+            Some(t) => (t.to_path_buf(), FileStamp::read(t).ok()),
+        };
+        let outcome = save_document(
+            &client,
+            doc,
+            &path,
+            expected.as_ref(),
+            options,
+            &|file, info, print| {
+                verify_written(
+                    &self.config,
+                    file,
+                    password.as_ref().map(|p| p.0.as_str()),
+                    info,
+                    Some(print),
+                )
+            },
+            &|| state(&self.state).docs.contains_key(&handle),
+        )?;
+        // The document belongs to the file it was saved to, which now looks different.
+        let mut source = source.lock().unwrap_or_else(|e| e.into_inner());
+        source.path = path;
+        // A stamp that cannot be read is not "no stamp" (that would switch the check for a changed
+        // file off): it equals no real state, so the next save asks.
+        source.stamp =
+            Some(FileStamp::read(&outcome.path).unwrap_or_else(|_| FileStamp::unknown()));
+        Ok(outcome)
     }
 
     fn entry(&self, handle: u64) -> Result<(Arc<EngineClient>, u64), ClientError> {
@@ -212,6 +354,17 @@ impl EnginePool {
     }
 }
 
+/// True when two paths lead to the same file.
+fn same_file(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 impl Drop for EnginePool {
     fn drop(&mut self) {
         self.kill_all();
@@ -231,6 +384,13 @@ mod tests {
         Arc::new(EngineClient::new(pool.config.clone()))
     }
 
+    fn no_source() -> Source {
+        Source {
+            path: PathBuf::from("a.pdf"),
+            stamp: None,
+        }
+    }
+
     fn epoch(pool: &EnginePool) -> u64 {
         state(&pool.state).epoch
     }
@@ -242,7 +402,9 @@ mod tests {
         // The window starts again while a document is still opening ...
         pool.kill_all();
         // ... so when that document is ready, nobody is left to use or close it.
-        let err = pool.register(client(&pool), 1, before).unwrap_err();
+        let err = pool
+            .register(client(&pool), 1, before, no_source(), None)
+            .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -260,11 +422,15 @@ mod tests {
     fn a_document_opened_after_a_reset_is_kept_and_handles_go_on_counting() {
         let pool = pool();
         let now = epoch(&pool);
-        let first = pool.register(client(&pool), 1, now).unwrap();
+        let first = pool
+            .register(client(&pool), 1, now, no_source(), None)
+            .unwrap();
         pool.kill_all();
         assert!(pool.is_empty());
         let now = epoch(&pool);
-        let second = pool.register(client(&pool), 1, now).unwrap();
+        let second = pool
+            .register(client(&pool), 1, now, no_source(), None)
+            .unwrap();
         assert!(second > first, "{second} should come after {first}");
         assert_eq!(pool.len(), 1);
     }

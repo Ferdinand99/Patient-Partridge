@@ -1,4 +1,4 @@
-# Patient Partridge protocol. Request tags (1 to 8), answer tags (129 to 136, 255), the
+# Patient Partridge protocol. Request tags (1 to 14), answer tags (129 to 143, 255), the
 # presence byte of an optional string, error codes, link kinds, and the numbers where the
 # decoders have limits (little endian u32).
 
@@ -10,6 +10,12 @@ req_outline="\x05"
 req_page_text="\x06"
 req_page_links="\x07"
 req_search="\x08"
+req_font_report="\x09"
+req_doc_info="\x0a"
+req_save_begin="\x0b"
+req_save_chunk="\x0c"
+req_save_end="\x0d"
+req_fingerprint="\x0e"
 
 res_hello="\x81"
 res_opened="\x82"
@@ -19,6 +25,13 @@ res_outline="\x85"
 res_page_text="\x86"
 res_page_links="\x87"
 res_matches="\x88"
+res_font_report="\x89"
+res_doc_info="\x8a"
+res_save_ready="\x8b"
+res_save_data="\x8c"
+res_save_ended="\x8d"
+res_progress="\x8e"
+res_fingerprint="\x8f"
 res_error="\xff"
 
 # A message starts with a tag and a request id.

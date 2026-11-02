@@ -28,11 +28,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use partridge_protocol::{
     read_frame_limited, write_request, ErrorCode, PageSize, Request, RequestBody, Response,
-    ResponseBody, MAX_QUERY_LEN, MAX_STRING_LEN, PROTOCOL_VERSION,
+    ResponseBody, MAX_QUERY_LEN, MAX_SAVE_BYTES, MAX_SAVE_CHUNK, MAX_STRING_LEN, PROTOCOL_VERSION,
+    SAVE_DATA_HEADER_LEN,
 };
 
 pub use spawn::{spawn_engine, EngineProcess, SandboxPolicy, SpawnRequest, SpawnedEngine};
@@ -41,6 +42,8 @@ pub use partridge_protocol::{FontScript, LinkTarget, OutlineItem, PageLink, Text
 
 mod pool;
 pub use pool::EnginePool;
+mod save;
+pub use save::{verify_written, DocInfo, Fingerprint, SaveError, SaveOptions, SaveOutcome};
 mod spawn;
 pub mod system_fonts;
 
@@ -51,6 +54,14 @@ const MAX_SMALL_ANSWER: usize = 9 * 1024 * 1024;
 const IDLE_LIMIT: usize = 70 * 1024;
 /// Header of a `Rendered` answer in front of the pixels.
 const RENDERED_HEADER: usize = 17;
+/// How many times a long request (`DocInfo`, `Fingerprint`, `SaveBegin`) may have to read the
+/// whole document: the check of the file before and after, and the serialising itself.
+const SAVE_PASSES: u64 = 4;
+
+/// What the error of an engine that was stopped for taking too long starts with. The app turns it
+/// into its own error code, so that the window can say what happened.
+pub const TOOK_TOO_LONG: &str = "it was still working when the overall time limit ended";
+
 /// Largest outline answer: 5 000 entries of at most 512 bytes of title and 9 bytes of framing.
 const MAX_OUTLINE_ANSWER: usize = 3 * 1024 * 1024;
 /// Largest page text answer: 100 000 characters of at most 4 bytes and 16 bytes of box each.
@@ -65,6 +76,23 @@ pub struct EngineConfig {
     pub args: Vec<OsString>,
     /// Longest the engine may take to answer one request before it is considered hung and killed.
     pub timeout: Duration,
+    /// Longest the engine may go without a sign of life while it describes or serialises a
+    /// document (`DocInfo`, `Fingerprint`, `SaveBegin`). These requests can take minutes for a
+    /// large document on a slow disk, so the engine reports progress while it works (about every
+    /// MiB written, 32 pages looked at or MiB of the file read), and every report starts this
+    /// wait afresh. An engine that makes progress is not taken for a hung one for being slow;
+    /// one that says nothing for this long is. Only `save_floor` and `save_slowest` set an end to
+    /// an engine that keeps reporting.
+    pub save_stall: Duration,
+    /// The signs of life renew `save_stall` and so could go on for ever (an engine that is hostile,
+    /// or a document with pages that take minutes each). One of these requests therefore also has
+    /// an overall limit: `save_floor` plus the time that the document would take to be read
+    /// `SAVE_PASSES` times at `save_slowest`. An engine that is still at it when the limit is up
+    /// is stopped, and the error says that it took too long.
+    pub save_floor: Duration,
+    /// The slowest speed, in bytes a second, at which a long request still has to get through the
+    /// document (see `save_floor`). A slow drive or a share is allowed to be this slow.
+    pub save_slowest: u64,
     /// Most memory the engine may use, in bytes. `None` leaves the engine's own limit (3 GiB).
     pub memory_limit: Option<u64>,
     /// Whether an engine without a working sandbox is refused. Release builds always insist.
@@ -83,6 +111,9 @@ impl EngineConfig {
             program: program.into(),
             args: Vec::new(),
             timeout: Duration::from_secs(60),
+            save_stall: Duration::from_secs(300),
+            save_floor: Duration::from_secs(600),
+            save_slowest: 1024 * 1024,
             memory_limit: None,
             sandbox: SandboxPolicy::default_for_build(),
             system_fonts: true,
@@ -98,6 +129,8 @@ pub enum ClientError {
     EngineStopped(String),
     /// The engine is fine and refused or failed this one request.
     Engine { code: ErrorCode, message: String },
+    /// A save did not happen, and the file it was meant for is as it was.
+    Save(SaveError),
 }
 
 impl fmt::Display for ClientError {
@@ -105,6 +138,7 @@ impl fmt::Display for ClientError {
         match self {
             ClientError::EngineStopped(why) => write!(f, "the PDF engine stopped: {why}"),
             ClientError::Engine { message, .. } => write!(f, "{message}"),
+            ClientError::Save(why) => write!(f, "{why}"),
         }
     }
 }
@@ -152,6 +186,21 @@ enum Event {
     Closed,
 }
 
+/// Why [`EngineClient::save_to`] stopped.
+#[derive(Debug)]
+pub enum SaveStreamError {
+    /// The engine failed, broke the rules, or the document is gone.
+    Client(ClientError),
+    /// The caller's sink failed: the bytes could not be written.
+    Sink(std::io::Error),
+}
+
+impl From<ClientError> for SaveStreamError {
+    fn from(e: ClientError) -> Self {
+        SaveStreamError::Client(e)
+    }
+}
+
 /// The engine process, reachable from the request thread and from whoever kills it.
 type SharedProcess = Arc<Mutex<Box<dyn EngineProcess>>>;
 
@@ -166,6 +215,8 @@ struct Running {
     in_flight: Arc<AtomicBool>,
     /// Largest frame the reader thread accepts right now.
     limit: Arc<AtomicUsize>,
+    /// Size of the file the document was opened from, in bytes (0 before there is a document).
+    document_len: u64,
 }
 
 #[derive(Default)]
@@ -408,6 +459,112 @@ impl EngineClient {
         }
     }
 
+    /// What the app needs to know before it saves: pages, protection, signatures.
+    pub fn doc_info(&self, doc: u64) -> Result<DocInfo, ClientError> {
+        self.call(
+            doc,
+            "document info",
+            |doc| RequestBody::DocInfo { doc },
+            |body| match body {
+                ResponseBody::DocInfo {
+                    pages,
+                    security,
+                    signatures,
+                    maybe_signed,
+                } => Ok(DocInfo {
+                    pages,
+                    security,
+                    signatures,
+                    maybe_signed,
+                }),
+                other => Err(other),
+            },
+        )
+    }
+
+    /// A digest of what a reader sees of every page of the document.
+    pub fn fingerprint(&self, doc: u64) -> Result<Fingerprint, ClientError> {
+        self.call(
+            doc,
+            "fingerprint",
+            |doc| RequestBody::Fingerprint { doc },
+            |body| match body {
+                ResponseBody::Fingerprint {
+                    pages,
+                    failed,
+                    digest,
+                } => Ok(Fingerprint {
+                    pages,
+                    failed,
+                    digest,
+                }),
+                other => Err(other),
+            },
+        )
+    }
+
+    /// Has the engine serialise the document, and hands every piece to `sink` as it arrives; the
+    /// pieces together are the file. Returns how many bytes there were.
+    ///
+    /// The engine is treated as hostile here too: the size it announces is held to
+    /// [`MAX_SAVE_BYTES`], every piece must be at the offset asked for and exactly as long as
+    /// asked, and the pieces must add up to the size announced. An engine that breaks one of
+    /// these is stopped, and the pieces already handed to `sink` are not a file. An error of the
+    /// sink (the disk is full) ends the save; the engine is told to drop its buffer.
+    pub fn save_to(
+        &self,
+        doc: u64,
+        sink: &mut dyn FnMut(&[u8]) -> std::io::Result<()>,
+    ) -> Result<u64, SaveStreamError> {
+        let mut inner = lock(&self.inner);
+        let Some(engine_doc) = Self::engine_doc(&inner, doc) else {
+            return Err(stale_document().into());
+        };
+        let size = match self.run(&mut inner, RequestBody::SaveBegin { doc: engine_doc })? {
+            ResponseBody::SaveReady { size } if size as usize <= MAX_SAVE_BYTES => size,
+            _ => {
+                return Err(self
+                    .unexpected::<()>(&mut inner, "save")
+                    .unwrap_err()
+                    .into())
+            }
+        };
+        let mut done: u32 = 0;
+        let result = loop {
+            if done == size {
+                break Ok(());
+            }
+            let len = (size - done).min(MAX_SAVE_CHUNK as u32);
+            let body = RequestBody::SaveChunk {
+                doc: engine_doc,
+                offset: done,
+                len,
+            };
+            match self.run(&mut inner, body) {
+                Ok(ResponseBody::SaveData { offset, data })
+                    if offset == done && data.len() == len as usize =>
+                {
+                    if let Err(e) = sink(&data) {
+                        break Err(SaveStreamError::Sink(e));
+                    }
+                    done += len;
+                }
+                Ok(_) => {
+                    break Err(self
+                        .unexpected::<()>(&mut inner, "save")
+                        .unwrap_err()
+                        .into());
+                }
+                Err(e) => break Err(e.into()),
+            }
+        };
+        // Freeing the buffer is housekeeping, and an engine that was stopped has none to free.
+        if inner.running.is_some() {
+            let _ = self.run(&mut inner, RequestBody::SaveEnd { doc: engine_doc });
+        }
+        result.map(|()| u64::from(size))
+    }
+
     /// Stops the engine process now. The documents it held are gone; opening a file starts a new
     /// engine. This works while another
     /// thread is waiting for an answer: that request then fails with `EngineStopped`.
@@ -461,6 +618,9 @@ impl EngineClient {
             RequestBody::Outline { .. } => MAX_OUTLINE_ANSWER,
             RequestBody::PageText { .. } => MAX_TEXT_ANSWER,
             RequestBody::PageLinks { .. } => MAX_LINKS_ANSWER,
+            RequestBody::SaveChunk { len, .. } => {
+                (SAVE_DATA_HEADER_LEN + (*len as usize).min(MAX_SAVE_CHUNK)).max(IDLE_LIMIT)
+            }
             // A search answer holds at most 2 000 matches of 8 bytes: it fits the idle limit.
             _ => IDLE_LIMIT,
         }
@@ -482,7 +642,14 @@ impl EngineClient {
             .limit
             .store(Self::answer_limit(&body), Ordering::SeqCst);
         running.in_flight.store(true, Ordering::SeqCst);
-        let result = self.wait_for_answer(running, id, body);
+        // A request that can take long gets the longer wait, renewed by every sign of life.
+        let patience = match body {
+            RequestBody::DocInfo { .. }
+            | RequestBody::Fingerprint { .. }
+            | RequestBody::SaveBegin { .. } => self.config.save_stall,
+            _ => self.config.timeout,
+        };
+        let result = self.wait_for_answer(running, id, body, patience);
         running.in_flight.store(false, Ordering::SeqCst);
         running.limit.store(IDLE_LIMIT, Ordering::SeqCst);
         result
@@ -493,6 +660,7 @@ impl EngineClient {
         running: &mut Running,
         id: u32,
         body: RequestBody,
+        patience: Duration,
     ) -> Result<ResponseBody, String> {
         write_request(&mut running.stdin, &Request { id, body }).map_err(|e| {
             format!(
@@ -500,19 +668,59 @@ impl EngineClient {
                 exit_text(&running.child)
             )
         })?;
-        // One request is in flight at a time, so the next event is its answer or a failure.
-        match running.events.recv_timeout(self.config.timeout) {
-            Ok(Event::Response(r)) if r.id == id => Ok(r.body),
-            Ok(Event::Response(_)) => Err("it answered a different request".into()),
-            Ok(Event::Failed(why)) => Err(format!("its answer was unreadable ({why})")),
-            Ok(Event::Closed) | Err(RecvTimeoutError::Disconnected) => {
-                Err(exit_text(&running.child))
+        // One request is in flight at a time, so the next event is its answer, a sign of life
+        // (only from a request that can take long, and each one has to show more work done than
+        // the one before) or a failure.
+        let may_report = patience != self.config.timeout;
+        let mut last_done = 0u32;
+        // The signs of life renew the patience, but not the overall time.
+        let started = Instant::now();
+        let overall = if may_report {
+            self.overall_limit(running.document_len)
+        } else {
+            Duration::MAX
+        };
+        loop {
+            let left = overall.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                return Err(too_long(overall));
             }
-            Err(RecvTimeoutError::Timeout) => Err(format!(
-                "it did not answer within {} seconds",
-                self.config.timeout.as_secs_f32().ceil()
-            )),
+            match running.events.recv_timeout(patience.min(left)) {
+                Ok(Event::Response(Response {
+                    id: reported,
+                    body: ResponseBody::Progress { done },
+                })) if reported == id && may_report && done > last_done => {
+                    last_done = done;
+                }
+                Ok(Event::Response(r)) if r.id == id => {
+                    if matches!(r.body, ResponseBody::Progress { .. }) {
+                        return Err("it reported progress that was not progress".into());
+                    }
+                    return Ok(r.body);
+                }
+                Ok(Event::Response(_)) => return Err("it answered a different request".into()),
+                Ok(Event::Failed(why)) => return Err(format!("its answer was unreadable ({why})")),
+                Ok(Event::Closed) | Err(RecvTimeoutError::Disconnected) => {
+                    return Err(exit_text(&running.child))
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    if started.elapsed() >= overall {
+                        return Err(too_long(overall));
+                    }
+                    return Err(format!(
+                        "it did not answer within {} seconds",
+                        patience.as_secs_f32().ceil()
+                    ));
+                }
+            }
         }
+    }
+
+    /// The longest a long request may take altogether, for a document of `len` bytes.
+    fn overall_limit(&self, len: u64) -> Duration {
+        let slowest = self.config.save_slowest.max(1);
+        let reading = Duration::from_secs(len.saturating_mul(SAVE_PASSES) / slowest);
+        self.config.save_floor.saturating_add(reading)
     }
 
     /// Makes sure an engine runs. An engine that ended by itself while idle is replaced quietly;
@@ -592,6 +800,9 @@ impl EngineClient {
             generation: inner.spawns,
             in_flight,
             limit,
+            document_len: document
+                .and_then(|file| file.metadata().ok())
+                .map_or(0, |meta| meta.len()),
         });
 
         match self.exchange(
@@ -714,6 +925,14 @@ pub fn sandbox_in_force(report: &str) -> bool {
 
 /// Says how the engine ended. The pipe closes a moment before the system reports the exit, so this
 /// waits a little for the exit status.
+/// The error of a long request that was still going when its overall limit ended.
+fn too_long(limit: Duration) -> String {
+    format!(
+        "{TOOK_TOO_LONG} ({} minutes)",
+        limit.as_secs().div_ceil(60).max(1)
+    )
+}
+
 fn exit_text(child: &SharedProcess) -> String {
     for _ in 0..40 {
         if let Ok(Some(status)) = lock(child).try_wait() {
