@@ -32,9 +32,10 @@ jobs:
       - name: Build
         run: cargo test -p partridge-engine --locked --no-run
       - name: Imports of the engine
+        continue-on-error: true
         shell: pwsh
         run: |
-          $dumpbin = Get-ChildItem 'C:\Program Files\Microsoft Visual Studio' -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'Hostx64\x64' } | Select-Object -First 1
+          $dumpbin = Get-ChildItem 'C:\Program Files\Microsoft Visual Studio' -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue | Where-Object { $_.FullName -like '*Hostx64*x64*' } | Select-Object -First 1
           & $dumpbin.FullName /dependents target\debug\partridge-engine.exe
           & $dumpbin.FullName /dependents target\debug\examples\engine_selftest.exe
           $pdfium = Get-ChildItem vendor/pdfium -Recurse -Filter pdfium.dll | Select-Object -First 1
