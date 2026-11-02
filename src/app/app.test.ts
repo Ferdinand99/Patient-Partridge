@@ -299,7 +299,7 @@ describe("App: the network block is not proved", () => {
     await flush();
     expect(line().hidden).toBe(false);
     expect(line().textContent).toContain("did not confirm");
-    click(button("Dismiss"));
+    click(document.getElementById("protection-dismiss") as HTMLElement);
     expect(line().hidden).toBe(true);
     // Not again for the next document.
     api.open.mockResolvedValueOnce({ ...opened(3, 3, "c.pdf"), networkNotProved: true });

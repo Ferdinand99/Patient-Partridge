@@ -6,8 +6,10 @@
 # `vcruntime140.dll` and the `api-ms-win-crt-*.dll` family (which are not on the system's list of
 # known libraries, so they have to be opened as files) failed to start about nine times in ten
 # with "library not found". Without the runtime DLLs what is left are libraries on the system's
-# list, which are mapped without opening a file. The programs also no longer need the Visual C++
-# redistributable to be installed.
+# list, which are mapped without opening a file. The engine also no longer needs the Visual C++
+# redistributable to be installed. (The app itself still imports the `api-ms-win-crt-*` libraries,
+# because `tauri build` keeps the C runtime in the system library for it; that does not matter for
+# the app, which does not run in the AppContainer.)
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
 

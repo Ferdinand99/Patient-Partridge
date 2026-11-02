@@ -45,6 +45,10 @@ fn main() {
         }
     }
 
+    // Libraries that the probes use and that a locked-in program could not load are loaded now.
+    #[cfg(windows)]
+    icmp_api::load();
+
     // The control is not locked in: the same attempts, to see that they work without a sandbox.
     if mode[0] == "control" {
         let mut say = |line: String| println!("{line}");
@@ -667,32 +671,83 @@ fn raw_socket() -> std::io::Result<()> {
     Ok(())
 }
 
+/// The ICMP functions of `iphlpapi.dll`. The library is loaded by name before the lock-in: it is
+/// not one of the system's known libraries, and a locked-in program cannot open a library file, so
+/// importing it the usual way would make the program fail to start.
+#[cfg(windows)]
+mod icmp_api {
+    use std::ffi::c_void;
+    use std::sync::OnceLock;
+
+    pub type Create = unsafe extern "system" fn() -> *mut c_void;
+    pub type SendEcho = unsafe extern "system" fn(
+        *mut c_void,
+        u32,
+        *const c_void,
+        u16,
+        *const c_void,
+        *mut c_void,
+        u32,
+        u32,
+    ) -> u32;
+    pub type Close = unsafe extern "system" fn(*mut c_void) -> i32;
+
+    pub struct Api {
+        pub create: Create,
+        pub send_echo: SendEcho,
+        pub close: Close,
+    }
+
+    static API: OnceLock<Option<Api>> = OnceLock::new();
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LoadLibraryA(name: *const std::ffi::c_char) -> *mut c_void;
+        fn GetProcAddress(module: *mut c_void, name: *const std::ffi::c_char) -> *mut c_void;
+    }
+
+    /// Loads the library and finds the three functions. Call it before the lock-in.
+    pub fn load() {
+        API.get_or_init(|| {
+            // SAFETY: documented calls with terminated names; the library stays loaded.
+            unsafe {
+                let module = LoadLibraryA(c"iphlpapi.dll".as_ptr());
+                if module.is_null() {
+                    return None;
+                }
+                let create = GetProcAddress(module, c"IcmpCreateFile".as_ptr());
+                let send = GetProcAddress(module, c"IcmpSendEcho".as_ptr());
+                let close = GetProcAddress(module, c"IcmpCloseHandle".as_ptr());
+                if create.is_null() || send.is_null() || close.is_null() {
+                    return None;
+                }
+                Some(Api {
+                    create: std::mem::transmute::<*mut c_void, Create>(create),
+                    send_echo: std::mem::transmute::<*mut c_void, SendEcho>(send),
+                    close: std::mem::transmute::<*mut c_void, Close>(close),
+                })
+            }
+        });
+    }
+
+    pub fn get() -> Option<&'static Api> {
+        API.get().and_then(Option::as_ref)
+    }
+}
+
 /// One ICMP echo through the ICMP service of the system (`IcmpSendEcho`), which is not a socket of
 /// the program. `Ok` when a reply came.
 #[cfg(windows)]
 fn icmp_echo(target: std::net::IpAddr) -> std::io::Result<()> {
-    use std::ffi::c_void;
-    #[link(name = "iphlpapi")]
-    extern "system" {
-        fn IcmpCreateFile() -> *mut c_void;
-        fn IcmpSendEcho(
-            handle: *mut c_void,
-            destination: u32,
-            data: *const c_void,
-            data_size: u16,
-            options: *const c_void,
-            reply: *mut c_void,
-            reply_size: u32,
-            timeout_ms: u32,
-        ) -> u32;
-        fn IcmpCloseHandle(handle: *mut c_void) -> i32;
-    }
     let std::net::IpAddr::V4(v4) = target else {
         return Err(std::io::Error::other("only IPv4"));
     };
+    let Some(api) = icmp_api::get() else {
+        return Err(std::io::Error::other("the ICMP library did not load"));
+    };
     // SAFETY: documented calls; the reply buffer is larger than one reply and the data.
     unsafe {
-        let handle = IcmpCreateFile();
+        let handle = (api.create)();
         if handle.is_null() || handle as isize == -1 {
             return Err(std::io::Error::other(format!(
                 "IcmpCreateFile: {}",
@@ -701,7 +756,7 @@ fn icmp_echo(target: std::net::IpAddr) -> std::io::Result<()> {
         }
         let mut reply = [0u8; 256];
         let data = [b'x'; 8];
-        let replies = IcmpSendEcho(
+        let replies = (api.send_echo)(
             handle,
             u32::from_ne_bytes(v4.octets()),
             data.as_ptr().cast(),
@@ -712,7 +767,7 @@ fn icmp_echo(target: std::net::IpAddr) -> std::io::Result<()> {
             1500,
         );
         let error = std::io::Error::last_os_error();
-        IcmpCloseHandle(handle);
+        (api.close)(handle);
         if replies == 0 {
             return Err(std::io::Error::other(format!("IcmpSendEcho: {error}")));
         }

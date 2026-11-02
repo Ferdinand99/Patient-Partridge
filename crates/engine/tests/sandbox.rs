@@ -224,6 +224,9 @@ fn v6_listeners() -> Option<(TcpListener, UdpSocket, u16)> {
 /// (port 443). Nothing is sent to it except the connection. `None` without a network, except on the
 /// CI runners, which have one.
 fn remote_target(name: Option<&str>) -> Option<String> {
+    if !cfg!(windows) {
+        return None;
+    }
     let found = name.and_then(|name| {
         (name, 443)
             .to_socket_addrs()

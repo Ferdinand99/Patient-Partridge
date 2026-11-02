@@ -38,7 +38,7 @@ public static class PartridgePackage {
 
 # Tries every way a hosted runner might offer to stop a service.
 function Stop-ServiceEveryWay($name) {
-  try { Stop-Service $name -Force -ErrorAction Stop; Say "Stop-Service $name: stopped" } catch { Say "Stop-Service ${name}: $_" }
+  try { Stop-Service $name -Force -ErrorAction Stop; Say "Stop-Service ${name}: stopped" } catch { Say "Stop-Service ${name}: $_" }
   Say ("sc.exe stop ${name}: " + (sc.exe stop $name | Out-String))
   Say ("net stop ${name}: " + (cmd /c "net stop $name /y 2>&1" | Out-String))
   # As the system account, through a scheduled task.
