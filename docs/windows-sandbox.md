@@ -90,11 +90,11 @@ Not known:
 - What Windows 10 and Windows 11 do.
 - How the name lookup is refused. It fails with `WSANO_RECOVERY` and not with "access denied", so the test shows that a lookup does not work, not which layer stops it.
 
-The previous wording of the README and of this page ("the block rests on the Windows Filtering Platform") was more than is known, and so was the claim that only the server images allow a raw socket.
+The block is therefore not described as resting on the Windows Filtering Platform: that is not what the tests show, and the rule that lets every token make a raw ICMP socket is, from reading the driver, in Windows 10 and 11 as well as in the server images (inferred, not tested there).
 
 ## Packet capture
 
-The question was whether an echo request from a raw socket in the sandbox leaves the computer, which the first review of this change could not answer: `sendto` returned success, which says nothing about the wire. The job "Windows, packet capture" (`scripts/windows-packet-capture.ps1`) runs `pktmon` on the runner, with a filter on 192.0.2.1 (the documentation address; nobody answers it), while a program sends five raw ICMP echo requests to it. It does this three times, on both server images:
+The question was whether an echo request from a raw socket in the sandbox leaves the computer. That `sendto` returns success says nothing about the wire. The job "Windows, packet capture" (`scripts/windows-packet-capture.ps1`) runs `pktmon` on the runner, with a filter on 192.0.2.1 (the documentation address; nobody answers it), while a program sends five raw ICMP echo requests to it. It does this three times, on both server images:
 
 | Run | Echo requests the program sent | Seen passing on to the network card | Seen dropped inside the stack |
 |---|---|---|---|
