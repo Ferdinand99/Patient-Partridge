@@ -185,3 +185,107 @@ fn handles_do_not_survive_an_engine_restart() {
     // None of that started another engine.
     assert_eq!(client.spawn_count(), 2);
 }
+
+#[test]
+fn i3_a_slow_save_is_not_taken_for_a_hung_engine() {
+    // The answer to SaveBegin takes 1.5 s, three times the limit that a render gets here.
+    let mut config = EngineConfig::new(fake_engine());
+    config.args = vec!["save-slow".into()];
+    config.timeout = Duration::from_millis(500);
+    let client = EngineClient::new(config);
+    let doc = client.open(&doc_path(), None).unwrap();
+    let mut size = 0usize;
+    let saved = client.save_to(doc.doc, &mut |piece| {
+        size += piece.len();
+        Ok(())
+    });
+    assert!(saved.is_ok(), "the engine was killed: {saved:?}");
+    assert_eq!(size, 2_500_000);
+    // The engine is still the same one.
+    assert_eq!(client.spawn_count(), 1);
+}
+
+#[test]
+fn i3_progress_keeps_a_save_alive_for_longer_than_the_limit_and_silence_does_not() {
+    // The save takes 1.8 s with a sign of life every 0.3 s; the engine may be silent for 1 s.
+    let mut config = EngineConfig::new(fake_engine());
+    config.args = vec!["save-progress".into()];
+    config.timeout = Duration::from_millis(500);
+    config.save_stall = Duration::from_secs(1);
+    let client = EngineClient::new(config);
+    let doc = client.open(&doc_path(), None).unwrap();
+    assert!(client.save_to(doc.doc, &mut |_| Ok(())).is_ok());
+    assert_eq!(client.spawn_count(), 1);
+
+    // Silence for longer than that is a hung engine.
+    let mut config = EngineConfig::new(fake_engine());
+    config.args = vec!["save-silent".into()];
+    config.timeout = Duration::from_millis(500);
+    config.save_stall = Duration::from_millis(700);
+    let client = EngineClient::new(config);
+    let doc = client.open(&doc_path(), None).unwrap();
+    let started = Instant::now();
+    assert!(client.save_to(doc.doc, &mut |_| Ok(())).is_err());
+    assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+#[test]
+fn i3_a_sign_of_life_that_shows_no_more_work_than_the_last_is_refused() {
+    let mut config = EngineConfig::new(fake_engine());
+    config.args = vec!["save-stuck".into()];
+    config.timeout = Duration::from_millis(500);
+    config.save_stall = Duration::from_secs(1);
+    let client = EngineClient::new(config);
+    let doc = client.open(&doc_path(), None).unwrap();
+    match client.save_to(doc.doc, &mut |_| Ok(())) {
+        Err(partridge_engine_client::SaveStreamError::Client(ClientError::EngineStopped(why))) => {
+            assert!(why.contains("progress"), "{why}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn n5_signs_of_life_do_not_keep_a_save_open_for_ever() {
+    // The engine reports more work every 0.1 s for a minute. Each sign renews the stall limit of
+    // 1 s, so only the overall limit (1 s for this small file) can end it.
+    let mut config = EngineConfig::new(fake_engine());
+    config.args = vec!["save-endless".into()];
+    config.timeout = Duration::from_millis(500);
+    config.save_stall = Duration::from_secs(1);
+    config.save_floor = Duration::from_secs(1);
+    config.save_slowest = u64::MAX;
+    let client = EngineClient::new(config);
+    let doc = client.open(&doc_path(), None).unwrap();
+    let started = Instant::now();
+    match client.save_to(doc.doc, &mut |_| Ok(())) {
+        Err(partridge_engine_client::SaveStreamError::Client(ClientError::EngineStopped(why))) => {
+            assert!(
+                why.starts_with(partridge_engine_client::TOOK_TOO_LONG),
+                "{why}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn n5_the_overall_limit_grows_with_the_size_of_the_file() {
+    // A file of 4 MiB at 1 MiB a second, four passes: 16 s more than the floor. A save that takes
+    // 1.8 s with signs of life every 0.3 s is far inside it, and a floor of 0 does not matter.
+    let mut config = EngineConfig::new(fake_engine());
+    config.args = vec!["save-progress".into()];
+    config.timeout = Duration::from_millis(500);
+    config.save_stall = Duration::from_secs(1);
+    config.save_floor = Duration::ZERO;
+    config.save_slowest = 1024 * 1024;
+    let client = EngineClient::new(config);
+    let big = partridge_testkit::TempFile::new("big.pdf", &vec![b'%'; 4 * 1024 * 1024]);
+    let doc = client.open(&big.path_str(), None).unwrap();
+    assert!(client.save_to(doc.doc, &mut |_| Ok(())).is_ok());
+}

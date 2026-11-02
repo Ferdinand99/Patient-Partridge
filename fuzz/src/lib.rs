@@ -14,9 +14,9 @@ use std::io::{self, Read};
 use arbitrary::{Result, Unstructured};
 use partridge_protocol::{
     ErrorCode, FontScript, LinkTarget, OutlineItem, PageLink, PageSize, Request, RequestBody,
-    Response,
-    ResponseBody, TextMatch, MAX_LINKS_PER_PAGE, MAX_MATCHES_PER_PAGE, MAX_OUTLINE_DEPTH,
-    MAX_OUTLINE_ITEMS, MAX_OUTLINE_TITLE, MAX_QUERY_LEN, MAX_STRING_LEN, MAX_URI_LEN,
+    Response, ResponseBody, TextMatch, MAX_LINKS_PER_PAGE, MAX_MATCHES_PER_PAGE, MAX_OUTLINE_DEPTH,
+    MAX_OUTLINE_ITEMS, MAX_OUTLINE_TITLE, MAX_QUERY_LEN, MAX_SAVE_BYTES, MAX_SAVE_CHUNK,
+    MAX_STRING_LEN, MAX_URI_LEN,
 };
 
 /// True about one time in `n`, and never when the input has run out: `Unstructured` answers
@@ -78,7 +78,7 @@ pub fn sanitized(rect: [f32; 4]) -> [f32; 4] {
 /// A request that the encoder writes without cutting anything.
 pub fn arb_request(u: &mut Unstructured) -> Result<Request> {
     let id: u32 = u.arbitrary()?;
-    let body = match u.int_in_range(0..=8u8)? {
+    let body = match u.int_in_range(0..=13u8)? {
         0 => RequestBody::Hello {
             protocol_version: u.arbitrary()?,
         },
@@ -109,12 +109,34 @@ pub fn arb_request(u: &mut Unstructured) -> Result<Request> {
             doc: u.arbitrary()?,
             page: u.arbitrary()?,
         },
-        7 => RequestBody::FontReport,
-        _ => RequestBody::Search {
+        7 => RequestBody::Search {
             doc: u.arbitrary()?,
             page: u.arbitrary()?,
             query: string_up_to(u, MAX_QUERY_LEN)?,
         },
+        8 => RequestBody::DocInfo {
+            doc: u.arbitrary()?,
+        },
+        9 => RequestBody::SaveBegin {
+            doc: u.arbitrary()?,
+        },
+        10 => RequestBody::SaveChunk {
+            doc: u.arbitrary()?,
+            offset: u.arbitrary()?,
+            // Now and then exactly the biggest piece, which the decoder must accept.
+            len: if chance(u, 8)? {
+                MAX_SAVE_CHUNK as u32
+            } else {
+                u.int_in_range(0..=MAX_SAVE_CHUNK as u32)?
+            },
+        },
+        11 => RequestBody::SaveEnd {
+            doc: u.arbitrary()?,
+        },
+        12 => RequestBody::Fingerprint {
+            doc: u.arbitrary()?,
+        },
+        _ => RequestBody::FontReport,
     };
     Ok(Request { id, body })
 }
@@ -139,7 +161,7 @@ pub struct GeneratedResponse {
 
 pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
     let id: u32 = u.arbitrary()?;
-    let (sent, expected) = match u.int_in_range(0..=9u8)? {
+    let (sent, expected) = match u.int_in_range(0..=15u8)? {
         0 => {
             let b = ResponseBody::Hello {
                 protocol_version: u.arbitrary()?,
@@ -267,6 +289,62 @@ pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
             (b.clone(), b)
         }
         8 => {
+            let code = ErrorCode::from_u8(u.int_in_range(1..=17u8)?).expect("1 to 17 are codes");
+            let b = ResponseBody::Error {
+                code,
+                message: string_up_to(u, MAX_STRING_LEN)?,
+            };
+            (b.clone(), b)
+        }
+        9 => {
+            let b = ResponseBody::DocInfo {
+                pages: u.arbitrary()?,
+                security: u.arbitrary()?,
+                signatures: u.arbitrary()?,
+                maybe_signed: u.arbitrary()?,
+            };
+            (b.clone(), b)
+        }
+        10 => {
+            // Now and then the biggest file there is.
+            let size = if chance(u, 8)? {
+                MAX_SAVE_BYTES as u32
+            } else {
+                u.int_in_range(0..=MAX_SAVE_BYTES as u32)?
+            };
+            let b = ResponseBody::SaveReady { size };
+            (b.clone(), b)
+        }
+        11 => {
+            // A piece of the file: a few bytes mostly, and now and then the biggest piece, at the
+            // offset where the last byte of the biggest file is.
+            let (offset, len) = if chance(u, 12)? {
+                ((MAX_SAVE_BYTES - MAX_SAVE_CHUNK) as u32, MAX_SAVE_CHUNK)
+            } else {
+                let len = u.int_in_range(0..=40usize)?;
+                (u.int_in_range(0..=(MAX_SAVE_BYTES - len) as u32)?, len)
+            };
+            let mut data = vec![0u8; len];
+            u.fill_buffer(&mut data)?;
+            let b = ResponseBody::SaveData { offset, data };
+            (b.clone(), b)
+        }
+        12 => (ResponseBody::SaveEnded, ResponseBody::SaveEnded),
+        13 => {
+            let b = ResponseBody::Progress {
+                done: u.arbitrary()?,
+            };
+            (b.clone(), b)
+        }
+        14 => {
+            let b = ResponseBody::Fingerprint {
+                pages: u.arbitrary()?,
+                failed: u.arbitrary()?,
+                digest: u.arbitrary()?,
+            };
+            (b.clone(), b)
+        }
+        _ => {
             // Any scripts, in the order of the list, as the engine reports them.
             let mut missed = Vec::new();
             for script in FontScript::ALL {
@@ -275,14 +353,6 @@ pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
                 }
             }
             let b = ResponseBody::FontReport { missed };
-            (b.clone(), b)
-        }
-        _ => {
-            let code = ErrorCode::from_u8(u.int_in_range(1..=12u8)?).expect("1 to 12 are codes");
-            let b = ResponseBody::Error {
-                code,
-                message: string_up_to(u, MAX_STRING_LEN)?,
-            };
             (b.clone(), b)
         }
     };

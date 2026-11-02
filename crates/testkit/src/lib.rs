@@ -132,6 +132,18 @@ pub fn simple_pdf(pages: usize) -> Vec<u8> {
     build(&specs, "", "", Vec::new())
 }
 
+/// A valid document of one page that is `bytes` bytes bigger than it needs to be: an object no
+/// page uses holds the padding, so the document is small to read and big to copy.
+pub fn padded_pdf(bytes: usize) -> Vec<u8> {
+    let spec = PageSpec {
+        width: 612,
+        height: 792,
+        content: Some(demo_content(1, 612, 792)),
+        extra: String::new(),
+    };
+    build(&[spec], "", "", vec![stream_object("", &"%".repeat(bytes))])
+}
+
 /// A valid document whose pages differ in size: Letter, A4 landscape, a small square, a tall strip.
 pub fn mixed_size_pdf() -> Vec<u8> {
     let sizes = [(612, 792), (842, 595), (300, 300), (200, 1000)];
@@ -236,6 +248,82 @@ BT /F1 12 Tf 72 400 Td 16 TL (A needle in a haystack.) Tj T* (Another NEEDLE her
         "",
         extras,
     )
+}
+
+/// A one page document with one digital signature field that holds a signature dictionary. The
+/// signature is not a real one (the byte range and the contents are made up), but PDFium counts
+/// it, which is all a test of the save path needs. A save that rewrites the file cannot keep the
+/// bytes a real signature covers.
+pub fn signed_pdf() -> Vec<u8> {
+    let specs = [PageSpec {
+        width: 612,
+        height: 792,
+        content: Some(demo_content(1, 612, 792)),
+        extra: "/Annots [6 0 R]".into(),
+    }];
+    // Object numbers: 1 catalog, 2 tree, 3 font, 4 page, 5 content, then the field and the dictionary.
+    let extras: Vec<Vec<u8>> = vec![
+        b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Signature1) /Rect [50 50 250 100] /F 132 /P 4 0 R /V 7 0 R >>".to_vec(),
+        format!(
+            "<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /ByteRange [0 100 200 100] /Contents <{}> /M (D:20260101000000Z) /Reason (Approved) >>",
+            "30".repeat(64)
+        )
+        .into_bytes(),
+    ];
+    build(
+        &specs,
+        "/AcroForm << /Fields [6 0 R] /SigFlags 3 >>",
+        "",
+        extras,
+    )
+}
+
+/// A one page document whose signature field sits under a grouping field, as some form designers
+/// make them: the entry of `/AcroForm /Fields` has no type of its own, and the widget below it
+/// carries `/FT /Sig` and the signature. PDFium's own count of signatures looks only at the
+/// direct entries of the field list and sees none.
+pub fn signed_nested_pdf() -> Vec<u8> {
+    let specs = [PageSpec {
+        width: 612,
+        height: 792,
+        content: Some(demo_content(1, 612, 792)),
+        extra: "/Annots [7 0 R]".into(),
+    }];
+    // Object numbers: 1 catalog, 2 tree, 3 font, 4 page, 5 content, 6 group, 7 widget, 8 signature.
+    let extras: Vec<Vec<u8>> = vec![
+        b"<< /T (Group) /Kids [7 0 R] >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Widget /Parent 6 0 R /T (Sig) /FT /Sig /Rect [50 50 250 100] /F 132 /P 4 0 R /V 8 0 R >>".to_vec(),
+        format!(
+            "<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /ByteRange [0 100 200 100] /Contents <{}> /M (D:20260101000000Z) >>",
+            "30".repeat(64)
+        )
+        .into_bytes(),
+    ];
+    build(
+        &specs,
+        "/AcroForm << /Fields [6 0 R] /SigFlags 3 >>",
+        "",
+        extras,
+    )
+}
+
+/// A certified document with no signature field at all: the signature dictionary hangs on the
+/// catalog (`/Perms /DocMDP`), where PDFium's count of signatures does not look. Only the words
+/// in the bytes of the file give it away.
+pub fn signed_without_field_pdf() -> Vec<u8> {
+    let specs = [PageSpec {
+        width: 612,
+        height: 792,
+        content: Some(demo_content(1, 612, 792)),
+        extra: String::new(),
+    }];
+    // Object numbers: 1 catalog, 2 tree, 3 font, 4 page, 5 content, 6 signature.
+    let extras: Vec<Vec<u8>> = vec![format!(
+        "<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /ByteRange [0 100 200 100] /Contents <{}> >>",
+        "30".repeat(64)
+    )
+    .into_bytes()];
+    build(&specs, "/Perms << /DocMDP 6 0 R >>", "", extras)
 }
 
 /// Letters of the right-to-left test page, in reading order: the first ten letters of the Hebrew

@@ -62,6 +62,8 @@ new Updater(document, {
   api,
   openPaths: () => app.openDocumentPaths(),
   closeMenu: () => app.closeMenu(),
+  unsavedCount: () => app.unsavedCount,
+  saveAll: () => app.saveAllChanges(),
 }).init();
 
 function openAll(paths: string[]): void {
@@ -88,6 +90,10 @@ void getCurrentWebview().onDragDropEvent((event) => {
     openAll(payload.paths);
   }
 });
+
+// The user closed the window or quit while a document has changes that are not saved: the app
+// holds the request back, and the window asks what to do.
+void listen("quit-requested", () => void app.requestQuit());
 
 // Files named on the command line, or sent by a second copy of the app (also "Open with" from a
 // file manager, once for every file chosen).

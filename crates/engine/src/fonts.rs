@@ -566,8 +566,13 @@ mod tests {
     }
 
     fn temp_file(name: &str, bytes: &[u8]) -> File {
-        let path =
-            std::env::temp_dir().join(format!("partridge-fonts-{}-{name}", std::process::id()));
+        // Tests run side by side and use the same names, so each file gets a number of its own.
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let number = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "partridge-fonts-{}-{number}-{name}",
+            std::process::id()
+        ));
         std::fs::write(&path, bytes).unwrap();
         let file = File::open(&path).unwrap();
         let _ = std::fs::remove_file(&path);

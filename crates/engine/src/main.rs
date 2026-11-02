@@ -9,7 +9,7 @@ use std::io::{self, BufReader, BufWriter};
 use std::process::ExitCode;
 
 use partridge_engine::{parse_args, startup};
-use partridge_protocol::{read_frame, write_response, Request};
+use partridge_protocol::{read_frame, write_response, Request, Response, ResponseBody};
 
 fn main() -> ExitCode {
     let args = match parse_args(std::env::args_os().skip(1)) {
@@ -35,7 +35,18 @@ fn main() -> ExitCode {
         let Ok(request) = Request::decode(&frame) else {
             return ExitCode::from(3);
         };
-        let response = engine.handle(request);
+        let id = request.id;
+        // A request that takes long says now and then that it is working, so that the app does
+        // not take the engine for hung.
+        let response = engine.handle_with_progress(request, &mut |done| {
+            let _ = write_response(
+                &mut output,
+                &Response {
+                    id,
+                    body: ResponseBody::Progress { done },
+                },
+            );
+        });
         if write_response(&mut output, &response).is_err() {
             return ExitCode::from(4);
         }

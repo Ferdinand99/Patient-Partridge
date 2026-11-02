@@ -26,10 +26,15 @@ export interface NoticeOptions {
    * at once. Without it the box can be answered at once.
    */
   armMs?: number;
+  /** Shows a bar that moves, for work of which nothing is known but that it is going on. */
+  busy?: boolean;
+  /** Takes the box away, with the answer "dismissed", when the signal fires (the work is done). */
+  signal?: AbortSignal;
 }
 
 export interface NoticeResult {
-  /** The id of the button pressed, or "cancel" when the box was dismissed with Escape. */
+  /** The id of the button pressed, "cancel" when the box was dismissed with Escape, or
+   * "dismissed" when its `signal` took it away. */
   button: string;
   password?: string;
 }
@@ -75,6 +80,15 @@ export function showNotice(layer: HTMLElement, options: NoticeOptions): Promise<
       box.append(input);
     }
 
+    if (options.busy) {
+      const bar = document.createElement("div");
+      bar.className = "sheet-busy";
+      bar.setAttribute("role", "progressbar");
+      bar.setAttribute("aria-label", options.title);
+      bar.append(document.createElement("span"));
+      box.append(bar);
+    }
+
     const row = document.createElement("div");
     row.className = "sheet-foot";
     const primary = options.buttons.find((b) => b.primary) ?? options.buttons[0];
@@ -115,6 +129,7 @@ export function showNotice(layer: HTMLElement, options: NoticeOptions): Promise<
     }
 
     const finish = (button: string) => {
+      options.signal?.removeEventListener("abort", onAbort);
       clearTimeout(armTimer);
       layer.removeEventListener("keydown", onKey);
       box.remove();
@@ -130,6 +145,12 @@ export function showNotice(layer: HTMLElement, options: NoticeOptions): Promise<
         finish("cancel");
       }
     };
+    const onAbort = () => finish("dismissed");
+    if (options.signal?.aborted) {
+      queueMicrotask(onAbort);
+    } else {
+      options.signal?.addEventListener("abort", onAbort);
+    }
     // Enter in the password field presses the primary button.
     box.addEventListener("submit", (e) => {
       e.preventDefault();
