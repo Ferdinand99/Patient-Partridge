@@ -225,6 +225,7 @@ impl State {
             height: 10,
         });
 
+        self.signatures(doc);
         // The page tools work on the document as it was saved and opened again (see `save`), which
         // is how PDFium wrote it, and then on the document as it was opened, which is how a person
         // meets them: a file that PDFium reads only after repairing it is changed and written out as
@@ -512,6 +513,40 @@ impl State {
         self.pages_now(doc)
     }
 
+    /// The signatures of the file: a report inside the caps, in which nothing is called trusted
+    /// (no trust list ships), every intact signature has the reason "no trust list", and the
+    /// signatures that are described are the first ones of those the library lists.
+    fn signatures(&mut self, doc: u32) {
+        match self.ask(RequestBody::Signatures {
+            doc,
+            now: 1_781_524_800,
+        }) {
+            ResponseBody::Signatures { report } => {
+                assert_eq!(report.trust_anchors, 0, "this version ships no trust list");
+                assert_eq!(
+                    report.items.len(),
+                    (report.total as usize).min(partridge_protocol::MAX_SIGNATURES)
+                );
+                for (place, item) in report.items.iter().enumerate() {
+                    assert_eq!(item.index as usize, place);
+                    assert_ne!(item.state, partridge_protocol::SignatureState::Trusted);
+                    if item.state == partridge_protocol::SignatureState::UnknownSigner {
+                        assert_eq!(
+                            item.reason,
+                            partridge_protocol::SignatureReason::NoTrustList
+                        );
+                    }
+                }
+            }
+            // A file that changes under the engine, or that cannot be read twice.
+            ResponseBody::Error {
+                code: ErrorCode::SourceChanged | ErrorCode::SourceUnreadable,
+                ..
+            } => {}
+            other => panic!("unexpected answer to Signatures: {other:?}"),
+        }
+    }
+
     /// The three requests of a save, and a look at the file that comes out.
     ///
     /// `level` 0 is the document as it was opened; the page tools are then tried on the saved file
@@ -612,12 +647,14 @@ impl State {
         for password in [None, Some(PASSWORD.to_string())] {
             self.engine
                 .set_document(std::fs::File::open(&saved).expect("open the saved file"));
-            if let ResponseBody::Opened { doc: again, pages } = self.ask(RequestBody::Open { password }) {
+            if let ResponseBody::Opened { doc: again, pages } =
+                self.ask(RequestBody::Open { password })
+            {
                 assert_eq!(pages.len() as u32, count, "the saved file has other pages");
                 match self.ask(RequestBody::DocInfo { doc: again }) {
-                    ResponseBody::DocInfo {
-                        security: now, ..
-                    } => assert_eq!(now, security, "the saved file is protected differently"),
+                    ResponseBody::DocInfo { security: now, .. } => {
+                        assert_eq!(now, security, "the saved file is protected differently")
+                    }
                     other => panic!("unexpected answer to DocInfo: {other:?}"),
                 }
                 // What a reader sees of the saved file is what it saw of the document. (A page that

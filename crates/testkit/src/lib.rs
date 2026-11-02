@@ -9,6 +9,7 @@ use md5::{Digest, Md5};
 
 mod pages;
 pub use pages::*;
+pub mod signed;
 
 /// One page of a generated document.
 pub struct PageSpec {

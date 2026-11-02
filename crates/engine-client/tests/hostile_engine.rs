@@ -289,3 +289,52 @@ fn n5_the_overall_limit_grows_with_the_size_of_the_file() {
     let doc = client.open(&big.path_str(), None).unwrap();
     assert!(client.save_to(doc.doc, &mut |_| Ok(())).is_ok());
 }
+
+// ---- signatures --------------------------------------------------------------------------------
+
+#[test]
+fn an_honest_report_of_signatures_comes_through() {
+    let client = client_with("sig-good", &[]);
+    let doc = client.open(&doc_path(), None).unwrap();
+    let report = client.signatures(doc.doc, 1_781_524_800).unwrap();
+    assert_eq!(
+        (report.total, report.items.len(), report.trust_anchors),
+        (2, 2, 0)
+    );
+    // A document with none.
+    let client = client_with("good", &[]);
+    let doc = client.open(&doc_path(), None).unwrap();
+    assert!(client.signatures(doc.doc, 0).unwrap().items.is_empty());
+}
+
+#[test]
+fn a_report_that_cannot_be_true_stops_the_engine() {
+    // A tick without a trust list, a tick without the name of the certificate, "no trust list"
+    // when there is one, signatures out of order, and more signatures than the total.
+    for mode in [
+        "sig-trusted-no-list",
+        "sig-trusted-no-name",
+        "sig-no-list-with-list",
+        "sig-wrong-order",
+        "sig-count",
+    ] {
+        let client = client_with(mode, &[]);
+        let doc = client.open(&doc_path(), None).unwrap();
+        // Stopped by the decoder (a count past the total) or by the check of the client.
+        match client.signatures(doc.doc, 1_781_524_800) {
+            Err(ClientError::EngineStopped(_)) => {}
+            other => panic!("{mode}: {other:?}"),
+        }
+        // The client starts a new engine for the next document.
+        assert!(client.open(&doc_path(), None).is_ok(), "{mode}");
+    }
+}
+
+#[test]
+fn the_time_of_the_check_is_held_to_what_the_protocol_takes() {
+    // A time before 1970 or after the year 9999 is brought into range, never sent as it is.
+    let client = client_with("sig-good", &[]);
+    let doc = client.open(&doc_path(), None).unwrap();
+    assert!(client.signatures(doc.doc, -5).is_ok());
+    assert!(client.signatures(doc.doc, i64::MAX).is_ok());
+}

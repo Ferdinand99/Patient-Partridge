@@ -12,6 +12,16 @@
       "holder": "Mads Marquart <mads@marquart.dk>"
     },
     {
+      "name": "cms",
+      "version": "0.2.3",
+      "license": "MIT",
+      "basis": "authors",
+      "authors": [
+        "RustCrypto Developers"
+      ],
+      "holder": "RustCrypto Developers"
+    },
+    {
       "name": "dispatch2",
       "version": "0.3.1",
       "license": "MIT",

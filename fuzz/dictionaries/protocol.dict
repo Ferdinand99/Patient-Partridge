@@ -1,4 +1,4 @@
-# Patient Partridge protocol. Request tags (1 to 14), answer tags (129 to 143, 255), the
+# Patient Partridge protocol. Request tags (1 to 14, 60), answer tags (129 to 143, 190, 255), the
 # presence byte of an optional string, error codes, link kinds, and the numbers where the
 # decoders have limits (little endian u32).
 
@@ -116,3 +116,6 @@ utf8_4="\xf0\x9f\x93\x95"
 utf8_cut_2="\xc3"
 utf8_cut_4="\xf0\x9f\x93"
 utf8_bad="\xff\xfe"
+
+req_signatures="\x3c"
+res_signatures="\xbe"

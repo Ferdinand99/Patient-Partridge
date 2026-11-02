@@ -3,6 +3,7 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import type { PageSizePt } from "../viewer/layout";
 import type { PageLinkInfo } from "../viewer/overlays";
+import type { SignaturesInfo } from "./signatures";
 
 /** Where the reader was in a file, as remembered on this computer. */
 export interface SavedPosition {
@@ -28,6 +29,8 @@ export interface SavedFile {
   name: string;
   /** The original was touched while it was open, with parts of it unread: this copy holds what was read. */
   touched?: boolean;
+  /** Other open documents (by their handle) that were read from the file this save replaced. */
+  replaced?: number[];
 }
 
 export interface OpenedDocument {
@@ -177,6 +180,14 @@ export const api = {
   /** The links of a page that lead to a web address or to a page of the document. */
   getPageLinks(doc: number, page: number): Promise<PageLinkInfo[]> {
     return invoke<PageLinkInfo[]>("get_page_links", { doc, page });
+  },
+
+  /**
+   * The digital signatures of a document, described and checked by its engine: the state of each
+   * as a code, and the text of the file (names, reasons, places) as plain text fields.
+   */
+  getSignatures(doc: number): Promise<SignaturesInfo> {
+    return invoke<SignaturesInfo>("get_signatures", { doc });
   },
 
   /** Finds a text on one page. Each match is `[start, length]` in characters of the page text. */

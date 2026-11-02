@@ -9,13 +9,14 @@
 
 use arbitrary::{Result, Unstructured};
 use partridge_protocol::{
-    FontScript, LinkTarget, Request, RequestBody, Response, ResponseBody, MAX_LINKS_PER_PAGE,
-    MAX_MATCHES_PER_PAGE, MAX_OUTLINE_DEPTH, MAX_OUTLINE_ITEMS, MAX_OUTLINE_TITLE, MAX_PAGE_CHARS,
-    MAX_PAGES, MAX_PAGE_TEXT_BYTES, MAX_QUERY_LEN, MAX_RENDER_PIXELS, MAX_RENDER_SIDE, MAX_SAVE_BYTES,
-    MAX_SAVE_CHUNK, MAX_STRING_LEN, MAX_URI_LEN,
+    FontScript, LinkTarget, Request, RequestBody, Response, ResponseBody, MAX_BYTE_RANGE,
+    MAX_LINKS_PER_PAGE, MAX_MATCHES_PER_PAGE, MAX_OUTLINE_DEPTH, MAX_OUTLINE_ITEMS,
+    MAX_OUTLINE_TITLE, MAX_PAGES, MAX_PAGE_CHARS, MAX_PAGE_TEXT_BYTES, MAX_QUERY_LEN,
+    MAX_RENDER_PIXELS, MAX_RENDER_SIDE, MAX_SAVE_BYTES, MAX_SAVE_CHUNK, MAX_SIGNATURES,
+    MAX_SIG_NAME, MAX_STRING_LEN, MAX_UNIX_TIME, MAX_URI_LEN,
 };
 
-use crate::chance;
+use crate::{chance, check_signature_report};
 
 // ---- the caps as assertions ----------------------------------------------------------
 
@@ -128,8 +129,13 @@ pub fn check_response_caps(response: &Response) {
                 matches.len()
             );
         }
+        ResponseBody::Signatures { report } => check_signature_report(report),
         ResponseBody::FontReport { missed } => {
-            assert!(missed.len() <= FontScript::ALL.len(), "{} scripts", missed.len());
+            assert!(
+                missed.len() <= FontScript::ALL.len(),
+                "{} scripts",
+                missed.len()
+            );
         }
         ResponseBody::Error { message, .. } => {
             assert!(message.len() <= MAX_STRING_LEN);
@@ -162,13 +168,13 @@ fn header(tag: u8, id: u32) -> Vec<u8> {
 }
 
 /// How many cases `over_cap_request_case` has.
-pub const OVER_CAP_REQUESTS: usize = 3 + crate::pages::PAGES_OVER_REQUESTS;
+pub const OVER_CAP_REQUESTS: usize = 4 + crate::pages::PAGES_OVER_REQUESTS;
 
 /// A request that is valid except that one string is one byte over its cap. Returns a name and
 /// the payload; the decoder must return an error.
 pub fn over_cap_request_case(case: usize, id: u32) -> (&'static str, Vec<u8>) {
     match case % OVER_CAP_REQUESTS {
-        n if n >= 3 => crate::pages::pages_over_cap_request_case(n - 3, id),
+        n if n >= 4 => crate::pages::pages_over_cap_request_case(n - 4, id),
         0 => {
             let mut p = header(2, id);
             p.push(1);
@@ -182,6 +188,15 @@ pub fn over_cap_request_case(case: usize, id: u32) -> (&'static str, Vec<u8>) {
             push_str(&mut p, MAX_QUERY_LEN + 1);
             ("search text over the cap", p)
         }
+        3 => {
+            // The time of the check is later than the end of the year 9999.
+            let mut p = header(60, id);
+            push_u32(&mut p, 1);
+            let now = MAX_UNIX_TIME as u64 + 1;
+            push_u32(&mut p, now as u32);
+            push_u32(&mut p, (now >> 32) as u32);
+            ("signature check time past the year 9999", p)
+        }
         _ => {
             // A request for a piece of the saved file that is one byte longer than a piece may be.
             let mut p = header(12, id);
@@ -194,7 +209,7 @@ pub fn over_cap_request_case(case: usize, id: u32) -> (&'static str, Vec<u8>) {
 }
 
 /// How many cases `over_cap_response_case` has.
-pub const OVER_CAP_RESPONSES: usize = 20 + crate::pages::PAGES_OVER_RESPONSES;
+pub const OVER_CAP_RESPONSES: usize = 26 + crate::pages::PAGES_OVER_RESPONSES;
 
 /// The two cases that are 1.7 MB.
 const PAGE_TEXT_OVER: usize = 6;
@@ -203,14 +218,14 @@ const PAGE_TEXT_AT_CAP: usize = 11;
 const SAVE_PIECE_OVER: usize = 17;
 const SAVE_PIECE_AT_CAP: usize = 18;
 /// The three cases of the page tools that are 800 KB, 320 KB and 800 KB.
-const PAGES_BIG: [usize; 3] = [20, 21, 22];
+const PAGES_BIG: [usize; 3] = [26, 27, 28];
 
 /// A response that is valid except for one thing, which is one over a cap. Two cases sit exactly
 /// at a cap instead (the biggest page text, the widest bitmap) and must be accepted. Returns a
 /// name, the payload, and whether the decoder must accept it.
 pub fn over_cap_response_case(case: usize, id: u32) -> (&'static str, Vec<u8>, bool) {
     match case % OVER_CAP_RESPONSES {
-        n if n >= 20 => crate::pages::pages_over_cap_response_case(n - 20, id),
+        n if n >= 26 => crate::pages::pages_over_cap_response_case(n - 26, id),
         0 => {
             let mut p = header(133, id);
             push_u32(&mut p, MAX_OUTLINE_ITEMS as u32 + 1);
@@ -381,8 +396,83 @@ pub fn over_cap_response_case(case: usize, id: u32) -> (&'static str, Vec<u8>, b
             p.extend_from_slice(b"123456789");
             ("save piece shorter than it says", p, false)
         }
+        20 => {
+            let mut p = header(190, id);
+            for v in [MAX_SIGNATURES as u32 + 1, 0, 0, MAX_SIGNATURES as u32 + 1] {
+                push_u32(&mut p, v);
+            }
+            for index in 0..=MAX_SIGNATURES as u32 {
+                push_signature(&mut p, index, 0, 0);
+            }
+            ("signature report with one signature too many", p, false)
+        }
+        21 => {
+            let mut p = signature_report(id);
+            push_signature(&mut p, 0, MAX_SIG_NAME + 1, 0);
+            ("signer name one byte too long", p, false)
+        }
+        22 => {
+            let mut p = signature_report(id);
+            push_signature(&mut p, 0, MAX_SIG_NAME, 0);
+            ("signer name of the most bytes", p, true)
+        }
+        23 => {
+            let mut p = signature_report(id);
+            push_signature(&mut p, 0, 0, MAX_BYTE_RANGE + 1);
+            ("signature byte range of one number too many", p, false)
+        }
+        24 => {
+            // A tick for a signature whose reason is a broken one.
+            let mut p = signature_report(id);
+            push_signature(&mut p, 0, 0, 0);
+            p[1 + 4 + 12 + 4 + 4] = 1;
+            (
+                "trusted state with the reason of a broken signature",
+                p,
+                false,
+            )
+        }
+        25 => {
+            let mut p = signature_report(id);
+            push_signature(&mut p, 0, 0, 0);
+            // Make the signer a text with a line break in it.
+            let at = p.len() - 13;
+            p[at] = 1;
+            p.splice(at + 1..at + 1, [2, 0, 0, 0, b'a', 10]);
+            ("signer name with a line break", p, false)
+        }
         _ => unreachable!("the case number is taken modulo the number of cases"),
     }
+}
+
+/// The start of a report with one signature in it.
+fn signature_report(id: u32) -> Vec<u8> {
+    let mut p = header(190, id);
+    for v in [1u32, 0, 0, 1] {
+        push_u32(&mut p, v);
+    }
+    p
+}
+
+/// One described signature (unknown signer, no trust list) whose signer name has `name` bytes and
+/// whose byte range has `ranges` numbers; the rest is empty.
+fn push_signature(out: &mut Vec<u8>, index: u32, name: usize, ranges: usize) {
+    push_u32(out, index);
+    out.extend_from_slice(&[2, 50, 1, 0, 1]);
+    push_u32(out, 0);
+    out.push(ranges as u8);
+    for _ in 0..ranges {
+        out.extend_from_slice(&0u64.to_le_bytes());
+    }
+    out.extend_from_slice(&0u64.to_le_bytes());
+    // The signer, then twelve more optional texts, all absent.
+    if name > 0 {
+        out.push(1);
+        push_str(out, name);
+    } else {
+        out.push(0);
+    }
+    out.extend_from_slice(&[0; 12]);
 }
 
 /// A request case picked by the fuzzer's bytes.

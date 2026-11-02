@@ -6,6 +6,7 @@ import "./styles/tokens.css";
 import "./styles/components.css";
 import "./styles/app.css";
 import "./styles/pages.css";
+import "./styles/signatures.css";
 import { App } from "./app/app";
 import { Updater } from "./app/updater";
 import { api } from "./lib/api";

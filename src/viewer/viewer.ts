@@ -635,7 +635,12 @@ export class DocumentView {
     if (m && m.wantKey === job.key) {
       m.failedKey = job.key;
       m.el.classList.add("viewer-page-failed");
-      m.el.dataset.error = "This page could not be drawn.";
+      m.el.dataset.error =
+        appError.code === "source_changed"
+          ? "The file was changed after it was opened, so this page was not drawn. Close the tab and open the file again."
+          : appError.code === "source_unreadable"
+            ? "A part of the file could not be read after it was opened, so this page was not drawn: it could be missing content. Close the tab and open the file again."
+            : "This page could not be drawn.";
     }
   }
 }
