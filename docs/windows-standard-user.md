@@ -1,6 +1,6 @@
 # Windows: running as a standard user
 
-The PDF engine runs in a sandbox that the app builds when it starts the engine: a restricted token, the untrusted integrity level, a job object, process mitigation policies and a desktop of its own (see `crates/engine-client/src/spawn/windows.rs`). A release build requires the sandbox, so if it could not be built, the engine would refuse every document.
+The PDF engine runs in a sandbox that the app builds when it starts the engine: an AppContainer without capabilities (which is what blocks the network) made from a restricted token, the untrusted integrity level, a job object, process mitigation policies and a desktop of its own (see `crates/engine-client/src/spawn/windows.rs` and [windows-sandbox.md](windows-sandbox.md)). A release build requires the sandbox, so if it could not be built, the engine would refuse every document.
 
 The Windows runners of GitHub run every step as an administrator. Most people who use the app are not administrators, and the token of such a user differs from the one the sandbox was tested with (no Administrators group, a medium integrity level that is not elevated, other defaults on the desktop). The CI job **Windows, as a standard user** (`windows-standard-user` in `.github/workflows/ci.yml`) closes that gap.
 
@@ -28,3 +28,10 @@ The log says it. On the runners the step runs in session 2, on `WinSta0\Default`
 - The installer is the per-user NSIS one. The MSI (per machine) is built and not installed here.
 - The release builds are not signed in CI, so SmartScreen is not part of this.
 - The report proves that the first page was drawn, not that the page looks right; the browser tests and the engine tests cover that.
+
+## The AppContainer and the files of the checks
+
+The engine runs in an AppContainer, which can open only what is open to its own package or to "all application packages". Two kinds of files are involved here:
+
+- **The installed app** (step 3 of the job). It is installed for the standard user in `%LOCALAPPDATA%`, where the user owns the files and "all application packages" cannot read. The app adds the entry for the engine's package itself, with the rights of the user. This is the case that matters for a real user, and the job checks that a release build of the app, with the engine required to be in its sandbox, draws a first page.
+- **The test programs**, built by the administrator into `C:\pp\build`. The standard user cannot change who may read files that the administrator owns, so `prepare.ps1` gives "all application packages" read access to `C:\pp` (what `Program Files` has), and the test programs find the engine there.
