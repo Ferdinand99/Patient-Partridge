@@ -1162,7 +1162,9 @@ export class App {
   /** Saves the document that is shown, if it has changes. Resolves with true when nothing is left unsaved. */
   async saveActive(): Promise<boolean> {
     const tab = this.active;
-    if (!tab || !tab.history.dirty) return true;
+    // History turns dirty only when a change ends, so a document that a tool is changing right now
+    // still goes on: the save waits for the change, or says that it is under way.
+    if (!tab || (!tab.history.dirty && !this.pageOps?.busyOn(tab.doc))) return true;
     return this.saveTab(tab, false);
   }
 
@@ -1208,6 +1210,8 @@ export class App {
         return false;
       }
     }
+    // The change that was waited for may have left nothing to save (it failed, or it was undone).
+    if (!asCopy && !tab.history.dirty) return true;
     // A save that is running is waited for, and then the state is looked at again: it may have
     // saved everything, or an edit may have come after it.
     while (tab.saving) {

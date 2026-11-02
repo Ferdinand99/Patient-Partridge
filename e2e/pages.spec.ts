@@ -648,6 +648,36 @@ test.describe("saving", () => {
     expect(writers).toEqual(["save_pdf"]);
   });
 
+  test("Ctrl+S during the first change of a clean document says that the change is under way, and saves nothing", async ({
+    page,
+  }) => {
+    const doc = await openDoc(page, "/docs/ten.pdf");
+    await press(page, 4);
+    await page.evaluate((d) => {
+      const stand = (window as unknown as { __E2E__: Stand }).__E2E__.pages;
+      stand.delayOnly = d;
+      stand.delay = 12000;
+    }, doc);
+    await page.keyboard.press("Delete");
+    await expect(page.locator(".busy-box")).toBeVisible();
+    // Nothing is unsaved yet: the document turns dirty when the change ends.
+    await expect(dirty(page)).toHaveCount(0);
+    await page.keyboard.press("Control+s");
+    await expect(notice(page)).toContainText('"ten.pdf" is being changed', { timeout: 3000 });
+    expect(await saves(page)).toEqual([]);
+    await notice(page).getByRole("button", { name: "OK" }).click();
+    await expect.poll(async () => (await labels(page, doc)).length, { timeout: 15000 }).toBe(9);
+    await answerNote(page, /What a delete leaves/);
+    // When the change has ended, the save writes the document as it is.
+    await page.evaluate(() => ((window as unknown as { __E2E__: Stand }).__E2E__.pages.delay = 0));
+    await press(page, 0);
+    await page.keyboard.press("Control+s");
+    await expect(dirty(page)).toHaveCount(0);
+    const written = await saves(page);
+    expect(written).toHaveLength(1);
+    expect(written[0].labels).toEqual([0, 1, 2, 3, 5, 6, 7, 8, 9]);
+  });
+
   test("taking the changes back makes the document clean again, and saving a signed document asks first", async ({
     page,
   }) => {
