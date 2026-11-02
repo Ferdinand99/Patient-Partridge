@@ -3075,12 +3075,19 @@ mod tags {
         for raw in 0..=255u8 {
             if let Some(code) = ErrorCode::from_u8(raw) {
                 assert_eq!(code as u8, raw);
-                assert!(names.insert(code.name()), "two error codes are called {}", code.name());
+                assert!(
+                    names.insert(code.name()),
+                    "two error codes are called {}",
+                    code.name()
+                );
             }
         }
         // The codes of the annotations and forms, and those of the page tools, are all there.
         for raw in [18u8, 19, 20, 24, 25, 50, 51, 52, 53, 54, 55, 56] {
-            assert!(ErrorCode::from_u8(raw).is_some(), "error code {raw} is missing");
+            assert!(
+                ErrorCode::from_u8(raw).is_some(),
+                "error code {raw} is missing"
+            );
         }
         assert_eq!(PROTOCOL_VERSION, 9);
     }
