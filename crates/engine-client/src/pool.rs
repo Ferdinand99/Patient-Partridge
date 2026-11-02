@@ -30,7 +30,7 @@ struct Entry {
     doc: u64,
     source: Arc<Mutex<Source>>,
     /// The password the document was opened with, to check a saved file against it.
-    password: Option<String>,
+    password: Option<Arc<Secret>>,
     /// Held while the document is being saved: one save at a time.
     saving: Arc<Mutex<()>>,
 }
@@ -49,6 +49,28 @@ pub struct EnginePool {
     config: EngineConfig,
     max_documents: usize,
     state: Mutex<State>,
+}
+
+/// A password held in memory: overwritten when it is let go of, never copied (it is shared), and
+/// not shown by `Debug`.
+struct Secret(String);
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        // SAFETY: the bytes are overwritten with zeros in place; the string is dropped right after,
+        // so no one reads it as text again. The writes are volatile so that they are not removed.
+        unsafe {
+            for byte in self.0.as_bytes_mut() {
+                std::ptr::write_volatile(byte, 0);
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(..)")
+    }
 }
 
 fn state(m: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
@@ -98,7 +120,7 @@ impl EnginePool {
         }
         let epoch = state(&self.state).epoch;
         // How the file looks now, to notice later that someone else changed it.
-        let stamp = FileStamp::read(Path::new(path)).ok();
+        let stamp = Some(FileStamp::read(Path::new(path)).unwrap_or_else(|_| FileStamp::unknown()));
         let client = Arc::new(EngineClient::new(self.config.clone()));
         let opened = match client.open(path, password) {
             Ok(opened) => opened,
@@ -116,7 +138,7 @@ impl EnginePool {
             opened.doc,
             epoch,
             source,
-            password.map(str::to_string),
+            password.map(|p| Arc::new(Secret(p.to_string()))),
         )?;
         Ok((handle, opened.pages))
     }
@@ -129,7 +151,7 @@ impl EnginePool {
         doc: u64,
         epoch: u64,
         source: Source,
-        password: Option<String>,
+        password: Option<Arc<Secret>>,
     ) -> Result<u64, ClientError> {
         let mut st = state(&self.state);
         let refusal = if st.epoch != epoch {
@@ -225,7 +247,16 @@ impl EnginePool {
             &path,
             expected.as_ref(),
             options,
-            &|file, info| verify_written(&self.config, file, password.as_deref(), info),
+            &|file, info, print| {
+                verify_written(
+                    &self.config,
+                    file,
+                    password.as_ref().map(|p| p.0.as_str()),
+                    info,
+                    Some(print),
+                )
+            },
+            &|| state(&self.state).docs.contains_key(&handle),
         )?;
         // The document belongs to the file it was saved to, which now looks different.
         let mut source = source.lock().unwrap_or_else(|e| e.into_inner());

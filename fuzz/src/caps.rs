@@ -59,6 +59,8 @@ pub fn check_response_caps(response: &Response) {
         ResponseBody::Opened { .. }
         | ResponseBody::Closed
         | ResponseBody::DocInfo { .. }
+        | ResponseBody::Progress { .. }
+        | ResponseBody::Fingerprint { .. }
         | ResponseBody::SaveEnded => {}
         ResponseBody::SaveReady { size } => {
             assert!(*size as usize <= MAX_SAVE_BYTES, "a file of {size} bytes");

@@ -88,7 +88,6 @@ describe("EditHistory: undo and redo", () => {
       redo: () => undefined,
     });
     await expect(h.undo()).rejects.toThrow("the engine said no");
-    expect(h.position).toBe(2);
     expect(h.undoLabel).toBe("b");
     // The history is not stuck busy: the other edit can still be reached once this one is fixed.
     expect(h.canUndo).toBe(true);
@@ -109,7 +108,7 @@ describe("EditHistory: undo and redo", () => {
     );
     release();
     expect(await first).toBe(true);
-    expect(h.position).toBe(1);
+    expect(h.undoLabel).toBe("a");
     expect(h.canUndo).toBe(true);
   });
 
@@ -188,7 +187,7 @@ describe("EditHistory: unsaved changes", () => {
     const h = new EditHistory();
     const { apply } = counter();
     apply(h, "one", 1);
-    const began = h.position;
+    const began = h.revision;
     apply(h, "two", 1); // made while the file was being written
     h.markSaved(began);
     expect(h.dirty).toBe(true);

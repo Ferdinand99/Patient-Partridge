@@ -57,15 +57,17 @@ The changes made to an open document live in its engine, so stopping the engines
 - The app refuses on its own side too: `install_update` fails with the kind `unsaved` before it takes the download, closes the gate or stops an engine, so a change made after the question is not lost either. The window then goes back to "downloaded, waiting".
 - Closing the window or quitting is held back the same way while a document is dirty (the window asks Save, Quit without saving or Cancel).
 
-This is tested with the window code (`src/app/updater.test.ts`) and with the app-side check (`an_update_is_not_installed_while_a_document_has_unsaved_changes`). There is no editing feature yet that makes a document dirty, so it has not been tried in the running app.
+A save that is running is waited for, not cut off: it holds a permit of the gate, and the install closes the gate, then waits (up to 10 seconds) for every permit before it stops any engine. If a save or an open is still running after that, nothing is stopped and nothing is installed, and the window says so (the update then has to be downloaded again). The dialog of Save a copy does not hold a permit while it is open.
+
+This is tested with the window code (`src/app/updater.test.ts`), with the app-side checks (`an_update_is_not_installed_while_a_document_has_unsaved_changes`, `a_save_that_is_running_is_waited_for_before_any_engine_is_stopped`) and, for the close request, with the mock runtime of Tauri running the app's guard on a real window event. There is no editing feature yet that makes a document dirty, so it has not been tried in the running app.
 
 ### Stopping the engines, and the open files
 
 Windows cannot replace a program that is running, and each open document has an engine process of its own in the install folder. So before the install:
 
-1. A gate closes: no document can be opened any more, whether by the window, a drop, or a second copy of the app.
-2. Every engine is stopped.
-3. The opens that were already under way are waited for (up to 10 seconds; when one is still running after that, nothing is installed and the app reports it), and every engine is stopped again (one of them could have started an engine after the first stop).
+1. A gate closes: no document can be opened or saved any more, whether by the window, a drop, or a second copy of the app.
+2. The opens and saves that were already under way are waited for (up to 10 seconds; when one is still running after that, nothing was stopped, nothing is installed and the app reports it).
+3. Every engine is stopped (no open or save can start an engine after this).
 4. The open files are written down: the app keeps the list itself, so the list is that of this moment (a file opened while the download ran is in it, one closed is not), with the one in view first (`restore-after-update.json` in the app's data folder, paths only, valid for one hour, read once at the next start and deleted).
 5. The installer runs. While the program is being replaced the window cannot be closed, because a half written file would be left.
 

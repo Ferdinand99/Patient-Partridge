@@ -295,6 +295,25 @@ pub fn signed_nested_pdf() -> Vec<u8> {
     )
 }
 
+/// A certified document with no signature field at all: the signature dictionary hangs on the
+/// catalog (`/Perms /DocMDP`), where PDFium's count of signatures does not look. Only the words
+/// in the bytes of the file give it away.
+pub fn signed_without_field_pdf() -> Vec<u8> {
+    let specs = [PageSpec {
+        width: 612,
+        height: 792,
+        content: Some(demo_content(1, 612, 792)),
+        extra: String::new(),
+    }];
+    // Object numbers: 1 catalog, 2 tree, 3 font, 4 page, 5 content, 6 signature.
+    let extras: Vec<Vec<u8>> = vec![format!(
+        "<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /ByteRange [0 100 200 100] /Contents <{}> >>",
+        "30".repeat(64)
+    )
+    .into_bytes()];
+    build(&specs, "/Perms << /DocMDP 6 0 R >>", "", extras)
+}
+
 /// Letters of the right-to-left test page, in reading order: the first ten letters of the Hebrew
 /// alphabet (U+05D0 to U+05D9).
 pub const RTL_LINE: &str = "\u{5d0}\u{5d1}\u{5d2}\u{5d3}\u{5d4}\u{5d5}\u{5d6}\u{5d7}\u{5d8}\u{5d9}";

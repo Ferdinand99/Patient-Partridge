@@ -93,8 +93,8 @@ interface Tab {
   history: EditHistory;
   /** What the app process was last told about unsaved changes of this document. */
   dirtyTold: boolean;
-  /** True while the document is being saved. */
-  saving: boolean;
+  /** Set while the document is being saved; resolves with the answer of that save. */
+  saving: Promise<boolean> | null;
   view: DocumentView;
   /** What the side panel knows about this document. */
   sidebarDoc: SidebarDocument;
@@ -125,6 +125,19 @@ const UNREACHED_CODES = new Set(["io", "engine_unavailable", "engine_stopped", "
 
 /** How long a tab of the last session may take to open at the start, in milliseconds. */
 export const SESSION_OPEN_LIMIT_MS = 10_000;
+
+/**
+ * Failures of a save that a copy gets round: the file itself cannot be replaced (not writable,
+ * held open, shared under several names, belonging to someone else, with access rights that
+ * cannot be kept), but another file can be written.
+ */
+const COPY_REMEDY = new Set([
+  "save_read_only",
+  "save_locked",
+  "save_hard_link",
+  "save_owner_changes",
+  "save_access_kept",
+]);
 
 const ZOOM_CHOICES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
 const DEFAULT_POSITION_DELAY_MS = 600;
@@ -572,7 +585,7 @@ export class App {
       name: opened.name,
       history: new EditHistory(),
       dirtyTold: false,
-      saving: false,
+      saving: null,
       view: undefined as unknown as DocumentView,
       sidebarDoc: undefined as unknown as SidebarDocument,
       saveTimer: undefined,
@@ -788,23 +801,38 @@ export class App {
    * (a save breaks a signature). A failure is told to the user. Resolves with true when saved.
    */
   private async saveTab(tab: Tab, asCopy: boolean): Promise<boolean> {
-    if (tab.saving) return false;
-    tab.saving = true;
-    // Edits made while the file is written are not in it.
-    const began = tab.history.position;
-    try {
-      const saved = asCopy ? await this.runSaveAs(tab, false) : await this.runSave(tab);
-      if (!saved) return false;
-      tab.history.markSaved(began);
-      if (saved.path !== tab.path || saved.name !== tab.name) {
-        tab.path = saved.path;
-        tab.name = saved.name;
-        this.syncChrome();
-      }
-      return true;
-    } finally {
-      tab.saving = false;
+    // A save that is running is waited for, and then the state is looked at again: it may have
+    // saved everything, or an edit may have come after it.
+    while (tab.saving) {
+      await tab.saving.catch(() => false);
+      if (!asCopy && !tab.history.dirty) return true;
     }
+    const running = this.writeTab(tab, asCopy);
+    tab.saving = running;
+    try {
+      return await running;
+    } finally {
+      tab.saving = null;
+    }
+  }
+
+  /**
+   * Does one save. Resolves with true only when the document has nothing unsaved afterwards: a
+   * save marks as saved the revision it wrote, so an edit made while the file was written (or one
+   * that pushed the oldest edit out of the history) keeps the document dirty and the answer is no.
+   * Only the window clears the dirty state; the app process is told when that happens.
+   */
+  private async writeTab(tab: Tab, asCopy: boolean): Promise<boolean> {
+    const began = tab.history.revision;
+    const saved = asCopy ? await this.runSaveAs(tab, false) : await this.runSave(tab);
+    if (!saved) return false;
+    tab.history.markSaved(began);
+    if (saved.path !== tab.path || saved.name !== tab.name) {
+      tab.path = saved.path;
+      tab.name = saved.name;
+      this.syncChrome();
+    }
+    return !tab.history.dirty;
   }
 
   private async runSave(tab: Tab): Promise<SavedFile | null> {
@@ -825,6 +853,10 @@ export class App {
           if (answer === "copy") return this.runSaveAs(tab, allowSigned);
           if (answer !== "overwrite") return null;
           overwrite = true;
+        } else if (COPY_REMEDY.has(error.code)) {
+          // A copy is the way out: the file stays as it is, the work goes to another file.
+          if ((await this.askCopy(tab, error)) !== "copy") return null;
+          return this.runSaveAs(tab, allowSigned);
         } else {
           await this.saveFailed(tab, error);
           return null;
@@ -866,6 +898,20 @@ export class App {
       ],
     });
     return answer.button === "copy" || answer.button === "anyway" ? answer.button : "cancel";
+  }
+
+  /** The save cannot replace this file, for a reason a copy gets round. */
+  private async askCopy(tab: Tab, error: AppErrorLike): Promise<"copy" | "cancel"> {
+    const text = describeError(error, tab.name);
+    const answer = await showNotice(this.noticeLayer, {
+      title: text.title,
+      detail: text.detail,
+      buttons: [
+        { id: "cancel", label: "Cancel", safe: true },
+        { id: "copy", label: "Save a copy…", primary: true },
+      ],
+    });
+    return answer.button === "copy" ? "copy" : "cancel";
   }
 
   private async askChanged(tab: Tab): Promise<"copy" | "overwrite" | "cancel"> {

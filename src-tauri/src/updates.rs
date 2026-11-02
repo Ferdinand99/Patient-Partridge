@@ -252,18 +252,19 @@ pub enum Stopped<X> {
 
 /// Runs `install` with no engine alive and no way for one to start.
 ///
-/// 1. The gate is closed, so no further document can be opened.
-/// 2. Every engine is stopped.
-/// 3. The opens that were already under way are waited for (at most `drain`). When one of them is
-///    still running after that, nothing is installed: its engine would keep the installer from
-///    replacing the program.
-/// 4. Every engine is stopped again: one of those opens may have started an engine after the first
-///    stop.
-/// 5. `prepare` runs (the app writes down which documents to bring back: the list is taken here,
+/// 1. The gate is closed, so no further document can be opened or saved.
+/// 2. The opens and saves that were already under way are waited for (at most `drain`). They hold
+///    a permit of the gate. Nothing has been stopped yet: a save that is running finishes, and an
+///    open that is running registers its engine. When one of them is still running after that,
+///    nothing is installed and nothing was stopped, so the user loses nothing.
+/// 3. Every engine is stopped. No permit is out and none can be given, so no engine can start
+///    after this.
+/// 4. `prepare` runs (the app writes down which documents to bring back: the list is taken here,
 ///    after nothing can be opened or closed by an open any more, and not before the download).
-/// 6. `install` runs.
+/// 5. `install` runs.
 ///
-/// When the wait or `install` fails the gate is opened again; the documents are gone either way.
+/// When the wait or `install` fails the gate is opened again. After a failed `install` the
+/// documents are gone; after a failed wait they are not.
 pub fn install_with_engines_stopped<E, T, X>(
     gate: &OpenGate,
     engines: &E,
@@ -275,7 +276,6 @@ where
     E: Engines + ?Sized,
 {
     gate.close();
-    engines.stop_all();
     if !gate.wait_idle(drain) {
         gate.reopen();
         return Err(Stopped::OpensStuck);
@@ -867,10 +867,15 @@ pub async fn install(
     let result = match outcome {
         Ok(Ok(())) => return Ok(()),
         Ok(Err(Stopped::Install(e))) => from_updater(e),
-        Ok(Err(Stopped::OpensStuck)) => failure(
-            FailureKind::Other,
-            "a file was still being opened, so nothing was installed",
-        ),
+        Ok(Err(Stopped::OpensStuck)) => {
+            // Nothing was stopped: the documents are as they were, and the app can be used.
+            state.installing.store(false, Ordering::SeqCst);
+            *state.downloaded.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            return Err(failure(
+                FailureKind::Busy,
+                "a file was still being opened or saved, so nothing was installed",
+            ));
+        }
         Err(e) => failure(FailureKind::Other, e.to_string()),
     };
     // The engines were stopped, and the program was not replaced: the app can be used again after
@@ -1301,9 +1306,46 @@ mod tests {
         late.join().unwrap();
         assert!(result.is_ok());
         assert_eq!(*seen.borrow(), vec!["prepare", "install"]);
-        assert_eq!(engines.stops.load(Ordering::SeqCst), 2);
+        assert_eq!(engines.stops.load(Ordering::SeqCst), 1);
         // After a good install the gate stays closed: the app is about to restart.
         assert!(gate.is_closed());
+    }
+
+    #[test]
+    fn a_save_that_is_running_is_waited_for_before_any_engine_is_stopped() {
+        let gate = Arc::new(OpenGate::default());
+        let engines = Arc::new(Counting {
+            live: AtomicUsize::new(1),
+            stops: AtomicUsize::new(0),
+        });
+        // A save holds a permit for a while. The engine of the document must stay alive until it
+        // is done: stopping it would end the save and the changes with it.
+        let permit = gate.enter().unwrap();
+        let alive_until_done = Arc::new(AtomicUsize::new(usize::MAX));
+        let saving = {
+            let engines = engines.clone();
+            let seen = alive_until_done.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                seen.store(engines.stops.load(Ordering::SeqCst), Ordering::SeqCst);
+                drop(permit);
+            })
+        };
+        let result: Result<(), Stopped<()>> = install_with_engines_stopped(
+            &gate,
+            &*engines,
+            Duration::from_secs(5),
+            || {},
+            || Ok(()),
+        );
+        saving.join().unwrap();
+        assert!(result.is_ok());
+        assert_eq!(
+            alive_until_done.load(Ordering::SeqCst),
+            0,
+            "an engine was stopped while a save was running"
+        );
+        assert_eq!(engines.stops.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1347,6 +1389,11 @@ mod tests {
         assert!(
             !*installed.borrow(),
             "nothing may be installed with an open still running"
+        );
+        assert_eq!(
+            engines.stops.load(Ordering::SeqCst),
+            0,
+            "an engine was stopped for an install that did not happen"
         );
         assert!(!gate.is_closed(), "the app is usable again");
         drop(permit);
@@ -1456,7 +1503,7 @@ mod tests {
                 Ok(())
             },
         );
-        assert_eq!(*order.borrow(), vec!["stop", "stop", "prepare", "install"]);
+        assert_eq!(*order.borrow(), vec!["stop", "prepare", "install"]);
     }
 
     fn fake_engine() -> PathBuf {

@@ -29,7 +29,7 @@ use serde::Serialize;
 use session::SessionStore;
 use tauri::webview::PageLoadEvent;
 use tauri::{AppHandle, Emitter, Manager, State};
-use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use updates::UpdateState;
 
 static START: OnceLock<Instant> = OnceLock::new();
@@ -91,6 +91,115 @@ fn exit_action(state: Option<&UpdateState>) -> ExitAction {
         Some(state) if state.unsaved().holds_exit() => ExitAction::Ask,
         _ => ExitAction::Go,
     }
+}
+
+/// Where a save as goes, and whether the user has to be asked before it replaces something.
+#[derive(Debug, PartialEq, Eq)]
+struct SaveTarget {
+    path: PathBuf,
+    ask_to_replace: bool,
+}
+
+/// A name typed without an ending gets `.pdf`. The dialog of the system asks about replacing the
+/// name as it was typed, not the name with the ending (GTK, for one, does not look further), so
+/// when the name with the ending is a file that exists, the app asks.
+fn plan_save_target(chosen: PathBuf, exists: impl Fn(&Path) -> bool) -> SaveTarget {
+    if chosen.extension().is_some() {
+        // The dialog has asked already, if the file exists.
+        return SaveTarget {
+            path: chosen,
+            ask_to_replace: false,
+        };
+    }
+    let mut path = chosen;
+    path.set_extension("pdf");
+    let ask_to_replace = exists(&path);
+    SaveTarget {
+        path,
+        ask_to_replace,
+    }
+}
+
+/// The id of the menu entry that quits the app.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const QUIT_MENU_ID: &str = "partridge-quit";
+
+/// What the entry "Quit" of the menu does: the same as a request to close the window.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn quit_from_menu<R: tauri::Runtime>(app: &AppHandle<R>) {
+    match exit_action(app.try_state::<UpdateState>().as_deref()) {
+        ExitAction::Go => app.exit(0),
+        ExitAction::Refuse => {}
+        ExitAction::Ask => {
+            let _ = app.emit(QUIT_REQUESTED, ());
+        }
+    }
+}
+
+/// The menu of the app. On macOS the standard menu has a Quit entry that ends the program
+/// through the system (`terminate:`) without asking anyone, so that entry (and its Cmd+Q) is
+/// replaced by one of the app's own, which goes through [`quit_from_menu`]. Quitting from the
+/// Dock's menu, and a log out or shut down, also go through the system and cannot be held back
+/// this way.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn app_menu<R: tauri::Runtime>(app: &AppHandle<R>) -> tauri::Result<tauri::menu::Menu<R>> {
+    let menu = tauri::menu::Menu::default(app)?;
+    use_own_quit(app, &menu)?;
+    Ok(menu)
+}
+
+/// Replaces the last entry of the first submenu (the application menu, where macOS puts Quit)
+/// by an entry of the app's own with the same key.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn use_own_quit<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    menu: &tauri::menu::Menu<R>,
+) -> tauri::Result<bool> {
+    use tauri::menu::{MenuItem, MenuItemKind};
+    let Some(MenuItemKind::Submenu(first)) = menu.items()?.into_iter().next() else {
+        return Ok(false);
+    };
+    let Some(last) = first.items()?.into_iter().last() else {
+        return Ok(false);
+    };
+    if !matches!(last, MenuItemKind::Predefined(_)) {
+        return Ok(false);
+    }
+    first.remove(&last)?;
+    let quit = MenuItem::with_id(
+        app,
+        QUIT_MENU_ID,
+        format!("Quit {}", app.package_info().name),
+        true,
+        Some("CmdOrCtrl+Q"),
+    )?;
+    first.append(&quit)?;
+    Ok(true)
+}
+
+/// Holds back a request to close the window while a document has changes that are not saved, and
+/// asks the window to put the question. (An update that is replacing the program holds it back
+/// too.)
+fn exit_guard<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
+    tauri::plugin::Builder::<R>::new("exit-guard")
+        .on_event(|app, event| {
+            if let tauri::RunEvent::WindowEvent {
+                event: tauri::WindowEvent::CloseRequested { api, .. },
+                ..
+            } = event
+            {
+                match exit_action(app.try_state::<UpdateState>().as_deref()) {
+                    ExitAction::Go => {}
+                    ExitAction::Refuse => api.prevent_close(),
+                    ExitAction::Ask => {
+                        // Changes that are not saved: the window asks the user what to do.
+                        api.prevent_close();
+                        let _ = app.emit(QUIT_REQUESTED, ());
+                    }
+                }
+            }
+        })
+        .build()
 }
 
 /// True for the pages of the app itself: the built window (`tauri://localhost` on macOS and Linux,
@@ -375,7 +484,9 @@ async fn save_pdf(
         overwrite_changed,
     };
     let outcome = blocking(move || pool.save(doc, options)).await?;
-    update_state.unsaved().set(doc, false);
+    // The dirty state is not touched here. A save writes the document as it was when the save
+    // began; an edit may have come since, and only the window knows. It tells the app process
+    // through `set_dirty` when the document is clean.
     Ok(outcome.into())
 }
 
@@ -390,10 +501,6 @@ async fn save_pdf_as(
     doc: u64,
     allow_signed: bool,
 ) -> Result<Option<SavedInfo>, CommandError> {
-    let _permit = update_state
-        .gate()
-        .enter()
-        .map_err(|_| updates::updating_error())?;
     let pool = engine.0.clone();
     let Some(current) = pool.source_path(doc) else {
         return Err(CommandError::from(ClientError::Engine {
@@ -402,42 +509,77 @@ async fn save_pdf_as(
         }));
     };
     let dialog_app = app.clone();
+    // The dialog is the user's to answer for as long as they like; the gate (which an update
+    // install closes) is entered only afterwards, so the dialog never holds an update back.
     let chosen = tauri::async_runtime::spawn_blocking(move || {
         let mut dialog = dialog_app
             .dialog()
             .file()
             .add_filter("PDF documents", &["pdf"]);
+        if let Some(window) = dialog_app.get_webview_window("main") {
+            dialog = dialog.set_parent(&window);
+        }
         if let Some(dir) = current.parent() {
             dialog = dialog.set_directory(dir);
         }
         if let Some(name) = current.file_name() {
             dialog = dialog.set_file_name(name.to_string_lossy());
         }
-        dialog.blocking_save_file()
+        let chosen = dialog.blocking_save_file()?;
+        let Ok(chosen) = chosen.into_path() else {
+            return Some(Err(()));
+        };
+        // A name typed without an ending gets `.pdf`. The dialog asked about replacing the name as
+        // it was typed; if the name with the ending is another file that exists, that is asked
+        // here, so nothing is replaced without a question.
+        let plan = plan_save_target(chosen, |p| p.exists());
+        if plan.ask_to_replace {
+            let mut sure = dialog_app
+                .dialog()
+                .message(format!(
+                    "{} already exists. Do you want to replace it?",
+                    plan.path.file_name().unwrap_or_default().to_string_lossy()
+                ))
+                .title("Replace the file?")
+                .kind(MessageDialogKind::Warning)
+                .buttons(MessageDialogButtons::OkCancelCustom(
+                    "Replace".into(),
+                    "Cancel".into(),
+                ));
+            if let Some(window) = dialog_app.get_webview_window("main") {
+                sure = sure.parent(&window);
+            }
+            if !sure.blocking_show() {
+                return None;
+            }
+        }
+        Some(Ok(plan.path))
     })
     .await
     .map_err(|e| CommandError {
         code: "internal".into(),
         message: e.to_string(),
     })?;
-    let Some(chosen) = chosen else {
-        return Ok(None);
+    let target = match chosen {
+        None => return Ok(None),
+        Some(Ok(path)) => path,
+        Some(Err(())) => {
+            return Err(CommandError {
+                code: "save_write_failed".into(),
+                message: "the place that was chosen is not a file on this computer".into(),
+            })
+        }
     };
-    let Ok(mut target) = chosen.into_path() else {
-        return Err(CommandError {
-            code: "save_write_failed".into(),
-            message: "the place that was chosen is not a file on this computer".into(),
-        });
-    };
-    if target.extension().is_none() {
-        target.set_extension("pdf");
-    }
+    // Not while an update is being installed: it would end the engine in the middle of the save.
+    let _permit = update_state
+        .gate()
+        .enter()
+        .map_err(|_| updates::updating_error())?;
     let options = SaveOptions {
         allow_signed,
         overwrite_changed: false,
     };
     let outcome = blocking(move || pool.save_as(doc, &target, options)).await?;
-    update_state.unsaved().set(doc, false);
     let info = SavedInfo::from(outcome);
     update_state.move_doc(doc, &info.path);
     Ok(Some(info))
@@ -657,22 +799,20 @@ fn engine_config(app: &tauri::App) -> EngineConfig {
 pub fn run() {
     let _ = START.set(Instant::now());
 
-    let app = tauri::Builder::default()
-        // While an update replaces the program, closing the window would leave a half file: the
-        // close is refused for those seconds.
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                match exit_action(window.try_state::<UpdateState>().as_deref()) {
-                    ExitAction::Go => {}
-                    ExitAction::Refuse => api.prevent_close(),
-                    ExitAction::Ask => {
-                        // Changes that are not saved: the window asks the user what to do.
-                        api.prevent_close();
-                        let _ = window.emit(QUIT_REQUESTED, ());
-                    }
-                }
-            }
-        })
+    let builder = tauri::Builder::default();
+    // On macOS the application menu has a Quit entry that would end the app without a word: it is
+    // replaced by one that goes through the same check as closing the window. (Windows and Linux
+    // have no menu bar and keep none.)
+    #[cfg(target_os = "macos")]
+    let builder = builder.menu(app_menu).on_menu_event(|app, event| {
+        if event.id().as_ref() == QUIT_MENU_ID {
+            quit_from_menu(app);
+        }
+    });
+    let app = builder
+        // While an update replaces the program, or a document has changes that are not saved,
+        // a request to close the window is held back.
+        .plugin(exit_guard())
         .on_page_load(|webview, payload| {
             if matches!(payload.event(), PageLoadEvent::Started) {
                 page_started(webview.app_handle());
@@ -905,6 +1045,197 @@ mod tests {
         ));
         assert_eq!(signed.code, "save_signed");
         assert!(signed.message.contains("2 digital signatures"));
+    }
+
+    #[test]
+    fn a_name_typed_without_an_ending_gets_pdf_and_asks_before_it_replaces_a_file() {
+        let exists = |names: &'static [&'static str]| {
+            move |p: &Path| names.iter().any(|n| p == Path::new(n))
+        };
+        // "report" and report.pdf exists: the dialog asked about "report" only.
+        assert_eq!(
+            plan_save_target(PathBuf::from("/docs/report"), exists(&["/docs/report.pdf"])),
+            SaveTarget {
+                path: PathBuf::from("/docs/report.pdf"),
+                ask_to_replace: true
+            }
+        );
+        // Nothing there: no question.
+        assert_eq!(
+            plan_save_target(PathBuf::from("/docs/report"), exists(&[])),
+            SaveTarget {
+                path: PathBuf::from("/docs/report.pdf"),
+                ask_to_replace: false
+            }
+        );
+        // A name with an ending is what the dialog asked about: it is not asked again.
+        assert_eq!(
+            plan_save_target(
+                PathBuf::from("/docs/report.pdf"),
+                exists(&["/docs/report.pdf"])
+            ),
+            SaveTarget {
+                path: PathBuf::from("/docs/report.pdf"),
+                ask_to_replace: false
+            }
+        );
+        assert_eq!(
+            plan_save_target(
+                PathBuf::from("/docs/notes.txt"),
+                exists(&["/docs/notes.txt"])
+            )
+            .path,
+            PathBuf::from("/docs/notes.txt")
+        );
+    }
+
+    /// The app of a test: the real guard on a window, with the mock runtime of Tauri.
+    fn mock_app() -> tauri::App<tauri::test::MockRuntime> {
+        let app = tauri::test::mock_builder()
+            .plugin(exit_guard())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(UpdateState::new(None, updates::InstallMethod::Automatic));
+        app
+    }
+
+    /// Runs the mock app through its event loop (one turn a second), with `step` called at the
+    /// start and after every turn, with the number of the turn. The loop ends when the last window
+    /// is closed and nothing holds the exit back.
+    fn run_mock(
+        app: tauri::App<tauri::test::MockRuntime>,
+        mut step: impl FnMut(&tauri::AppHandle<tauri::test::MockRuntime>, usize) + 'static,
+    ) {
+        let mut turn = 0usize;
+        app.run(move |handle, event| match event {
+            tauri::RunEvent::Ready => {
+                step(handle, 0);
+            }
+            tauri::RunEvent::MainEventsCleared => {
+                turn += 1;
+                if turn > 6 {
+                    panic!("the app did not end: a close request was held back for good");
+                }
+                step(handle, turn);
+            }
+            _ => {}
+        });
+    }
+
+    #[test]
+    fn closing_the_window_asks_first_and_keeps_the_window_while_a_document_has_unsaved_changes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tauri::Listener;
+        let app = mock_app();
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counter = asked.clone();
+        app.listen(QUIT_REQUESTED, move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        let seen = asked.clone();
+        run_mock(app, move |handle, turn| match turn {
+            0 => {
+                let window =
+                    tauri::WebviewWindowBuilder::new(handle, "main", tauri::WebviewUrl::default())
+                        .build()
+                        .unwrap();
+                // A document with changes: the close request is held back, and the window code
+                // is asked.
+                handle.state::<UpdateState>().unsaved().set(1, true);
+                window.close().unwrap();
+            }
+            1 => {
+                assert_eq!(seen.load(Ordering::SeqCst), 1, "the window was not asked");
+                assert!(
+                    handle.get_webview_window("main").is_some(),
+                    "the window was closed over unsaved changes"
+                );
+                // The user chose to quit without saving: the next close request goes through.
+                handle.state::<UpdateState>().unsaved().allow_exit();
+                handle.get_webview_window("main").unwrap().close().unwrap();
+            }
+            _ => {
+                assert_eq!(
+                    seen.load(Ordering::SeqCst),
+                    1,
+                    "asked again after the answer"
+                );
+                assert!(handle.get_webview_window("main").is_none());
+            }
+        });
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn closing_a_window_without_unsaved_changes_asks_nothing() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tauri::Listener;
+        let app = mock_app();
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counter = asked.clone();
+        app.listen(QUIT_REQUESTED, move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        run_mock(app, |handle, turn| {
+            if turn == 0 {
+                tauri::WebviewWindowBuilder::new(handle, "main", tauri::WebviewUrl::default())
+                    .build()
+                    .unwrap()
+                    .close()
+                    .unwrap();
+            }
+        });
+        assert_eq!(asked.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn the_quit_entry_of_the_application_menu_is_replaced_by_one_that_goes_through_the_guard() {
+        use tauri::menu::{Menu, MenuItemKind, PredefinedMenuItem, Submenu};
+        let app = mock_app();
+        let handle = app.handle();
+        let quit = PredefinedMenuItem::quit(handle, None).unwrap();
+        let about = PredefinedMenuItem::separator(handle).unwrap();
+        let application = Submenu::with_items(handle, "App", true, &[&about, &quit]).unwrap();
+        let edit = Submenu::with_items(
+            handle,
+            "Edit",
+            true,
+            &[&PredefinedMenuItem::copy(handle, None).unwrap()],
+        )
+        .unwrap();
+        let menu = Menu::with_items(handle, &[&application, &edit]).unwrap();
+
+        assert!(use_own_quit(handle, &menu).unwrap());
+
+        let items = application.items().unwrap();
+        assert_eq!(items.len(), 2);
+        match items.last().unwrap() {
+            MenuItemKind::MenuItem(item) => assert_eq!(item.id().as_ref(), QUIT_MENU_ID),
+            _ => panic!("the last entry is not an entry of the app"),
+        }
+        // Other menus are left alone.
+        assert_eq!(edit.items().unwrap().len(), 1);
+        // A menu without a predefined last entry is not touched.
+        assert!(!use_own_quit(handle, &menu).unwrap());
+    }
+
+    #[test]
+    fn the_quit_entry_asks_while_a_document_has_unsaved_changes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tauri::Listener;
+        let app = mock_app();
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counter = asked.clone();
+        app.listen(QUIT_REQUESTED, move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        app.state::<UpdateState>().unsaved().set(3, true);
+        quit_from_menu(app.handle());
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+        // While the program is being replaced it does nothing at all.
+        let blocked = mock_app();
+        blocked.state::<UpdateState>().unsaved().set(3, true);
+        quit_from_menu(blocked.handle());
     }
 
     #[test]

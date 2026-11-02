@@ -15,14 +15,25 @@ export interface Edit {
 /** The most edits kept. The oldest are forgotten first. */
 export const HISTORY_LIMIT = 200;
 
+interface Entry {
+  edit: Edit;
+  /** Names the state of the document after this edit. Never used for another edit. */
+  id: number;
+}
+
 export class EditHistory {
-  private edits: Edit[] = [];
-  /** How many edits are in effect: `edits[0..position]`. The rest can be redone. */
+  private edits: Entry[] = [];
+  /** How many edits are in effect: `edits[0..pos]`. The rest can be redone. */
   private pos = 0;
+  /** The next number for a state. Counts up for the life of the history. */
+  private nextId = 1;
+  /** The number of the state before the oldest edit that is kept (0 until edits are forgotten). */
+  private baseId = 0;
   /**
-   * The position the saved file corresponds to. Null when no position of the history matches
-   * the saved file any more (the edit that was saved was forgotten, or was undone and then
-   * replaced by a new edit): the document then counts as changed whatever the position.
+   * The state the saved file corresponds to, by its number. A state keeps its number whatever
+   * happens around it: an undo that returns to it gives the number back, and an edit that
+   * replaces it, or one that is forgotten, takes the number away for good, so the document then
+   * counts as changed whatever is done. Null when there is no such state.
    */
   private saved: number | null = 0;
   private busy = false;
@@ -30,9 +41,12 @@ export class EditHistory {
 
   constructor(private readonly limit = HISTORY_LIMIT) {}
 
-  /** Number of edits in effect. Changes with every push, undo and redo. */
-  get position(): number {
-    return this.pos;
+  /**
+   * The number of the state of the document now. A save asks for it before it begins and hands it
+   * back when it is done, and so marks as saved the state it wrote and no other.
+   */
+  get revision(): number {
+    return this.pos === 0 ? this.baseId : this.edits[this.pos - 1].id;
   }
 
   get canUndo(): boolean {
@@ -45,16 +59,16 @@ export class EditHistory {
 
   /** What undo would take back, for a menu: null when there is nothing. */
   get undoLabel(): string | null {
-    return this.pos > 0 ? this.edits[this.pos - 1].label : null;
+    return this.pos > 0 ? this.edits[this.pos - 1].edit.label : null;
   }
 
   get redoLabel(): string | null {
-    return this.pos < this.edits.length ? this.edits[this.pos].label : null;
+    return this.pos < this.edits.length ? this.edits[this.pos].edit.label : null;
   }
 
   /** True when the document differs from the file that was last saved. */
   get dirty(): boolean {
-    return this.saved !== this.pos;
+    return this.saved !== this.revision;
   }
 
   /** Tells `listener` after every change of the history or of the saved position. Returns a stop function. */
@@ -72,18 +86,14 @@ export class EditHistory {
     // the caller, and is reported as one.
     if (this.busy) throw new Error("an undo or redo is still running");
     this.edits.length = this.pos;
-    if (this.saved !== null && this.saved > this.pos) this.saved = null;
-    this.edits.push(edit);
+    this.edits.push({ edit, id: this.nextId++ });
     this.pos = this.edits.length;
     if (this.edits.length > this.limit) {
       const excess = this.edits.length - this.limit;
+      // The state before the oldest edit that is kept is the one the forgotten edits led to.
+      this.baseId = this.edits[excess - 1].id;
       this.edits.splice(0, excess);
       this.pos -= excess;
-      if (this.saved !== null) {
-        this.saved -= excess;
-        // The state before the oldest edit that is kept cannot be reached any more.
-        if (this.saved < 0) this.saved = null;
-      }
     }
     this.changed();
   }
@@ -95,22 +105,22 @@ export class EditHistory {
    */
   async undo(): Promise<boolean> {
     if (!this.canUndo) return false;
-    const edit = this.edits[this.pos - 1];
+    const edit = this.edits[this.pos - 1].edit;
     return this.step(() => edit.undo(), -1);
   }
 
   async redo(): Promise<boolean> {
     if (!this.canRedo) return false;
-    const edit = this.edits[this.pos];
+    const edit = this.edits[this.pos].edit;
     return this.step(() => edit.redo(), 1);
   }
 
   /**
-   * Says that the document was saved as it was at `position` (what `position` returned when the
+   * Says that the document was saved as it was at `revision` (what `revision` returned when the
    * save began). An edit made while the save was running therefore still counts as unsaved.
    */
-  markSaved(position: number = this.pos): void {
-    this.saved = position;
+  markSaved(revision: number = this.revision): void {
+    this.saved = revision;
     this.changed();
   }
 
@@ -118,7 +128,8 @@ export class EditHistory {
   reset(): void {
     this.edits = [];
     this.pos = 0;
-    this.saved = 0;
+    this.baseId = this.nextId++;
+    this.saved = this.baseId;
     this.changed();
   }
 

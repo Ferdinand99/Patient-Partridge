@@ -39,7 +39,27 @@ pub struct DocInfo {
     pub pages: u32,
     /// The revision of the security handler (2 to 4), 255 for a newer one, 0 for none.
     pub security: u8,
+    /// How many signatures the engine found, in the field list and in the widgets of the pages.
     pub signatures: u32,
+    /// The bytes of the file mention something that belongs to a signature.
+    pub maybe_signed: bool,
+}
+
+impl DocInfo {
+    /// A document is treated as signed when either way of looking says so. A warning that was not
+    /// needed is cheap; a signature broken without a word is not.
+    pub fn is_signed(&self) -> bool {
+        self.signatures > 0 || self.maybe_signed
+    }
+}
+
+/// A digest of what a reader sees of the document (see the engine's `Fingerprint`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fingerprint {
+    pub pages: u32,
+    /// Pages whose size, text or objects could not be read.
+    pub failed: u32,
+    pub digest: u64,
 }
 
 /// What the caller has agreed to.
@@ -79,6 +99,20 @@ pub enum SaveError {
     ProtectionLost,
     /// Another save of the same document is under way.
     Busy,
+    /// The file the document is read from was changed in place after the document was opened, so
+    /// what the engine has of it may be a mix of two versions. Nothing can be saved from it.
+    SourceChanged,
+    /// A read of the file the document comes from failed, so the document may be missing parts.
+    SourceUnreadable,
+    /// The file is open in a way that does not let it be replaced here.
+    Locked,
+    /// The file has more than one name (a hard link); a save would leave the other names with the
+    /// old file.
+    HardLink,
+    /// The file belongs to another user or group, and the new file would not.
+    OwnerWouldChange,
+    /// The access rights of the file could not be given to the new file.
+    AccessNotKept,
 }
 
 impl SaveError {
@@ -94,6 +128,12 @@ impl SaveError {
             SaveError::Verify(_) => "save_verify_failed",
             SaveError::ProtectionLost => "save_protection_lost",
             SaveError::Busy => "save_busy",
+            SaveError::SourceChanged => "save_source_changed",
+            SaveError::SourceUnreadable => "save_source_unreadable",
+            SaveError::Locked => "save_locked",
+            SaveError::HardLink => "save_hard_link",
+            SaveError::OwnerWouldChange => "save_owner_changes",
+            SaveError::AccessNotKept => "save_access_kept",
         }
     }
 }
@@ -121,6 +161,30 @@ impl fmt::Display for SaveError {
                 "the new file would not be protected by the password like the document is"
             ),
             SaveError::Busy => write!(f, "another save of this document is under way"),
+            SaveError::SourceChanged => write!(
+                f,
+                "the file was changed while it was open, so what is open is no longer safe to save"
+            ),
+            SaveError::SourceUnreadable => write!(
+                f,
+                "a part of the file could not be read, so the document may be missing parts"
+            ),
+            SaveError::Locked => write!(
+                f,
+                "the file is open in a way that does not let it be replaced here"
+            ),
+            SaveError::HardLink => write!(
+                f,
+                "the file has more than one name, and a save would split them"
+            ),
+            SaveError::OwnerWouldChange => write!(
+                f,
+                "the file belongs to someone else, and the new file would not"
+            ),
+            SaveError::AccessNotKept => write!(
+                f,
+                "the access rights of the file could not be given to the new file"
+            ),
         }
     }
 }
@@ -163,6 +227,16 @@ impl FileStamp {
     pub fn read(path: &Path) -> io::Result<FileStamp> {
         fs::metadata(path).map(|m| FileStamp::of(&m))
     }
+
+    /// For a file that could not be looked at when the document was opened: it equals no real
+    /// state of a file, so the first save asks, and the answer makes it known.
+    pub fn unknown() -> FileStamp {
+        FileStamp {
+            len: u64::MAX,
+            modified: None,
+            id: Some((u64::MAX, u64::MAX)),
+        }
+    }
 }
 
 // ---- errors of the disk ---------------------------------------------------------------------------
@@ -184,10 +258,40 @@ fn is_disk_full(e: &io::Error) -> bool {
     }
 }
 
+/// True for an error that says the file is in use in a way that blocks the step: a sharing or
+/// lock violation, or one of the errors that the replacing of a file gives on Windows.
+fn is_locked(e: &io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        // ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION, ERROR_UNABLE_TO_REMOVE_REPLACED,
+        // ERROR_UNABLE_TO_MOVE_REPLACEMENT, ERROR_UNABLE_TO_MOVE_REPLACEMENT_2
+        matches!(e.raw_os_error(), Some(32 | 33 | 1175 | 1176 | 1177))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = e;
+        false
+    }
+}
+
+/// An error of the last step, the replacing of the file. The folder and the file have been tried
+/// for write access before this, so on Windows a refusal here means the file is held open in a way
+/// that blocks the swap (FAT, exFAT and network drives cannot replace a file that is open), not
+/// that it is read-only.
+fn replace_error(e: &io::Error) -> SaveError {
+    if cfg!(windows) && e.kind() == io::ErrorKind::PermissionDenied {
+        return SaveError::Locked;
+    }
+    from_io(e, "the file")
+}
+
 /// Sorts an error of the file system into what the user can act on.
 fn from_io(e: &io::Error, what: &str) -> SaveError {
     if is_disk_full(e) {
         return SaveError::DiskFull;
+    }
+    if is_locked(e) {
+        return SaveError::Locked;
     }
     match e.kind() {
         io::ErrorKind::PermissionDenied => {
@@ -317,7 +421,28 @@ fn check_target(target: &Path) -> Result<Option<fs::Metadata>, SaveError> {
         Ok(meta) if meta.permissions().readonly() => Err(SaveError::ReadOnly(
             "the file is read-only; save a copy under another name instead".into(),
         )),
-        Ok(meta) => Ok(Some(meta)),
+        Ok(meta) => {
+            // The rename needs rights on the folder, not on the file, so a file the user may not
+            // write would be replaced all the same. Whether they may is found out by trying to
+            // open it for writing (nothing is written or cut off).
+            if let Err(e) = OpenOptions::new().write(true).open(target) {
+                return Err(match e.kind() {
+                    io::ErrorKind::PermissionDenied if !is_locked(&e) => SaveError::ReadOnly(
+                        "you may not change this file; save a copy under another name instead"
+                            .into(),
+                    ),
+                    _ => from_io(&e, "the file"),
+                });
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if meta.nlink() > 1 {
+                    return Err(SaveError::HardLink);
+                }
+            }
+            Ok(Some(meta))
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(from_io(&e, "the file")),
     }
@@ -325,12 +450,27 @@ fn check_target(target: &Path) -> Result<Option<fs::Metadata>, SaveError> {
 
 /// A link is followed, so that the file it points to is replaced and the link stays a link.
 fn resolve(target: &Path) -> PathBuf {
-    match fs::symlink_metadata(target) {
-        Ok(m) if m.file_type().is_symlink() => {
-            fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf())
+    let mut path = target.to_path_buf();
+    // A link that points at nothing is followed by hand, so that the file it names is made and the
+    // link stays a link. A loop of links stops after a few steps.
+    for _ in 0..16 {
+        match fs::symlink_metadata(&path) {
+            Ok(m) if m.file_type().is_symlink() => {
+                if let Ok(real) = fs::canonicalize(&path) {
+                    return real;
+                }
+                let Ok(next) = fs::read_link(&path) else {
+                    return path;
+                };
+                path = match path.parent() {
+                    Some(dir) => dir.join(next),
+                    None => next,
+                };
+            }
+            _ => return path,
         }
-        _ => target.to_path_buf(),
     }
+    path
 }
 
 // ---- checking what was written ---------------------------------------------------------------------------
@@ -343,6 +483,7 @@ pub fn verify_written(
     path: &Path,
     password: Option<&str>,
     expected: DocInfo,
+    print: Option<&Fingerprint>,
 ) -> Result<(), SaveError> {
     let verify = |why: String| SaveError::Verify(why);
     let text = path.to_string_lossy();
@@ -375,6 +516,22 @@ pub fn verify_written(
                 "it holds {} signatures, the document holds {}",
                 got.signatures, expected.signatures
             )));
+        }
+        if let Some(print) = print {
+            let seen = client
+                .fingerprint(opened.doc)
+                .map_err(|e| verify(format!("its pages could not be looked at ({e})")))?;
+            if seen.failed > 0 {
+                return Err(verify(format!(
+                    "{} of its pages could not be read",
+                    seen.failed
+                )));
+            }
+            if seen.pages != print.pages || seen.digest != print.digest {
+                return Err(verify(
+                    "its pages (their size, text or contents) are not those of the document".into(),
+                ));
+            }
         }
         Ok(())
     })();
@@ -409,15 +566,23 @@ pub(crate) fn save_document(
     target: &Path,
     expected: Option<&FileStamp>,
     options: SaveOptions,
-    verify: &dyn Fn(&Path, DocInfo) -> Result<(), SaveError>,
+    verify: &dyn Fn(&Path, DocInfo, &Fingerprint) -> Result<(), SaveError>,
+    still_open: &dyn Fn() -> bool,
 ) -> Result<SaveOutcome, ClientError> {
-    let info = client.doc_info(doc)?;
-    if info.signatures > 0 && !options.allow_signed {
+    let info = client.doc_info(doc).map_err(from_engine)?;
+    if info.is_signed() && !options.allow_signed {
         return Err(SaveError::Signed {
-            signatures: info.signatures,
+            signatures: info.signatures.max(1),
         }
         .into());
     }
+    // What the pages are like now, as the engine that holds the document sees them. The file
+    // that is written must give the same.
+    let print = client.fingerprint(doc).map_err(from_engine)?;
+    if print.failed > 0 {
+        return Err(SaveError::SourceUnreadable.into());
+    }
+    let requested = target;
     let target = resolve(target);
     let existing = check_target(&target)?;
     // Ask early: there is no point in writing a file that will not be used.
@@ -425,23 +590,31 @@ pub(crate) fn save_document(
     remove_stale_temps(&target);
 
     let (mut temp, mut file) = create_temp(&target, existing.is_some())?;
+    if let Some(meta) = &existing {
+        // The new file belongs to the same user and group as the old one, and can be reached by
+        // the same people. Where that cannot be done the save stops: a file that quietly changes
+        // hands, or opens to others, is worse than a save that asks for a copy.
+        keep_owner(&file, meta)?;
+        keep_access(&target, &temp.path)?;
+    }
     let mut written: u64 = 0;
+    let mut sum = Fnv::new();
     let total = client.save_to(doc, &mut |piece| {
         file.write_all(piece)?;
+        sum.update(piece);
         written += piece.len() as u64;
         Ok(())
     });
     let total = match total {
         Ok(total) => total,
         Err(SaveStreamError::Sink(e)) => return Err(from_io(&e, "the new file").into()),
-        Err(SaveStreamError::Client(e)) => return Err(e),
+        Err(SaveStreamError::Client(e)) => return Err(from_engine(e)),
     };
     if written != total {
         return Err(SaveError::Write("fewer bytes were written than were sent".into()).into());
     }
     if let Some(meta) = &existing {
-        // The file keeps the permissions it had. (Where the owner is another user, the system
-        // decides who owns the new file.)
+        // The file keeps the permissions it had.
         file.set_permissions(meta.permissions())
             .map_err(|e| from_io(&e, "the new file"))?;
     }
@@ -458,15 +631,32 @@ pub(crate) fn save_document(
         .into());
     }
 
-    verify(&temp.path, info)?;
+    // What is on the disk is what was received: read it back and compare.
+    let back = digest_of_file(&temp.path).map_err(|e| from_io(&e, "the new file"))?;
+    if back != sum.finish() {
+        return Err(SaveError::Write(
+            "what is on the disk is not what was written; the disk may be failing".into(),
+        )
+        .into());
+    }
 
+    verify(&temp.path, info, &print)?;
+
+    // The document may have been closed while the file was checked (the user gave the changes up):
+    // then nothing is replaced.
+    if !still_open() {
+        return Err(ClientError::Engine {
+            code: ErrorCode::UnknownDocument,
+            message: "the document was closed before the file was replaced".into(),
+        });
+    }
     // The last look at the target, as close to the replacement as it gets.
     check_unchanged(&target, expected, options)?;
-    fs::rename(&temp.path, &target).map_err(|e| from_io(&e, "the file"))?;
+    fs::rename(&temp.path, &target).map_err(|e| replace_error(&e))?;
     temp.keep = true;
     sync_folder(&target);
     Ok(SaveOutcome {
-        path: target,
+        path: requested.to_path_buf(),
         bytes: total,
     })
 }
@@ -505,6 +695,179 @@ fn sync_folder(target: &Path) {
     }
     #[cfg(not(unix))]
     let _ = target;
+}
+
+// ---- small helpers of the save ------------------------------------------------------------------------------------
+
+/// FNV-1a over 64 bits, to see that the bytes on the disk are the bytes that were received. It is
+/// a check against a failing disk, not against an adversary.
+struct Fnv(u64);
+
+impl Fnv {
+    fn new() -> Fnv {
+        Fnv(0xcbf2_9ce4_8422_2325)
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+fn digest_of_file(path: &Path) -> io::Result<u64> {
+    use std::io::Read;
+    let mut file = File::open(path)?;
+    let mut sum = Fnv::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            return Ok(sum.finish());
+        }
+        sum.update(&buffer[..n]);
+    }
+}
+
+/// An error of the engine while saving, as the save error it stands for.
+fn from_engine(e: ClientError) -> ClientError {
+    match e {
+        ClientError::Engine {
+            code: ErrorCode::SourceChanged,
+            ..
+        } => SaveError::SourceChanged.into(),
+        ClientError::Engine {
+            code: ErrorCode::SourceUnreadable,
+            ..
+        } => SaveError::SourceUnreadable.into(),
+        other => other,
+    }
+}
+
+/// What to do about the owner and the group of the file that is replaced, given the owner and the
+/// group of the new file and the ones we may give it.
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OwnerPlan {
+    /// The new file is the old file's already.
+    Same,
+    /// Give the new file this owner (when different) and group (when different).
+    Chown { uid: Option<u32>, gid: Option<u32> },
+}
+
+#[cfg(unix)]
+pub(crate) fn plan_owner(old: (u32, u32), new: (u32, u32)) -> OwnerPlan {
+    if old == new {
+        return OwnerPlan::Same;
+    }
+    OwnerPlan::Chown {
+        uid: (old.0 != new.0).then_some(old.0),
+        gid: (old.1 != new.1).then_some(old.1),
+    }
+}
+
+/// Gives the new file the owner and group of the old one, or says it cannot.
+#[cfg(unix)]
+fn keep_owner(file: &File, old: &fs::Metadata) -> Result<(), SaveError> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+    let new = file.metadata().map_err(|e| from_io(&e, "the new file"))?;
+    let OwnerPlan::Chown { uid, gid } = plan_owner((old.uid(), old.gid()), (new.uid(), new.gid()))
+    else {
+        return Ok(());
+    };
+    // SAFETY: a plain system call on a descriptor this function borrows; (uid_t)-1 means "leave
+    // as it is".
+    let done = unsafe {
+        libc::fchown(
+            file.as_raw_fd(),
+            uid.unwrap_or(u32::MAX),
+            gid.unwrap_or(u32::MAX),
+        )
+    };
+    if done == 0 {
+        Ok(())
+    } else {
+        Err(SaveError::OwnerWouldChange)
+    }
+}
+
+#[cfg(not(unix))]
+fn keep_owner(_file: &File, _old: &fs::Metadata) -> Result<(), SaveError> {
+    Ok(())
+}
+
+/// Gives the new file the access rights (the DACL) of the old one, on Windows. A new file in a
+/// folder gets the folder's rights, which for a file that was shared with fewer people (or more)
+/// is not the same.
+#[cfg(windows)]
+fn keep_access(old: &Path, new: &Path) -> Result<(), SaveError> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
+    use windows_sys::Win32::Security::Authorization::{
+        GetNamedSecurityInfoW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        GetSecurityDescriptorControl, ACL, DACL_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
+        UNPROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain(Some(0)).collect() };
+    let (from, to) = (wide(old), wide(new));
+    let mut dacl: *mut ACL = null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+    // SAFETY: documented Win32 calls on paths that are valid, zero ended and live for the call;
+    // the descriptor that the first call allocates is freed with LocalFree after the second.
+    unsafe {
+        let status = GetNamedSecurityInfoW(
+            from.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            &mut dacl,
+            null_mut(),
+            &mut descriptor,
+        );
+        if status != ERROR_SUCCESS {
+            return Err(SaveError::AccessNotKept);
+        }
+        let mut control: u16 = 0;
+        let mut revision: u32 = 0;
+        let protected = GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) != 0
+            && control & SE_DACL_PROTECTED != 0;
+        let flags = DACL_SECURITY_INFORMATION
+            | if protected {
+                PROTECTED_DACL_SECURITY_INFORMATION
+            } else {
+                UNPROTECTED_DACL_SECURITY_INFORMATION
+            };
+        let status = SetNamedSecurityInfoW(
+            to.as_ptr(),
+            SE_FILE_OBJECT,
+            flags,
+            null_mut(),
+            null_mut(),
+            dacl,
+            null_mut(),
+        );
+        LocalFree(descriptor);
+        if status != ERROR_SUCCESS {
+            return Err(SaveError::AccessNotKept);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn keep_access(_old: &Path, _new: &Path) -> Result<(), SaveError> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -555,6 +918,12 @@ mod tests {
             SaveError::Verify("v".into()),
             SaveError::ProtectionLost,
             SaveError::Busy,
+            SaveError::SourceChanged,
+            SaveError::SourceUnreadable,
+            SaveError::Locked,
+            SaveError::HardLink,
+            SaveError::OwnerWouldChange,
+            SaveError::AccessNotKept,
         ];
         let mut codes: Vec<&str> = all.iter().map(SaveError::code).collect();
         codes.sort_unstable();
@@ -638,7 +1007,7 @@ mod tests {
         (client, doc)
     }
 
-    fn accept(_: &Path, _: DocInfo) -> Result<(), SaveError> {
+    fn accept(_: &Path, _: DocInfo, _: &Fingerprint) -> Result<(), SaveError> {
         Ok(())
     }
 
@@ -649,7 +1018,7 @@ mod tests {
         expected: Option<&FileStamp>,
         options: SaveOptions,
     ) -> Result<SaveOutcome, ClientError> {
-        save_document(client, doc, target, expected, options, &accept)
+        save_document(client, doc, target, expected, options, &accept, &|| true)
     }
 
     fn save_error(result: Result<SaveOutcome, ClientError>) -> SaveError {
@@ -740,11 +1109,12 @@ mod tests {
                 &path,
                 None,
                 SaveOptions::default(),
-                &|file, _| {
+                &|file, _, _| {
                     // The new file exists and holds all the bytes when it is checked.
                     assert_eq!(fs::metadata(file).unwrap().len() as usize, FAKE_SIZE);
                     Err(refusal.clone())
                 },
+                &|| true,
             );
             assert_eq!(save_error(result), refusal);
             assert_untouched(&dir, &path);
@@ -762,17 +1132,20 @@ mod tests {
             &path,
             None,
             SaveOptions::default(),
-            &|_, info| {
+            &|_, info, print| {
                 assert_eq!(
                     info,
                     DocInfo {
                         pages: 1,
                         security: 0,
-                        signatures: 0
+                        signatures: 0,
+                        maybe_signed: false
                     }
                 );
+                assert_eq!(print.pages, 1);
                 Ok(())
             },
+            &|| true,
         )
         .unwrap();
     }
@@ -881,10 +1254,11 @@ mod tests {
             &path,
             Some(&stamp),
             SaveOptions::default(),
-            &move |_, _| {
+            &move |_, _, _| {
                 fs::write(&during, b"changed during the check, and longer").unwrap();
                 Ok(())
             },
+            &|| true,
         );
         assert_eq!(save_error(result), SaveError::Changed);
         assert_eq!(
@@ -943,6 +1317,33 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn the_owner_and_group_of_the_old_file_are_asked_for_only_where_they_differ() {
+        assert_eq!(plan_owner((10, 20), (10, 20)), OwnerPlan::Same);
+        assert_eq!(
+            plan_owner((10, 20), (10, 99)),
+            OwnerPlan::Chown {
+                uid: None,
+                gid: Some(20)
+            }
+        );
+        assert_eq!(
+            plan_owner((10, 20), (11, 20)),
+            OwnerPlan::Chown {
+                uid: Some(10),
+                gid: None
+            }
+        );
+        assert_eq!(
+            plan_owner((10, 20), (11, 21)),
+            OwnerPlan::Chown {
+                uid: Some(10),
+                gid: Some(20)
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn the_new_file_can_be_read_by_nobody_else_while_it_is_written() {
         use std::os::unix::fs::PermissionsExt;
         let dir = Dir::new("private");
@@ -982,7 +1383,8 @@ mod tests {
                 &path,
                 None,
                 SaveOptions::default(),
-                &|_, _| std::process::abort(),
+                &|_, _, _| std::process::abort(),
+                &|| true,
             );
             return;
         }
@@ -1025,14 +1427,14 @@ mod tests {
     }
 
     /// Needs a small file system: `PARTRIDGE_TEST_SMALL_DISK` names a folder on one that has
-    /// room for less than the 2.5 MB the stand-in saves. The CI runners have none, so this runs
-    /// where somebody mounts one (a small tmpfs).
+    /// room for less than the 2.5 MB the stand-in saves. It is ignored by default (the default run
+    /// has no such disk) and run on purpose with `--ignored`: CI mounts a small tmpfs for it on
+    /// Linux, and fails if the variable is missing.
     #[test]
+    #[ignore = "needs a small file system: PARTRIDGE_TEST_SMALL_DISK (run in CI with --ignored)"]
     fn a_full_disk_stops_the_save_and_leaves_the_file_as_it_was() {
-        let Some(small) = std::env::var_os("PARTRIDGE_TEST_SMALL_DISK") else {
-            eprintln!("skipped: PARTRIDGE_TEST_SMALL_DISK is not set");
-            return;
-        };
+        let small = std::env::var_os("PARTRIDGE_TEST_SMALL_DISK")
+            .expect("PARTRIDGE_TEST_SMALL_DISK names a folder on a small file system");
         let dir = PathBuf::from(small).join(format!("full-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("report.pdf");

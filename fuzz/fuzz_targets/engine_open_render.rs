@@ -238,6 +238,17 @@ impl State {
             } => (pages, security),
             other => panic!("unexpected answer to DocInfo: {other:?}"),
         };
+        let print = match self.ask(RequestBody::Fingerprint { doc }) {
+            ResponseBody::Fingerprint {
+                pages: seen,
+                failed,
+                digest,
+            } => {
+                assert_eq!(seen, count, "the fingerprint names another number of pages");
+                (failed, digest)
+            }
+            other => panic!("unexpected answer to Fingerprint: {other:?}"),
+        };
         assert_eq!(pages, count, "DocInfo names another number of pages");
         let size = match self.ask(RequestBody::SaveBegin { doc }) {
             ResponseBody::SaveReady { size } => size as usize,
@@ -322,6 +333,17 @@ impl State {
                         security: now, ..
                     } => assert_eq!(now, security, "the saved file is protected differently"),
                     other => panic!("unexpected answer to DocInfo: {other:?}"),
+                }
+                // What a reader sees of the saved file is what it saw of the document. (A page that
+                // could not be read before cannot be expected to read now.)
+                if print.0 == 0 {
+                    match self.ask(RequestBody::Fingerprint { doc: again }) {
+                        ResponseBody::Fingerprint { failed, digest, .. } => {
+                            assert_eq!(failed, 0, "pages of the saved file cannot be read");
+                            assert_eq!(digest, print.1, "the saved file is another document");
+                        }
+                        other => panic!("unexpected answer to Fingerprint: {other:?}"),
+                    }
                 }
                 self.ask(RequestBody::Close { doc: again });
                 break;

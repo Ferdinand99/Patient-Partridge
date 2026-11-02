@@ -94,6 +94,7 @@ fn requests() -> Vec<(&'static str, Request)> {
             ),
         ),
         ("save_end", b(13, RequestBody::SaveEnd { doc: 1 })),
+        ("fingerprint", b(14, RequestBody::Fingerprint { doc: 1 })),
     ]
 }
 
@@ -231,6 +232,7 @@ fn responses() -> Vec<(&'static str, Response)> {
                     pages: 12,
                     security: 4,
                     signatures: 1,
+                    maybe_signed: true,
                 },
             ),
         ),
@@ -246,6 +248,18 @@ fn responses() -> Vec<(&'static str, Response)> {
             ),
         ),
         ("save_ended", b(13, ResponseBody::SaveEnded)),
+        ("progress", b(15, ResponseBody::Progress { done: 1_048_576 })),
+        (
+            "fingerprint",
+            b(
+                16,
+                ResponseBody::Fingerprint {
+                    pages: 12,
+                    failed: 0,
+                    digest: 0x0123_4567_89ab_cdef,
+                },
+            ),
+        ),
         (
             "error_save_too_large",
             b(
@@ -430,7 +444,7 @@ fn main() {
     );
 
     // Round trips: one input per kind of message.
-    for kind in 0..12u8 {
+    for kind in 0..13u8 {
         write(
             &dir,
             "protocol_roundtrip_request",
@@ -438,7 +452,7 @@ fn main() {
             &generator_input(kind, kind as u32),
         );
     }
-    for kind in 0..13u8 {
+    for kind in 0..15u8 {
         write(
             &dir,
             "protocol_roundtrip_response",

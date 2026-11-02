@@ -204,3 +204,43 @@ fn i3_a_slow_save_is_not_taken_for_a_hung_engine() {
     // The engine is still the same one.
     assert_eq!(client.spawn_count(), 1);
 }
+
+#[test]
+fn i3_progress_keeps_a_save_alive_for_longer_than_the_limit_and_silence_does_not() {
+    // The save takes 1.8 s with a sign of life every 0.3 s; the engine may be silent for 1 s.
+    let mut config = EngineConfig::new(fake_engine());
+    config.args = vec!["save-progress".into()];
+    config.timeout = Duration::from_millis(500);
+    config.save_stall = Duration::from_secs(1);
+    let client = EngineClient::new(config);
+    let doc = client.open(&doc_path(), None).unwrap();
+    assert!(client.save_to(doc.doc, &mut |_| Ok(())).is_ok());
+    assert_eq!(client.spawn_count(), 1);
+
+    // Silence for longer than that is a hung engine.
+    let mut config = EngineConfig::new(fake_engine());
+    config.args = vec!["save-silent".into()];
+    config.timeout = Duration::from_millis(500);
+    config.save_stall = Duration::from_millis(700);
+    let client = EngineClient::new(config);
+    let doc = client.open(&doc_path(), None).unwrap();
+    let started = Instant::now();
+    assert!(client.save_to(doc.doc, &mut |_| Ok(())).is_err());
+    assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+#[test]
+fn i3_a_sign_of_life_that_shows_no_more_work_than_the_last_is_refused() {
+    let mut config = EngineConfig::new(fake_engine());
+    config.args = vec!["save-stuck".into()];
+    config.timeout = Duration::from_millis(500);
+    config.save_stall = Duration::from_secs(1);
+    let client = EngineClient::new(config);
+    let doc = client.open(&doc_path(), None).unwrap();
+    match client.save_to(doc.doc, &mut |_| Ok(())) {
+        Err(partridge_engine_client::SaveStreamError::Client(ClientError::EngineStopped(why))) => {
+            assert!(why.contains("progress"), "{why}");
+        }
+        other => panic!("{other:?}"),
+    }
+}

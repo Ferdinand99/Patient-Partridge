@@ -17,7 +17,7 @@ use std::fmt;
 use std::io::{self, Read, Write};
 
 /// Version of this protocol. Both sides check it in the `Hello` exchange.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Largest frame (payload) either side accepts: 128 MiB, enough for the biggest allowed bitmap.
 pub const MAX_FRAME_LEN: usize = 128 * 1024 * 1024;
@@ -83,6 +83,7 @@ const TAG_REQ_DOC_INFO: u8 = 9;
 const TAG_REQ_SAVE_BEGIN: u8 = 10;
 const TAG_REQ_SAVE_CHUNK: u8 = 11;
 const TAG_REQ_SAVE_END: u8 = 12;
+const TAG_REQ_FINGERPRINT: u8 = 13;
 
 const TAG_RES_HELLO: u8 = 129;
 const TAG_RES_OPENED: u8 = 130;
@@ -96,6 +97,8 @@ const TAG_RES_DOC_INFO: u8 = 137;
 const TAG_RES_SAVE_READY: u8 = 138;
 const TAG_RES_SAVE_DATA: u8 = 139;
 const TAG_RES_SAVE_ENDED: u8 = 140;
+const TAG_RES_PROGRESS: u8 = 141;
+const TAG_RES_FINGERPRINT: u8 = 142;
 const TAG_RES_ERROR: u8 = 255;
 
 /// What went wrong while reading or decoding a frame.
@@ -185,6 +188,12 @@ pub enum ErrorCode {
     SaveFailed = 14,
     /// The saved document would be bigger than [`MAX_SAVE_BYTES`].
     SaveTooLarge = 15,
+    /// The file the document is read from changed while the document was open, so what PDFium
+    /// read at different times may come from different versions of it. Nothing is serialised.
+    SourceChanged = 16,
+    /// Reading the file the document comes from failed at least once, so the document may be
+    /// missing parts. Nothing is serialised.
+    SourceUnreadable = 17,
 }
 
 impl ErrorCode {
@@ -205,6 +214,8 @@ impl ErrorCode {
             13 => ErrorCode::SandboxUnavailable,
             14 => ErrorCode::SaveFailed,
             15 => ErrorCode::SaveTooLarge,
+            16 => ErrorCode::SourceChanged,
+            17 => ErrorCode::SourceUnreadable,
             _ => return None,
         })
     }
@@ -227,6 +238,8 @@ impl ErrorCode {
             ErrorCode::SandboxUnavailable => "sandbox_unavailable",
             ErrorCode::SaveFailed => "save_failed",
             ErrorCode::SaveTooLarge => "save_too_large",
+            ErrorCode::SourceChanged => "source_changed",
+            ErrorCode::SourceUnreadable => "source_unreadable",
         }
     }
 }
@@ -275,6 +288,10 @@ pub enum RequestBody {
     SaveChunk { doc: u32, offset: u32, len: u32 },
     /// Free the buffer made by `SaveBegin`.
     SaveEnd { doc: u32 },
+    /// A digest of everything a reader sees of the document: the size of every page, the text,
+    /// the number of objects and annotations. The app asks it of the engine that holds the
+    /// document and of the engine that reads the saved file, and the two must agree.
+    Fingerprint { doc: u32 },
 }
 
 /// One entry of the table of contents.
@@ -357,12 +374,30 @@ pub enum ResponseBody {
     Matches {
         matches: Vec<TextMatch>,
     },
-    /// Answer to `DocInfo`. `security` is the revision of the standard security handler (2 to 6)
-    /// and 0 for a document that is not encrypted.
+    /// Answer to `DocInfo`. `security` is the revision of the standard security handler (2 to 4,
+    /// 255 for a newer one) and 0 for a document that is not encrypted. `signatures` is how many
+    /// signatures PDFium finds, looking at the field list and at every widget on every page.
+    /// `maybe_signed` is true when the bytes of the file mention anything that belongs to a
+    /// signature (`/ByteRange`, `/DocMDP`, `/SigFlags`), whether PDFium found one or not: a
+    /// document is treated as signed when either says so.
     DocInfo {
         pages: u32,
         security: u8,
         signatures: u32,
+        maybe_signed: bool,
+    },
+    /// Sent while a request takes long (`SaveBegin`, `DocInfo`, `Fingerprint`) to show the engine
+    /// is working: `done` counts bytes written or pages looked at. Only the request in flight can
+    /// get them, and the app waits for the answer as long as they keep coming.
+    Progress {
+        done: u32,
+    },
+    /// Answer to `Fingerprint`: how many pages, how many of them could not be read, and a digest
+    /// of what was read.
+    Fingerprint {
+        pages: u32,
+        failed: u32,
+        digest: u64,
     },
     /// Answer to `SaveBegin`: the size of the serialised document, at most [`MAX_SAVE_BYTES`].
     SaveReady {
@@ -513,6 +548,11 @@ impl Request {
                 put_u32(&mut out, self.id);
                 put_u32(&mut out, *doc);
             }
+            RequestBody::Fingerprint { doc } => {
+                out.push(TAG_REQ_FINGERPRINT);
+                put_u32(&mut out, self.id);
+                put_u32(&mut out, *doc);
+            }
         }
         out
     }
@@ -561,6 +601,7 @@ impl Request {
                 RequestBody::SaveChunk { doc, offset, len }
             }
             TAG_REQ_SAVE_END => RequestBody::SaveEnd { doc: r.u32()? },
+            TAG_REQ_FINGERPRINT => RequestBody::Fingerprint { doc: r.u32()? },
             other => return Err(ProtocolError::UnknownTag(other)),
         };
         r.finish()?;
@@ -678,12 +719,30 @@ impl Response {
                 pages,
                 security,
                 signatures,
+                maybe_signed,
             } => {
                 out.push(TAG_RES_DOC_INFO);
                 put_u32(&mut out, self.id);
                 put_u32(&mut out, *pages);
                 out.push(*security);
                 put_u32(&mut out, *signatures);
+                out.push(u8::from(*maybe_signed));
+            }
+            ResponseBody::Progress { done } => {
+                out.push(TAG_RES_PROGRESS);
+                put_u32(&mut out, self.id);
+                put_u32(&mut out, *done);
+            }
+            ResponseBody::Fingerprint {
+                pages,
+                failed,
+                digest,
+            } => {
+                out.push(TAG_RES_FINGERPRINT);
+                put_u32(&mut out, self.id);
+                put_u32(&mut out, *pages);
+                put_u32(&mut out, *failed);
+                out.extend_from_slice(&digest.to_le_bytes());
             }
             ResponseBody::SaveReady { size } => {
                 out.push(TAG_RES_SAVE_READY);
@@ -867,7 +926,27 @@ impl Response {
                 pages: r.u32()?,
                 security: r.u8()?,
                 signatures: r.u32()?,
+                maybe_signed: match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    other => return Err(ProtocolError::UnknownValue(other)),
+                },
             },
+            TAG_RES_PROGRESS => ResponseBody::Progress { done: r.u32()? },
+            TAG_RES_FINGERPRINT => {
+                let pages = r.u32()?;
+                let failed = r.u32()?;
+                let digest = {
+                    let low = u64::from(r.u32()?);
+                    let high = u64::from(r.u32()?);
+                    low | (high << 32)
+                };
+                ResponseBody::Fingerprint {
+                    pages,
+                    failed,
+                    digest,
+                }
+            }
             TAG_RES_SAVE_READY => {
                 let size = r.u32()?;
                 if size as usize > MAX_SAVE_BYTES {
@@ -1249,6 +1328,19 @@ mod tests {
                     pages: 500,
                     security: 3,
                     signatures: 2,
+                    maybe_signed: true,
+                },
+            },
+            Response {
+                id: 18,
+                body: ResponseBody::Progress { done: u32::MAX },
+            },
+            Response {
+                id: 19,
+                body: ResponseBody::Fingerprint {
+                    pages: 12,
+                    failed: 1,
+                    digest: 0xDEAD_BEEF_0123_4567,
                 },
             },
             Response {
@@ -1299,6 +1391,7 @@ mod tests {
                 len: 0,
             },
             RequestBody::SaveEnd { doc: 7 },
+            RequestBody::Fingerprint { doc: 7 },
         ] {
             let req = Request { id: 99, body };
             let bytes = req.encode();
@@ -1372,6 +1465,26 @@ mod tests {
             ResponseBody::SaveData { data, .. } => assert_eq!(data.len(), MAX_SAVE_CHUNK),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn the_flag_of_a_possibly_signed_document_is_a_flag() {
+        let mut bytes = Response {
+            id: 1,
+            body: ResponseBody::DocInfo {
+                pages: 1,
+                security: 0,
+                signatures: 0,
+                maybe_signed: true,
+            },
+        }
+        .encode();
+        assert_eq!(*bytes.last().unwrap(), 1);
+        *bytes.last_mut().unwrap() = 2;
+        assert!(matches!(
+            Response::decode(bytes),
+            Err(ProtocolError::UnknownValue(2))
+        ));
     }
 
     #[test]
@@ -1963,13 +2076,15 @@ mod tests {
 
     #[test]
     fn error_codes_round_trip_and_have_names() {
-        for v in 1..=15u8 {
+        for v in 1..=17u8 {
             let code = ErrorCode::from_u8(v).unwrap();
             assert_eq!(code as u8, v);
             assert!(!code.name().is_empty());
         }
         assert!(ErrorCode::from_u8(0).is_none());
-        assert!(ErrorCode::from_u8(16).is_none());
+        assert!(ErrorCode::from_u8(18).is_none());
+        assert_eq!(ErrorCode::from_u8(16).unwrap().name(), "source_changed");
+        assert_eq!(ErrorCode::from_u8(17).unwrap().name(), "source_unreadable");
         assert_eq!(ErrorCode::from_u8(14).unwrap().name(), "save_failed");
         assert_eq!(ErrorCode::from_u8(15).unwrap().name(), "save_too_large");
     }

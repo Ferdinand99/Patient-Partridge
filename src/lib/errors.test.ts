@@ -29,13 +29,31 @@ describe("describeError: saving", () => {
       "save_busy",
       "save_failed",
       "save_too_large",
+      "save_source_changed",
+      "save_source_unreadable",
+      "save_locked",
+      "save_hard_link",
+      "save_owner_changes",
+      "save_access_kept",
     ];
     for (const code of codes) {
       const d = describeError({ code, message: "detail" }, "tax.pdf");
       expect(d.title, code).not.toBe("Something went wrong");
       expect(d.action).toBe("none");
     }
-    for (const code of ["save_read_only", "save_disk_full", "save_verify_failed", "save_failed", "save_too_large"]) {
+    for (const code of [
+      "save_read_only",
+      "save_disk_full",
+      "save_verify_failed",
+      "save_failed",
+      "save_too_large",
+      "save_source_changed",
+      "save_source_unreadable",
+      "save_locked",
+      "save_hard_link",
+      "save_owner_changes",
+      "save_access_kept",
+    ]) {
       expect(describeError({ code, message: "" }, "tax.pdf").detail, code).toContain('"tax.pdf"');
     }
     expect(describeError({ code: "save_write_failed", message: "no luck" }, "tax.pdf").detail).toContain("no luck");

@@ -12,12 +12,14 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use partridge_protocol::{
     ErrorCode, PageSize, Request, RequestBody, Response, ResponseBody, MAX_RENDER_PIXELS,
     MAX_RENDER_SIDE, MAX_SAVE_CHUNK, PROTOCOL_VERSION,
 };
 use pdfium_render::prelude::*;
+use source::{GuardedReader, SourceFile, SourceGuard};
 
 #[cfg(unix)]
 pub mod fds;
@@ -25,6 +27,7 @@ pub mod fonts;
 pub mod limits;
 pub mod sandbox;
 pub mod save;
+pub mod source;
 pub mod startup;
 pub mod stdio;
 pub mod text;
@@ -128,7 +131,9 @@ pub struct Engine {
     saves: HashMap<u32, Vec<u8>>,
     next_doc: u32,
     /// The one document the app handed over. `Open` takes it.
-    document: Option<File>,
+    document: Option<Box<dyn SourceFile>>,
+    /// The file the open document is read from, watched (see the `source` module).
+    source: Option<Arc<Mutex<SourceGuard>>>,
     /// The sandbox layers in force, as reported in the greeting. Empty when there is none.
     sandbox: String,
     /// When set, every request fails with this error and the engine reads nothing.
@@ -161,6 +166,7 @@ impl Engine {
             saves: HashMap::new(),
             next_doc: 1,
             document: None,
+            source: None,
             sandbox: String::new(),
             refusal: None,
         }
@@ -168,7 +174,14 @@ impl Engine {
 
     /// Hands the engine the document it may open. This does not read it.
     pub fn set_document(&mut self, file: File) {
-        self.document = Some(file);
+        self.document = Some(Box::new(file));
+    }
+
+    /// Test builds only: hands over a source that a test can make fail or change.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn set_document_source(&mut self, source: Box<dyn SourceFile>) {
+        self.document = Some(source);
     }
 
     /// Records which sandbox layers are in force (for the greeting).
@@ -190,7 +203,17 @@ impl Engine {
 
     /// Answers one request.
     pub fn handle(&mut self, request: Request) -> Response {
-        let body = match self.dispatch(request.body) {
+        self.handle_with_progress(request, &mut |_| {})
+    }
+
+    /// As [`Engine::handle`]. A request that takes long (a save, a description of the document)
+    /// calls `progress` now and then, so that the caller can tell the app the engine is working.
+    pub fn handle_with_progress(
+        &mut self,
+        request: Request,
+        progress: &mut dyn FnMut(u32),
+    ) -> Response {
+        let body = match self.dispatch(request.body, progress) {
             Ok(body) => body,
             Err((code, message)) => ResponseBody::Error { code, message },
         };
@@ -200,7 +223,11 @@ impl Engine {
         }
     }
 
-    fn dispatch(&mut self, body: RequestBody) -> Result<ResponseBody, Failure> {
+    fn dispatch(
+        &mut self,
+        body: RequestBody,
+        progress: &mut dyn FnMut(u32),
+    ) -> Result<ResponseBody, Failure> {
         if let Some(refusal) = &self.refusal {
             return Err(refusal.clone());
         }
@@ -276,11 +303,30 @@ impl Engine {
                     matches: text::find_matches(&plain, &query),
                 })
             }),
-            RequestBody::DocInfo { doc } => Ok(save::doc_info(self.document(doc)?)),
+            RequestBody::DocInfo { doc } => {
+                let document = self.document(doc)?;
+                // Before anything else: a file that changed under the document is the first thing
+                // the user has to hear, not a question about replacing it.
+                self.check_source()?;
+                Ok(save::doc_info(document, self.source.as_deref(), progress))
+            }
+            RequestBody::Fingerprint { doc } => {
+                let document = self.document(doc)?;
+                self.check_source()?;
+                let print = save::fingerprint(document, progress);
+                self.check_source()?;
+                Ok(print)
+            }
             RequestBody::SaveBegin { doc } => {
                 // A buffer from an earlier save is gone before the next one is made.
                 self.saves.remove(&doc);
-                let bytes = save::serialise(self.document(doc)?)?;
+                let document = self.document(doc)?;
+                // The file must be what it was when the parts that are in memory were read: the
+                // parts that are not are read now, and a mix of two versions is not a document.
+                self.check_source()?;
+                let bytes =
+                    save::serialise_up_to(document, partridge_protocol::MAX_SAVE_BYTES, progress)?;
+                self.check_source()?;
                 let size = bytes.len() as u32;
                 self.saves.insert(doc, bytes);
                 Ok(ResponseBody::SaveReady { size })
@@ -324,6 +370,14 @@ impl Engine {
         self.docs.get_mut(&doc).map(edit)
     }
 
+    /// Fails when the file the document is read from changed, or a read of it failed.
+    fn check_source(&self) -> Result<(), Failure> {
+        match &self.source {
+            Some(source) => source::lock(source).verify().map_err(save::source_failure),
+            None => Ok(()),
+        }
+    }
+
     fn document(&self, doc: u32) -> Result<&PdfDocument<'static>, Failure> {
         self.docs
             .get(&doc)
@@ -354,21 +408,26 @@ impl Engine {
         password: Option<&str>,
     ) -> Result<ResponseBody, Failure> {
         // The engine does not open files. It reads the one the app handed over, once.
-        let Some(file) = self.document.take() else {
+        let Some(mut file) = self.document.take() else {
             return fail(
                 ErrorCode::InvalidRequest,
                 "no document was handed to the engine, or it was opened already",
             );
         };
-        let is_file = file.metadata().map(|m| m.is_file()).unwrap_or(false);
-        if !is_file {
+        if !file.is_plain_file() {
             return fail(ErrorCode::Io, "the handle is not a file");
         }
+        let Ok(guard) = SourceGuard::new(file) else {
+            return fail(ErrorCode::Io, "the file could not be looked at");
+        };
+        let guard = Arc::new(Mutex::new(guard));
         // The file is read on demand by PDFium (through a custom reader that seeks and reads the
-        // inherited handle); it is not loaded into memory as a whole.
+        // inherited handle); it is not loaded into memory as a whole. The reader watches the
+        // file, so that a save can tell whether it changed.
         let doc = pdfium
-            .load_pdf_from_reader(file, password)
+            .load_pdf_from_reader(GuardedReader::new(guard.clone()), password)
             .map_err(|e| map_open_error(e, password.is_some()))?;
+        self.source = Some(guard);
         // One unreadable page must not refuse the whole document: it gets a placeholder size.
         let page_list = doc.pages();
         let pages = (0..page_list.len())

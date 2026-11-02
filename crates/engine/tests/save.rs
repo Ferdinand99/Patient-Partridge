@@ -94,6 +94,7 @@ fn info(engine: &mut Engine, doc: u32) -> (u32, u8, u32) {
             pages,
             security,
             signatures,
+            ..
         } => (pages, security, signatures),
         other => panic!("{other:?}"),
     }
@@ -247,10 +248,15 @@ fn a_document_over_the_size_limit_is_not_handed_over() {
         let bytes = save::serialise(document).unwrap();
         size = bytes.len();
         // One byte too small is too small; the exact size is fine.
-        let err = save::serialise_up_to(document, size - 1).unwrap_err();
+        let err = save::serialise_up_to(document, size - 1, &mut |_| {}).unwrap_err();
         assert_eq!(err.0, ErrorCode::SaveTooLarge);
-        assert_eq!(save::serialise_up_to(document, size).unwrap().len(), size);
-        let err = save::serialise_up_to(document, 10).unwrap_err();
+        assert_eq!(
+            save::serialise_up_to(document, size, &mut |_| {})
+                .unwrap()
+                .len(),
+            size
+        );
+        let err = save::serialise_up_to(document, 10, &mut |_| {}).unwrap_err();
         assert_eq!(err.0, ErrorCode::SaveTooLarge);
     })
     .unwrap();
@@ -338,4 +344,254 @@ fn the_engine_speaks_the_new_protocol_version() {
         )),
         ErrorCode::ProtocolMismatch
     );
+}
+
+// ---- findings of the review: what the engine watches while a document is open ------------------
+
+use partridge_engine::source::SourceFile;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::SystemTime;
+
+/// A file that can be made to fail, and that fails by itself after a number of reads.
+struct Flaky {
+    file: File,
+    broken: Arc<AtomicBool>,
+    reads_left: Arc<AtomicUsize>,
+}
+
+impl SourceFile for Flaky {
+    fn read_at(&mut self, pos: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.broken.load(Ordering::SeqCst) {
+            return Err(std::io::Error::other("the share is gone"));
+        }
+        if self
+            .reads_left
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_err()
+        {
+            self.broken.store(true, Ordering::SeqCst);
+            return Err(std::io::Error::other("the share dropped"));
+        }
+        self.file.read_at(pos, buf)
+    }
+
+    fn state(&mut self) -> std::io::Result<(u64, Option<SystemTime>)> {
+        self.file.state()
+    }
+
+    fn is_plain_file(&mut self) -> bool {
+        true
+    }
+}
+
+fn open_flaky(
+    engine: &mut Engine,
+    bytes: &[u8],
+    reads: usize,
+) -> (u32, Arc<AtomicBool>, kit::TempFile) {
+    let file = kit::TempFile::new("flaky.pdf", bytes);
+    let broken = Arc::new(AtomicBool::new(false));
+    engine.set_document_source(Box::new(Flaky {
+        file: File::open(file.path()).unwrap(),
+        broken: broken.clone(),
+        reads_left: Arc::new(AtomicUsize::new(reads)),
+    }));
+    let ResponseBody::Opened { doc, .. } = ask(engine, RequestBody::Open { password: None }) else {
+        panic!("the document did not open");
+    };
+    (doc, broken, file)
+}
+
+#[test]
+fn c2_a_read_that_fails_before_a_save_makes_the_save_refuse() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let (doc, broken, _file) = open_flaky(e, &kit::simple_pdf(4), usize::MAX);
+    assert!(matches!(
+        ask(e, RequestBody::SaveBegin { doc }),
+        ResponseBody::SaveReady { .. }
+    ));
+    // The share drops. PDFium would leave out what it cannot read, and the save would go on.
+    broken.store(true, Ordering::SeqCst);
+    assert_eq!(
+        error_code(ask(e, RequestBody::SaveBegin { doc })),
+        ErrorCode::SourceUnreadable
+    );
+    // The failure stays on record: coming back does not make the document whole again.
+    broken.store(false, Ordering::SeqCst);
+    assert_eq!(
+        error_code(ask(e, RequestBody::SaveBegin { doc })),
+        ErrorCode::SourceUnreadable
+    );
+}
+
+#[test]
+fn c2_a_read_that_fails_in_the_middle_of_a_save_makes_the_save_refuse() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    // Opening reads a few blocks; the file fails a little after that, while the pages are read.
+    let (doc, _broken, _file) = open_flaky(e, &kit::simple_pdf(40), 6);
+    let answer = ask(e, RequestBody::SaveBegin { doc });
+    assert!(
+        matches!(
+            answer,
+            ResponseBody::Error {
+                code: ErrorCode::SourceUnreadable,
+                ..
+            }
+        ),
+        "{answer:?}"
+    );
+    // Nothing was handed out.
+    assert_eq!(
+        error_code(ask(
+            e,
+            RequestBody::SaveChunk {
+                doc,
+                offset: 0,
+                len: 1
+            }
+        )),
+        ErrorCode::InvalidRequest
+    );
+}
+
+#[test]
+fn c1_a_file_changed_in_place_gives_source_changed_for_every_description_and_save() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let original = kit::simple_pdf(3);
+    let file = kit::TempFile::new("inplace.pdf", &original);
+    e.set_document(File::open(file.path()).unwrap());
+    let ResponseBody::Opened { doc, .. } = ask(e, RequestBody::Open { password: None }) else {
+        panic!();
+    };
+    assert!(page_text(e, doc, 0).contains("Page 1"));
+    // Another program rewrites the file in place, with the same size.
+    let mut theirs = original.clone();
+    let at = theirs.windows(6).position(|w| w == b"Page 1").unwrap();
+    theirs[at..at + 6].copy_from_slice(b"Page X");
+    std::fs::write(file.path(), &theirs).unwrap();
+    for body in [
+        RequestBody::DocInfo { doc },
+        RequestBody::Fingerprint { doc },
+        RequestBody::SaveBegin { doc },
+    ] {
+        assert_eq!(error_code(ask(e, body)), ErrorCode::SourceChanged);
+    }
+}
+
+#[test]
+fn i3_a_save_of_a_bigger_document_reports_its_progress() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let doc = open(e, &kit::simple_pdf(6000), None).unwrap();
+    let mut seen: Vec<u32> = Vec::new();
+    let response = e.handle_with_progress(
+        Request {
+            id: 5,
+            body: RequestBody::SaveBegin { doc },
+        },
+        &mut |done| seen.push(done),
+    );
+    let ResponseBody::SaveReady { size } = response.body else {
+        panic!("{response:?}");
+    };
+    assert!(
+        size > 2 * 1024 * 1024,
+        "the test document is too small: {size}"
+    );
+    assert!(!seen.is_empty(), "no sign of life");
+    assert!(seen.windows(2).all(|w| w[0] < w[1]), "{seen:?}");
+    assert!(*seen.last().unwrap() <= size);
+}
+
+fn print_of(engine: &mut Engine, doc: u32) -> (u32, u32, u64) {
+    match ask(engine, RequestBody::Fingerprint { doc }) {
+        ResponseBody::Fingerprint {
+            pages,
+            failed,
+            digest,
+        } => (pages, failed, digest),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn c2_the_fingerprint_of_a_document_is_the_one_of_the_file_it_is_saved_to() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    for (name, bytes) in [
+        ("plain", kit::simple_pdf(5)),
+        ("features", kit::features_pdf()),
+        ("mixed", kit::mixed_size_pdf()),
+        ("links", kit::many_links_pdf(12)),
+        ("signed", kit::signed_pdf()),
+    ] {
+        let doc = open(e, &bytes, None).unwrap();
+        let live = print_of(e, doc);
+        assert_eq!(live.1, 0, "{name}: pages that could not be read");
+        let saved = save_all(e, doc, 65536);
+        let again = open(e, &saved, None).unwrap();
+        assert_eq!(print_of(e, again), live, "{name}");
+    }
+    // With a change in memory the file that is saved still matches the document, and not the
+    // document as it was.
+    let doc = open(e, &kit::simple_pdf(2), None).unwrap();
+    let before = print_of(e, doc);
+    add_text(e, doc, "A NEW LINE OF TEXT");
+    let after = print_of(e, doc);
+    assert_ne!(before.2, after.2);
+    let saved = save_all(e, doc, 65536);
+    let again = open(e, &saved, None).unwrap();
+    assert_eq!(print_of(e, again), after);
+}
+
+#[test]
+fn c2_the_fingerprint_sees_a_page_that_lost_its_text_or_its_size() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let original = kit::simple_pdf(3);
+    let a = open(e, &original, None).unwrap();
+    // The same document with the second page's text turned into other letters ...
+    let mut changed = original.clone();
+    let at = changed
+        .windows(6)
+        .position(|w| w == b"Page 2")
+        .expect("page 2");
+    changed[at..at + 6].copy_from_slice(b"Page Z");
+    let b = open(e, &changed, None).unwrap();
+    assert_ne!(print_of(e, a).2, print_of(e, b).2);
+    // ... and one whose pages have other sizes.
+    let c = open(e, &kit::mixed_size_pdf(), None).unwrap();
+    assert_ne!(print_of(e, a).2, print_of(e, c).2);
+}
+
+#[test]
+fn i5_a_signature_field_under_a_grouping_field_is_found_two_ways() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let doc = open(e, &kit::signed_nested_pdf(), None).unwrap();
+    match ask(e, RequestBody::DocInfo { doc }) {
+        ResponseBody::DocInfo {
+            signatures,
+            maybe_signed,
+            ..
+        } => {
+            // The words of a signature are in the file whatever the field tree looks like.
+            assert!(maybe_signed);
+            eprintln!("signatures found by PDFium and the widgets: {signatures}");
+        }
+        other => panic!("{other:?}"),
+    }
+    let plain = open(e, &kit::simple_pdf(2), None).unwrap();
+    match ask(e, RequestBody::DocInfo { doc: plain }) {
+        ResponseBody::DocInfo {
+            signatures,
+            maybe_signed,
+            ..
+        } => assert_eq!((signatures, maybe_signed), (0, false)),
+        other => panic!("{other:?}"),
+    }
 }

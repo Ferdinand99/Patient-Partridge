@@ -14,6 +14,7 @@ req_doc_info="\x09"
 req_save_begin="\x0a"
 req_save_chunk="\x0b"
 req_save_end="\x0c"
+req_fingerprint="\x0d"
 
 res_hello="\x81"
 res_opened="\x82"
@@ -27,6 +28,8 @@ res_doc_info="\x89"
 res_save_ready="\x8a"
 res_save_data="\x8b"
 res_save_ended="\x8c"
+res_progress="\x8d"
+res_fingerprint="\x8e"
 res_error="\xff"
 
 # A message starts with a tag and a request id.

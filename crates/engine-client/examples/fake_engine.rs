@@ -180,6 +180,7 @@ fn main() {
                     pages: 1,
                     security: 0,
                     signatures: if mode == "save-signed" { 2 } else { 0 },
+                    maybe_signed: false,
                 },
             ),
             RequestBody::SaveBegin { .. } => match mode.as_str() {
@@ -191,6 +192,29 @@ fn main() {
                         message: "the stand-in cannot save".into(),
                     },
                 ),
+                "save-progress" => {
+                    // Takes long, and says so: six signs of life, 0.3 s apart.
+                    for step in 1..=6u32 {
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        reply(
+                            &mut output,
+                            id,
+                            ResponseBody::Progress { done: step * 1000 },
+                        );
+                    }
+                    reply(&mut output, id, ResponseBody::SaveReady { size: SAVE_SIZE });
+                }
+                "save-stuck" => {
+                    // Alive, but nothing to show for it: the same number again and again.
+                    for _ in 0..8 {
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        reply(&mut output, id, ResponseBody::Progress { done: 5 });
+                    }
+                    reply(&mut output, id, ResponseBody::SaveReady { size: SAVE_SIZE });
+                }
+                "save-silent" => {
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                }
                 "save-slow" => {
                     // Slow, but alive: it answers after a while.
                     std::thread::sleep(std::time::Duration::from_millis(1500));
@@ -241,6 +265,15 @@ fn main() {
                 }
             }
             RequestBody::SaveEnd { .. } => reply(&mut output, id, ResponseBody::SaveEnded),
+            RequestBody::Fingerprint { .. } => reply(
+                &mut output,
+                id,
+                ResponseBody::Fingerprint {
+                    pages: 1,
+                    failed: if mode == "save-unreadable" { 1 } else { 0 },
+                    digest: 7,
+                },
+            ),
         }
     }
 }

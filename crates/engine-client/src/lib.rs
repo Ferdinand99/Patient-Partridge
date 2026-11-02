@@ -43,7 +43,7 @@ pub use partridge_protocol::{LinkTarget, OutlineItem, PageLink, TextMatch};
 mod pool;
 pub use pool::EnginePool;
 mod save;
-pub use save::{verify_written, DocInfo, SaveError, SaveOptions, SaveOutcome};
+pub use save::{verify_written, DocInfo, Fingerprint, SaveError, SaveOptions, SaveOutcome};
 mod spawn;
 
 /// Largest answer to an open request. An `Opened` answer holds 8 bytes per page, so this allows
@@ -67,6 +67,12 @@ pub struct EngineConfig {
     pub args: Vec<OsString>,
     /// Longest the engine may take to answer one request before it is considered hung and killed.
     pub timeout: Duration,
+    /// Longest the engine may go without a sign of life while it describes or serialises a
+    /// document (`DocInfo`, `Fingerprint`, `SaveBegin`). These requests can take minutes for a
+    /// large document on a slow disk, so the engine reports progress while it works (about every
+    /// MiB written or 32 pages looked at), and every report starts this wait afresh. A slow save
+    /// is therefore never taken for a hung engine; one that says nothing for this long is.
+    pub save_stall: Duration,
     /// Most memory the engine may use, in bytes. `None` leaves the engine's own limit (3 GiB).
     pub memory_limit: Option<u64>,
     /// Whether an engine without a working sandbox is refused. Release builds always insist.
@@ -79,6 +85,7 @@ impl EngineConfig {
             program: program.into(),
             args: Vec::new(),
             timeout: Duration::from_secs(60),
+            save_stall: Duration::from_secs(300),
             memory_limit: None,
             sandbox: SandboxPolicy::default_for_build(),
         }
@@ -416,10 +423,33 @@ impl EngineClient {
                     pages,
                     security,
                     signatures,
+                    maybe_signed,
                 } => Ok(DocInfo {
                     pages,
                     security,
                     signatures,
+                    maybe_signed,
+                }),
+                other => Err(other),
+            },
+        )
+    }
+
+    /// A digest of what a reader sees of every page of the document.
+    pub fn fingerprint(&self, doc: u64) -> Result<Fingerprint, ClientError> {
+        self.call(
+            doc,
+            "fingerprint",
+            |doc| RequestBody::Fingerprint { doc },
+            |body| match body {
+                ResponseBody::Fingerprint {
+                    pages,
+                    failed,
+                    digest,
+                } => Ok(Fingerprint {
+                    pages,
+                    failed,
+                    digest,
                 }),
                 other => Err(other),
             },
@@ -565,7 +595,14 @@ impl EngineClient {
             .limit
             .store(Self::answer_limit(&body), Ordering::SeqCst);
         running.in_flight.store(true, Ordering::SeqCst);
-        let result = self.wait_for_answer(running, id, body);
+        // A request that can take long gets the longer wait, renewed by every sign of life.
+        let patience = match body {
+            RequestBody::DocInfo { .. }
+            | RequestBody::Fingerprint { .. }
+            | RequestBody::SaveBegin { .. } => self.config.save_stall,
+            _ => self.config.timeout,
+        };
+        let result = self.wait_for_answer(running, id, body, patience);
         running.in_flight.store(false, Ordering::SeqCst);
         running.limit.store(IDLE_LIMIT, Ordering::SeqCst);
         result
@@ -576,6 +613,7 @@ impl EngineClient {
         running: &mut Running,
         id: u32,
         body: RequestBody,
+        patience: Duration,
     ) -> Result<ResponseBody, String> {
         write_request(&mut running.stdin, &Request { id, body }).map_err(|e| {
             format!(
@@ -583,18 +621,37 @@ impl EngineClient {
                 exit_text(&running.child)
             )
         })?;
-        // One request is in flight at a time, so the next event is its answer or a failure.
-        match running.events.recv_timeout(self.config.timeout) {
-            Ok(Event::Response(r)) if r.id == id => Ok(r.body),
-            Ok(Event::Response(_)) => Err("it answered a different request".into()),
-            Ok(Event::Failed(why)) => Err(format!("its answer was unreadable ({why})")),
-            Ok(Event::Closed) | Err(RecvTimeoutError::Disconnected) => {
-                Err(exit_text(&running.child))
+        // One request is in flight at a time, so the next event is its answer, a sign of life
+        // (only from a request that can take long, and each one has to show more work done than
+        // the one before) or a failure.
+        let may_report = patience != self.config.timeout;
+        let mut last_done = 0u32;
+        loop {
+            match running.events.recv_timeout(patience) {
+                Ok(Event::Response(Response {
+                    id: reported,
+                    body: ResponseBody::Progress { done },
+                })) if reported == id && may_report && done > last_done => {
+                    last_done = done;
+                }
+                Ok(Event::Response(r)) if r.id == id => {
+                    if matches!(r.body, ResponseBody::Progress { .. }) {
+                        return Err("it reported progress that was not progress".into());
+                    }
+                    return Ok(r.body);
+                }
+                Ok(Event::Response(_)) => return Err("it answered a different request".into()),
+                Ok(Event::Failed(why)) => return Err(format!("its answer was unreadable ({why})")),
+                Ok(Event::Closed) | Err(RecvTimeoutError::Disconnected) => {
+                    return Err(exit_text(&running.child))
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err(format!(
+                        "it did not answer within {} seconds",
+                        patience.as_secs_f32().ceil()
+                    ))
+                }
             }
-            Err(RecvTimeoutError::Timeout) => Err(format!(
-                "it did not answer within {} seconds",
-                self.config.timeout.as_secs_f32().ceil()
-            )),
         }
     }
 

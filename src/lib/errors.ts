@@ -89,7 +89,7 @@ export function describeError(error: AppErrorLike, fileName?: string): Described
     case "save_read_only":
       return {
         title: "The file cannot be saved here",
-        detail: `${file} is read-only, or it is in a folder that you may not write to. Nothing was changed. Save a copy under another name instead.`,
+        detail: `You may not change ${file}: it is read-only, or the rights on it do not let you write to it. Nothing was changed. Save a copy under another name instead.`,
         action: "none",
       };
     case "save_disk_full":
@@ -114,6 +114,42 @@ export function describeError(error: AppErrorLike, fileName?: string): Described
       return {
         title: "The password protection would be lost",
         detail: `The new file would not have been protected by the password like ${file} is, so it was not used. ${file} was not changed, and your changes are still in the open document.`,
+        action: "none",
+      };
+    case "save_source_changed":
+      return {
+        title: "The file changed while it was open",
+        detail: `Another program changed ${file} in place while Patient Partridge had it open. The app reads a PDF as it needs it, so what it has now would be a mix of the old and the new file, and nothing was saved. The file on the disk was not touched. Close the tab and open the file again to keep working. Changes made here since it was opened cannot be saved.`,
+        action: "none",
+      };
+    case "save_source_unreadable":
+      return {
+        title: "The file could not be read",
+        detail: `A part of ${file} could not be read while saving (a drive or a network connection may have dropped), so the saved file would be missing parts. Nothing was saved, and the file on the disk was not touched. Close the tab, check the drive, and open the file again.`,
+        action: "none",
+      };
+    case "save_locked":
+      return {
+        title: "The file cannot be replaced here",
+        detail: `${file} is open in a way that does not let it be replaced. This is usual on a USB stick or a network drive: the app keeps the file open while the document is open. Nothing was changed. Save a copy instead.`,
+        action: "none",
+      };
+    case "save_hard_link":
+      return {
+        title: "The file has more than one name",
+        detail: `${file} is a hard link: the same file under several names. Saving would give this name a new file and leave the other names with the old one, so nothing was changed. Save a copy instead.`,
+        action: "none",
+      };
+    case "save_owner_changes":
+      return {
+        title: "The file belongs to someone else",
+        detail: `${file} belongs to another user or group, and the new file would not. Saving would take it from them, so nothing was changed. Save a copy instead.`,
+        action: "none",
+      };
+    case "save_access_kept":
+      return {
+        title: "The access rights could not be kept",
+        detail: `The access rights of ${file} could not be given to the new file, so nothing was changed. Saving would have changed who may open the file. Save a copy instead.`,
         action: "none",
       };
     case "save_not_a_file":

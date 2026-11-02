@@ -88,6 +88,13 @@ jobs:
         run: cargo clippy -p patient-partridge --all-targets --features update-driver --locked -- -D warnings
       - name: Test
         run: cargo test --workspace --locked --no-fail-fast
+      # A save on a disk with no room left leaves the file as it was. Needs a small file system.
+      - name: Full disk test (Linux)
+        if: always() && runner.os == 'Linux'
+        run: |
+          sudo mkdir -p /mnt/small
+          sudo mount -t tmpfs -o size=1m,mode=1777 tmpfs /mnt/small
+          PARTRIDGE_TEST_SMALL_DISK=/mnt/small cargo test -p partridge-engine-client --locked -- --ignored a_full_disk
       # What the engine tried after it locked itself in (open a file, connect, start a program,
       # write a file) and what the system answered, on each system.
       - name: Sandbox proof

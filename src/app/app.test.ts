@@ -2214,7 +2214,6 @@ describe("App: changes that are not saved", () => {
     it("tells the user what went wrong and keeps the change, for every other failure", async () => {
       const { api, app } = await openDirty();
       for (const [code, text] of [
-        ["save_read_only", "read-only"],
         ["save_verify_failed", "did not pass the check"],
         ["save_protection_lost", "password protection would be lost"],
         ["save_write_failed", "could not be saved"],
@@ -2400,5 +2399,53 @@ describe("App: a save that an edit overtakes", () => {
     await asking;
     expect(m.api.save).toHaveBeenCalledTimes(1);
     expect(m.api.quitApp).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("App: a save that cannot replace the file", () => {
+  async function openDirty() {
+    const m = make();
+    await m.app.openPath("/docs/book.pdf");
+    await flush();
+    m.app.recordEdit({ label: "Change", undo: () => undefined, redo: () => undefined });
+    return m;
+  }
+
+  it("offers a copy when the file is held open, shared under several names, or someone else's", async () => {
+    for (const code of ["save_locked", "save_hard_link", "save_owner_changes", "save_access_kept", "save_read_only"]) {
+      document.body.replaceChildren();
+      installPage();
+      const m = await openDirty();
+      m.api.save.mockRejectedValueOnce({ code, message: "x" });
+      key("s", { ctrlKey: true });
+      await flush();
+      expect(button("Save a copy…"), code).not.toBeNull();
+      click(button("Save a copy…"));
+      await flush();
+      expect(m.api.saveAs, code).toHaveBeenCalledWith(1, false);
+      expect(m.app.unsavedCount, code).toBe(0);
+    }
+  });
+
+  it("does not say the file is read-only when it is not", async () => {
+    const m = await openDirty();
+    m.api.save.mockRejectedValueOnce({ code: "save_locked", message: "x" });
+    key("s", { ctrlKey: true });
+    await flush();
+    expect(notice()?.textContent).not.toContain("read-only");
+    expect(notice()?.textContent).toContain("USB stick or a network drive");
+  });
+
+  it("tells the user to open the file again when it changed in place, and offers no copy", async () => {
+    const m = await openDirty();
+    m.api.save.mockRejectedValueOnce({ code: "save_source_changed", message: "x" });
+    key("s", { ctrlKey: true });
+    await flush();
+    expect(notice()?.textContent).toContain("Close the tab and open the file again");
+    expect(button("Save a copy…")).toBeNull();
+    click(button("OK"));
+    await flush();
+    expect(m.api.saveAs).not.toHaveBeenCalled();
+    expect(m.app.unsavedCount).toBe(1);
   });
 });

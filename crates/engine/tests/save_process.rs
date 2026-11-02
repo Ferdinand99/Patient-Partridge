@@ -9,7 +9,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, SystemTime};
 
 use partridge_engine_client::{
     verify_written, ClientError, DocInfo, EngineClient, EngineConfig, EnginePool, SandboxPolicy,
@@ -107,7 +106,8 @@ fn a_document_is_saved_in_place_and_the_new_file_opens() {
         DocInfo {
             pages: 3,
             security: 0,
-            signatures: 0
+            signatures: 0,
+            maybe_signed: false,
         }
     );
 
@@ -179,7 +179,8 @@ fn a_password_protected_document_is_saved_protected() {
         DocInfo {
             pages: 2,
             security: 2,
-            signatures: 0
+            signatures: 0,
+            maybe_signed: false,
         }
     );
 }
@@ -196,9 +197,10 @@ fn the_check_refuses_a_file_that_lost_its_protection_or_is_not_the_document() {
         pages,
         security,
         signatures,
+        maybe_signed: false,
     };
     let check = |path: &Path, password: Option<&str>, expected: DocInfo| {
-        verify_written(&config(), path, password, expected)
+        verify_written(&config(), path, password, expected, None)
     };
 
     // The right file passes.
@@ -280,13 +282,12 @@ fn a_file_that_someone_else_changed_is_asked_about_not_overwritten() {
     let pool = pool();
     let (handle, _) = pool.open(&text(&path), None).unwrap();
 
-    // Somebody else saves a different document there.
+    // Somebody else saves a different document there, the way editors do: a new file, renamed
+    // over this one. (A rewrite in place is a different case, in the c1 tests: the engine's
+    // handle would see the new bytes, and nothing can be saved.)
     let theirs = kit::simple_pdf(5);
-    fs::write(&path, &theirs).unwrap();
-    let file = fs::File::options().write(true).open(&path).unwrap();
-    file.set_modified(SystemTime::now() + Duration::from_secs(10))
-        .unwrap();
-    drop(file);
+    let tmp = dir.write("tmp.pdf", &theirs);
+    fs::rename(&tmp, &path).unwrap();
 
     assert_eq!(
         save_error(pool.save(handle, SaveOptions::default())),
@@ -393,7 +394,11 @@ fn c1_a_file_rewritten_in_place_is_not_saved_over_with_a_mix_of_both() {
     };
     let err = save_error(pool.save(handle, replace));
     assert_eq!(err.code(), "save_source_changed", "{err:?}");
-    assert_eq!(fs::read(&path).unwrap(), theirs, "their file was overwritten");
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        theirs,
+        "their file was overwritten"
+    );
     let copy = dir.0.join("copy.pdf");
     let err = save_error(pool.save_as(handle, &copy, SaveOptions::default()));
     assert_eq!(err.code(), "save_source_changed", "{err:?}");
@@ -556,4 +561,47 @@ fn i8_the_owner_and_the_group_of_a_file_are_kept_where_the_system_allows() {
     pool.save(handle, SaveOptions::default()).unwrap();
     let meta = fs::metadata(&path).unwrap();
     assert_eq!((meta.uid(), meta.gid()), (2345, 3456));
+}
+
+#[test]
+fn i5_a_signature_that_no_field_points_to_is_found_by_the_words_in_the_file() {
+    let dir = Dir::new("i5b");
+    let original = kit::signed_without_field_pdf();
+    let path = dir.write("a.pdf", &original);
+    let pool = pool();
+    let (handle, _) = pool.open(&text(&path), None).unwrap();
+    let err = save_error(pool.save(handle, SaveOptions::default()));
+    assert!(matches!(err, SaveError::Signed { .. }), "{err:?}");
+    assert_eq!(fs::read(&path).unwrap(), original);
+    // And the same document with a copy asked for on purpose goes through the question too.
+    let copy = dir.0.join("copy.pdf");
+    let err = save_error(pool.save_as(handle, &copy, SaveOptions::default()));
+    assert!(matches!(err, SaveError::Signed { .. }), "{err:?}");
+    assert!(!copy.exists());
+}
+
+#[test]
+fn c2_the_check_sees_a_file_with_the_same_pages_but_other_content() {
+    let dir = Dir::new("c2c");
+    let a = dir.write("a.pdf", &kit::simple_pdf(3));
+    // Three pages as well, but the text of every page is another text.
+    let mut other = kit::simple_pdf(3);
+    for at in 0..other.len().saturating_sub(4) {
+        if &other[at..at + 4] == b"Line" {
+            other[at..at + 4].copy_from_slice(b"Lone");
+        }
+    }
+    let b = dir.write("b.pdf", &other);
+    let client = EngineClient::new(config());
+    let opened = client.open(&text(&a), None).unwrap();
+    let info = client.doc_info(opened.doc).unwrap();
+    let print = client.fingerprint(opened.doc).unwrap();
+    assert_eq!(print.failed, 0);
+
+    // The file it was made from passes. Another file with the same number of pages does not.
+    verify_written(&config(), &a, None, info, Some(&print)).unwrap();
+    let err = verify_written(&config(), &b, None, info, Some(&print)).unwrap_err();
+    assert!(matches!(err, SaveError::Verify(_)), "{err:?}");
+    // Without the fingerprint the old check cannot tell them apart.
+    verify_written(&config(), &b, None, info, None).unwrap();
 }

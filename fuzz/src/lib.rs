@@ -78,7 +78,7 @@ pub fn sanitized(rect: [f32; 4]) -> [f32; 4] {
 /// A request that the encoder writes without cutting anything.
 pub fn arb_request(u: &mut Unstructured) -> Result<Request> {
     let id: u32 = u.arbitrary()?;
-    let body = match u.int_in_range(0..=11u8)? {
+    let body = match u.int_in_range(0..=12u8)? {
         0 => RequestBody::Hello {
             protocol_version: u.arbitrary()?,
         },
@@ -130,7 +130,10 @@ pub fn arb_request(u: &mut Unstructured) -> Result<Request> {
                 u.int_in_range(0..=MAX_SAVE_CHUNK as u32)?
             },
         },
-        _ => RequestBody::SaveEnd {
+        11 => RequestBody::SaveEnd {
+            doc: u.arbitrary()?,
+        },
+        _ => RequestBody::Fingerprint {
             doc: u.arbitrary()?,
         },
     };
@@ -157,7 +160,7 @@ pub struct GeneratedResponse {
 
 pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
     let id: u32 = u.arbitrary()?;
-    let (sent, expected) = match u.int_in_range(0..=12u8)? {
+    let (sent, expected) = match u.int_in_range(0..=14u8)? {
         0 => {
             let b = ResponseBody::Hello {
                 protocol_version: u.arbitrary()?,
@@ -285,7 +288,7 @@ pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
             (b.clone(), b)
         }
         8 => {
-            let code = ErrorCode::from_u8(u.int_in_range(1..=15u8)?).expect("1 to 15 are codes");
+            let code = ErrorCode::from_u8(u.int_in_range(1..=17u8)?).expect("1 to 17 are codes");
             let b = ResponseBody::Error {
                 code,
                 message: string_up_to(u, MAX_STRING_LEN)?,
@@ -297,6 +300,7 @@ pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
                 pages: u.arbitrary()?,
                 security: u.arbitrary()?,
                 signatures: u.arbitrary()?,
+                maybe_signed: u.arbitrary()?,
             };
             (b.clone(), b)
         }
@@ -324,7 +328,21 @@ pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
             let b = ResponseBody::SaveData { offset, data };
             (b.clone(), b)
         }
-        _ => (ResponseBody::SaveEnded, ResponseBody::SaveEnded),
+        12 => (ResponseBody::SaveEnded, ResponseBody::SaveEnded),
+        13 => {
+            let b = ResponseBody::Progress {
+                done: u.arbitrary()?,
+            };
+            (b.clone(), b)
+        }
+        _ => {
+            let b = ResponseBody::Fingerprint {
+                pages: u.arbitrary()?,
+                failed: u.arbitrary()?,
+                digest: u.arbitrary()?,
+            };
+            (b.clone(), b)
+        }
     };
     Ok(GeneratedResponse {
         sent: Response { id, body: sent },
