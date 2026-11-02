@@ -683,8 +683,8 @@ fn a_locked_in_engine_cannot_open_files_use_the_network_or_start_programs() {
             );
         }
         // A raw ICMP socket is a way to the network that the AppContainer does not close on every
-        // computer (it can depend on the rights of the account that runs the program: the runners
-        // are administrators). The engine tries it in its own check, so what it says about the
+        // computer (it can depend on the system and on the account that runs the program: the server images
+        // of CI allow it, also to a standard user). The engine tries it in its own check, so what it says about the
         // network must agree with what the sandboxed program can do: when a packet can be sent from
         // a raw socket, the engine says `network-not-proved`, and otherwise `no-network`.
         let can_send = line(lines, "raw_socket_send_loopback").contains("ALLOWED");
