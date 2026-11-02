@@ -47,3 +47,13 @@ jobs:
       - name: The other engine tests
         if: always()
         run: cargo test -p partridge-engine -p partridge-engine-client --locked --no-fail-fast
+      - name: Access lists after the run
+        if: always()
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          icacls target\debug
+          icacls target\debug\partridge-engine.exe
+          icacls target\debug\examples\engine_selftest.exe
+          icacls vendor\pdfium\win-x64
+          icacls vendor\pdfium\win-x64\pdfium.dll

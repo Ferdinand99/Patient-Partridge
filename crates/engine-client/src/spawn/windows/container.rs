@@ -39,14 +39,14 @@ use std::sync::{Mutex, OnceLock};
 
 use windows_sys::Win32::Foundation::{LocalFree, HANDLE};
 use windows_sys::Win32::Security::Authorization::{
-    GetEffectiveRightsFromAclW, GetNamedSecurityInfoW, GetSecurityInfo, SetEntriesInAclW,
-    SetNamedSecurityInfoW, SetSecurityInfo, EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE,
-    SE_FILE_OBJECT, SE_OBJECT_TYPE, SE_WINDOW_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
-    TRUSTEE_W,
+    GetNamedSecurityInfoW, GetSecurityInfo, SetEntriesInAclW, SetNamedSecurityInfoW,
+    SetSecurityInfo, EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT,
+    SE_OBJECT_TYPE, SE_WINDOW_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::Isolation::DeriveAppContainerSidFromAppContainerName;
 use windows_sys::Win32::Security::{
-    FreeSid, GetLengthSid, ACL, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    AclSizeInformation, EqualSid, FreeSid, GetAce, GetAclInformation, GetLengthSid,
+    ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
 };
 use windows_sys::Win32::Storage::FileSystem::{FILE_GENERIC_EXECUTE, FILE_GENERIC_READ};
 
@@ -57,6 +57,8 @@ use super::{wide, Owned};
 const PACKAGE_NAME: &str = "Partridge.Engine.Sandbox";
 
 const READ_CONTROL: u32 = 0x0002_0000;
+/// The type of an ACE that allows access (`ACCESS_ALLOWED_ACE_TYPE`).
+const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 /// Read and enumerate the objects of a desktop, make windows and menus, write objects. No hooks,
 /// no journal, no switching.
 const DESKTOP_RIGHTS: u32 = 0x01 | 0x02 | 0x04 | 0x40 | 0x80 | READ_CONTROL;
@@ -166,6 +168,41 @@ impl Drop for Local {
     }
 }
 
+/// True when an entry of the ACL itself allows all of `rights` to exactly this SID. (Not the
+/// effective rights through groups such as "Users" or "Everyone": those do not open anything to an
+/// AppContainer, which is checked against its own package SID.)
+///
+/// # Safety
+/// `acl` must be a valid ACL and `sid` a valid SID.
+unsafe fn allows(acl: *const ACL, sid: &[u8], rights: u32) -> bool {
+    let mut size: ACL_SIZE_INFORMATION = std::mem::zeroed();
+    if GetAclInformation(
+        acl,
+        (&mut size as *mut ACL_SIZE_INFORMATION).cast(),
+        std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+        AclSizeInformation,
+    ) == 0
+    {
+        return false;
+    }
+    let mut granted = 0u32;
+    for index in 0..size.AceCount {
+        let mut ace: *mut c_void = null_mut();
+        if GetAce(acl, index, &mut ace) == 0 || ace.is_null() {
+            continue;
+        }
+        let ace = &*(ace as *const ACCESS_ALLOWED_ACE);
+        if ace.Header.AceType != ACCESS_ALLOWED_ACE_TYPE {
+            continue;
+        }
+        let owner = &ace.SidStart as *const u32 as *mut c_void;
+        if EqualSid(owner, sid.as_ptr() as *mut c_void) != 0 {
+            granted |= ace.Mask;
+        }
+    }
+    granted & rights == rights
+}
+
 /// Adds an entry that allows `rights` to the package SID in the DACL that `get` reads, and writes
 /// the result with `set`. Does nothing when the package already has those rights.
 fn add_entry(
@@ -180,14 +217,9 @@ fn add_entry(
     let _descriptor = Local(descriptor);
 
     let who = trustee(sid);
-    if !dacl.is_null() {
-        let mut have = 0u32;
-        // SAFETY: the ACL is the one just read; the trustee is a live SID.
-        if unsafe { GetEffectiveRightsFromAclW(dacl, &who, &mut have) } == 0
-            && have & rights == rights
-        {
-            return Ok(());
-        }
+    // SAFETY: the ACL is the one just read; the SID is live.
+    if !dacl.is_null() && unsafe { allows(dacl, sid, rights) } {
+        return Ok(());
     }
     let entry = EXPLICIT_ACCESS_W {
         grfAccessPermissions: rights,
@@ -300,6 +332,8 @@ fn engine_paths(program: &Path, args: &[std::ffi::OsString]) -> Vec<PathBuf> {
     let fonts_dir = option("--fonts-dir").unwrap_or_else(|| pdfium_dir.join("fonts"));
 
     let mut paths = vec![
+        // The folder of the program too: the loader looks there first for the libraries it loads.
+        program.parent().map(Path::to_path_buf).unwrap_or_default(),
         program.to_path_buf(),
         pdfium_dir.clone(),
         pdfium_dir.join("pdfium.dll"),
