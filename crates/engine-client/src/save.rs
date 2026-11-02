@@ -831,6 +831,17 @@ fn keep_owner(_file: &File, _old: &fs::Metadata) -> Result<(), SaveError> {
     Ok(())
 }
 
+/// A security descriptor may have no owner; such an owner is unknown, and an unknown owner cannot
+/// be kept.
+#[cfg(windows)]
+fn owner_known(owner: *const std::ffi::c_void) -> Result<(), SaveError> {
+    if owner.is_null() {
+        Err(SaveError::OwnerWouldChange)
+    } else {
+        Ok(())
+    }
+}
+
 /// Gives the new file the access rights of the old one. A new file in a folder gets the rights of
 /// the folder (and its owner is the user who saves), which for a file that was shared with fewer
 /// people or more is not the same.
@@ -895,6 +906,10 @@ fn keep_access(old: &Path, new: &Path) -> Result<(), SaveError> {
             if status != ERROR_SUCCESS {
                 return Err(SaveError::AccessNotKept);
             }
+            // Win32 allows a descriptor without an owner. Comparing with a null owner would
+            // crash, and what cannot be told is treated as an owner that cannot be kept.
+            owner_known(owner)?;
+            owner_known(new_owner)?;
             if EqualSid(owner, new_owner) == 0 {
                 let status = SetNamedSecurityInfoW(
                     to.as_ptr(),
@@ -1570,6 +1585,17 @@ mod tests {
                 gid: Some(20)
             }
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_descriptor_without_an_owner_is_an_owner_that_cannot_be_kept() {
+        assert_eq!(
+            owner_known(std::ptr::null()),
+            Err(SaveError::OwnerWouldChange)
+        );
+        let sid = 1u8;
+        assert_eq!(owner_known((&sid as *const u8).cast()), Ok(()));
     }
 
     #[cfg(unix)]

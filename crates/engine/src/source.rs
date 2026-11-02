@@ -18,10 +18,12 @@
 //!   digest, and whether any read failed.
 //!
 //! The digests catch a change in the parts that were read, also when the size and the time of
-//! change were put back. A new time of change with the same size is accepted once every block of
-//! the file has been read and still has its digest (a program that only touched the file). They cannot catch a change in a part that was never read (nothing of the
-//! document depends on it) or one made before the first read of that part, which the size and
-//! the time of change are there for.
+//! change were put back. A new time of change with the same size is accepted as long as every
+//! block that was read still has its digest (a program that only touched the file): refusing it
+//! would cost the user every edit of a document that is, as far as can be told, the one that was
+//! opened. They cannot catch a change in a part that was never read (nothing of the document
+//! depends on it), or one made before the first read of that part, which the size is there for;
+//! the whole-file scan of the first save digests the rest, so a change after that is seen.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -177,9 +179,8 @@ impl SourceGuard {
     }
 
     /// Looks at the file again. `Ok` only if nothing is wrong: no read failed, the size is as it
-    /// was, every block read so far has the digest it had, and the time of change is as it was or
-    /// the whole file has been read (a program that only touched the file moved the time and
-    /// changed nothing). A failure of this look itself is an error for now, not a mark against the
+    /// was, and every block read so far has the digest it had. A new time of change alone is not
+    /// a change (a program that only touched the file moved the time and changed nothing). A failure of this look itself is an error for now, not a mark against the
     /// file: the next look is a new try. `progress` is told how many blocks are read, about every
     /// MiB.
     pub fn verify(&mut self, progress: &mut dyn FnMut(u32)) -> Result<(), Problem> {
@@ -216,11 +217,12 @@ impl SourceGuard {
             }
         }
         if let Some(modified) = time_moved {
-            // Every byte of the file is what was read once: nothing can be a mix of two versions.
-            let all_read = (0..self.len.div_ceil(BLOCK)).all(|i| self.blocks.contains_key(&i));
-            if !all_read {
-                return Err(Problem::Changed);
-            }
+            // Only the time moved, and every block that was read has the digest it had: a program
+            // that touched the file, or saved the same bytes again. A part that was never read
+            // cannot be compared with anything, so a change there is not seen (see the top of
+            // this file); refusing the save for it would cost the user every edit of a document
+            // that is, as far as anything can be told, the one that was opened. The new time is
+            // the one to compare with from now on.
             self.modified = modified;
         }
         Ok(())
@@ -394,26 +396,53 @@ mod tests {
     }
 
     #[test]
-    fn a_change_of_size_or_time_is_seen() {
+    fn a_change_of_size_is_seen() {
+        let longer = rig(100_000);
+        let mut reader = GuardedReader::new(longer.guard.clone());
+        let mut buf = [0u8; 10];
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(lock(&longer.guard).verify(&mut |_| {}), Ok(()));
+        longer.data.lock().unwrap().push(1);
+        assert_eq!(
+            lock(&longer.guard).verify(&mut |_| {}),
+            Err(Problem::Changed)
+        );
+    }
+
+    #[test]
+    fn m1_a_touch_before_the_whole_file_is_known_does_not_cost_the_edits() {
         let touched = rig(100_000);
         let mut reader = GuardedReader::new(touched.guard.clone());
         let mut buf = [0u8; 10];
         reader.read_exact(&mut buf).unwrap();
         assert_eq!(lock(&touched.guard).verify(&mut |_| {}), Ok(()));
-        // Most of the file was never read: a new time of change may hide anything.
+        // Most of the file was never read, and the time of change is new: the blocks that were
+        // read have their digests, so this is the file that was opened.
         *touched.modified.lock().unwrap() =
             Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(5));
+        assert_eq!(lock(&touched.guard).verify(&mut |_| {}), Ok(()));
+        // The scan of the first save reads the rest, and the next look still agrees.
+        assert!(!lock(&touched.guard)
+            .contains_any(&[b"/ByteRange"], &mut |_| {})
+            .unwrap());
+        assert_eq!(lock(&touched.guard).verify(&mut |_| {}), Ok(()));
+        // A new time with other bytes in a block that was read is still a change, and so is a
+        // block that was read for the first time after the touch and then changed.
+        touched.data.lock().unwrap()[90_000] ^= 0xff;
+        *touched.modified.lock().unwrap() =
+            Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(9));
         assert_eq!(
             lock(&touched.guard).verify(&mut |_| {}),
             Err(Problem::Changed)
         );
-        // And so does a new size.
-        let longer = rig(100_000);
-        let mut reader = GuardedReader::new(longer.guard.clone());
+        let other = rig(100_000);
+        let mut reader = GuardedReader::new(other.guard.clone());
         reader.read_exact(&mut buf).unwrap();
-        longer.data.lock().unwrap().push(1);
+        other.data.lock().unwrap()[3] ^= 0xff;
+        *other.modified.lock().unwrap() =
+            Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(5));
         assert_eq!(
-            lock(&longer.guard).verify(&mut |_| {}),
+            lock(&other.guard).verify(&mut |_| {}),
             Err(Problem::Changed)
         );
     }

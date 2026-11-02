@@ -438,6 +438,28 @@ fn c1_a_same_size_rewrite_with_the_old_time_is_seen_in_the_part_that_was_read() 
 }
 
 #[test]
+fn m1_a_touch_before_the_first_save_still_lets_the_edits_out_as_a_copy() {
+    let dir = Dir::new("m1");
+    let original = kit::simple_pdf(3);
+    let path = dir.write("a.pdf", &original);
+    let before = fs::metadata(&path).unwrap().modified().unwrap();
+    let pool = pool();
+    let (handle, _) = pool.open(&text(&path), None).unwrap();
+
+    // Another program only touches the file: the same bytes, a new time of change. Most of the
+    // file was never read by the engine when this happens.
+    let file = fs::File::options().write(true).open(&path).unwrap();
+    file.set_modified(before + std::time::Duration::from_secs(3600))
+        .unwrap();
+    drop(file);
+
+    let copy = dir.0.join("copy.pdf");
+    pool.save_as(handle, &copy, SaveOptions::default()).unwrap();
+    assert_eq!(describe(&copy, None).pages, 3);
+    assert_eq!(fs::read(&path).unwrap(), original);
+}
+
+#[test]
 fn c1_a_file_replaced_by_a_rename_keeps_the_old_handle_and_a_copy_is_safe() {
     let dir = Dir::new("c1c");
     let path = dir.write("a.pdf", &kit::simple_pdf(3));

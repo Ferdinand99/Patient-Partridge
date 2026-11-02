@@ -794,6 +794,12 @@ export class App {
     const chosen = new Promise<"stay" | "leave">((resolve) => (choose = resolve));
     const reveal = () => {
       if (over.signal.aborted) return;
+      // The save waits for the answer to a question (or an error) that is open: a second box with
+      // a moving bar beside it, and the focus, would only be in the way. The question has the focus.
+      if (!shown && this.noticeLayer.childElementCount > 0) {
+        this.focusTopNotice();
+        return;
+      }
       if (!shown) {
         shown = true;
         void showNotice(this.noticeLayer, {
@@ -812,7 +818,15 @@ export class App {
       }
       this.focusTopNotice();
     };
-    const timer = setTimeout(reveal, SAVE_SHEET_DELAY_MS);
+    // While a question is open the timer is held: it looks again after the same time, so the box
+    // still comes up when the save goes on long after the answer.
+    let timer: ReturnType<typeof setTimeout>;
+    const tick = () => {
+      if (over.signal.aborted) return;
+      if (this.noticeLayer.childElementCount > 0) timer = setTimeout(tick, SAVE_SHEET_DELAY_MS);
+      else reveal();
+    };
+    timer = setTimeout(tick, SAVE_SHEET_DELAY_MS);
     const before = this.quitReveal;
     this.quitReveal = reveal;
     const finished = work(halt.signal).then(
