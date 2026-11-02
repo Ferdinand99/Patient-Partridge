@@ -846,12 +846,7 @@ fn take_snapshot(
     match serialise(engine, doc, limit, progress)? {
         Some(bytes) => {
             let annots = engine.annots.get(&doc).cloned();
-            Ok(tools(engine, doc).keep(
-                bytes,
-                sizes.len(),
-                Some(sizes_digest(&sizes)),
-                annots,
-            ))
+            Ok(tools(engine, doc).keep(bytes, sizes.len(), Some(sizes_digest(&sizes)), annots))
         }
         None => Ok(0),
     }

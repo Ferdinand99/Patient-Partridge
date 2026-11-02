@@ -242,10 +242,7 @@ export class Annotator implements AnnotLayerEvents {
   setHeld(held: boolean): void {
     if (this.held === held) return;
     this.held = held;
-    if (held) {
-      this.view.annotationLayer.abort();
-      this.host.announce(PAGES_BUSY_NOTICE);
-    }
+    if (held) this.view.annotationLayer.abort();
     this.host.changed();
   }
 

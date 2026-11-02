@@ -159,7 +159,10 @@ fn an_annotation_a_field_and_a_move_of_pages_all_reach_the_saved_file() {
     ));
     assert_eq!(value_of(e, again, 0, "applicant"), "Ada King");
     assert_eq!(value_of(e, again, 1, "applicant"), "Ada King");
-    assert!(contains(&bytes, b"Ada King"), "the field value is in the file");
+    assert!(
+        contains(&bytes, b"Ada King"),
+        "the field value is in the file"
+    );
     let _ = (made, second);
 }
 
@@ -244,7 +247,7 @@ fn a_change_of_the_pages_does_not_leave_the_form_environment_or_the_annotation_r
         ResponseBody::FormInfo { .. }
     ));
     set_text(e, doc, 0, "applicant", "Before");
-    assert_eq!(e.form_scans_for_tests(doc).is_some(), true);
+    assert!(e.form_scans_for_tests(doc).is_some());
     let made = note(e, doc, 0, "KEEP");
 
     // A move of the pages: the environment of the form is dropped (it holds the document and its
@@ -345,7 +348,6 @@ fn deleting_a_page_takes_the_notes_made_on_it_out_of_the_file() {
     let listed = list(e, doc, 0);
     assert_eq!(listed.len(), 1, "{listed:?}");
     assert_eq!(listed[0].text, "KEPT-NOTE-OF-PAGE-ONE");
-    assert_eq!(listed[0].id, listed[0].id);
     assert!(list(e, doc, 1).is_empty());
     // What the page held is not in the saved file; what the others hold is.
     let bytes = save_all(e, doc);
@@ -356,13 +358,7 @@ fn deleting_a_page_takes_the_notes_made_on_it_out_of_the_file() {
     assert!(contains(&bytes, b"KEPT-NOTE-OF-PAGE-ONE"));
     let _ = on_one;
     // Taking the delete back brings the page and its note back.
-    pages_op(
-        e,
-        PagesRequest::Restore {
-            doc,
-            snapshot,
-        },
-    );
+    pages_op(e, PagesRequest::Restore { doc, snapshot });
     assert_eq!(texts(e, doc, 3), ["Page 1", "Page 2", "Page 3"]);
     let back = list(e, doc, 1);
     assert!(

@@ -1353,7 +1353,13 @@ pub fn encrypted_pdf_with_owner(
     pages: usize,
     permissions: i32,
 ) -> Vec<u8> {
-    encrypted_pdf_impl(user_password, Some(owner_password), pages, permissions, false)
+    encrypted_pdf_impl(
+        user_password,
+        Some(owner_password),
+        pages,
+        permissions,
+        false,
+    )
 }
 
 fn encrypted_pdf_impl(

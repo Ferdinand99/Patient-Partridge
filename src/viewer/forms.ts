@@ -290,7 +290,8 @@ export class FormLayer {
     if (on) {
       for (const view of [...this.typed]) this.commitText(view.page, view);
       this.held = true;
-      this.tell(PAGES_BUSY_NOTICE, false);
+      // A document with no fields on show has nothing to wait for, and nothing to say.
+      if (this.enabled) this.tell(PAGES_BUSY_NOTICE, false);
     } else {
       this.held = false;
       const at = this.messages.findIndex((m) => m.text === PAGES_BUSY_NOTICE);
@@ -331,6 +332,7 @@ export class FormLayer {
           this.say("xfa", XFA_NOTICE);
         } else if (info.kind === "acro") {
           this.enabled = true;
+          if (this.held) this.tell(PAGES_BUSY_NOTICE, false);
           if (info.actions) this.say("actions", ACTIONS_NOTICE);
           for (const [page, state] of this.pages) {
             if (!state.list) this.load(page, state);

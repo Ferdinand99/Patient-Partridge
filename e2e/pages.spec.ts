@@ -499,6 +499,27 @@ test.describe("pages from other files", () => {
     await expect(dirty(page)).toBeVisible();
   });
 
+  test("while a change runs, the annotation tools wait and say why, and work again when it is done", async ({ page }) => {
+    const doc = await openDoc(page, "/docs/ten.pdf");
+    await page.locator("#annotate-button").click();
+    await expect(page.locator("#tool-pen")).toBeEnabled();
+    await press(page, 4);
+    await page.evaluate(() => ((window as unknown as { __E2E__: Stand }).__E2E__.pages.delay = 1500));
+    await page.keyboard.press("Delete");
+    await expect(page.locator(".busy-box")).toBeVisible();
+    // The tools are off, the bar says why, and a tool that is pressed anyway is not picked.
+    await expect(page.locator("#tool-pen")).toBeDisabled();
+    await expect(page.locator("#annotbar")).toContainText("The pages of this document are being changed");
+    await page.locator("#tool-pen").click({ force: true });
+    await expect(page.locator("#tool-pen")).not.toHaveAttribute("aria-pressed", "true");
+    await expect.poll(async () => (await labels(page, doc)).length, { timeout: 8000 }).toBe(9);
+    await answerNote(page, /What a delete leaves/);
+    await expect(page.locator("#tool-pen")).toBeEnabled();
+    await expect(page.locator("#annotbar")).not.toContainText("The pages of this document are being changed");
+    await page.locator("#tool-pen").click();
+    await expect(page.locator("#tool-pen")).toHaveAttribute("aria-pressed", "true");
+  });
+
   test("while a change runs, the other tabs, the keys and the menu answer, and the other document is saved and closed", async ({
     page,
   }) => {
