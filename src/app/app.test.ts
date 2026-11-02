@@ -117,6 +117,8 @@ function make(
     pages?: PageToolsApi;
     /** What the engine says about the signatures of every document; none is asked for without it. */
     signatures?: SignaturesInfo;
+    /** How long a close, a quit, a save and a print wait for a page tool before they ask. */
+    changeGraceMs?: number;
   } = {},
 ) {
   let nextDoc = 1;
@@ -190,6 +192,7 @@ function make(
     viewLimits: options.viewLimits,
     pages: options.pages,
     pageBusyDelayMs: 1000,
+    changeGraceMs: options.changeGraceMs,
     print: {
       encode: vi.fn(() => Promise.resolve(new Blob(["jpeg"]))),
       createUrl: vi.fn(() => `blob:test/${++urlCounter}`),
@@ -2956,6 +2959,263 @@ describe("App: page tools", () => {
     });
   });
 
+
+  describe("a change that takes long, on one of two documents", () => {
+    const tabsOf = (app: App) => (app as unknown as { tabs: { id: number; doc: number }[] }).tabs;
+    const lost = { code: "engine_stopped", message: "the engine stopped" };
+
+    /** Two documents. A turn of the first has not answered yet. The grace before a question is short. */
+    async function turningFirst(graceMs = 20, firstDirty = false) {
+      const pages = fakePages();
+      const made = make({ pages: pages as unknown as PageToolsApi, changeGraceMs: graceMs });
+      await made.app.openPath("/a.pdf");
+      await flush();
+      await made.app.openPath("/b.pdf");
+      await flush();
+      click(tab("a.pdf"));
+      await flush();
+      if (firstDirty) made.app.recordEdit(edit);
+      let finish!: (c: PagesChanged) => void;
+      let fail!: (e: unknown) => void;
+      pages.pagesRotate.mockImplementationOnce(
+        () =>
+          new Promise<PagesChanged>((resolve, reject) => {
+            finish = resolve;
+            fail = reject;
+          }),
+      );
+      const ops = opsOf(made.app);
+      const turning = ops.rotate([0], 1);
+      await flush();
+      const [a, b] = tabsOf(made.app);
+      return {
+        ...made,
+        pages,
+        ops,
+        turning,
+        a,
+        b,
+        finish: (c: PagesChanged = changed(3, 0, 1)) => finish(c),
+        fail: (e: unknown = lost) => fail(e),
+      };
+    }
+
+    const later = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const edit = { label: "edit", undo: () => Promise.resolve(), redo: () => Promise.resolve() };
+
+    it("a save of the other document does not wait for it", async () => {
+      const { app, api, finish, turning, b } = await turningFirst(60_000);
+      click(tab("b.pdf"));
+      await flush();
+      app.recordEdit(edit);
+      const saved = app.saveActive();
+      await flush();
+      expect(api.save).toHaveBeenCalledOnce();
+      expect(api.save.mock.calls[0][0]).toBe(b.doc);
+      expect(await saved).toBe(true);
+      finish();
+      await turning;
+    });
+
+    it("closing the other document does not wait for it, and asks nothing", async () => {
+      const { app, finish, turning, b } = await turningFirst(60_000);
+      expect(await app.requestClose(b.id)).toBe(true);
+      expect(tabTitles()).toEqual(["a.pdf"]);
+      expect(notice()).toBeNull();
+      finish();
+      await turning;
+    });
+
+    it("printing the other document does not wait for it", async () => {
+      const { app, finish, turning } = await turningFirst(60_000);
+      click(tab("b.pdf"));
+      await flush();
+      const printing = app.printActive();
+      await flush();
+      expect(document.querySelector(".print-dialog")).not.toBeNull();
+      document.querySelector<HTMLElement>(".print-dialog .btn-secondary")?.click();
+      await printing;
+      finish();
+      await turning;
+    });
+
+    it("a save of the document that is being changed waits a moment, and then says why it did not save", async () => {
+      const pages = fakePages();
+      const { app, api } = make({ pages: pages as unknown as PageToolsApi, changeGraceMs: 20 });
+      await app.openPath("/a.pdf");
+      await flush();
+      const ops = opsOf(app);
+      await ops.rotate([0], 1);
+      let finish!: (c: PagesChanged) => void;
+      pages.pagesRotate.mockImplementationOnce(() => new Promise<PagesChanged>((r) => (finish = r)));
+      const second = ops.rotate([1], 1);
+      await flush();
+      const saved = app.saveActive();
+      await later(80);
+      await flush();
+      expect(notice()?.textContent).toContain("is being changed");
+      expect(api.save).not.toHaveBeenCalled();
+      click(button("OK"));
+      expect(await saved).toBe(false);
+      finish(changed(3, 0, 1));
+      await second;
+    });
+
+    it("closing it asks, after a moment, whether to wait or to close now and lose the change", async () => {
+      const { app, a, finish, turning } = await turningFirst();
+      const closing = app.requestClose(a.id);
+      await later(80);
+      await flush();
+      expect(notice()?.textContent).toContain('"a.pdf" is still being changed');
+      expect(notice()?.textContent).toContain("that change and the changes to this document that you have not saved are lost");
+      expect(tabTitles()).toEqual(["a.pdf", "b.pdf"]);
+      // Wait: nothing is closed, nothing is lost.
+      click(button("Wait"));
+      expect(await closing).toBe(false);
+      expect(tabTitles()).toEqual(["a.pdf", "b.pdf"]);
+      finish();
+      await turning;
+    });
+
+    it("closing it now ends the document at once, and the change that was under way says nothing", async () => {
+      const { app, api, a, fail, turning } = await turningFirst();
+      const closing = app.requestClose(a.id);
+      await later(80);
+      await flush();
+      click(button("Close now"));
+      expect(await closing).toBe(true);
+      expect(tabTitles()).toEqual(["b.pdf"]);
+      expect(api.close).toHaveBeenCalledWith(a.doc);
+      // The engine of the document is ended with it: the turn fails, and that is not said again.
+      fail();
+      await turning;
+      await flush();
+      expect(notice()).toBeNull();
+    });
+
+    it("closing it again while the first request waits brings the question up at once", async () => {
+      const { app, a, finish, turning } = await turningFirst(60_000);
+      const first = app.requestClose(a.id);
+      await flush();
+      expect(notice()).toBeNull();
+      expect(await app.requestClose(a.id)).toBe(false);
+      await flush();
+      expect(notice()?.textContent).toContain("is still being changed");
+      click(button("Wait"));
+      expect(await first).toBe(false);
+      finish();
+      await turning;
+    });
+
+    it("a change that ends while the question is open leaves the ordinary questions to follow", async () => {
+      const { app, a, finish, turning } = await turningFirst();
+      const closing = app.requestClose(a.id);
+      await later(80);
+      await flush();
+      finish();
+      await turning;
+      await flush();
+      click(button("Close now"));
+      await flush();
+      // The change was made: the document has changes that are not saved, and is not closed unasked.
+      expect(notice()?.textContent).toContain("Save changes");
+      click(button("Cancel"));
+      expect(await closing).toBe(false);
+      expect(tabTitles()).toEqual(["a.pdf", "b.pdf"]);
+    });
+
+    it("quitting asks, after a moment, whether to wait or to quit now", async () => {
+      const { app, api, finish, turning } = await turningFirst();
+      const quitting = app.requestQuit();
+      await later(80);
+      await flush();
+      expect(notice()?.textContent).toContain('"a.pdf" is still being changed');
+      expect(notice()?.textContent).toContain("If you quit now");
+      click(button("Wait"));
+      await quitting;
+      expect(api.quitApp).not.toHaveBeenCalled();
+      expect(api.stayOpen).toHaveBeenCalledOnce();
+      finish();
+      await turning;
+    });
+
+    it("quitting now quits at once when nothing else is unsaved", async () => {
+      const { app, api, finish, turning } = await turningFirst();
+      const quitting = app.requestQuit();
+      await later(80);
+      await flush();
+      click(button("Quit now"));
+      await quitting;
+      expect(api.quitApp).toHaveBeenCalledOnce();
+      expect(notice()).toBeNull();
+      finish();
+      await turning;
+    });
+
+    it("quitting now does not ask about the document whose change was given up, though it has other changes unsaved", async () => {
+      const { app, api, finish, turning } = await turningFirst(20, true);
+      const quitting = app.requestQuit();
+      await later(80);
+      await flush();
+      click(button("Quit now"));
+      await quitting;
+      expect(notice()).toBeNull();
+      expect(api.save).not.toHaveBeenCalled();
+      expect(api.quitApp).toHaveBeenCalledOnce();
+      finish();
+      await turning;
+    });
+
+    it("quitting now still asks about the other documents that have changes that are not saved", async () => {
+      const { app, api, finish, turning } = await turningFirst();
+      click(tab("b.pdf"));
+      await flush();
+      app.recordEdit(edit);
+      const quitting = app.requestQuit();
+      await later(80);
+      await flush();
+      click(button("Quit now"));
+      await flush();
+      // Only b.pdf is asked about: the change to a.pdf was given up with the choice.
+      expect(notice()?.textContent).toContain('Save changes to "b.pdf"?');
+      click(button("Save and quit"));
+      await quitting;
+      expect(api.save).toHaveBeenCalledOnce();
+      expect(api.save.mock.calls[0][0]).toBe(tabsOf(app)[1].doc);
+      expect(api.quitApp).toHaveBeenCalledOnce();
+      finish();
+      await turning;
+    });
+
+    it("a second request to quit brings the question up at once", async () => {
+      const { app, api, finish, turning } = await turningFirst(60_000);
+      const quitting = app.requestQuit();
+      await flush();
+      expect(notice()).toBeNull();
+      await app.requestQuit();
+      await flush();
+      expect(notice()?.textContent).toContain("is still being changed");
+      click(button("Wait"));
+      await quitting;
+      expect(api.quitApp).not.toHaveBeenCalled();
+      finish();
+      await turning;
+    });
+
+    it("printing it waits a moment, and then says that the print would show the old pages", async () => {
+      const { app, finish, turning } = await turningFirst();
+      const printing = app.printActive();
+      await later(80);
+      await flush();
+      expect(notice()?.textContent).toContain("is being changed");
+      expect(document.querySelector(".print-dialog")).toBeNull();
+      click(button("OK"));
+      await printing;
+      expect(document.querySelector(".print-dialog")).toBeNull();
+      finish();
+      await turning;
+    });
+  });
   describe("on a signed document", () => {
     const item: SignatureItem = {
       index: 0,

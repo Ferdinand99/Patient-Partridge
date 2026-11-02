@@ -111,11 +111,13 @@ pub struct EngineConfig {
     /// The slowest speed, in bytes a second, at which a long request still has to get through the
     /// document (see `save_floor`). A slow drive or a share is allowed to be this slow.
     pub save_slowest: u64,
-    /// The overall limit of a change to the pages, which is much longer than `save_floor`: a
-    /// change to a long document of pages with a lot on them can take many minutes and still be
-    /// healthy, and it tells that it is working (the engine reports progress at least four times a
-    /// second), so it is only ended by `save_stall` when it says nothing, and by this when it goes
-    /// on for hours. `save_slowest` adds to it as for a save.
+    /// The overall limit of a change to the pages, longer than `save_floor`: a change to a long
+    /// document of pages with a lot on them can take many minutes and still be healthy, and it tells
+    /// that it is working (the engine reports progress after each page it has done, and at most four
+    /// times a second), so it is only ended by `save_stall` when it says nothing, and by this when
+    /// it goes on and on. There is no way to stop such a change short of ending the engine, and the
+    /// window holds the document for as long as it lasts, so the limit is 20 minutes and no more.
+    /// `save_slowest` adds to it as for a save.
     pub pages_floor: Duration,
     /// Most memory the engine may use, in bytes. `None` leaves the engine's own limit (3 GiB).
     pub memory_limit: Option<u64>,
@@ -138,7 +140,7 @@ impl EngineConfig {
             save_stall: Duration::from_secs(300),
             save_floor: Duration::from_secs(600),
             save_slowest: 1024 * 1024,
-            pages_floor: Duration::from_secs(3600),
+            pages_floor: Duration::from_secs(20 * 60),
             memory_limit: None,
             sandbox: SandboxPolicy::default_for_build(),
             system_fonts: true,

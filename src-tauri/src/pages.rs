@@ -183,9 +183,9 @@ pub async fn pages_set_boxes(
     let _permit = permit(&update_state)?;
     let _changing = Changing::begin(&update_state, doc);
     let pool = engine.0.clone();
-    blocking(move || pool.pages_set_boxes(doc, &pages, &boxes))
-        .await
-        .map(Into::into)
+    let changed = blocking(move || pool.pages_set_boxes(doc, &pages, &boxes)).await?;
+    unsaved(&update_state, doc);
+    Ok(changed.into())
 }
 
 #[tauri::command]
@@ -215,9 +215,9 @@ pub async fn pages_restore(
     let _permit = permit(&update_state)?;
     let _changing = Changing::begin(&update_state, doc);
     let pool = engine.0.clone();
-    blocking(move || pool.pages_restore(doc, snapshot))
-        .await
-        .map(Into::into)
+    let changed = blocking(move || pool.pages_restore(doc, snapshot)).await?;
+    unsaved(&update_state, doc);
+    Ok(changed.into())
 }
 
 /// Inserts all pages of the file at `path` so that the first becomes page `at`. The file needs the

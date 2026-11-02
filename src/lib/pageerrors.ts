@@ -70,7 +70,7 @@ export function describePageError(error: AppErrorLike, name: string, source?: st
     case "page_change_failed":
       return {
         title: "The pages could not be changed",
-        detail: `The PDF library refused the change${error.message ? ` (${error.message})` : ""}. "${name}" was not changed.`,
+        detail: `The change could not be made${error.message ? ` (${error.message})` : ""}. "${name}" was not changed.`,
       };
     case "busy":
     case "save_busy":

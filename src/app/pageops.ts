@@ -80,12 +80,16 @@ interface FailContext {
 
 export class PageOps {
   private working = false;
+  /** The document the running tool (or a step back or forward) is changing. */
+  private workingDoc: number | null = null;
   private readonly idleWaiters: (() => void)[] = [];
   private box: BusyBox | null = null;
   private readonly delay: number;
   /** What the running tool shows in its box, and whether the delay has run out. */
   private running: { title: string; stoppable: boolean; doc: number } | null = null;
   private due = false;
+  /** A Stop was asked for during this run, whether or not it could end the step in hand. */
+  private stopAsked = false;
   private holds = 0;
   /** The notes already shown for a document, so that each is said once. */
   private readonly noted = new Set<string>();
@@ -96,6 +100,16 @@ export class PageOps {
     private readonly hooks: PageOpsHooks = {},
   ) {
     this.delay = hooks.busyDelayMs ?? 400;
+  }
+
+  /** The document that a tool is changing right now (a step back or forward too), or null. */
+  get busyDoc(): number | null {
+    return this.working ? this.workingDoc : null;
+  }
+
+  /** True while a tool is changing the document `doc`. A tool on another document is not in the way. */
+  busyOn(doc: number): boolean {
+    return this.working && this.workingDoc === doc;
   }
 
   /** True while a tool (or taking one back) is working. Only one works at a time. */
@@ -246,6 +260,16 @@ export class PageOps {
       async () => {
         for (const path of files) {
           let inserted: number | null;
+          // A Stop that came too late for the file before ends the list after it, and so does one
+          // that came between two files: it is not forgotten.
+          if (this.stopAsked) {
+            this.host.announce(
+              count > 0
+                ? `Stopped. The ${pagesWord(count)} added before stay; the rest were not added.`
+                : "Stopped. The document is as it was.",
+            );
+            break;
+          }
           // A Stop that came too late ended with the file before; the next one can be stopped again.
           this.box?.canStop();
           const name = path.split(/[\\/]/).pop() ?? path;
@@ -418,7 +442,7 @@ export class PageOps {
    */
   private async exclusive<T>(doc: number, work: () => Promise<T>): Promise<T> {
     if (this.working) throw { code: "busy", message: "another page tool is working" };
-    this.setWorking(true);
+    this.setWorking(true, doc);
     try {
       return await work();
     } catch (e) {
@@ -449,9 +473,10 @@ export class PageOps {
   private async run<T>(t: PageTarget, title: string, work: () => Promise<T>, options: RunOptions = {}): Promise<T | null> {
     // Something else started while a dialog was open (the file dialog of an insert, say).
     if (this.working) return null;
-    this.setWorking(true);
+    this.setWorking(true, t.doc);
     this.running = { title, stoppable: options.stoppable === true, doc: t.doc };
     this.due = false;
+    this.stopAsked = false;
     this.holds = options.held ? 1 : 0;
     const timer = setTimeout(() => {
       this.due = true;
@@ -509,6 +534,7 @@ export class PageOps {
 
   /** Stops what can be stopped without a cost. A change that is under way is left to finish. */
   private async stop(doc: number): Promise<void> {
+    this.stopAsked = true;
     try {
       const result = await this.api.pagesCancel(doc);
       if (result === "working") this.box?.cannotStop(TOOL_NOTES.stopTooLate);
@@ -540,9 +566,10 @@ export class PageOps {
     await this.host.notice({ title: text.title, detail, buttons: OK });
   }
 
-  private setWorking(on: boolean): void {
+  private setWorking(on: boolean, doc: number | null = null): void {
     if (this.working === on) return;
     this.working = on;
+    this.workingDoc = on ? doc : null;
     this.hooks.busyChanged?.(on);
     if (!on) for (const resolve of this.idleWaiters.splice(0)) resolve();
   }

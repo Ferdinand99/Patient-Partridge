@@ -100,6 +100,11 @@ export interface AppDeps {
   pages?: PageToolsApi;
   /** How long a page tool may work before the box with the bar shows, in milliseconds. For tests. */
   pageBusyDelayMs?: number;
+  /**
+   * How long a close, a quit, a save or a print waits for a page tool that is changing the document
+   * before it asks what to do, in milliseconds. Default: CHANGE_GRACE_MS. For tests.
+   */
+  changeGraceMs?: number;
 }
 
 interface Tab {
@@ -182,6 +187,11 @@ function samePlace(a: ViewPosition, b: ViewPosition): boolean {
 const APP_NAME = "Patient Partridge";
 /** How long a save is waited for before a box says that it is going on. */
 const SAVE_SHEET_DELAY_MS = 500;
+/**
+ * How long a close, a quit, a save or a print waits for a page tool that is changing the document
+ * before it asks the user what to do. A change that ends in a moment is waited for without a word.
+ */
+const CHANGE_GRACE_MS = 2000;
 const SAVE_SLOW_DETAIL =
   "A large file or a slow drive can take a while. You can wait, or give up the changes you made: the file on the disk stays as it is. Cancel keeps the program open and lets the save carry on.";
 
@@ -238,6 +248,10 @@ export class App {
   private quitting = false;
   /** What a second request to quit does while the first is still being dealt with. */
   private quitReveal: (() => void) | null = null;
+  /** The tabs whose close is waiting for a change to end or asking what to do about it. */
+  private readonly closing = new Set<number>();
+  /** What brings up the question about a change at once, for the requests that are waiting. */
+  private readonly askAtOnce = new Set<() => void>();
 
   private readonly stage: HTMLElement;
   private readonly empty: HTMLElement;
@@ -896,9 +910,33 @@ export class App {
    * save, give the changes up, or keep the tab. Resolves with true when the tab is closed.
    */
   async requestClose(id: number): Promise<boolean> {
+    const first = this.tabs.find((t) => t.id === id);
+    if (!first) return true;
     // A page tool that is still working makes the document dirty when it is done. A tab that
-    // looks clean now is closed with that change lost, so the tool is waited for first.
-    if (this.pageOps?.busy) await this.pageOps.whenIdle();
+    // looks clean now is closed with that change lost, so a change that ends in a moment is waited
+    // for. One that takes long is put to the user: wait, or leave now and lose the change and what
+    // is not saved. A tool that works on another document is none of this tab's business.
+    if (this.pageOps?.busyOn(first.doc)) {
+      if (this.closing.has(id)) {
+        // Asked again while the first request is waiting: the question comes at once.
+        for (const ask of this.askAtOnce) ask();
+        return false;
+      }
+      this.closing.add(id);
+      try {
+        const ended = await this.changeEnded(first.doc);
+        if (!ended && this.tabs.includes(first) && this.pageOps.busyOn(first.doc)) {
+          if ((await this.askAboutChange(first, "close")) === "wait") return false;
+          // The change may have ended while the question was open; then the ordinary questions follow.
+          if (this.tabs.includes(first) && this.pageOps.busyOn(first.doc)) {
+            this.closeTab(first.id);
+            return true;
+          }
+        }
+      } finally {
+        this.closing.delete(id);
+      }
+    }
     const tab = this.tabs.find((t) => t.id === id);
     if (!tab) return true;
     if (!tab.history.dirty) {
@@ -1002,6 +1040,49 @@ export class App {
     this.noticeLayer.lastElementChild?.querySelector<HTMLElement>("button:not(:disabled)")?.focus();
   }
 
+  /**
+   * Waits for the page tool that is changing the document `doc` (any document when null) for a
+   * moment. Resolves with true when no such tool is working any more, and with false when the
+   * moment has passed or a request that waits as well asked for the question at once.
+   */
+  private async changeEnded(doc: number | null): Promise<boolean> {
+    const ops = this.pageOps;
+    const busy = () => (doc === null ? ops?.busy === true : ops?.busyOn(doc) === true);
+    if (!ops || !busy()) return true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let asked!: () => void;
+    const late = new Promise<false>((resolve) => {
+      timer = setTimeout(() => resolve(false), this.deps.changeGraceMs ?? CHANGE_GRACE_MS);
+      asked = () => resolve(false);
+    });
+    this.askAtOnce.add(asked);
+    try {
+      const ended = await Promise.race([ops.whenIdle().then(() => true as const), late]);
+      return ended && !busy();
+    } finally {
+      clearTimeout(timer);
+      this.askAtOnce.delete(asked);
+    }
+  }
+
+  /**
+   * A page tool is still changing a document that the user is closing or leaving the program with.
+   * There is no Stop for such a change (it cannot be ended without ending the engine), so the user
+   * chooses: wait for it, or leave now and lose the change and the unsaved changes of that document.
+   */
+  private async askAboutChange(tab: Tab, what: "close" | "quit"): Promise<"wait" | "leave"> {
+    const leave = what === "close" ? "close the document" : "quit";
+    const answer = await showNotice(this.noticeLayer, {
+      title: `"${tab.name}" is still being changed`,
+      detail: `A change to its pages is under way. If you ${leave} now, that change and the changes to this document that you have not saved are lost. To keep them, wait until the change has finished, then ${leave}.`,
+      buttons: [
+        { id: "wait", label: "Wait", safe: true },
+        { id: "leave", label: what === "close" ? "Close now" : "Quit now" },
+      ],
+    });
+    return answer.button === "leave" ? "leave" : "wait";
+  }
+
   /** Closes a tab at once, whatever it holds. The questions are asked by `requestClose`. */
   closeTab(id: number): void {
     const index = this.tabs.findIndex((t) => t.id === id);
@@ -1087,9 +1168,12 @@ export class App {
     return this.saveTab(tab, true);
   }
 
-  /** Saves every document that has changes. Resolves with true when all were saved. */
-  async saveAllChanges(halt?: AbortSignal): Promise<boolean> {
-    for (const tab of this.tabs.filter((t) => t.history.dirty)) {
+  /**
+   * Saves every document that has changes, except `given`, a document the user gave up (its change
+   * was under way when the program was left). Resolves with true when all were saved.
+   */
+  async saveAllChanges(halt?: AbortSignal, given?: Tab): Promise<boolean> {
+    for (const tab of this.tabs.filter((t) => t.history.dirty && t !== given)) {
       // The user stopped waiting: what is running finishes, but no other document is begun.
       if (halt?.aborted) return false;
       if (!(await this.saveTab(tab, false))) return false;
@@ -1103,8 +1187,19 @@ export class App {
    * (a save breaks a signature). A failure is told to the user. Resolves with true when saved.
    */
   private async saveTab(tab: Tab, asCopy: boolean): Promise<boolean> {
-    // A page tool that is still working would make the bytes of the save those of no one state.
-    if (this.pageOps?.busy) await this.pageOps.whenIdle();
+    // A page tool that is still changing this document would make the bytes of the save those of no
+    // one state. A change that ends in a moment is waited for; for a long one the user is told. A
+    // tool that works on another document does not matter: each document has an engine of its own.
+    if (this.pageOps?.busyOn(tab.doc) && !(await this.changeEnded(tab.doc))) {
+      if (this.pageOps.busyOn(tab.doc)) {
+        await showNotice(this.noticeLayer, {
+          title: `"${tab.name}" is being changed`,
+          detail: "A change to its pages is under way, and a save would not write the document as it will be. Save again when the change has finished.",
+          buttons: [{ id: "ok", label: "OK", primary: true }],
+        });
+        return false;
+      }
+    }
     // A save that is running is waited for, and then the state is looked at again: it may have
     // saved everything, or an edit may have come after it.
     while (tab.saving) {
@@ -1277,9 +1372,29 @@ export class App {
     this.quitReveal = () => this.focusTopNotice();
     try {
       // A page tool that is still working makes a document dirty when it is done: its change must
-      // not be missed because the answer had not come yet.
-      if (this.pageOps?.busy) await this.pageOps.whenIdle();
-      const dirty = this.tabs.filter((t) => t.history.dirty);
+      // not be missed because the answer had not come yet. A change that ends in a moment is waited
+      // for. One that takes long is put to the user: wait, or quit now and lose the change and the
+      // unsaved changes of that document. The other documents are asked about as usual.
+      let given: Tab | undefined;
+      const ops = this.pageOps;
+      if (ops?.busy) {
+        const working = this.tabs.find((t) => t.doc === ops.busyDoc);
+        this.quitReveal = () => {
+          for (const ask of this.askAtOnce) ask();
+          this.focusTopNotice();
+        };
+        const ended = await this.changeEnded(null);
+        this.quitReveal = () => this.focusTopNotice();
+        if (!ended && working && this.tabs.includes(working) && ops.busy) {
+          if ((await this.askAboutChange(working, "quit")) === "wait") {
+            await this.deps.api.stayOpen().catch(() => undefined);
+            return;
+          }
+          // The change may have ended while the question was open; then it counts like any other.
+          if (ops.busy) given = working;
+        }
+      }
+      const dirty = this.tabs.filter((t) => t.history.dirty && t !== given);
       if (dirty.length === 0) {
         await this.deps.api.quitApp();
         return;
@@ -1304,7 +1419,7 @@ export class App {
         return;
       }
       if (answer.button === "save") {
-        const ended = await this.waitForSave((halt) => this.saveAllChanges(halt), {
+        const ended = await this.waitForSave((halt) => this.saveAllChanges(halt, given), {
           title: dirty.length === 1 ? `Saving "${dirty[0].name}"…` : `Saving ${dirty.length} documents…`,
           detail: SAVE_SLOW_DETAIL,
           leave: "Quit without saving",
@@ -1668,8 +1783,19 @@ export class App {
 
   /** Asks which pages, prepares them, and opens the print dialog of the system. */
   async printActive(): Promise<void> {
-    // A page tool that is still working would have the print run on the old list of pages.
-    if (this.pageOps?.busy) await this.pageOps.whenIdle();
+    // A page tool that is still changing this document would have the print run on the old list of
+    // pages. A change that ends in a moment is waited for; for a long one the user is told.
+    const working = this.active;
+    if (working && this.pageOps?.busyOn(working.doc) && !(await this.changeEnded(working.doc))) {
+      if (this.pageOps.busyOn(working.doc)) {
+        await showNotice(this.noticeLayer, {
+          title: `"${working.name}" is being changed`,
+          detail: "A change to its pages is under way, and the print would show the pages as they were. Print again when the change has finished.",
+          buttons: [{ id: "ok", label: "OK", primary: true }],
+        });
+        return;
+      }
+    }
     const tab = this.active;
     if (!tab || this.printing || tab.view.pageCount === 0) return;
     this.printing = true;

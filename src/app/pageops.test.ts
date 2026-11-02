@@ -410,7 +410,7 @@ describe("when something goes wrong", () => {
     const t = setup();
     for (const [code, needle] of [
       ["too_many_pages", /10,000 pages/],
-      ["page_change_failed", /refused the change/],
+      ["page_change_failed", /could not be made/],
       ["snapshot_gone", /too old|let go of/],
       ["busy", /being saved/],
       ["page_out_of_range", /cannot be changed that way/],
@@ -590,6 +590,59 @@ describe("working", () => {
     finish({ changed: changed(13, 11, 3), inserted: 3 });
     const result = await work;
     expect(result?.select).toEqual([0, 1, 2]);
+  });
+
+  it("a stop that came too late for one file ends the list after it, and a stop between two files does too", async () => {
+    for (const between of [false, true]) {
+      vi.useFakeTimers();
+      document.body.replaceChildren();
+      const t = setup({ busyDelayMs: 100, picked: ["/in/a.pdf", "/in/b.pdf", "/in/c.pdf"] });
+      t.api.pagesCancel.mockResolvedValueOnce((between ? "idle" : "working") as never);
+      let finish!: (v: { changed: PagesChanged; inserted: number }) => void;
+      t.api.pagesInsertPdf.mockImplementationOnce(() => new Promise((r) => (finish = r)));
+      const work = t.ops.insertFiles(0);
+      await vi.advanceTimersByTimeAsync(150);
+      t.layer.querySelector<HTMLButtonElement>(".busy-box button")?.click();
+      await vi.advanceTimersByTimeAsync(0);
+      finish({ changed: changed(13, 11, 3), inserted: 3 });
+      const result = await work;
+      // The first file stays, the others are not tried, and it is said.
+      expect(t.api.pagesInsertPdf).toHaveBeenCalledOnce();
+      expect(result?.select).toEqual([0, 1, 2]);
+      expect(t.announced.some((a) => /Stopped\. The 3 pages added before stay/.test(a))).toBe(true);
+      vi.useRealTimers();
+    }
+  });
+
+  it("knows which document a tool is changing, and that a tool on another one is not in the way", async () => {
+    const t = setup();
+    expect(t.ops.busyDoc).toBeNull();
+    expect(t.ops.busyOn(5)).toBe(false);
+    let finish!: (c: PagesChanged) => void;
+    t.api.pagesRotate.mockImplementationOnce(() => new Promise((r) => (finish = r)));
+    const work = t.ops.rotate([0], 1);
+    await Promise.resolve();
+    expect(t.ops.busyDoc).toBe(5);
+    expect(t.ops.busyOn(5)).toBe(true);
+    expect(t.ops.busyOn(6)).toBe(false);
+    finish(changed(10, 0, 1));
+    await work;
+    expect(t.ops.busyDoc).toBeNull();
+    // Taking a change back names its document too.
+    let release!: (c: PagesChanged) => void;
+    t.api.pagesRotate.mockImplementationOnce(() => new Promise((r) => (release = r)));
+    const turning = t.ops.rotate([1], 1);
+    await Promise.resolve();
+    release(changed(10, 0, 1));
+    await turning;
+    t.api.pagesRotate.mockImplementationOnce(() => new Promise((r) => (finish = r)));
+    const undoing = t.history.undo();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(t.ops.busyOn(5)).toBe(true);
+    finish(changed(10, 0, 1));
+    await undoing;
+    expect(t.ops.busyDoc).toBeNull();
   });
 
   it("copying pages out keeps the box away while the dialog of the system is open", async () => {
