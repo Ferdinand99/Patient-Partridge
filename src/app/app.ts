@@ -760,7 +760,7 @@ export class App {
     };
     return {
       api: forms,
-      record: (edit) => this.recordFormEdit(tab, edit, 0),
+      record: (edit) => this.recordFormEdit(tab, edit),
       pending: () => this.historyChanged(tab),
     };
   }
@@ -769,13 +769,13 @@ export class App {
    * Puts a change of a form in the history of its tab. While an undo or a redo is still running the
    * history refuses it, so the change waits for the end of that (a moment) and is not lost.
    */
-  private recordFormEdit(tab: Tab, edit: FormEdit, attempt: number): void {
+  private recordFormEdit(tab: Tab, edit: FormEdit): void {
     try {
       tab.history.push(edit);
     } catch {
       // The change is made, so it is recorded however long the undo or redo takes.
       if (this.tabs.includes(tab)) {
-        setTimeout(() => this.recordFormEdit(tab, edit, attempt + 1), 20);
+        setTimeout(() => this.recordFormEdit(tab, edit), 20);
       }
     }
   }

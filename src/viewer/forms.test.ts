@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ACTIONS_NOTICE,
+  BLOCKED_NOTICE,
   FormLayer,
   XFA_NOTICE,
   type FormEdit,
@@ -333,6 +334,51 @@ describe("filling in", () => {
     expect(r.api.setFormField).toHaveBeenCalledTimes(1);
   });
 
+  it("sends text that was typed when the box loses the focus and no change event comes", async () => {
+    // WebKit sends a blur and no change when the window loses the focus, and the change only when
+    // the focus comes back, if at all.
+    const r = await rig([[field({ index: 0, name: "a", value: "old" })]]);
+    const input = r.control(0) as HTMLInputElement;
+    input.focus();
+    input.value = "typed";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    expect(r.layer.hasPendingInput).toBe(true);
+    input.dispatchEvent(new Event("blur"));
+    await flush();
+    expect(r.api.setFormField).toHaveBeenCalledTimes(1);
+    expect(r.api.setFormField).toHaveBeenCalledWith(7, 0, 0, "a", { kind: "text", text: "typed" });
+    expect(input.value).toBe("typed");
+    expect(r.edits).toHaveLength(1);
+    // The change event that comes later finds the text sent.
+    change(input);
+    await flush();
+    expect(r.api.setFormField).toHaveBeenCalledTimes(1);
+    expect(r.layer.hasPendingInput).toBe(false);
+  });
+
+  it("sends the text of a box with several lines when it loses the focus with no change event", async () => {
+    const r = await rig([[field({ index: 0, name: "notes", multiline: true })]]);
+    const area = r.control(0) as HTMLTextAreaElement;
+    area.focus();
+    area.value = "one\ntwo";
+    area.dispatchEvent(new Event("input", { bubbles: true }));
+    area.dispatchEvent(new Event("blur"));
+    await flush();
+    expect(r.api.setFormField).toHaveBeenCalledWith(7, 0, 0, "notes", { kind: "text", text: "one\ntwo" });
+  });
+
+  it("shows the text of the engine again when a box that was not typed in loses the focus", async () => {
+    const r = await rig([[field({ index: 0, name: "a", value: "kept" })]]);
+    const input = r.control(0) as HTMLInputElement;
+    input.focus();
+    // Changed by something other than typing (no input event), so there is nothing to send.
+    input.value = "stray";
+    input.dispatchEvent(new Event("blur"));
+    await flush();
+    expect(input.value).toBe("kept");
+    expect(r.api.setFormField).not.toHaveBeenCalled();
+  });
+
   it("puts the old text back when the reader presses Escape", async () => {
     const r = await rig([[field({ index: 0, name: "a", value: "kept" })]]);
     const input = r.control(0) as HTMLInputElement;
@@ -567,6 +613,59 @@ describe("what the form bar says", () => {
     expect(r.api.getFormFields).not.toHaveBeenCalled();
     expect(r.controls()).toHaveLength(0);
     expect(r.layer.fillable).toBe(false);
+  });
+
+  it("says in plain words why a field is left alone, and says it again when the reader tries the field", async () => {
+    const r = await rig(
+      [[field({ index: 0, name: "a", readOnly: true, action: true, actionBlocked: true, tooltip: "Name" }), field({ index: 1, name: "b" })]],
+      { kind: "acro", actions: true },
+    );
+    // Once, when the page is shown.
+    expect(r.bar()).toBe(BLOCKED_NOTICE);
+    expect(BLOCKED_NOTICE).toContain("cannot be filled in here");
+    expect(BLOCKED_NOTICE).toContain("clears or hides fields");
+    expect(BLOCKED_NOTICE).toContain("another reader");
+    // The field says it too.
+    expect(r.control(0).title).toContain("Name - This field cannot be filled in here");
+    expect(r.control(1).title).toBe("");
+    // The reader puts the message away, then tries the field: it comes back, once.
+    r.host.querySelector<HTMLButtonElement>(".form-bar-close")?.click();
+    expect(r.bar()).toBe(ACTIONS_NOTICE);
+    r.host.querySelector<HTMLButtonElement>(".form-bar-close")?.click();
+    expect(r.bar()).toBe("");
+    const input = r.control(0) as HTMLInputElement;
+    input.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    input.focus();
+    input.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    expect(r.bar()).toBe(BLOCKED_NOTICE);
+    expect(r.host.querySelectorAll(".form-bar-text")).toHaveLength(1);
+    // A field that can be filled in does not bring it.
+    r.host.querySelector<HTMLButtonElement>(".form-bar-close")?.click();
+    expect(r.bar()).toBe("");
+    (r.control(1) as HTMLInputElement).focus();
+    (r.control(1) as HTMLInputElement).dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    expect(r.bar()).toBe("");
+    expect(r.api.setFormField).not.toHaveBeenCalled();
+  });
+
+  it("says why for a check box and a drop-down list that are left alone, when they are pressed", async () => {
+    const r = await rig(
+      [
+        [
+          field({ index: 0, name: "box", kind: "checkbox", readOnly: true, action: true, actionBlocked: true }),
+          field({ index: 1, name: "pick", kind: "combo", readOnly: true, action: true, actionBlocked: true, options: [opt("X", true)] }),
+        ],
+      ],
+      { kind: "acro", actions: true },
+    );
+    for (const index of [0, 1]) {
+      r.host.querySelector<HTMLButtonElement>(".form-bar-close")?.click();
+      r.host.querySelector<HTMLButtonElement>(".form-bar-close")?.click();
+      expect(r.bar()).toBe("");
+      r.control(index).dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+      expect(r.bar()).toBe(BLOCKED_NOTICE);
+    }
+    expect(r.api.setFormField).not.toHaveBeenCalled();
   });
 
   it("says once that scripts and actions do not run", async () => {

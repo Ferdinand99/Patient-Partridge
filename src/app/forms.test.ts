@@ -337,11 +337,19 @@ describe("text that is typed and not left", () => {
     expect(input.isConnected).toBe(false);
   });
 
-  it("is given up when the box loses the focus without a change being sent", async () => {
-    const { app, input } = await typing();
+  it("is sent when the box loses the focus and no change event comes (WebKit, when the window loses the focus)", async () => {
+    const { app, api, input } = await typing();
     input.dispatchEvent(new Event("blur"));
-    expect(input.value).toBe("");
-    expect(app.unsavedCount).toBe(0);
+    await flush();
+    expect(api.setFormField).toHaveBeenCalledTimes(1);
+    expect(api.setFormField).toHaveBeenCalledWith(1, 0, 0, "name", { kind: "text", text: "typed" });
+    // The text is still in the box, and the tab is changed as before.
+    expect(input.value).toBe("typed");
+    expect(app.unsavedCount).toBe(1);
+    // The change event that WebKit sends when the focus comes back does not send it again.
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    await flush();
+    expect(api.setFormField).toHaveBeenCalledTimes(1);
   });
 
   it("no longer counts once the reader puts the old text back", async () => {

@@ -108,7 +108,7 @@ export const ACTIONS_NOTICE =
 
 /** What the form bar says about fields that are left alone for the action they carry. */
 export const BLOCKED_NOTICE =
-  "Some fields have an action that could change the form (reset or hide fields), and Patient Partridge does not run actions. Those fields are left as they are and cannot be filled in here.";
+  "Some fields in this form cannot be filled in here. The form has a button that clears or hides fields, and these fields have actions or scripts of their own that Patient Partridge does not run and cannot check. It leaves them as they are, so that nothing you have typed gets cleared. To fill them in, use another reader, such as Adobe Acrobat.";
 
 /** What the form bar says when the form of a document cannot be read. */
 export const UNREADABLE_NOTICE = "The form of this document could not be read, so it cannot be filled in here.";
@@ -396,6 +396,8 @@ export class FormLayer {
   /** Shows a message in the bar. A short message goes away by itself. */
   private tell(text: string, transient = true): void {
     if (this.destroyed) return;
+    // The message that is on show is not put up a second time.
+    if (this.messages[this.messages.length - 1]?.text === text) return;
     const entry: { text: string; timer?: ReturnType<typeof setTimeout> } = { text };
     if (transient) {
       entry.timer = setTimeout(() => {
@@ -557,7 +559,7 @@ export class FormLayer {
       el.title = `${field.tooltip ? `${field.tooltip} - ` : ""}The value of this field is too long to change here.`;
     }
     if (field.actionBlocked) {
-      el.title = `${field.tooltip ? `${field.tooltip} - ` : ""}This field has an action that is not run, so it is left as it is.`;
+      el.title = `${field.tooltip ? `${field.tooltip} - ` : ""}This field cannot be filled in here: it has an action or a script that Patient Partridge does not run, and this form can clear or hide fields.`;
     }
     if (field.required) el.setAttribute("aria-required", "true");
     if (field.readOnly || field.valueCut) el.setAttribute("aria-readonly", "true");
@@ -694,6 +696,7 @@ export class FormLayer {
 
   private attach(page: number, state: PageState, view: FieldView): void {
     const { el, field } = view;
+    if (field.actionBlocked) this.explainBlocked(view);
     if (field.kind === "checkbox" || field.kind === "radio") {
       el.addEventListener("click", (e) => {
         e.preventDefault();
@@ -734,10 +737,16 @@ export class FormLayer {
       });
       el.addEventListener("blur", () => {
         view.editing = false;
-        // What the engine has is shown again, whatever was typed and not sent.
+        // Some web views (WebKit, when the window loses the focus) send a blur and no change, and
+        // send the change only when the focus comes back, if at all. Text that was typed is sent
+        // now; the change that may follow finds it sent and does nothing.
+        if (this.typed.has(view)) {
+          this.commitText(page, view);
+          return;
+        }
+        // Nothing was typed: what the engine has is shown again.
         if (view.lastSent === null) {
           el.value = view.field.value;
-          this.typed.delete(view);
           this.updatePending();
         }
       });
@@ -763,6 +772,20 @@ export class FormLayer {
         }
       });
     }
+  }
+
+  /**
+   * Says why a field that is left alone cannot be filled in, when the reader tries to use it, so
+   * that it does not look like a fault. The words are those the bar gave when the page was shown.
+   */
+  private explainBlocked(view: FieldView): void {
+    const say = () => this.tell(BLOCKED_NOTICE);
+    view.el.addEventListener("mousedown", say);
+    view.el.addEventListener("click", say);
+    view.el.addEventListener("focus", say);
+    view.el.addEventListener("keydown", (e) => {
+      if ((e as KeyboardEvent).key !== "Tab") say();
+    });
   }
 
   private attachRadioKeys(state: PageState, view: FieldView): void {
