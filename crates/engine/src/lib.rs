@@ -677,12 +677,35 @@ impl Engine {
 /// The loaded library, and the scripts the font source had to refuse (a bit for each).
 type Loaded = (&'static Pdfium, Arc<AtomicU8>);
 
+/// The folder as a full path. On Windows this does not ask the mount manager for the DOS name of
+/// the volume (what `canonicalize` does), because the engine runs in an AppContainer that may not
+/// open that device. The app names the folder, so there is nothing to resolve; it only has to be one.
+#[cfg(windows)]
+fn resolve_folder(dir: &Path) -> std::io::Result<PathBuf> {
+    let full = std::path::absolute(dir)?;
+    // `metadata` says why when the folder cannot be reached (access denied, for one), where
+    // `is_dir` would only say no.
+    if std::fs::metadata(&full)?.is_dir() {
+        Ok(full)
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "it is not a folder",
+        ))
+    }
+}
+
+#[cfg(not(windows))]
+fn resolve_folder(dir: &Path) -> std::io::Result<PathBuf> {
+    std::fs::canonicalize(dir)
+}
+
 fn load_pdfium(
     dir: &Path,
     fonts_dir: &Path,
     system_fonts: Vec<(FontScript, File)>,
 ) -> Result<Loaded, String> {
-    let dir = std::fs::canonicalize(dir)
+    let dir = resolve_folder(dir)
         .map_err(|e| format!("the PDFium folder {} is not usable: {e}", dir.display()))?;
     let library = Pdfium::pdfium_platform_library_name_at_path(&dir);
     let bindings = Pdfium::bind_to_library(&library).map_err(|e| {

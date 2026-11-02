@@ -296,6 +296,29 @@ describe("App: opening a file", () => {
   });
 });
 
+describe("App: the network block is not proved", () => {
+  it("says so once, in one calm line that can be dismissed", async () => {
+    const { app, api } = make();
+    const line = () => document.getElementById("protection-line") as HTMLElement;
+    await app.openPath("/a.pdf");
+    await flush();
+    expect(line().hidden).toBe(true);
+    api.open.mockResolvedValueOnce({ ...opened(2, 3, "b.pdf"), networkNotProved: true });
+    await app.openPath("/b.pdf");
+    await flush();
+    expect(line().hidden).toBe(false);
+    expect(line().textContent).toContain("did not confirm");
+    click(document.getElementById("protection-dismiss") as HTMLElement);
+    expect(line().hidden).toBe(true);
+    // Not again for the next document.
+    api.open.mockResolvedValueOnce({ ...opened(3, 3, "c.pdf"), networkNotProved: true });
+    await app.openPath("/c.pdf");
+    await flush();
+    expect(line().hidden).toBe(true);
+    expect(app.tabCount).toBe(3);
+  });
+});
+
 describe("App: tabs", () => {
   it("switches between documents and shows each one's page count", async () => {
     const { app, api, deps } = make();

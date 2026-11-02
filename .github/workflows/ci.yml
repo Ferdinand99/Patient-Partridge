@@ -34,6 +34,12 @@ jobs:
           - name: windows
             os: windows-latest
             lint: false
+          # Windows Server 2022 (build 20348) is closer to Windows 10 and 11 than the newest
+          # image: the token calls and the list of known libraries that the sandbox depends on can
+          # differ between versions.
+          - name: windows-2022
+            os: windows-2022
+            lint: false
           - name: macos
             os: macos-latest
             lint: false
@@ -96,7 +102,7 @@ jobs:
           sudo mkdir -p /mnt/small
           sudo mount -t tmpfs -o size=1m,mode=1777 tmpfs /mnt/small
           PARTRIDGE_TEST_SMALL_DISK=/mnt/small cargo test -p partridge-engine-client --locked -- --ignored a_full_disk
-      # What the engine tried after it locked itself in (open a file, connect, start a program,
+      # What the engine tried after it locked itself in (open a file, connect, send, look up a name, start a program,
       # write a file) and what the system answered, on each system.
       - name: Sandbox proof
         if: always()
@@ -116,9 +122,6 @@ jobs:
         env:
           PARTRIDGE_REQUIRE_FONT_SCRIPTS: all
         run: cargo test -p partridge-engine --locked --test system_fonts -- --nocapture --test-threads 1
-      - name: Does an AppContainer stop the network on Windows (diagnosis)
-        if: always() && runner.os == 'Windows'
-        run: cargo test -p partridge-engine --locked --test windows_appcontainer -- --ignored --nocapture
       - name: The sandbox log (macOS)
         if: failure() && runner.os == 'macOS'
         run: log show --last 10m --predicate 'sender == "Sandbox"' --style compact | grep -i 'engine|partridge' | tail -100 || true
@@ -430,10 +433,14 @@ jobs:
   # its path), and runs the sandbox tests of the engine as that user. Steps and limits are in
   # scripts/windows-standard-user and docs/windows-standard-user.md.
   windows-standard-user:
-    name: Windows, as a standard user
+    name: Windows, as a standard user (${{ matrix.os }})
     needs: build
-    runs-on: windows-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-2022]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -441,7 +448,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          key: standard-user
+          key: standard-user-${{ matrix.os }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 22
@@ -468,6 +475,9 @@ jobs:
           $setup = Get-ChildItem installers -Filter '*-setup.exe' | Select-Object -First 1
           if (-not $setup) { throw 'The Build job made no NSIS installer.' }
           Copy-Item $setup.FullName C:\pp\in\
+          $msi = Get-ChildItem installers -Filter '*.msi' | Select-Object -First 1
+          if (-not $msi) { throw 'The Build job made no MSI.' }
+          Copy-Item $msi.FullName C:\pp\in\
           $library = Get-ChildItem vendor/pdfium -Recurse -Filter pdfium.dll | Select-Object -First 1
           Copy-Item "$($library.DirectoryName)\*" C:\pp\pdfium\ -Recurse
           Get-ChildItem C:\pp\in, C:\pp\pdfium | Format-Table Name, Length
@@ -476,6 +486,15 @@ jobs:
       - name: Build the engine tests
         shell: pwsh
         run: ./scripts/windows-standard-user/build-tests.ps1
+
+      # What a deployment tool or an administrator does: install in a folder outside Program Files,
+      # as an administrator. The files then belong to the administrators, and the standard user who
+      # runs the program cannot change who may read them. The installers add the entry for the
+      # engine's package themselves; the third copy has none (a control: the engine must fail there,
+      # which is what every installation outside Program Files did before the installers did this).
+      - name: Install outside the profile, as an administrator
+        shell: pwsh
+        run: ./scripts/windows-standard-user/install-as-admin.ps1
 
       - name: Run the checks as the standard user
         shell: powershell
@@ -498,7 +517,7 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
-          name: standard-user-logs
+          name: standard-user-logs-${{ matrix.os }}
           path: C:\pp\out\*
           if-no-files-found: ignore
           retention-days: 7
@@ -508,3 +527,134 @@ jobs:
         shell: powershell
         run: |
           if ($env:PP_USER) { Remove-LocalUser -Name $env:PP_USER -ErrorAction SilentlyContinue }
+
+  # The engine proves the network block with real attempts at start-up. That proof depends on the
+  # Windows Filtering Platform, which the firewall profiles, the firewall service (MpsSvc) and the
+  # filtering engine (BFE) feed. This job puts the runner in each of those states and records what
+  # the engine does: it must open the document in all of them, and it must say truthfully whether it
+  # could prove the block (docs/windows-sandbox.md).
+  windows-capture:
+    name: Windows, packet capture (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-2022]
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: capture-${{ matrix.os }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+      - name: Fetch PDFium
+        run: node scripts/fetch-pdfium.mjs
+      - name: Build the tests
+        run: |
+          cargo build -p partridge-engine --examples --locked
+          cargo test -p partridge-engine --locked --no-run --test sandbox
+      # pktmon is the packet monitor of Windows. It shows whether a raw echo request that a
+      # program sends leaves for the network card; the control shows that the capture sees it.
+      - name: Raw echo requests under pktmon
+        run: ./scripts/windows-packet-capture.ps1
+      - name: Stop the capture
+        if: always()
+        run: |
+          pktmon stop 2>&1 | Out-Null
+          pktmon filter remove 2>&1 | Out-Null
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: capture-${{ matrix.os }}
+          path: logs/*
+          if-no-files-found: ignore
+          retention-days: 7
+
+  windows-firewall:
+    name: Windows, firewall state (${{ matrix.state }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # In every state that a hosted runner allows, the engine still proves the block: TCP,
+          # UDP and raw sockets are refused. (The script fails when the runner did not reach the
+          # state, so a green leg is a state that was made.)
+          - { os: windows-latest, state: default, expect: proved }
+          - { os: windows-latest, state: profiles-off, expect: proved }
+          - { os: windows-latest, state: outbound-allowed, expect: proved }
+          - { os: windows-latest, state: package-allowed, expect: proved }
+          - { os: windows-latest, state: loopback-exempt, expect: proved }
+          - { os: windows-2022, state: default, expect: proved }
+          - { os: windows-2022, state: profiles-off, expect: proved }
+          # Not in the list, on purpose: a hosted runner refuses to stop the firewall service
+          # (MpsSvc) or the filtering engine (BFE), for an administrator and for the system account
+          # alike, so a leg for either would run in the default state. The script has both states
+          # and fails when the service is still running, for a runner that allows it.
+          # A debug engine told to take the answer of the network check as one that is not "blocked":
+          # the whole path after it (greeting, client, document) must work and say so.
+          - { os: windows-latest, state: simulated-answer, expect: not-proved }
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: firewall-${{ matrix.os }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+      - name: Fetch PDFium
+        run: node scripts/fetch-pdfium.mjs
+      - name: Build the tests
+        run: |
+          cargo build -p partridge-engine --examples --locked
+          cargo test -p partridge-engine --locked --no-run --test sandbox --test windows_start --test windows_network_states --test sandbox_refusal
+      - name: Put the runner in the state
+        run: ./scripts/windows-firewall-state.ps1 ${{ matrix.state }}
+      # A native command's exit code is checked by hand: a pipe into Tee-Object hides it.
+      - name: What the engine does in this state
+        env:
+          PARTRIDGE_FIREWALL_STATE: ${{ matrix.state }}
+          PARTRIDGE_NETWORK_EXPECT: ${{ matrix.expect }}
+          PARTRIDGE_TEST_NETWORK_UNPROVED: ${{ matrix.state == 'simulated-answer' && '1' || '' }}
+        run: |
+          cargo test -p partridge-engine --locked --test windows_network_states -- --nocapture 2>&1 | Tee-Object -FilePath logs/engine.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: The sandbox proof in this state
+        if: matrix.state != 'simulated-answer'
+        run: |
+          cargo test -p partridge-engine --locked --test sandbox -- --nocapture --test-threads 1 2>&1 | Tee-Object -FilePath logs/sandbox.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Many starts in this state
+        env:
+          PARTRIDGE_TEST_NETWORK_UNPROVED: ${{ matrix.state == 'simulated-answer' && '1' || '' }}
+        run: |
+          cargo test -p partridge-engine --locked --test windows_start -- --nocapture 2>&1 | Tee-Object -FilePath logs/starts.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Put the services back
+        if: always()
+        run: |
+          Set-NetFirewallProfile -Profile Domain, Public, Private -Enabled True -ErrorAction SilentlyContinue
+          Start-Service BFE -ErrorAction SilentlyContinue
+          Start-Service MpsSvc -ErrorAction SilentlyContinue
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: firewall-${{ matrix.os }}-${{ matrix.state }}
+          path: logs/*
+          if-no-files-found: ignore
+          retention-days: 7

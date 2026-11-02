@@ -8,8 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicU8;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 mod pages;
@@ -95,6 +94,8 @@ pub struct EnginePool {
     config: EngineConfig,
     max_documents: usize,
     state: Mutex<State>,
+    /// True once an engine has run without proving that the network is blocked (Windows).
+    network_not_proved: AtomicBool,
 }
 
 /// A password held in memory: overwritten when it is let go of, never copied (it is shared), and
@@ -136,7 +137,14 @@ impl EnginePool {
             config,
             max_documents,
             state: Mutex::new(State::default()),
+            network_not_proved: AtomicBool::new(false),
         }
+    }
+
+    /// True when an engine of this pool has run, since the app started, without being able to prove
+    /// that the network is blocked. The app tells the user once.
+    pub fn network_not_proved(&self) -> bool {
+        self.network_not_proved.load(Ordering::Relaxed)
     }
 
     /// Number of documents that are open.
@@ -175,6 +183,12 @@ impl EnginePool {
                 return Err(e);
             }
         };
+        if client
+            .sandbox_report()
+            .is_some_and(|report| crate::network_not_proved(&report))
+        {
+            self.network_not_proved.store(true, Ordering::Relaxed);
+        }
         let source = Source {
             path: PathBuf::from(path),
             original: PathBuf::from(path),

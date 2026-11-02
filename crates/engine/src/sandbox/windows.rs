@@ -1,27 +1,38 @@
 //! Windows: the restrictions are placed on the engine by the app when it starts the engine (see the
-//! `windows` module of `partridge-engine-client`): a restricted token that has only the null SID as
-//! restricting SID, the untrusted integrity level, a job object with no child processes and a
-//! memory limit, and process mitigation policies.
+//! `windows` module of `partridge-engine-client`): an AppContainer token with no capabilities made
+//! from a restricted token that has only the null SID as restricting SID and no privilege (not even
+//! `SeChangeNotifyPrivilege`), the untrusted integrity level, a job object with no child processes
+//! and a memory limit, process mitigation policies, and a desktop of its own.
 //!
 //! A process with such a token cannot even load its own DLLs, so the engine starts with the first
-//! thread impersonating a more powerful token (the user's own). Loading PDFium and the fonts happens
-//! in that state. This function ends it (`RevertToSelf`), so the thread falls back to the
-//! restricted token, and then checks every layer: the token is restricted, the integrity level is
-//! below medium, the process is in a job, and the mitigation policies are on. Finally it tries to
-//! open a file, which must fail. It also tries to make a socket (Winsock is started first, under
-//! the start identity, so that the answer is the system's) and to open the network device itself
-//! with `NtCreateFile`, but only to find out whether the network is blocked. It is not: the
-//! restricted token does not stop the network on Windows, so those two attempts succeed, the layer
-//! `no-network` is not reported and the engine goes on.
+//! thread impersonating a more powerful token of the same package (the user's own rights, as a
+//! restricted token, with the privilege). Loading PDFium and the fonts happens in that state. This
+//! function ends it (`RevertToSelf`), so the thread falls back to the locked-down token, and then
+//! checks every layer: the token is restricted, holds no privilege and is an AppContainer token,
+//! the integrity level is the untrusted one, the process is in a job, and the mitigation policies
+//! are on. It tries to open a file, which must fail. And it tries the network: a TCP connection
+//! and a UDP datagram to the loopback address, and raw ICMP sockets. Each must fail with "access
+//! denied". The AppContainer without capabilities makes the system answer the first two that way
+//! (what the restricted token alone never did); a raw socket is refused because the token has no
+//! right to open the device that every socket is made from.
+//!
+//! When the network attempts do not get that answer, the engine still runs, because everything it
+//! controls is in force, but it does not say that the network is blocked: the greeting names
+//! `network-not-proved` instead of `no-network` and carries what the system answered, and the app
+//! tells the user. That is a state the engine has not been seen in on a normal computer (the
+//! hosted runners of CI, with the firewall switched off or rules for the package, still get the
+//! answers); it is there for a computer where something else changes the answer. The fail-closed
+//! condition is the AppContainer token and the other layers, which the engine checks itself; a
+//! token that is not an AppContainer token, that holds a privilege, or a layer that is missing,
+//! still ends the engine.
 
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::ptr::null_mut;
+use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE};
-use windows_sys::Win32::Networking::WinSock::{
-    closesocket, socket, WSAStartup, AF_INET, INVALID_SOCKET, SOCK_DGRAM, WSADATA,
-};
 use windows_sys::Win32::Security::{
     GetTokenInformation, IsTokenRestricted, RevertToSelf, SetTokenInformation, TokenIntegrityLevel,
     SID_AND_ATTRIBUTES, TOKEN_ADJUST_DEFAULT, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
@@ -40,9 +51,9 @@ use windows_sys::Win32::System::Threading::{
 
 const SE_GROUP_INTEGRITY: u32 = 0x0000_0020;
 
-/// The integrity level of a process is the last sub-authority of the SID in its token. Medium is
-/// 0x2000.
-const MEDIUM_INTEGRITY: u32 = 0x2000;
+/// The integrity level of a process is the last sub-authority of the SID in its token. The
+/// untrusted level, the lowest, is 0.
+const UNTRUSTED_INTEGRITY: u32 = 0;
 
 /// The pseudo handle for the token of the process itself (`GetCurrentProcessToken` in C). The
 /// engine cannot open its own token the usual way: with the restricted token it has now, the
@@ -95,8 +106,8 @@ fn check_layers() -> Result<Vec<&'static str>, String> {
         }
         layers.push("restricted-token");
 
-        if integrity_level()? >= MEDIUM_INTEGRITY {
-            return Err("the integrity level of the engine is not below medium".to_string());
+        if integrity_level()? != UNTRUSTED_INTEGRITY {
+            return Err("the integrity level of the engine is not the untrusted one".to_string());
         }
         layers.push("low-integrity");
 
@@ -129,127 +140,47 @@ fn check_layers() -> Result<Vec<&'static str>, String> {
             return Err("extension points are not disabled".to_string());
         }
         layers.push("mitigations");
+
+        // TokenIsAppContainer (29): non-zero for an AppContainer token.
+        let mut is_container = 0u32;
+        let mut returned = 0u32;
+        let ok = GetTokenInformation(
+            own_token(),
+            29,
+            (&mut is_container as *mut u32).cast::<c_void>(),
+            size_of::<u32>() as u32,
+            &mut returned,
+        );
+        if ok == 0 || is_container == 0 {
+            return Err("the engine is not in an AppContainer".to_string());
+        }
+        layers.push("appcontainer");
+
+        // TokenPrivileges (3): the token of the engine holds none (the app removed even
+        // `SeChangeNotifyPrivilege`, which `DISABLE_MAX_PRIVILEGE` keeps). The list starts with a
+        // count of the entries.
+        let mut needed = 0u32;
+        GetTokenInformation(own_token(), 3, null_mut(), 0, &mut needed);
+        let mut buffer = vec![0u8; needed.max(4) as usize];
+        let ok = GetTokenInformation(
+            own_token(),
+            3,
+            buffer.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        );
+        if ok == 0 {
+            return Err(format!("GetTokenInformation: {}", last_error()));
+        }
+        let count = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
+        if count != 0 {
+            return Err(format!(
+                "the token of the engine holds {count} privilege(s)"
+            ));
+        }
+        layers.push("no-privileges");
     }
     Ok(layers)
-}
-
-/// Starts Winsock while the thread still has the start identity, so that the network check below
-/// can make a real attempt at a socket and the refusal it gets is the system's, not a library that
-/// could not start.
-fn start_winsock() -> bool {
-    // SAFETY: documented call with a live structure.
-    unsafe {
-        let mut data: WSADATA = zeroed();
-        WSAStartup(0x0202, &mut data) == 0
-    }
-}
-
-/// Opens `\Device\Afd\Endpoint` with `NtCreateFile`, the first thing creating a socket does,
-/// without Winsock. Returns the status.
-fn open_network_device() -> i32 {
-    #[repr(C)]
-    struct UnicodeString {
-        length: u16,
-        maximum_length: u16,
-        buffer: *const u16,
-    }
-    #[repr(C)]
-    struct ObjectAttributes {
-        length: u32,
-        root_directory: *mut c_void,
-        object_name: *const UnicodeString,
-        attributes: u32,
-        security_descriptor: *const c_void,
-        security_quality_of_service: *const c_void,
-    }
-    #[repr(C)]
-    struct IoStatusBlock {
-        status: isize,
-        information: usize,
-    }
-    #[link(name = "ntdll")]
-    extern "system" {
-        fn NtCreateFile(
-            handle: *mut *mut c_void,
-            access: u32,
-            attributes: *const ObjectAttributes,
-            io: *mut IoStatusBlock,
-            allocation: *const i64,
-            file_attributes: u32,
-            share: u32,
-            disposition: u32,
-            options: u32,
-            ea: *const c_void,
-            ea_length: u32,
-        ) -> i32;
-    }
-    let path: Vec<u16> = r"\Device\Afd\Endpoint".encode_utf16().collect();
-    let name = UnicodeString {
-        length: (path.len() * 2) as u16,
-        maximum_length: (path.len() * 2) as u16,
-        buffer: path.as_ptr(),
-    };
-    let attributes = ObjectAttributes {
-        length: size_of::<ObjectAttributes>() as u32,
-        root_directory: null_mut(),
-        object_name: &name,
-        attributes: 0x40, // OBJ_CASE_INSENSITIVE
-        security_descriptor: std::ptr::null(),
-        security_quality_of_service: std::ptr::null(),
-    };
-    let mut handle: *mut c_void = null_mut();
-    let mut io = IoStatusBlock {
-        status: 0,
-        information: 0,
-    };
-    // SAFETY: documented native call with live structures; a handle that opens is closed again.
-    unsafe {
-        let status = NtCreateFile(
-            &mut handle,
-            0xC010_0000, // GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE
-            &attributes,
-            &mut io,
-            std::ptr::null(),
-            0,
-            3,
-            1, // FILE_OPEN
-            0,
-            std::ptr::null(),
-            0,
-        );
-        if status >= 0 && !handle.is_null() {
-            CloseHandle(handle);
-        }
-        status
-    }
-}
-
-/// Tries what the token forbids. If a file can be opened, the sandbox is not in force.
-fn verify() -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    if std::fs::File::open(&exe).is_ok() {
-        return Err("a file could still be opened".to_string());
-    }
-    Ok(())
-}
-
-/// Whether the network is out of reach: no socket can be made and the device that sockets are made
-/// from cannot be opened. The CI run of this check found that the restricted token does **not** do
-/// this on Windows (a socket can be made, and the device can be opened), so the engine does not
-/// report the layer and the README says the engine can use the network on Windows. Only an
-/// AppContainer stops it; see the README.
-fn network_is_blocked(winsock_started: bool) -> bool {
-    if winsock_started {
-        // SAFETY: documented calls; a socket that is made is closed again.
-        unsafe {
-            let s = socket(AF_INET as i32, SOCK_DGRAM, 0);
-            if s != INVALID_SOCKET {
-                closesocket(s);
-                return false;
-            }
-        }
-    }
-    open_network_device() < 0
 }
 
 /// True when the engine runs on the desktop the app made for it, not on the user's.
@@ -314,9 +245,122 @@ fn lower_integrity() -> Result<(), String> {
     Ok(())
 }
 
+/// Loads the network support while the thread still has the start identity: Winsock reads its
+/// provider list from the registry the first time a socket is made, which the locked-down token
+/// cannot do. The checks below then get the answer of the network policy, not of a library that
+/// could not start. The results do not matter.
+fn start_winsock() {
+    let _ = UdpSocket::bind("127.0.0.1:0");
+    let _ = TcpListener::bind("127.0.0.1:0");
+}
+
+/// `WSAEACCES`: what the system answers when the network policy forbids the attempt.
+const WSAEACCES: i32 = 10013;
+
+/// What the system said to a network attempt that was meant to fail.
+fn refused_by_policy<T>(what: &str, result: std::io::Result<T>) -> Result<(), String> {
+    match result {
+        Ok(_) => Err(format!("{what} worked: the network is not blocked")),
+        Err(e) if e.raw_os_error() == Some(WSAEACCES) => Ok(()),
+        Err(e) => Err(format!(
+            "{what} failed, but not with the answer of a blocked network (access denied): {e}"
+        )),
+    }
+}
+
+/// `ERROR_ACCESS_DENIED`: what the system answers for an IPv6 socket that policy refuses.
+const ERROR_ACCESS_DENIED: i32 = 5;
+
+/// True when the error of a failed `socket` call is the answer of a blocked network: access denied
+/// (`WSAEACCES`, or error 5 on IPv6). For IPv6 also "no such address family, socket type or
+/// protocol" (`WSAEAFNOSUPPORT`, `WSAEPROTONOSUPPORT`, `WSAESOCKTNOSUPPORT`): a computer without
+/// IPv6 has nothing there to refuse and nothing to use.
+fn socket_refused(code: i32, ipv6: bool) -> bool {
+    code == WSAEACCES
+        || code == ERROR_ACCESS_DENIED
+        || (ipv6 && matches!(code, 10047 | 10043 | 10044))
+}
+
+/// A raw ICMP socket is a way to the network that the AppContainer does not close by itself: CI
+/// showed that one can be made and used from an AppContainer token that still has
+/// `SeChangeNotifyPrivilege`, on every server image and also as a standard user. What closes it is
+/// the token having no such privilege (the app removes it): then the device every socket is made
+/// from, `\Device\Afd\Endpoint`, cannot be opened and `socket` fails with "access denied". This
+/// makes the socket and nothing else: no packet is sent. A socket that can be made means the way is
+/// open.
+fn raw_socket_is_blocked() -> Result<(), String> {
+    use windows_sys::Win32::Networking::WinSock::{
+        closesocket, socket, WSAGetLastError, INVALID_SOCKET,
+    };
+    // (address family, name, protocol): ICMP over IPv4 (1) and ICMPv6 over IPv6 (58).
+    for (family, protocol, what) in [(2, 1, "raw ICMP socket"), (23, 58, "raw ICMPv6 socket")] {
+        // SAFETY: documented Winsock calls (Winsock is started, see `start_winsock`).
+        unsafe {
+            let s = socket(family, 3, protocol);
+            if s == INVALID_SOCKET {
+                let code = WSAGetLastError();
+                if socket_refused(code, family == 23) {
+                    continue;
+                }
+                return Err(format!(
+                    "a {what} could not be made, but not with the answer of a blocked network                      (access denied): error {code}"
+                ));
+            }
+            closesocket(s);
+        }
+        return Err(format!(
+            "a {what} could be made: the network is not blocked for it"
+        ));
+    }
+    Ok(())
+}
+
+/// Tries to reach the network and expects the system to forbid it. The address is the loopback
+/// one: if the policy did not forbid it, nothing leaves the computer and the answer is "refused
+/// by the other end", which is not the answer of a blocked network. (A process in an AppContainer
+/// without the `internetClient` capability cannot connect to the loopback address either.)
+fn network_is_blocked() -> Result<(), String> {
+    let address = SocketAddr::from(([127, 0, 0, 1], 9));
+    refused_by_policy(
+        "a TCP connection",
+        TcpStream::connect_timeout(&address, Duration::from_secs(2)),
+    )?;
+    // A datagram: either the socket cannot be bound or the send is refused.
+    match UdpSocket::bind("127.0.0.1:0") {
+        Err(e) if e.raw_os_error() == Some(WSAEACCES) => {}
+        Err(e) => return Err(format!("a UDP socket could not be made: {e}")),
+        Ok(socket) => refused_by_policy("a UDP datagram", socket.send_to(&[0u8], address))?,
+    }
+    raw_socket_is_blocked()
+}
+
+/// What the system answered when the network was not proved blocked (set once by [`lock_down`]).
+static NETWORK_NOTE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Why the network block was not proved on this computer, if it was not: what the system answered
+/// to the attempts, on one line. `None` when the block was proved.
+pub fn network_note() -> Option<String> {
+    NETWORK_NOTE.get().map(|note| {
+        note.chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .take(300)
+            .collect()
+    })
+}
+
+/// The network check, or in a debug build with the test switch an answer that is not the one of a
+/// blocked network, to try what happens then.
+fn network_proof() -> Result<(), String> {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("PARTRIDGE_TEST_NETWORK_UNPROVED").is_some_and(|v| !v.is_empty()) {
+        return Err("a TCP connection failed, but not with the answer of a blocked network (access denied): forced by a test".to_string());
+    }
+    network_is_blocked()
+}
+
 /// Ends the start-up identity and checks that the restrictions are in force.
 pub fn lock_down() -> Result<Vec<&'static str>, String> {
-    let winsock_started = start_winsock();
+    start_winsock();
     lower_integrity()?;
     // SAFETY: no arguments. Ends the impersonation of the first thread, if there is one.
     unsafe {
@@ -324,8 +368,15 @@ pub fn lock_down() -> Result<Vec<&'static str>, String> {
     }
     let mut layers = check_layers()?;
     verify()?;
-    if network_is_blocked(winsock_started) {
-        layers.push("no-network");
+    // The network is the reason for the AppContainer: it is only reported as blocked when the
+    // system has just refused real attempts. Without that answer the engine goes on (it is in an
+    // AppContainer, which was checked above) and says that the block was not proved.
+    match network_proof() {
+        Ok(()) => layers.push("no-network"),
+        Err(why) => {
+            let _ = NETWORK_NOTE.set(why);
+            layers.push("network-not-proved");
+        }
     }
     // The desktop is an extra layer: the engines run on the user's desktop where the system would
     // not make one.
@@ -333,4 +384,53 @@ pub fn lock_down() -> Result<Vec<&'static str>, String> {
         layers.push("own-desktop");
     }
     Ok(layers)
+}
+
+/// Tries what the token forbids. If a file can be opened, the sandbox is not in force. (The
+/// engine's own program is open to the AppContainer, so it is the restricted token, with the null
+/// SID as its only restricting SID, that refuses this.)
+fn verify() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    if std::fs::File::open(&exe).is_ok() {
+        return Err("a file could still be opened".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failed(code: i32) -> std::io::Result<()> {
+        Err(std::io::Error::from_raw_os_error(code))
+    }
+
+    #[test]
+    fn only_access_denied_counts_as_a_refused_socket() {
+        assert!(socket_refused(WSAEACCES, false));
+        assert!(socket_refused(ERROR_ACCESS_DENIED, true));
+        // No IPv6 on the computer is not a way out; no IPv4 raw support would be a surprise.
+        assert!(socket_refused(10047, true));
+        assert!(!socket_refused(10047, false));
+        // Anything else (no buffers, a timeout, success is not an error at all) proves nothing.
+        for code in [10055, 10060, 10022, 0] {
+            assert!(!socket_refused(code, true), "{code}");
+            assert!(!socket_refused(code, false), "{code}");
+        }
+    }
+
+    #[test]
+    fn only_access_denied_counts_as_a_blocked_network() {
+        assert!(refused_by_policy("an attempt", failed(WSAEACCES)).is_ok());
+        // Refused by the other end, timed out, no route, a name that does not resolve: the network
+        // was not what said no.
+        for code in [10061, 10060, 10051, 10065, 11001] {
+            assert!(
+                refused_by_policy("an attempt", failed(code)).is_err(),
+                "{code}"
+            );
+        }
+        // And an attempt that worked.
+        assert!(refused_by_policy("an attempt", Ok(())).is_err());
+    }
 }

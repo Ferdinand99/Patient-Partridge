@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The PDF engine runs in an AppContainer, which can read only what is open to its own package. In
+  Program Files the system already allows "all application packages" to read, and the program adds
+  the entry for its own package itself when the files belong to the user. In any other folder (the
+  install page of the installer lets the user choose one, and deployment tools set INSTALLDIR) the
+  files belong to the administrators, and the user who runs the program cannot change that. So the
+  installer, which runs with administrator rights, adds the entry for the package of the engine
+  (S-1-15-2-..., computed from the name "Partridge.Engine.Sandbox"; a test of the engine client
+  checks that it is the one the app uses), and only that:
+
+    - read and execute for that package on the install folder, without inheritance,
+    - the same on the two files the engine opens by path: partridge-engine.exe and pdfium.dll.
+
+  Nothing else in the folder gets an entry, and no other application package gains anything, so
+  choosing a folder with other files in it (Documents, the root of a drive) opens none of them. The
+  entry on the folder is removed again on uninstall; the entries on the files go with the files. A
+  failure is not an error of the installation: a folder on a file system without access lists needs
+  no entry.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <DirectoryRef Id="INSTALLDIR">
+      <Component Id="PackageAccessMarker" Guid="*">
+        <RegistryValue Root="HKLM" Key="Software\Patient Partridge Installer" Name="PackageAccess" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <ComponentGroup Id="PackageAccessGroup">
+      <ComponentRef Id="PackageAccessMarker" />
+    </ComponentGroup>
+
+    <!-- The command line of each step goes to the deferred action through the property of the same name. -->
+    <CustomAction Id="PackageAccessFolderCommand" Property="PackageAccessFolder" Value="&quot;[SystemFolder]icacls.exe&quot; &quot;[INSTALLDIR].&quot; /grant *S-1-15-2-1452645665-1071814252-341713739-2096083442-1079832312-2911523698-3580489556:(RX)" />
+    <CustomAction Id="PackageAccessFolder" BinaryKey="WixCA" DllEntry="CAQuietExec" Execute="deferred" Impersonate="no" Return="ignore" />
+    <CustomAction Id="PackageAccessEngineCommand" Property="PackageAccessEngine" Value="&quot;[SystemFolder]icacls.exe&quot; &quot;[INSTALLDIR]partridge-engine.exe&quot; /grant *S-1-15-2-1452645665-1071814252-341713739-2096083442-1079832312-2911523698-3580489556:(RX)" />
+    <CustomAction Id="PackageAccessEngine" BinaryKey="WixCA" DllEntry="CAQuietExec" Execute="deferred" Impersonate="no" Return="ignore" />
+    <CustomAction Id="PackageAccessPdfiumCommand" Property="PackageAccessPdfium" Value="&quot;[SystemFolder]icacls.exe&quot; &quot;[INSTALLDIR]pdfium.dll&quot; /grant *S-1-15-2-1452645665-1071814252-341713739-2096083442-1079832312-2911523698-3580489556:(RX)" />
+    <CustomAction Id="PackageAccessPdfium" BinaryKey="WixCA" DllEntry="CAQuietExec" Execute="deferred" Impersonate="no" Return="ignore" />
+    <CustomAction Id="PackageAccessRemoveCommand" Property="PackageAccessRemove" Value="&quot;[SystemFolder]icacls.exe&quot; &quot;[INSTALLDIR].&quot; /remove *S-1-15-2-1452645665-1071814252-341713739-2096083442-1079832312-2911523698-3580489556" />
+    <CustomAction Id="PackageAccessRemove" BinaryKey="WixCA" DllEntry="CAQuietExec" Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="PackageAccessFolderCommand" Before="PackageAccessFolder">NOT (REMOVE="ALL")</Custom>
+      <Custom Action="PackageAccessFolder" After="InstallFiles">NOT (REMOVE="ALL")</Custom>
+      <Custom Action="PackageAccessEngineCommand" Before="PackageAccessEngine">NOT (REMOVE="ALL")</Custom>
+      <Custom Action="PackageAccessEngine" After="PackageAccessFolder">NOT (REMOVE="ALL")</Custom>
+      <Custom Action="PackageAccessPdfiumCommand" Before="PackageAccessPdfium">NOT (REMOVE="ALL")</Custom>
+      <Custom Action="PackageAccessPdfium" After="PackageAccessEngine">NOT (REMOVE="ALL")</Custom>
+      <!-- On uninstall, before the files are removed (and with them the folder, if it is empty). -->
+      <Custom Action="PackageAccessRemoveCommand" Before="PackageAccessRemove">REMOVE="ALL"</Custom>
+      <Custom Action="PackageAccessRemove" Before="RemoveFiles">REMOVE="ALL"</Custom>
+    </InstallExecuteSequence>
+  </Fragment>
+</Wix>

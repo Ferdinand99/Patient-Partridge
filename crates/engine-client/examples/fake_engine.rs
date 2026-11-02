@@ -8,7 +8,8 @@
 //! - `wrong-id`: answers `Open` with the wrong request id.
 //! - `wrong-size`: answers `Render` with a bitmap of another size than asked for.
 //! - `hang`: never answers `Open`.
-//! - `exit-once`: exits right after the first `Hello` (when the marker file does not exist yet).
+//! - `exit-once`: exits right after the first `Hello` (when the marker file does not exist yet, or is
+//!   empty: on Windows the test makes it first, because the engine cannot create files).
 //! - `good`: behaves like an engine with one 612 x 792 document.
 //! - `no-sandbox`: like `good`, but greets without naming a sandbox.
 //! - `save-good`: like `good`, and saves a made-up file of 2 500 000 bytes (byte `i` is `i % 251`).
@@ -30,7 +31,6 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::io::{self, BufReader, BufWriter};
-use std::path::Path;
 
 use partridge_protocol::{
     read_frame, write_frame, write_response, CertificateTime, ErrorCode, PageSize, Request,
@@ -106,7 +106,8 @@ fn main() {
                     }
                     "exit-once" => {
                         if let Some(marker) = &marker {
-                            if !Path::new(marker).exists() {
+                            let seen = std::fs::read(marker).is_ok_and(|bytes| !bytes.is_empty());
+                            if !seen {
                                 let _ = std::fs::write(marker, b"x");
                                 return;
                             }
