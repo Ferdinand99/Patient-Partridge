@@ -1321,8 +1321,9 @@ mod tests {
     }
 
     /// What the app does when the page in the window starts again, with real engines: all of them
-    /// end, the addresses are forgotten, and the pool takes new documents. (Only the lookup of the
-    /// managed state by `page_started` is left out; the launch of the app in CI covers that.)
+    /// end, the addresses are forgotten, and the pool takes new documents. Not covered: the page
+    /// load hook that calls `page_started`, and its lookup of the managed state. A launch of the
+    /// app in CI passes without them, so no test fails if they are removed.
     #[test]
     fn a_page_that_starts_again_ends_the_engines_of_the_old_one() {
         use partridge_testkit as kit;

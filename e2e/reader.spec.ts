@@ -70,7 +70,7 @@ test("starts empty, in the Hedgerow look, with its own font", async ({ page }) =
   expect(font.some((f) => f.includes("InterVariable") && f.endsWith("loaded"))).toBe(true);
   // The open button is the inverted pill of the design system.
   const pill = await page.locator("#empty-open").evaluate((el) => getComputedStyle(el).borderRadius);
-  expect(Number.parseFloat(pill)).toBeGreaterThan(60);
+  expect(Number.parseFloat(pill)).toBeGreaterThan(100);
 });
 
 test("opens a document in a tab and draws its first page", async ({ page }) => {

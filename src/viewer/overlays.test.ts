@@ -655,6 +655,98 @@ describe("copying one document at a time", () => {
   });
 });
 
+describe("a page the engine cut", () => {
+  const cutText = (page: number) => (page === 0 ? `word ${"y".repeat(100_000 - 5)}` : "");
+
+  it("warns about the missing end only when the selection reaches it", async () => {
+    const { view } = open({}, 1, { text: cutText });
+    await flush();
+    // A double click on the first word: the word is whole, nothing is missing from it.
+    const at = screen(view, 0, 50 + W * 2, 105);
+    for (let i = 0; i < 2; i++) {
+      pointer(view, "pointerdown", at);
+      pointer(view, "pointerup", at);
+    }
+    expect(view.selectedText().text).toBe("word");
+    expect(view.selectedText().cut).toBe(0);
+    // Select all runs to the end of the page, which the engine cut.
+    view.selectAll();
+    await flush();
+    expect(view.selectedText().cut).toBe(1);
+    expect((await view.loadSelectedText()).cut).toBe(1);
+  });
+
+  it("does not warn in a copy of a word on it either", async () => {
+    const { view } = open({}, 1, { text: cutText, limits: { preloadChars: 0 } });
+    await flush();
+    const at = screen(view, 0, 50 + W * 2, 105);
+    for (let i = 0; i < 2; i++) {
+      pointer(view, "pointerdown", at);
+      pointer(view, "pointerup", at);
+    }
+    const copy = await view.loadSelectedText();
+    expect(copy.text).toBe("word");
+    expect(copy.cut).toBe(0);
+  });
+});
+
+describe("telling how far a copy has got", () => {
+  it("reports each page it goes through, and ends on the last", async () => {
+    const { view } = open({}, 40, {
+      text: (page) => `Page ${page}`,
+      limits: { preloadChars: 0, copyChars: 100_000 },
+    });
+    await flush();
+    view.selectAll();
+    const steps: [number, number][] = [];
+    const copy = await view.loadSelectedText((done, total) => steps.push([done, total]));
+    expect(copy.status).toBe("done");
+    expect(steps).toHaveLength(40);
+    expect(steps[0]).toEqual([1, 40]);
+    expect(steps[39]).toEqual([40, 40]);
+  });
+
+  it("reports nothing for a press that finds a copy already running", async () => {
+    const { view } = open({}, 40, { text: (page) => `Page ${page}`, limits: { preloadChars: 0 } });
+    await flush();
+    view.selectAll();
+    const first = view.loadSelectedText();
+    const progress = vi.fn();
+    expect((await view.loadSelectedText(progress)).status).toBe("busy");
+    expect(progress).not.toHaveBeenCalled();
+    await first;
+  });
+});
+
+describe("pages that were short of room get another try", () => {
+  const small = { width: 612, height: 100 };
+  // The most link buttons for a document are 5,000: 600 links on each page use them up in nine pages.
+  const links: PageLinkInfo[] = Array.from({ length: 600 }, () => ({ rect: [0, 0, 1, 1], uri: null, page: 0 }));
+  const buttonsOn = (view: DocumentView, page: number) =>
+    view.element.querySelectorAll(`.viewer-page[data-page="${page}"] .page-link`).length;
+
+  it("gives the pages that stay their link buttons when pages that left have given their room back", async () => {
+    const { view } = openPages(60, small, { getPageLinks: () => Promise.resolve(links) });
+    await flush();
+    const before = new Map(mountedPages(view).map((page) => [page, buttonsOn(view, page)]));
+    const total = [...before.values()].reduce((n, c) => n + c, 0);
+    // The room is used up, and some of the pages on screen have fewer buttons than they want.
+    expect(total).toBe(MAX_LINK_BUTTONS);
+    expect([...before.values()].some((count) => count < 600)).toBe(true);
+    // Scroll on by a few pages: the first ones leave, the others stay.
+    view.element.scrollTop = 1200;
+    view.element.dispatchEvent(new Event("scroll"));
+    await flush();
+    const stayed = mountedPages(view).filter((page) => before.has(page));
+    expect(stayed.length).toBeGreaterThan(0);
+    expect(stayed.length).toBeLessThan(before.size);
+    const was = stayed.reduce((n, page) => n + (before.get(page) ?? 0), 0);
+    const now = stayed.reduce((n, page) => n + buttonsOn(view, page), 0);
+    expect(now).toBeGreaterThan(was);
+    expect(highlights(view, "page-link").length).toBeLessThanOrEqual(MAX_LINK_BUTTONS);
+  });
+});
+
 const mountedPages = (view: DocumentView) =>
   [...view.element.querySelectorAll<HTMLElement>(".viewer-page")].map((el) => Number(el.dataset.page));
 
@@ -785,6 +877,34 @@ describe("a page that cannot be read", () => {
     await flush();
     expect(calls).toBeGreaterThan(0);
     expect(calls).toBeLessThanOrEqual(4);
+  });
+
+  it("is asked for again when it is drawn again at another zoom", async () => {
+    const { view, getPageText } = open({}, 3);
+    let fail = true;
+    getPageText.mockImplementation((_d: number, page: number) =>
+      page === 1 && fail ? Promise.reject(new Error("busy")) : Promise.resolve(wire("fine")),
+    );
+    await flush();
+    const first = getPageText.mock.calls.filter((c) => c[1] === 1).length;
+    fail = false;
+    view.stepZoom(1);
+    await flush();
+    expect(getPageText.mock.calls.filter((c) => c[1] === 1).length).toBeGreaterThan(first);
+  });
+
+  it("is asked for again when the reader presses on it", async () => {
+    const { view, getPageText } = open({}, 3);
+    let fail = true;
+    getPageText.mockImplementation((_d: number, page: number) =>
+      page === 0 && fail ? Promise.reject(new Error("busy")) : Promise.resolve(wire("fine")),
+    );
+    await flush();
+    const first = getPageText.mock.calls.filter((c) => c[1] === 0).length;
+    fail = false;
+    pointer(view, "pointerdown", screen(view, 0, 70, 105));
+    await flush();
+    expect(getPageText.mock.calls.filter((c) => c[1] === 0).length).toBeGreaterThan(first);
   });
 
   it("is asked for again when it is mounted again", async () => {

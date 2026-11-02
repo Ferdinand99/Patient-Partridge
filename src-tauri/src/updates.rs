@@ -26,7 +26,7 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, State};
 use tauri_plugin_updater::UpdaterExt;
 
-use crate::positions::{create_private_dir, write_private_file};
+use crate::positions::{create_private_dir, read_plain_file, write_private_file};
 use crate::unsaved::Unsaved;
 use crate::{links, locate, now_seconds, CommandError, Engine};
 
@@ -392,11 +392,7 @@ impl Settings {
 }
 
 pub(crate) fn read_small_file(file: &Path) -> Option<Vec<u8>> {
-    let meta = std::fs::metadata(file).ok()?;
-    if meta.len() > MAX_SMALL_FILE {
-        return None;
-    }
-    std::fs::read(file).ok()
+    read_plain_file(file, MAX_SMALL_FILE)
 }
 
 pub(crate) fn write_json<T: Serialize>(file: &Path, value: &T) -> io::Result<()> {

@@ -180,14 +180,27 @@ pub(crate) fn write_private_file(file: &Path, bytes: &[u8]) -> io::Result<()> {
     options.open(file)?.write_all(bytes)
 }
 
-fn read_entries(file: &Path) -> Vec<Entry> {
-    let Ok(meta) = fs::metadata(file) else {
-        return Vec::new();
-    };
-    if meta.len() > MAX_FILE_BYTES {
-        return Vec::new();
+/// Reads a small file of the app's own data, or gives nothing. Only a plain file is read, after
+/// links are followed: a named pipe would block the start, and a link to a device such as
+/// `/dev/zero` would fill the memory. A file longer than `cap` bytes is not read, and a file that
+/// grows while it is read is cut at the limit and counts as too long.
+pub(crate) fn read_plain_file(file: &Path, cap: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let meta = fs::metadata(file).ok()?;
+    if !meta.is_file() || meta.len() > cap {
+        return None;
     }
-    let Ok(bytes) = fs::read(file) else {
+    let mut bytes = Vec::new();
+    fs::File::open(file)
+        .ok()?
+        .take(cap + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= cap).then_some(bytes)
+}
+
+fn read_entries(file: &Path) -> Vec<Entry> {
+    let Some(bytes) = read_plain_file(file, MAX_FILE_BYTES) else {
         return Vec::new();
     };
     let Ok(stored) = serde_json::from_slice::<Stored>(&bytes) else {
@@ -380,6 +393,37 @@ mod tests {
         let mut positions = Positions::load(Some(dir.file()));
         positions.set("a.pdf", pos(2), 5).unwrap();
         assert_eq!(Positions::load(Some(dir.file())).len(), 1);
+    }
+
+    #[test]
+    fn only_a_plain_file_of_a_fitting_size_is_read() {
+        let dir = TempDir::new();
+        let file = dir.file();
+        fs::write(&file, b"12345").unwrap();
+        assert_eq!(read_plain_file(&file, 5).as_deref(), Some(&b"12345"[..]));
+        assert_eq!(read_plain_file(&file, 4), None);
+        assert_eq!(
+            read_plain_file(&dir.file().with_extension("missing"), 5),
+            None
+        );
+        // A folder is not a file.
+        assert_eq!(read_plain_file(file.parent().unwrap(), 1 << 20), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_named_pipe_and_a_link_to_a_device_are_not_read() {
+        let dir = TempDir::new();
+        let pipe = dir.file().with_extension("pipe");
+        let made = std::process::Command::new("mkfifo").arg(&pipe).status();
+        if made.is_ok_and(|s| s.success()) {
+            // Opening a pipe for reading would wait for ever: the answer must come at once.
+            assert_eq!(read_plain_file(&pipe, 1 << 20), None);
+        }
+        let link = dir.file().with_extension("link");
+        if std::os::unix::fs::symlink("/dev/zero", &link).is_ok() {
+            assert_eq!(read_plain_file(&link, 1 << 20), None);
+        }
     }
 
     #[test]
