@@ -73,15 +73,12 @@ fn start_once() -> String {
 fn how_starts_end_with_layers_taken_away() {
     for variant in [
         "",
-        "nomit",
-        "nojob",
-        "nodesk",
-        "nolowbox",
-        "nomit,nojob,nodesk",
+        "affinity",
+        "rs",
     ] {
         std::env::set_var("PARTRIDGE_DIAG", variant);
         let mut tally: std::collections::BTreeMap<String, u32> = Default::default();
-        for _ in 0..10 {
+        for _ in 0..20 {
             *tally.entry(start_once()).or_default() += 1;
         }
         println!("variant [{variant}]:");

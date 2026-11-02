@@ -395,10 +395,17 @@ fn make_tokens() -> io::Result<(Owned, Owned)> {
             }
         }
         let mut nobody = null_sid();
-        let restricting = [SID_AND_ATTRIBUTES {
+        let mut aap: Vec<u8> = vec![1, 2, 0, 0, 0, 0, 0, 15, 2, 0, 0, 0, 1, 0, 0, 0];
+        let mut restricting = vec![SID_AND_ATTRIBUTES {
             Sid: nobody.as_mut_ptr().cast(),
             Attributes: 0,
         }];
+        if diag("rs") {
+            restricting.push(SID_AND_ATTRIBUTES {
+                Sid: aap.as_mut_ptr().cast(),
+                Attributes: 0,
+            });
+        }
 
         let mut restricted: HANDLE = null_mut();
         check(
@@ -487,6 +494,10 @@ fn make_job(memory_limit: u64) -> io::Result<Owned> {
             | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
         limits.BasicLimitInformation.ActiveProcessLimit = 1;
         limits.ProcessMemoryLimit = memory_limit as usize;
+        if diag("affinity") {
+            limits.BasicLimitInformation.LimitFlags |= 0x10; // JOB_OBJECT_LIMIT_AFFINITY
+            limits.BasicLimitInformation.Affinity = 1;
+        }
         check(
             SetInformationJobObject(
                 job.raw(),
