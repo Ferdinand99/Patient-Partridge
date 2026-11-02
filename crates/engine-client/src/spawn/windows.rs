@@ -4,7 +4,13 @@
 //!   privilege removed, every group (and the user) turned into deny-only, and one restricting SID,
 //!   the null SID, which no object grants access to. With such a token almost no securable object
 //!   can be opened: no file, no registry key, no named pipe, no other process. It does not stop the
-//!   network: a process with this token can still make a socket and connect.
+//!   network by itself: a process with only this token can still make a socket and connect.
+//! - **AppContainer without capabilities** (see `container`). The same two tokens (the engine's
+//!   and the one its first thread starts with) are turned into tokens of a package that holds no
+//!   capability. The system's network filters refuse every network access of such a process:
+//!   connect, send and name lookup, loopback included. This is what blocks the network. The
+//!   restricted token stays under it: an object must be open to the restricting SID and to the
+//!   package.
 //! - **Untrusted integrity level**, below everything the user owns (set by the engine on its own
 //!   token just before it gives up the start identity).
 //! - **A job object of its own** (so no race with another job): a single process, no child

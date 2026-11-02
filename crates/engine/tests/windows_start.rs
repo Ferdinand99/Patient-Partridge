@@ -1,9 +1,10 @@
 //! The engine on Windows starts in a locked-down AppContainer. A process with such a token cannot
-//! let the system's loader hand the loading of libraries to helper threads (only the first thread
-//! has the identity that may open files), so the app starts the engine on one processor and gives
-//! the others back after the greeting. Without that, about nine starts in ten end with "library
-//! not found". These tests start the real engine many times, so a start that fails at random
-//! fails here too.
+//! let the system's loader hand the loading of libraries to its helper threads (only the first
+//! thread has the identity that may open files), so every library the engine imports must be one
+//! the system maps without opening a file. That holds when the C runtime is linked statically
+//! (`.cargo/config.toml`); with the dynamic runtime about nine starts in ten ended with "library
+//! not found". These tests start the real engine many times, and many at once, so a start that
+//! fails at random fails here too.
 
 #![cfg(windows)]
 

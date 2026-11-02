@@ -2,7 +2,8 @@
 //!
 //! The app opens the document and gives the engine an inherited, read-only handle to it. The engine
 //! gets exactly four things: standard input and output for the protocol, a null device for standard
-//! error, and the document. On Windows the engine is also started with a restricted token, the
+//! error, and the document. On Windows the engine is also started in an AppContainer without
+//! capabilities (which blocks the network) made from a restricted token, with the
 //! untrusted integrity level, its own job object and process mitigation policies (see `windows`).
 //! On Unix the engine locks itself in after it has loaded what it needs (see `partridge-engine`).
 

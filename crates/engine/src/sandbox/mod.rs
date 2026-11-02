@@ -8,7 +8,8 @@
 //! - **Linux**: a seccomp-BPF allowlist that is always applied (no new files, no sockets, no new
 //!   processes, no `ptrace`, no executable memory), and Landlock on top where the kernel has it.
 //! - **macOS**: a Seatbelt profile that denies everything by default.
-//! - **Windows**: the app starts the engine with a restricted token, a low integrity level, a job
+//! - **Windows**: the app starts the engine in an AppContainer without capabilities (which blocks the
+//!   network) made from a restricted token, with a low integrity level, a job
 //!   object and process mitigation policies (see `partridge-engine-client`); the engine only gives
 //!   up the more powerful start-up identity here and checks that the restrictions are in force.
 //!
@@ -16,8 +17,8 @@
 //! read-only handle. Nothing in the sandbox has to allow reading any file.
 //!
 //! A sandbox that did not apply is a failure. Every layer is checked after it is applied (the
-//! engine tries to open a file and, on Linux and macOS, a socket, and must be refused; on Windows
-//! the network is not blocked, only reported), and a release build that cannot show a working
+//! engine tries to open a file and to use the network, and must be refused: a socket on Linux and
+//! macOS, a TCP connection and a UDP datagram on Windows), and a release build that cannot show a working
 //! sandbox refuses to read documents.
 
 #[cfg(target_os = "linux")]

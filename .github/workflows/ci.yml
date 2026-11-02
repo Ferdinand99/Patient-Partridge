@@ -96,7 +96,7 @@ jobs:
           sudo mkdir -p /mnt/small
           sudo mount -t tmpfs -o size=1m,mode=1777 tmpfs /mnt/small
           PARTRIDGE_TEST_SMALL_DISK=/mnt/small cargo test -p partridge-engine-client --locked -- --ignored a_full_disk
-      # What the engine tried after it locked itself in (open a file, connect, start a program,
+      # What the engine tried after it locked itself in (open a file, connect, send, look up a name, start a program,
       # write a file) and what the system answered, on each system.
       - name: Sandbox proof
         if: always()
@@ -116,9 +116,6 @@ jobs:
         env:
           PARTRIDGE_REQUIRE_FONT_SCRIPTS: all
         run: cargo test -p partridge-engine --locked --test system_fonts -- --nocapture --test-threads 1
-      - name: Does an AppContainer stop the network on Windows (diagnosis)
-        if: always() && runner.os == 'Windows'
-        run: cargo test -p partridge-engine --locked --test windows_appcontainer -- --ignored --nocapture
       - name: The sandbox log (macOS)
         if: failure() && runner.os == 'macOS'
         run: log show --last 10m --predicate 'sender == "Sandbox"' --style compact | grep -i 'engine|partridge' | tail -100 || true
