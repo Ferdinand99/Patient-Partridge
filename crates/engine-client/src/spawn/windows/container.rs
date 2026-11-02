@@ -87,31 +87,13 @@ pub(super) fn package_sid() -> io::Result<&'static [u8]> {
     .map_err(|why| io::Error::other(why.clone()))
 }
 
-#[repr(C)]
-struct SecurityQualityOfService {
-    length: u32,
-    impersonation_level: i32,
-    context_tracking_mode: u8,
-    effective_only: u8,
-}
-
-#[repr(C)]
-struct ObjectAttributes {
-    length: u32,
-    root_directory: *mut c_void,
-    object_name: *const c_void,
-    attributes: u32,
-    security_descriptor: *const c_void,
-    security_quality_of_service: *const SecurityQualityOfService,
-}
-
 #[link(name = "ntdll")]
 extern "system" {
     fn NtCreateLowBoxToken(
         token: *mut HANDLE,
         existing: HANDLE,
         access: u32,
-        attributes: *const ObjectAttributes,
+        attributes: *const c_void,
         package_sid: *const c_void,
         capability_count: u32,
         capabilities: *const c_void,
@@ -121,37 +103,21 @@ extern "system" {
 }
 
 const TOKEN_ALL_ACCESS_RIGHTS: u32 = 0x000F_01FF;
-const SECURITY_IMPERSONATION: i32 = 2;
-const SECURITY_DYNAMIC_TRACKING: u8 = 1;
 
-/// A copy of `source` that is an AppContainer token of the package, with no capabilities. The copy
-/// has the same type as the source: a primary token stays primary, an impersonation token stays an
-/// impersonation token.
-pub(super) fn lowbox(source: &Owned, impersonation: bool) -> io::Result<Owned> {
+/// A primary token that is a copy of `source` (a primary token) turned into an AppContainer token
+/// of the package, with no capabilities. The system always makes a primary token of it; an
+/// impersonation token is made from that with `DuplicateTokenEx`.
+pub(super) fn lowbox(source: &Owned) -> io::Result<Owned> {
     let sid = package_sid()?;
-    let quality = SecurityQualityOfService {
-        length: std::mem::size_of::<SecurityQualityOfService>() as u32,
-        impersonation_level: SECURITY_IMPERSONATION,
-        context_tracking_mode: SECURITY_DYNAMIC_TRACKING,
-        effective_only: 0,
-    };
-    let attributes = ObjectAttributes {
-        length: std::mem::size_of::<ObjectAttributes>() as u32,
-        root_directory: null_mut(),
-        object_name: null(),
-        attributes: 0,
-        security_descriptor: null(),
-        security_quality_of_service: if impersonation { &quality } else { null() },
-    };
     let mut token: HANDLE = null_mut();
-    // SAFETY: documented native call; the SID, the attributes and the quality of service outlive
-    // it, and no capability or handle is passed.
+    // SAFETY: documented native call; the SID outlives it, and no attributes, capability or handle
+    // is passed.
     let status = unsafe {
         NtCreateLowBoxToken(
             &mut token,
             source.raw(),
             TOKEN_ALL_ACCESS_RIGHTS,
-            &attributes,
+            null(),
             sid.as_ptr().cast(),
             0,
             null(),

@@ -380,20 +380,6 @@ fn make_tokens() -> io::Result<(Owned, Owned)> {
             "CreateRestrictedToken (start)",
         )?;
         let start_token = Owned::new(start_token)?;
-        let mut imp: HANDLE = null_mut();
-        check(
-            DuplicateTokenEx(
-                start_token.raw(),
-                TOKEN_ALL_ACCESS,
-                null(),
-                SecurityImpersonation,
-                TokenImpersonation,
-                &mut imp,
-            ),
-            "DuplicateTokenEx",
-        )?;
-        let initial = Owned::new(imp)?;
-
         // The user and every group become deny-only, except the integrity entry, which cannot.
         let mut disable: Vec<SID_AND_ATTRIBUTES> = vec![SID_AND_ATTRIBUTES {
             Sid: user.User.Sid,
@@ -455,8 +441,21 @@ fn make_tokens() -> io::Result<(Owned, Owned)> {
         // The AppContainer: the same two tokens, as tokens of a package that has no capabilities.
         // The start identity has to be one of the same package, or the system lowers it to
         // "identification" and the loader fails.
-        let lockdown = container::lowbox(&lockdown, false)?;
-        let initial = container::lowbox(&initial, true)?;
+        let lockdown = container::lowbox(&lockdown)?;
+        let start_box = container::lowbox(&start_token)?;
+        let mut imp: HANDLE = null_mut();
+        check(
+            DuplicateTokenEx(
+                start_box.raw(),
+                TOKEN_ALL_ACCESS,
+                null(),
+                SecurityImpersonation,
+                TokenImpersonation,
+                &mut imp,
+            ),
+            "DuplicateTokenEx (start, AppContainer)",
+        )?;
+        let initial = Owned::new(imp)?;
         Ok((lockdown, initial))
     }
 }
