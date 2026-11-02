@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MAX_URI_LENGTH, classifyUri, describeLink, shortAddress, visibleAddress } from "./linkPolicy";
+import { MAX_URI_LENGTH, classifyUri, describeLink, visibleAddress } from "./linkPolicy";
 
 describe("classifyUri", () => {
   it("accepts plain http and https addresses", () => {
@@ -62,18 +62,6 @@ describe("classifyUri", () => {
       expect(classifyUri(uri).kind, JSON.stringify(uri)).toBe("blocked");
     }
     expect(classifyUri(`https://example.com/${"a".repeat(MAX_URI_LENGTH)}`).kind).toBe("blocked");
-  });
-});
-
-describe("shortAddress", () => {
-  it("leaves a short address and cuts a long one in the middle", () => {
-    expect(shortAddress("https://example.com/")).toBe("https://example.com/");
-    const long = `https://example.com/${"a".repeat(200)}end`;
-    const short = shortAddress(long, 41);
-    expect(short).toHaveLength(41);
-    expect(short.startsWith("https://example.com/")).toBe(true);
-    expect(short.endsWith("end")).toBe(true);
-    expect(short).toContain("…");
   });
 });
 

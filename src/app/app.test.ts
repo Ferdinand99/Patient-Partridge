@@ -1516,6 +1516,104 @@ describe("App: copying when a page was cut, closed on the way, or pressed twice"
     expect(notice()).toBeNull();
   });
 
+  it("shows how far a long copy has got, and takes the line away when it is over", async () => {
+    clipboard(vi.fn(() => Promise.resolve()));
+    const { app, api } = make({ viewLimits: { preloadChars: 0 } });
+    longDoc(api);
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((r) => (release = r));
+    api.getPageText.mockImplementation(async (_d: number, p: number) => {
+      if (p === 25) await gate;
+      return { text: "Hello world", rects: layoutRects("Hello world") };
+    });
+    await app.openPath("/a.pdf");
+    await flush();
+    key("a", { ctrlKey: true });
+    await flush();
+    expect(q("#copy-status").hidden).toBe(true);
+    copyEvent();
+    await flush();
+    expect(q("#copy-status").hidden).toBe(false);
+    expect(q("#copy-status").textContent).toMatch(/^Copying the text: page \d+ of 30$/);
+    release();
+    await flush();
+    await flush();
+    expect(q("#copy-status").hidden).toBe(true);
+    expect(q("#copy-status").textContent).toBe("");
+  });
+
+  it("keeps the line while a second press finds the first copy still running", async () => {
+    clipboard(vi.fn(() => Promise.resolve()));
+    const { app, api } = make({ viewLimits: { preloadChars: 0 } });
+    longDoc(api);
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((r) => (release = r));
+    api.getPageText.mockImplementation(async (_d: number, p: number) => {
+      if (p === 25) await gate;
+      return { text: "Hello world", rects: layoutRects("Hello world") };
+    });
+    await app.openPath("/a.pdf");
+    await flush();
+    key("a", { ctrlKey: true });
+    await flush();
+    copyEvent();
+    await flush();
+    copyEvent();
+    await flush();
+    expect(q("#copy-status").hidden).toBe(false);
+    release();
+    await flush();
+    await flush();
+    expect(q("#copy-status").hidden).toBe(true);
+  });
+
+  it("says so when the selection changed during the copy and nothing was copied", async () => {
+    const write = vi.fn(() => Promise.resolve());
+    clipboard(write);
+    const { app, api } = make({ viewLimits: { preloadChars: 0 } });
+    longDoc(api);
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((r) => (release = r));
+    api.getPageText.mockImplementation(async (_d: number, p: number) => {
+      if (p === 25) await gate;
+      return { text: "Hello world", rects: layoutRects("Hello world") };
+    });
+    await app.openPath("/a.pdf");
+    await flush();
+    key("a", { ctrlKey: true });
+    await flush();
+    copyEvent();
+    await flush();
+    key("Escape");
+    release();
+    await flush();
+    await flush();
+    expect(write).not.toHaveBeenCalled();
+    expect(notice()?.textContent).toContain("The text was not copied");
+    expect(notice()?.textContent).toContain("selection changed");
+    expect(q("#copy-status").hidden).toBe(true);
+  });
+
+  it("leaves the clipboard as it was when the selection holds no text", async () => {
+    const write = vi.fn(() => Promise.resolve());
+    clipboard(write);
+    const { app, api } = make();
+    api.getPageText.mockImplementation(() => Promise.resolve({ text: "", rects: [] }));
+    longDoc(api, 2);
+    await app.openPath("/a.pdf");
+    await flush();
+    key("a", { ctrlKey: true });
+    await flush();
+    const event = new Event("copy", { bubbles: true, cancelable: true }) as Event & { clipboardData: unknown };
+    const setData = vi.fn();
+    event.clipboardData = { setData };
+    document.body.dispatchEvent(event);
+    expect(setData).not.toHaveBeenCalled();
+    expect(event.defaultPrevented).toBe(false);
+    await flush();
+    expect(notice()).toBeNull();
+  });
+
   it("leaves the clipboard alone when the tab is closed during the copy", async () => {
     const write = vi.fn(() => Promise.resolve());
     clipboard(write);
@@ -1572,6 +1670,22 @@ describe("App: the menu of the right mouse button", () => {
     await flush();
     expect(write).toHaveBeenCalledWith("Hello world\nHello world\nHello world");
     expect(q("#context-menu").hidden).toBe(true);
+  });
+
+  it("writes nothing when Copy is chosen on a selection that holds no text", async () => {
+    const write = vi.fn(() => Promise.resolve());
+    clipboard(write);
+    const { app, api } = make();
+    api.getPageText.mockImplementation(() => Promise.resolve({ text: "", rects: [] }));
+    await app.openPath("/a.pdf");
+    await flush();
+    key("a", { ctrlKey: true });
+    await flush();
+    rightClick(app.currentView!.element);
+    click(q("#context-copy"));
+    await flush();
+    expect(write).not.toHaveBeenCalled();
+    expect(notice()).toBeNull();
   });
 
   it("offers nothing when no text is selected", async () => {
@@ -1715,6 +1829,25 @@ describe("App: reopening the tabs of the last session", () => {
     expect(api.open.mock.calls.filter(([path]) => path === "/docs/c.pdf")).toHaveLength(1);
   });
 
+  it("puts a named file that is in the list back where it was, not at the end", async () => {
+    const { app } = make();
+    await app.start({ session: saved, given: ["/docs/a.pdf"] });
+    await flush();
+    expect(tabTitles()).toEqual(["a.pdf", "b.pdf", "c.pdf"]);
+    expect(selectedTab()).toBe("a.pdf");
+  });
+
+  it("keeps all 16 tabs when a file named at the start is one of them", async () => {
+    const { app, api } = make();
+    const full = Array.from({ length: 16 }, (_, i) => `/docs/f${i}.pdf`);
+    await app.start({ session: { paths: full, active: 0 }, given: ["/docs/f7.pdf"] });
+    await flush();
+    expect(app.tabCount).toBe(16);
+    expect(api.open).toHaveBeenCalledTimes(16);
+    expect(notice()).toBeNull();
+    expect(selectedTab()).toBe("f7.pdf");
+  });
+
   it("opens nothing, and says nothing, when there is nothing to reopen", async () => {
     const { app, api } = make();
     await app.start({ session: { paths: [], active: null } });
@@ -1724,7 +1857,7 @@ describe("App: reopening the tabs of the last session", () => {
     expect(q("#empty").hidden).toBe(false);
   });
 
-  it("skips files that are gone with one calm notice that counts them, and the start is not held back", async () => {
+  it("skips files that are gone with one calm notice that counts them", async () => {
     const { app, api } = make();
     api.open.mockImplementation((path: string) =>
       path === "/docs/b.pdf" || path === "/docs/c.pdf"
