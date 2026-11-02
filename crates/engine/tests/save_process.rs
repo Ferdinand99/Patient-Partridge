@@ -443,12 +443,13 @@ fn c1_a_same_size_rewrite_with_the_old_time_is_seen_in_the_part_that_was_read() 
 #[test]
 fn m1_a_touch_before_the_first_save_still_lets_the_edits_out_as_a_copy() {
     let dir = Dir::new("m1");
-    let original = kit::simple_pdf(3);
+    let original = kit::padded_pdf(1024 * 1024);
     let path = dir.write("a.pdf", &original);
     let before = fs::metadata(&path).unwrap().modified().unwrap();
     let pool = pool();
     let (handle, _) = pool.open(&text(&path), None).unwrap();
 
+    // A document that is mostly an object nobody reads: the engine has read little of it.
     // Another program only touches the file: the same bytes, a new time of change. Most of the
     // file was never read by the engine when this happens.
     let file = fs::File::options().write(true).open(&path).unwrap();
@@ -474,7 +475,7 @@ fn m1_a_touch_before_the_first_save_still_lets_the_edits_out_as_a_copy() {
     let copy = dir.0.join("copy.pdf");
     let outcome = pool.save_as(handle, &copy, SaveOptions::default()).unwrap();
     assert!(outcome.touched);
-    assert_eq!(describe(&copy, None).pages, 3);
+    assert_eq!(describe(&copy, None).pages, 1);
     assert_eq!(fs::read(&path).unwrap(), original);
 }
 
