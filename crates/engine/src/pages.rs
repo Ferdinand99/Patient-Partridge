@@ -525,7 +525,7 @@ pub fn raw_document(document: &PdfDocument<'_>) -> Option<FPDF_DOCUMENT> {
         .take_while(char::is_ascii_hexdigit)
         .collect();
     let value = usize::from_str_radix(&hex, 16).ok()?;
-    if value == 0 || value % std::mem::align_of::<usize>() != 0 {
+    if value == 0 || !value.is_multiple_of(std::mem::align_of::<usize>()) {
         return None;
     }
     // The handle must be the one of this document: it has as many pages as the document.
@@ -842,7 +842,7 @@ fn reference_after(dict: &[u8], key: &[u8]) -> Option<u32> {
 /// The object numbers of the references (`N G R`) that make up `text` and nothing else.
 fn all_references(text: &[u8]) -> Option<Vec<u32>> {
     let all: Vec<&[u8]> = words(text).collect();
-    if all.len() % 3 != 0 {
+    if !all.len().is_multiple_of(3) {
         return None;
     }
     all.chunks(3)
