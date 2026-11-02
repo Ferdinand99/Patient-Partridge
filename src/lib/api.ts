@@ -72,6 +72,7 @@ export type UpdateFailureKind =
   | "busy"
   | "unsaved"
   | "manual"
+  | "location"
   | "other";
 
 export interface UpdateFailure {
