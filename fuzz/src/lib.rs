@@ -294,11 +294,11 @@ pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
         8 => {
             // The codes of the reader and the save, and now and then those of the page tools.
             let raw = if chance(u, 6)? {
-                u.int_in_range(40..=44u8)?
+                u.int_in_range(50..=56u8)?
             } else {
                 u.int_in_range(1..=17u8)?
             };
-            let code = ErrorCode::from_u8(raw).expect("1 to 17 and 40 to 44 are codes");
+            let code = ErrorCode::from_u8(raw).expect("1 to 17 and 50 to 56 are codes");
             let b = ResponseBody::Error {
                 code,
                 message: string_up_to(u, MAX_STRING_LEN)?,

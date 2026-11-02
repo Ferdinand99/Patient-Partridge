@@ -39,30 +39,30 @@ pub const MIN_BLANK_SIDE: f32 = 8.0;
 /// Largest number a page box may hold on the wire, in points. Larger numbers are refused.
 pub const MAX_BOX_VALUE: f32 = 1.0e7;
 
-pub(crate) const FIRST_REQUEST_TAG: u8 = 60;
-pub(crate) const LAST_REQUEST_TAG: u8 = 71;
-pub(crate) const FIRST_RESPONSE_TAG: u8 = 190;
-pub(crate) const LAST_RESPONSE_TAG: u8 = 195;
+pub(crate) const FIRST_REQUEST_TAG: u8 = 80;
+pub(crate) const LAST_REQUEST_TAG: u8 = 91;
+pub(crate) const FIRST_RESPONSE_TAG: u8 = 200;
+pub(crate) const LAST_RESPONSE_TAG: u8 = 205;
 
-const TAG_DELETE: u8 = 60;
-const TAG_REORDER: u8 = 61;
-const TAG_ROTATE: u8 = 62;
-const TAG_CROP: u8 = 63;
-const TAG_SET_BOXES: u8 = 64;
-const TAG_INSERT_BLANK: u8 = 65;
-const TAG_RESTORE: u8 = 66;
-const TAG_IMPORT_BEGIN: u8 = 67;
-const TAG_IMPORT_CHUNK: u8 = 68;
-const TAG_IMPORT_END: u8 = 69;
-const TAG_IMPORT_ABORT: u8 = 70;
-const TAG_EXPORT_BEGIN: u8 = 71;
+const TAG_DELETE: u8 = 80;
+const TAG_REORDER: u8 = 81;
+const TAG_ROTATE: u8 = 82;
+const TAG_CROP: u8 = 83;
+const TAG_SET_BOXES: u8 = 84;
+const TAG_INSERT_BLANK: u8 = 85;
+const TAG_RESTORE: u8 = 86;
+const TAG_IMPORT_BEGIN: u8 = 87;
+const TAG_IMPORT_CHUNK: u8 = 88;
+const TAG_IMPORT_END: u8 = 89;
+const TAG_IMPORT_ABORT: u8 = 90;
+const TAG_EXPORT_BEGIN: u8 = 91;
 
-const TAG_CHANGED: u8 = 190;
-const TAG_CROPPED: u8 = 191;
-const TAG_IMPORT_READY: u8 = 192;
-const TAG_IMPORT_ACK: u8 = 193;
-const TAG_EXPORTED: u8 = 194;
-const TAG_DONE: u8 = 195;
+const TAG_CHANGED: u8 = 200;
+const TAG_CROPPED: u8 = 201;
+const TAG_IMPORT_READY: u8 = 202;
+const TAG_IMPORT_ACK: u8 = 203;
+const TAG_EXPORTED: u8 = 204;
+const TAG_DONE: u8 = 205;
 
 /// A request of the page tools. A box is `[left, bottom, right, top]` in the page's own
 /// coordinates (PDF user space, before the page's rotation).

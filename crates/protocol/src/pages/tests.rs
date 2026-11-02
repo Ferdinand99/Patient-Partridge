@@ -418,6 +418,8 @@ fn the_new_error_codes_have_names_and_round_trip() {
         (ErrorCode::ImportFailed, "import_failed"),
         (ErrorCode::PageChangeFailed, "page_change_failed"),
         (ErrorCode::Busy, "busy"),
+        (ErrorCode::InsertSourceFailed, "insert_source_failed"),
+        (ErrorCode::PagesNotAllowed, "pages_not_allowed"),
     ] {
         assert_eq!(code.name(), name);
         assert_eq!(ErrorCode::from_u8(code as u8), Some(code));
