@@ -58,8 +58,23 @@ describe("actionForKey", () => {
     expect(actionForKey(key("z"))).toBeNull();
   });
 
+  it("picks a tool of the annotation bar with a plain letter, and toggles the bar with Ctrl+Shift+A", () => {
+    const letters = { v: "select", h: "highlight", u: "underline", t: "strikeout", n: "note", p: "pen", m: "stamp" };
+    for (const [letter, tool] of Object.entries(letters)) {
+      expect(actionForKey(key(letter))).toEqual({ type: "tool", tool });
+      expect(actionForKey(key(letter.toUpperCase()))).toEqual({ type: "tool", tool });
+      // Shift, Ctrl and Alt make it something else or nothing.
+      expect(actionForKey(key(letter.toUpperCase(), { shiftKey: true }))).toBeNull();
+      expect(actionForKey(key(letter, { altKey: true }))).toBeNull();
+    }
+    expect(actionForKey(key("a", { ctrlKey: true }))).toEqual({ type: "select-all" });
+    expect(actionForKey(key("A", { ctrlKey: true, shiftKey: true }))).toEqual({ type: "toggle-annotations" });
+    expect(actionForKey(key("A", { metaKey: true, shiftKey: true }))).toEqual({ type: "toggle-annotations" });
+  });
+
   it("leaves other keys and Alt combinations alone", () => {
     expect(actionForKey(key("a"))).toBeNull();
+    expect(actionForKey(key("x"))).toBeNull();
     expect(actionForKey(key("c", { ctrlKey: true }))).toBeNull();
     expect(actionForKey(key("ArrowDown", { altKey: true }))).toBeNull();
     expect(actionForKey(key("-"))).toBeNull();
@@ -101,7 +116,8 @@ describe("pageScrollDistance", () => {
   it("prints with Ctrl+P", () => {
     expect(actionForKey(key("p", { ctrlKey: true }))).toEqual({ type: "print" });
     expect(actionForKey(key("P", { metaKey: true }))).toEqual({ type: "print" });
-    expect(actionForKey(key("p"))).toBeNull();
+    // A plain P picks the pen, no longer nothing.
+    expect(actionForKey(key("p"))).toEqual({ type: "tool", tool: "pen" });
   });
 
   it("shows and hides the side panel with Ctrl+B", () => {

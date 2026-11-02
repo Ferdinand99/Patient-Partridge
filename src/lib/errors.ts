@@ -176,6 +176,18 @@ export function describeError(error: AppErrorLike, fileName?: string): Described
         detail: `${file} would be larger than 512 MiB, which is more than Patient Partridge saves. Nothing was saved, and the file on the disk was not changed.`,
         action: "none",
       };
+    case "no_such_annotation":
+      return {
+        title: "The annotation is not there any more",
+        detail: "The annotation was changed or removed already, so this change was not made. Nothing was lost.",
+        action: "none",
+      };
+    case "annotation_refused":
+      return {
+        title: "The annotation was not changed",
+        detail: "Patient Partridge could not make this change to the annotation. Nothing was lost.",
+        action: "none",
+      };
     case "updating":
       return {
         title: "An update is being installed",

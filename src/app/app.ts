@@ -3,6 +3,7 @@
 // storage) comes in through `AppDeps`, so tests can run the whole flow with fakes.
 
 import type { OpenedDocument, OutlineEntry, SavedFile, SavedPosition } from "../lib/api";
+import { PALETTE, PEN_WIDTHS, type Annotation, type Tool } from "../lib/annotations";
 import { describeError, fileNameOf, isEngineLost, toAppError, type AppErrorLike } from "../lib/errors";
 import { classifyUri, visibleAddress } from "../lib/linkPolicy";
 import { parsePageInput } from "../lib/pageInput";
@@ -21,6 +22,8 @@ import type { CopyResult, PageLinkInfo } from "../viewer/overlays";
 import { DocumentView, type ViewPosition, type ViewerOptions } from "../viewer/viewer";
 import { zoomLabel, type ZoomMode } from "../viewer/zoom";
 import { FindBar } from "./find";
+import { Annotator, type AnnotatorApi } from "./annotator";
+import { AnnotBar } from "./annotbar";
 import { EditHistory, type Edit } from "./history";
 import { MenuController } from "./menu";
 import {
@@ -58,7 +61,10 @@ export interface AppDeps {
     saveAs(doc: number, allowSigned: boolean): Promise<SavedFile | null>;
     quitApp(): Promise<void>;
     stayOpen(): Promise<void>;
-  };
+  } & Partial<AnnotatorApi> & {
+      /** The annotations of a page. Without it, and without the other annotation calls, the annotation bar is off. */
+      listAnnotations?(doc: number, page: number): Promise<Annotation[]>;
+    };
   /** Shows the file dialog. Resolves with the chosen paths, or an empty list when cancelled. */
   pickFiles(): Promise<string[]>;
   setWindowTitle(title: string): void;
@@ -99,6 +105,8 @@ interface Tab {
   /** Set while the document is being saved; resolves with the answer of that save. */
   saving: Promise<boolean> | null;
   view: DocumentView;
+  /** The annotations of the document, or null when the app process offers none. */
+  annotator: Annotator | null;
   /** What the side panel knows about this document. */
   sidebarDoc: SidebarDocument;
   saveTimer: ReturnType<typeof setTimeout> | undefined;
@@ -203,6 +211,13 @@ export class App {
   private readonly sidebar: Sidebar;
   private readonly find: FindBar;
   private readonly selectionProxy: HTMLElement;
+  private readonly annotbar: AnnotBar;
+  private readonly annotStatus: HTMLElement;
+  private readonly popovers: HTMLElement;
+  /** Whether the annotation bar is shown. */
+  private annotOpen = false;
+  /** Makes the same sentence be read twice in a row. */
+  private announceFlip = false;
   private readonly printRoot: HTMLElement;
   private printJob: PrintJob | null = null;
   private printing = false;
@@ -228,6 +243,25 @@ export class App {
     });
     this.menu = new MenuController(byId(root, "menu-button"), byId(root, "menu"));
     this.selectionProxy = byId(root, "sel-proxy");
+    this.annotStatus = byId(root, "annot-status");
+    this.popovers = byId(root, "annot-popovers");
+    this.annotbar = new AnnotBar(root, {
+      toggle: (open) => this.setAnnotating(open, true),
+      setTool: (tool) => this.active?.annotator?.setTool(tool),
+      setColor: (color) => this.active?.annotator?.setColor(color),
+      setPenWidth: (width) => this.active?.annotator?.setPenWidth(width),
+      setStamp: (stamp) => {
+        this.active?.annotator?.setStamp(stamp);
+        this.active?.view.element.focus({ preventScroll: true });
+      },
+      editText: () => {
+        const a = this.active?.annotator;
+        if (a?.selected) void a.editText(a.selected.page, a.selected.id);
+      },
+      remove: () => void this.active?.annotator?.removeSelected(),
+      undo: () => void this.undoActive(),
+      redo: () => void this.redoActive(),
+    });
     this.printRoot = byId(root, "print-root");
     this.find = new FindBar(root, {
       searchPage: (doc, page, query) => deps.api.searchPage(doc, page, query),
@@ -596,6 +630,7 @@ export class App {
       dirtyTold: false,
       saving: null,
       view: undefined as unknown as DocumentView,
+      annotator: null,
       sidebarDoc: undefined as unknown as SidebarDocument,
       saveTimer: undefined,
       forgottenAt: null,
@@ -632,16 +667,28 @@ export class App {
         onSelectionChange: (has) => {
           if (!has && this.active === tab) this.selectionProxy.textContent = "";
         },
-        onSelectionSettled: () => this.updateSelectionProxy(tab),
+        onSelectionSettled: () => {
+          tab.annotator?.selectionSettled();
+          this.updateSelectionProxy(tab);
+        },
         onTextLimit: () => void this.textLimitHit(tab),
         onScripts: () => {
           tab.sawScripts = true;
           void this.fontsMissed(tab);
         },
         onPageDrawn: () => void this.fontsMissed(tab),
+        annotations: {
+          onSelect: (page, id) => tab.annotator?.onSelect(page, id),
+          onPlace: (page, x, y, client) => tab.annotator?.onPlace(page, x, y, client),
+          onStroke: (page, points) => tab.annotator?.onStroke(page, points),
+          onMove: (page, id, dx, dy) => tab.annotator?.onMove(page, id, dx, dy),
+          onEdit: (page, id) => tab.annotator?.onEdit(page, id),
+          onLoadFailed: (page, error) => tab.annotator?.onLoadFailed(page, error),
+        },
       },
       { start: opened.position ?? null, limits: this.deps.viewLimits },
     );
+    tab.annotator = this.makeAnnotator(tab);
     tab.history.onChange(() => this.historyChanged(tab));
     tab.sidebarDoc = {
       doc: opened.doc,
@@ -774,6 +821,7 @@ export class App {
       this.printJob.cleanup();
     }
     this.find.forget(tab.view);
+    tab.annotator?.destroy();
     tab.view.destroy();
     this.sidebar.forget(tab.doc);
     void this.deps.api.close(tab.doc).catch(() => undefined);
@@ -783,6 +831,101 @@ export class App {
       if (neighbour) this.activate(neighbour.id);
     }
     this.syncChrome();
+  }
+
+  // ---- annotations -----------------------------------------------------------
+
+  /** The annotations of a document, if the app process offers the calls for them. */
+  private makeAnnotator(tab: Tab): Annotator | null {
+    const api = this.deps.api;
+    if (
+      !api.listAnnotations ||
+      !api.addMarkup ||
+      !api.addNote ||
+      !api.addInk ||
+      !api.addStamp ||
+      !api.updateAnnotation ||
+      !api.removeAnnotation ||
+      !api.restoreAnnotation
+    ) {
+      return null;
+    }
+    return new Annotator(tab.doc, tab.view, tab.history, api as AnnotatorApi, {
+      popovers: this.popovers,
+      announce: (text) => this.announce(text),
+      ask: (options) => showNotice(this.noticeLayer, options),
+      failed: (error) => void this.annotationFailed(tab, error),
+      changed: () => {
+        if (this.active === tab) this.syncAnnotBar();
+      },
+      pageChanged: (page) => this.sidebar.pageChanged(tab.doc, page),
+    });
+  }
+
+  /** A change to an annotation failed. A lost engine ends the tab; anything else is told and forgotten. */
+  private async annotationFailed(tab: Tab, error: unknown): Promise<void> {
+    if (!this.tabs.includes(tab)) return;
+    const app = toAppError(error);
+    if (isEngineLost(app)) {
+      await this.documentLost(tab, app);
+      return;
+    }
+    const text = describeError(app, tab.name);
+    await showNotice(this.noticeLayer, {
+      title: text.title === "Something went wrong" ? "The annotation was not changed" : text.title,
+      detail: `${text.detail} The document is as it was before this change.`,
+      buttons: [{ id: "ok", label: "OK", primary: true }],
+    });
+  }
+
+  /** Says something to a screen reader, in the live region of the page. */
+  private announce(text: string): void {
+    this.announceFlip = !this.announceFlip;
+    this.annotStatus.textContent = this.announceFlip ? text : `${text}\u00a0`;
+  }
+
+  /** Shows or hides the annotation bar. Hiding it puts the pointer back to picking. */
+  private setAnnotating(open: boolean, focus = false): void {
+    this.annotOpen = open;
+    if (!open) {
+      for (const tab of this.tabs) tab.annotator?.setTool("select");
+    }
+    this.syncAnnotBar();
+    if (open && focus) this.annotbar.focusBar();
+  }
+
+  /** Picks a tool from the keyboard: the bar opens if it was closed. */
+  private chooseTool(tool: Tool): void {
+    const annotator = this.active?.annotator;
+    if (!annotator) return;
+    if (!this.annotOpen) this.setAnnotating(true);
+    if (tool === "stamp" && annotator.tool === "stamp") {
+      this.annotbar.openStampMenu();
+      return;
+    }
+    annotator.setTool(tool);
+    this.active?.view.element.focus({ preventScroll: true });
+  }
+
+  /** Brings the annotation bar in step with the document in front. */
+  private syncAnnotBar(): void {
+    const tab = this.active;
+    const annotator = tab?.annotator ?? null;
+    const picked = annotator?.current ?? null;
+    this.annotbar.render({
+      open: this.annotOpen,
+      enabled: annotator !== null,
+      tool: annotator?.tool ?? "select",
+      color: annotator?.color ?? PALETTE[0].rgba,
+      penWidth: annotator?.penWidth ?? PEN_WIDTHS[1].width,
+      stamp: annotator?.stamp ?? "approved",
+      canEditText: picked?.can.editText ?? false,
+      canRemove: picked?.can.remove ?? false,
+      canUndo: tab?.history.canUndo ?? false,
+      canRedo: tab?.history.canRedo ?? false,
+      undoLabel: tab?.history.undoLabel ?? null,
+      redoLabel: tab?.history.redoLabel ?? null,
+    });
   }
 
   /** The engine of one document stopped and took the document with it. The other tabs carry on. */
@@ -817,6 +960,7 @@ export class App {
     }
     this.drawTabs();
     this.drawTitle();
+    if (this.active === tab) this.syncAnnotBar();
   }
 
   /** Saves the document that is shown, if it has changes. Resolves with true when nothing is left unsaved. */
@@ -1187,6 +1331,7 @@ export class App {
     this.sidebar.setDocument(active?.sidebarDoc ?? null);
     this.find.setTarget(active ? { doc: active.doc, view: active.view } : null);
     this.selectionProxy.textContent = "";
+    this.syncAnnotBar();
     if (!active) {
       this.pageInput.value = "";
       this.pageTotal.textContent = "";
@@ -1293,6 +1438,10 @@ export class App {
   // ---- keyboard --------------------------------------------------------------
 
   private onKeyDown(e: KeyboardEvent): void {
+    if (this.noticeLayer.childElementCount === 0 && this.annotationKey(e)) {
+      e.preventDefault();
+      return;
+    }
     if (e.key === "Escape" && this.noticeLayer.childElementCount === 0) {
       const view = this.active?.view;
       if (view?.hasSelection && !(e.target instanceof HTMLInputElement)) {
@@ -1355,12 +1504,38 @@ export class App {
       if (typing) return;
       e.preventDefault();
       void (action.type === "undo" ? this.undoActive() : this.redoActive());
+    } else if (action.type === "tool") {
+      e.preventDefault();
+      this.chooseTool(action.tool);
+    } else if (action.type === "toggle-annotations") {
+      e.preventDefault();
+      if (this.active?.annotator) this.setAnnotating(!this.annotOpen, !this.annotOpen);
     } else if (action.type === "next-tab" || action.type === "previous-tab") {
       e.preventDefault();
       this.stepTab(action.type === "next-tab" ? 1 : -1);
     } else if (this.active?.view.handleAction(action)) {
       e.preventDefault();
     }
+  }
+
+  /**
+   * Keys for the annotation that is picked (Delete, Enter, the arrows) and for the tool in use
+   * (Escape, and Enter for the note and the stamp). They belong to the annotation only when no text
+   * is being typed and no button but an annotation has the focus.
+   */
+  private annotationKey(e: KeyboardEvent): boolean {
+    const annotator = this.active?.annotator;
+    if (!annotator || e.ctrlKey || e.metaKey || e.altKey) return false;
+    const target = e.target as HTMLElement | null;
+    const typing =
+      target instanceof HTMLInputElement ||
+      target instanceof HTMLSelectElement ||
+      target instanceof HTMLTextAreaElement;
+    if (typing) return false;
+    const onBox = target instanceof Element && target.closest(".annot") !== null;
+    if (e.key === "Escape") return annotator.handleKey(e);
+    if (target instanceof HTMLButtonElement && !onBox) return false;
+    return annotator.handleKey(e);
   }
 
   // ---- printing --------------------------------------------------------------
