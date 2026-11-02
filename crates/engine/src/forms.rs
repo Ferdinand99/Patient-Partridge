@@ -137,6 +137,7 @@ pub fn info(
     pdfium: &'static Pdfium,
     document: &PdfDocument<'_>,
     source: Option<&std::sync::Mutex<SourceGuard>>,
+    progress: &mut dyn FnMut(u32),
 ) -> ResponseBody {
     let bindings = pdfium.bindings();
     let Some(handle) = document_handle(bindings, document) else {
@@ -155,7 +156,7 @@ pub fn info(
         scripts
             || match source {
                 Some(guard) => crate::source::lock(guard)
-                    .contains_any(&ACTION_WORDS)
+                    .contains_any(&ACTION_WORDS, progress)
                     .unwrap_or(true),
                 None => false,
             }

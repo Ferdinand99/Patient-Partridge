@@ -1,4 +1,4 @@
-# Patient Partridge protocol. Request tags (1 to 14), answer tags (129 to 143, 255), the
+# Patient Partridge protocol. Request tags (1 to 14, 40 to 42), answer tags (129 to 143, 170, 171, 255), the
 # presence byte of an optional string, error codes, link kinds, and the numbers where the
 # decoders have limits (little endian u32).
 
@@ -91,3 +91,26 @@ utf8_4="\xf0\x9f\x93\x95"
 utf8_cut_2="\xc3"
 utf8_cut_4="\xf0\x9f\x93"
 utf8_bad="\xff\xfe"
+
+# Forms: request tags 40 to 42, answer tags 170 and 171, the three kinds of value of a change,
+# the error codes 24 and 25, and the caps of the field lists (512, 8192, 500, 1000, 256).
+req_form_info="\x28"
+req_list_form_fields="\x29"
+req_set_form_field="\x2a"
+res_form_info="\xaa"
+res_form_fields="\xab"
+form_value_text="\x01"
+form_value_checked="\x02"
+form_value_choice="\x03"
+error_code_form_unsupported="\x18"
+error_code_form_refused="\x19"
+error_code_form_past="\x1a"
+form_name_cap="\x00\x02\x00\x00"
+form_name_cap_plus_1="\x01\x02\x00\x00"
+form_value_cap="\x00\x20\x00\x00"
+form_value_cap_plus_1="\x01\x20\x00\x00"
+form_options_cap="\xf4\x01\x00\x00"
+form_options_cap_plus_1="\xf5\x01\x00\x00"
+form_fields_cap="\xe8\x03\x00\x00"
+form_fields_cap_plus_1="\xe9\x03\x00\x00"
+form_label_cap_plus_1="\x01\x01\x00\x00"

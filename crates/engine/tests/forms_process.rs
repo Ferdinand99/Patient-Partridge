@@ -98,7 +98,7 @@ fn a_form_is_filled_in_saved_and_read_back_by_another_engine() {
     assert_eq!(pool.form_info(handle).unwrap(), (FormKind::Acro, false));
     let mut fields = pool.form_fields(handle, 0).unwrap();
     assert_eq!(fields.len(), 13);
-    let mut set = |fields: &[FormField], name: &str, index: usize, value: FormValue| {
+    let set = |fields: &[FormField], name: &str, index: usize, value: FormValue| {
         let target: Vec<&FormField> = fields.iter().filter(|f| f.name == name).collect();
         let target = target[index];
         pool.set_form_field(handle, 0, target.index, &target.name, &value)

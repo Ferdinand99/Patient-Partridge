@@ -208,6 +208,19 @@ fn the_decoder_refuses_a_field_that_is_over_a_cap_or_has_a_value_it_does_not_kno
 
 #[test]
 fn the_decoder_refuses_more_fields_than_the_cap_or_than_the_bytes_hold() {
+    // One field more than a page may have, all of them there: only the cap itself refuses this.
+    let one = raw_field(1, 0, 0, 1, 1, 0);
+    let list = |count: usize| {
+        let mut bytes = vec![171u8];
+        bytes.extend_from_slice(&5u32.to_le_bytes());
+        bytes.extend_from_slice(&(count as u32).to_le_bytes());
+        for _ in 0..count {
+            bytes.extend_from_slice(&one[9..]);
+        }
+        bytes
+    };
+    assert!(Response::decode(list(MAX_FORM_FIELDS_PER_PAGE)).is_ok());
+    assert!(Response::decode(list(MAX_FORM_FIELDS_PER_PAGE + 1)).is_err());
     for count in [MAX_FORM_FIELDS_PER_PAGE as u32 + 1, 50, u32::MAX] {
         let mut bytes = vec![171u8];
         bytes.extend_from_slice(&5u32.to_le_bytes());

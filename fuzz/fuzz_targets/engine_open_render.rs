@@ -33,6 +33,11 @@
 //!   the end, or longer than a piece may be, is refused. The saved file opens again (with the
 //!   password, for the encrypted seed) with the same number of pages and the same kind of
 //!   protection. A document that PDFium cannot write fails only with `SaveFailed`.
+//! - Forms: `FormInfo` answers, and for a form the reader fills in, the fields of each page are
+//!   listed (within the caps, with a place on the page) and the first three are set to a value of
+//!   their kind. A change is answered with the list or refused with `FormFieldRefused`; a form
+//!   that is not an AcroForm is refused with `FormUnsupported`. The save that follows writes the
+//!   changed form, and the check that reopens it holds for it too.
 //! - Every answer can be encoded and decoded by the app, and the encoder cuts nothing.
 //! - A page that exists fails only with `Corrupt` or `RenderFailed`; a page past the end gives
 //!   `PageOutOfRange`.
@@ -44,8 +49,8 @@ use libfuzzer_sys::fuzz_target;
 use partridge_engine::Engine;
 use partridge_fuzz::check_response_caps;
 use partridge_protocol::{
-    ErrorCode, LinkTarget, PageSize, Request, RequestBody, Response, ResponseBody, MAX_SAVE_BYTES,
-    MAX_SAVE_CHUNK, PROTOCOL_VERSION,
+    ErrorCode, FormFieldKind, FormKind, FormValue, LinkTarget, PageSize, Request, RequestBody,
+    Response, ResponseBody, MAX_SAVE_BYTES, MAX_SAVE_CHUNK, PROTOCOL_VERSION,
 };
 
 /// Longest side of the bitmaps the target draws. Small, so that an iteration is fast.
@@ -75,6 +80,7 @@ fn list_len(body: &ResponseBody) -> usize {
         ResponseBody::PageText { rects, .. } => rects.len(),
         ResponseBody::PageLinks { links } => links.len(),
         ResponseBody::Matches { matches } => matches.len(),
+        ResponseBody::FormFields { fields } => fields.len(),
         _ => 0,
     }
 }
@@ -199,12 +205,17 @@ impl State {
             other => panic!("unexpected answer to Outline: {other:?}"),
         }
 
+        let form = match self.ask(RequestBody::FormInfo { doc }) {
+            ResponseBody::FormInfo { kind, .. } => kind,
+            other => panic!("unexpected answer to FormInfo: {other:?}"),
+        };
         let mut wanted: Vec<u32> = (0..count.min(PAGES_PER_FILE)).collect();
         if count > PAGES_PER_FILE {
             wanted.push(count - 1);
         }
         for page in wanted {
             self.page(doc, page, count, pages[page as usize]);
+            self.form(doc, page, form);
         }
         // Past the end is an error, never a crash.
         self.expect_range_error(RequestBody::PageText { doc, page: count });
@@ -455,6 +466,57 @@ impl State {
                 assert_eq!(rgba.len(), (w * h * 4) as usize);
             }
             other => self.expect_page_error(&other),
+        }
+    }
+
+    /// The fields of a page, and a change to the first three of them.
+    fn form(&mut self, doc: u32, page: u32, kind: FormKind) {
+        let listed = self.ask(RequestBody::ListFormFields { doc, page });
+        if kind != FormKind::Acro {
+            match listed {
+                ResponseBody::Error {
+                    code: ErrorCode::FormUnsupported,
+                    ..
+                } => return,
+                other => panic!("fields of a document that has no form the reader fills in: {other:?}"),
+            }
+        }
+        let fields = match listed {
+            ResponseBody::FormFields { fields } => fields,
+            // A page that cannot be loaded.
+            ResponseBody::Error {
+                code: ErrorCode::PageOutOfRange | ErrorCode::Corrupt,
+                ..
+            } => return,
+            other => panic!("unexpected answer to ListFormFields: {other:?}"),
+        };
+        for field in &fields {
+            let [l, t, r, b] = field.rect;
+            assert!(r - l >= 1.0 && b - t >= 1.0, "a field without a place: {:?}", field.rect);
+            assert!(field.options.len() <= partridge_protocol::MAX_FORM_OPTIONS);
+        }
+        for field in fields.iter().take(3) {
+            let value = match field.kind {
+                FormFieldKind::Text => FormValue::Text("fuzz\nvalue (\\) \u{e5}".into()),
+                FormFieldKind::Checkbox | FormFieldKind::Radio => FormValue::Checked(true),
+                FormFieldKind::Combo | FormFieldKind::List => FormValue::Choice(vec![0]),
+            };
+            match self.ask(RequestBody::SetFormField {
+                doc,
+                page,
+                index: field.index,
+                name: field.name.clone(),
+                value,
+            }) {
+                ResponseBody::FormFields { fields: after } => {
+                    assert!(after.iter().any(|f| f.index == field.index));
+                }
+                ResponseBody::Error {
+                    code: ErrorCode::FormFieldRefused,
+                    ..
+                } => {}
+                other => panic!("unexpected answer to SetFormField: {other:?}"),
+            }
         }
     }
 

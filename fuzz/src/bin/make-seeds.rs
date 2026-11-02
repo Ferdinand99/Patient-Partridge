@@ -15,7 +15,8 @@ use partridge_fuzz::{
     over_cap_request_case, over_cap_response_case, OVER_CAP_REQUESTS, OVER_CAP_RESPONSES,
 };
 use partridge_protocol::{
-    ErrorCode, FontScript, LinkTarget, OutlineItem, PageLink, PageSize, Request, RequestBody,
+    field_flag, ErrorCode, FontScript, FormField, FormFieldKind, FormKind, FormOption, FormValue,
+    LinkTarget, OutlineItem, PageLink, PageSize, Request, RequestBody,
     Response,
     ResponseBody, TextMatch, MAX_FRAME_LEN, MAX_LINKS_PER_PAGE, MAX_MATCHES_PER_PAGE,
     MAX_OUTLINE_DEPTH, MAX_OUTLINE_ITEMS, MAX_OUTLINE_TITLE, MAX_QUERY_LEN, MAX_SAVE_BYTES,
@@ -97,6 +98,51 @@ fn requests() -> Vec<(&'static str, Request)> {
         ),
         ("save_end", b(13, RequestBody::SaveEnd { doc: 1 })),
         ("fingerprint", b(14, RequestBody::Fingerprint { doc: 1 })),
+        ("form_info", b(15, RequestBody::FormInfo { doc: 1 })),
+        (
+            "list_form_fields",
+            b(16, RequestBody::ListFormFields { doc: 1, page: 0 }),
+        ),
+        (
+            "set_form_text",
+            b(
+                17,
+                RequestBody::SetFormField {
+                    doc: 1,
+                    page: 0,
+                    index: 2,
+                    name: "fullname".into(),
+                    value: FormValue::Text("Ada
+Lovelace".into()),
+                },
+            ),
+        ),
+        (
+            "set_form_checked",
+            b(
+                18,
+                RequestBody::SetFormField {
+                    doc: 1,
+                    page: 0,
+                    index: 3,
+                    name: "agree".into(),
+                    value: FormValue::Checked(true),
+                },
+            ),
+        ),
+        (
+            "set_form_choice",
+            b(
+                19,
+                RequestBody::SetFormField {
+                    doc: 1,
+                    page: 0,
+                    index: 12,
+                    name: "toppings".into(),
+                    value: FormValue::Choice(vec![0, 2]),
+                },
+            ),
+        ),
     ]
 }
 
@@ -268,6 +314,62 @@ fn responses() -> Vec<(&'static str, Response)> {
                     pages: 12,
                     failed: 0,
                     digest: 0x0123_4567_89ab_cdef,
+                },
+            ),
+        ),
+        (
+            "form_info",
+            b(
+                17,
+                ResponseBody::FormInfo {
+                    kind: FormKind::Acro,
+                    has_actions: true,
+                },
+            ),
+        ),
+        (
+            "form_fields",
+            b(
+                18,
+                ResponseBody::FormFields {
+                    fields: vec![
+                        FormField {
+                            index: 0,
+                            kind: FormFieldKind::Text,
+                            flags: field_flag::REQUIRED | field_flag::MULTILINE,
+                            turns: 1,
+                            rect: [150.0, 68.0, 400.0, 92.0],
+                            font_size: 12.0,
+                            name: "person.first".into(),
+                            tooltip: "First name".into(),
+                            value: "Ada
+Lovelace".into(),
+                            max_len: 40,
+                            options: vec![],
+                        },
+                        FormField {
+                            index: 1,
+                            kind: FormFieldKind::Combo,
+                            flags: field_flag::EDITABLE,
+                            turns: 0,
+                            rect: [150.0, 108.0, 350.0, 130.0],
+                            font_size: 0.0,
+                            name: "country".into(),
+                            tooltip: String::new(),
+                            value: "Norway".into(),
+                            max_len: 0,
+                            options: vec![
+                                FormOption {
+                                    selected: true,
+                                    label: "Norway".into(),
+                                },
+                                FormOption {
+                                    selected: false,
+                                    label: "Sweden".into(),
+                                },
+                            ],
+                        },
+                    ],
                 },
             ),
         ),
@@ -629,8 +731,19 @@ fn main() {
         ("links_over_the_cap", kit::many_links_pdf(501)),
         ("encrypted", kit::encrypted_pdf("secret", 1)),
         ("truncated", kit::truncated_pdf()),
+        // Forms: every kind of field, a turned page, XFA, scripts and actions, a signature, fields
+        // that sit under a parent, and a page with many fields.
+        ("form", kit::forms_pdf()),
+        ("form_rotated", kit::forms_rotated_pdf(90)),
+        ("form_scripts", kit::forms_script_pdf()),
+        ("form_xfa", kit::xfa_pdf()),
+        ("form_xfa_full", kit::xfa_full_pdf()),
+        ("form_signed", kit::forms_signed_pdf()),
+        ("form_nested", kit::forms_nested_pdf()),
+        ("form_many", kit::forms_many_pdf(40)),
         ("corrupt", kit::corrupt_pdf()),
     ];
+
     for (name, bytes) in pdfs {
         write(&dir, target, &format!("{name}.pdf"), &bytes);
     }
