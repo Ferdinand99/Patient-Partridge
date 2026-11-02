@@ -32,7 +32,10 @@
 //!   the pieces asked for one after the other add up to a file that starts like a PDF. A piece past
 //!   the end, or longer than a piece may be, is refused. The saved file opens again (with the
 //!   password, for the encrypted seed) with the same number of pages and the same kind of
-//!   protection. A document that PDFium cannot write fails only with `SaveFailed`.
+//!   protection, and every page looked at that both it and a fresh open of the original can read
+//!   has the same size and the same text. (Not the whole fingerprint: the fields and annotations
+//!   added before the save change the objects and annotations the fingerprint counts.) A document
+//!   that PDFium cannot write fails only with `SaveFailed`.
 //! - Forms: `FormInfo` answers, and for a form the reader fills in, the fields of each page are
 //!   listed (within the caps, with a place on the page) and the first three are set to a value of
 //!   their kind. A change is answered with the list or refused with `FormFieldRefused`; a form
@@ -67,6 +70,20 @@ const PAGES_PER_FILE: u32 = 3;
 
 /// The password of the encrypted seed file.
 const PASSWORD: &str = "secret";
+
+/// The pages looked at in a file: the first few and the last one. They are the pages the target
+/// changes (fields and annotations), and the pages whose text the saved file is compared on.
+fn looked_at(count: u32) -> Vec<u32> {
+    let mut pages: Vec<u32> = (0..count.min(PAGES_PER_FILE)).collect();
+    if count > PAGES_PER_FILE {
+        pages.push(count - 1);
+    }
+    pages
+}
+
+/// What a reader sees of a page without any mark on it: its size and its text. The text is `None`
+/// when the page cannot be read.
+type Look = (PageSize, Option<String>);
 
 struct State {
     engine: Engine,
@@ -211,22 +228,11 @@ impl State {
             other => panic!("unexpected answer to Outline: {other:?}"),
         }
 
-        let form = match self.ask(RequestBody::FormInfo { doc }) {
-            ResponseBody::FormInfo { kind, .. } => kind,
-            // A form whose handle cannot be reached is told, not taken for a document without a form.
-            ResponseBody::Error {
-                code: ErrorCode::FormUnsupported,
-                ..
-            } => FormKind::None,
-            other => panic!("unexpected answer to FormInfo: {other:?}"),
-        };
-        let mut wanted: Vec<u32> = (0..count.min(PAGES_PER_FILE)).collect();
-        if count > PAGES_PER_FILE {
-            wanted.push(count - 1);
-        }
-        for page in wanted {
+        // The window asks this once, before the first page is drawn.
+        self.form_kind(doc);
+        for page in looked_at(count) {
             self.page(doc, page, count, pages[page as usize]);
-            self.form(doc, page, form);
+            self.form(doc, page);
         }
         // Past the end is an error, never a crash.
         self.expect_range_error(RequestBody::PageText { doc, page: count });
@@ -512,7 +518,7 @@ impl State {
         }
 
         // The original, read afresh as the saved file will be.
-        let fresh = self.fresh_fingerprint();
+        let fresh = self.fresh_look(count);
 
         // The saved file opens again. (A file that PDFium had to repair may not; then the app's
         // check would refuse the save. One that opens must be the same document.)
@@ -529,23 +535,29 @@ impl State {
                     } => assert_eq!(now, security, "the saved file is protected differently"),
                     other => panic!("unexpected answer to DocInfo: {other:?}"),
                 }
-                // A saved file that reads in full must hold what the original holds. The original is
-                // read afresh for this, not taken from the fingerprint made above: reading the
-                // outline fills PDFium's list of pages, so a page that a fresh read cannot load
-                // (a page tree that does not match its own count) reads in that session and not in
-                // the next one, and the two are not like for like. A saved file with a page that
-                // cannot be read is not compared: PDFium repairs a damaged file when it opens it
-                // and can write the repaired tree in a form it cannot read back, and the app's check
-                // of a saved file refuses exactly that (`crates/engine-client/src/save.rs`).
-                if let Some((0, digest)) = fresh {
-                    match self.ask(RequestBody::Fingerprint { doc: again }) {
-                        ResponseBody::Fingerprint {
-                            failed: 0,
-                            digest: same,
-                            ..
-                        } => assert_eq!(same, digest, "the saved file is another document"),
-                        ResponseBody::Fingerprint { .. } => {}
-                        other => panic!("unexpected answer to Fingerprint: {other:?}"),
+                // A page the saved file shows must read as it does in the original: the same size
+                // and the same text. Only that, because the fields and the annotations this target
+                // adds change what the file holds besides (objects, annotations), and the pages
+                // they sit on keep their size and their text. The original is read afresh for
+                // this, not taken from the document the changes were made in: reading the outline
+                // fills PDFium's list of pages, so a page that a fresh read cannot load (a page
+                // tree that does not match its own count) reads in that session and not in the next
+                // one, and the two are not like for like. A page that either side cannot read is
+                // not compared: PDFium repairs a damaged file when it opens it and can write the
+                // repaired tree in a form it cannot read back, and the app's check of a saved file
+                // refuses exactly that (`crates/engine-client/src/save.rs`).
+                if let Some(before) = fresh {
+                    let after = self.looks(again, &pages, count);
+                    for ((page, (was_size, was_text)), (_, (now_size, now_text))) in
+                        before.iter().zip(after.iter())
+                    {
+                        if let (Some(was), Some(now)) = (was_text, now_text) {
+                            assert_eq!(was, now, "page {page} of the saved file reads another text");
+                            assert_eq!(
+                                was_size, now_size,
+                                "page {page} of the saved file has another size"
+                            );
+                        }
                     }
                 }
                 self.ask(RequestBody::Close { doc: again });
@@ -555,18 +567,30 @@ impl State {
         let _ = std::fs::remove_file(&saved);
     }
 
-    /// The fingerprint of the input file opened again from nothing: how many pages cannot be read,
-    /// and the digest of the rest. `None` when it does not open (it did once, so that is rare).
-    fn fresh_fingerprint(&mut self) -> Option<(u32, u64)> {
-        for password in [None, Some(PASSWORD.to_string())] {
-            self.hand_over();
-            if let ResponseBody::Opened { doc, .. } = self.ask(RequestBody::Open { password }) {
-                let print = match self.ask(RequestBody::Fingerprint { doc }) {
-                    ResponseBody::Fingerprint { failed, digest, .. } => Some((failed, digest)),
+    /// The size and the text of each page in `looked_at`, as an open document gives them. `sizes`
+    /// are the page sizes the `Open` answer named.
+    fn looks(&mut self, doc: u32, sizes: &[PageSize], count: u32) -> Vec<(u32, Look)> {
+        looked_at(count)
+            .into_iter()
+            .map(|page| {
+                let text = match self.ask(RequestBody::PageText { doc, page }) {
+                    ResponseBody::PageText { text, .. } => Some(text),
                     _ => None,
                 };
+                (page, (sizes[page as usize], text))
+            })
+            .collect()
+    }
+
+    /// The pages of the input file, looked at in a document opened from nothing. `None` when it
+    /// does not open (it did once, so that is rare).
+    fn fresh_look(&mut self, count: u32) -> Option<Vec<(u32, Look)>> {
+        for password in [None, Some(PASSWORD.to_string())] {
+            self.hand_over();
+            if let ResponseBody::Opened { doc, pages } = self.ask(RequestBody::Open { password }) {
+                let looks = (pages.len() as u32 == count).then(|| self.looks(doc, &pages, count));
                 self.ask(RequestBody::Close { doc });
-                return print;
+                return looks;
             }
         }
         None
@@ -678,8 +702,23 @@ impl State {
         }
     }
 
+    /// What kind of form the document has now. It can change while the pages are drawn: PDFium adds
+    /// an empty `/AcroForm` to a document when it makes the picture of a text box that has none.
+    fn form_kind(&mut self, doc: u32) -> FormKind {
+        match self.ask(RequestBody::FormInfo { doc }) {
+            ResponseBody::FormInfo { kind, .. } => kind,
+            // A form whose handle cannot be reached is told, not taken for a document without a form.
+            ResponseBody::Error {
+                code: ErrorCode::FormUnsupported,
+                ..
+            } => FormKind::None,
+            other => panic!("unexpected answer to FormInfo: {other:?}"),
+        }
+    }
+
     /// The fields of a page, and a change to the first three of them.
-    fn form(&mut self, doc: u32, page: u32, kind: FormKind) {
+    fn form(&mut self, doc: u32, page: u32) {
+        let kind = self.form_kind(doc);
         let listed = self.ask(RequestBody::ListFormFields { doc, page });
         if kind != FormKind::Acro {
             match listed {
