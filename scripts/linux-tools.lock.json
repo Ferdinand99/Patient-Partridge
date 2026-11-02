@@ -13,6 +13,7 @@
     },
     {
       "file": "linuxdeploy-plugin-appimage.AppImage",
+      "rolling": true,
       "url": "https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous/linuxdeploy-plugin-appimage-x86_64.AppImage",
       "sha256": "49d6a17160675a6bd1781699aae6bdf7692d98552e02a3671d2183d10547842e"
     }

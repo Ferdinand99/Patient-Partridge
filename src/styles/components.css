@@ -297,6 +297,23 @@
   min-width: 8rem;
 }
 
+.copy-status {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: var(--z-popover);
+  max-width: calc(100vw - 32px);
+  padding: 8px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  background: var(--material);
+  -webkit-backdrop-filter: var(--blur-material);
+  backdrop-filter: var(--blur-material);
+  box-shadow: var(--shadow-pop);
+  color: var(--text);
+  font-size: 0.8125rem;
+}
+
 .menu-label {
   padding: 8px 10px 4px;
   color: var(--muted);

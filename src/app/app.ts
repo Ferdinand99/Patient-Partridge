@@ -221,6 +221,11 @@ export class App {
   private readonly sidebar: Sidebar;
   private readonly find: FindBar;
   private readonly selectionProxy: HTMLElement;
+  private readonly copyStatus: HTMLElement;
+  /** The line of each running copy (copies of different tabs can run together) shows in one place. */
+  private readonly copyLines = new Map<DocumentView, string>();
+  /** The place of each path in the list of the last session, while that list is being reopened. */
+  private sessionRanks = new Map<string, number>();
   private readonly printRoot: HTMLElement;
   private printJob: PrintJob | null = null;
   private printing = false;
@@ -246,6 +251,7 @@ export class App {
     });
     this.menu = new MenuController(byId(root, "menu-button"), byId(root, "menu"));
     this.selectionProxy = byId(root, "sel-proxy");
+    this.copyStatus = byId(root, "copy-status");
     this.printRoot = byId(root, "print-root");
     this.find = new FindBar(root, {
       searchPage: (doc, page, query) => deps.api.searchPage(doc, page, query),
@@ -373,8 +379,37 @@ export class App {
    */
   private async reopenSession(saved: SessionTabs | null | undefined, given: string[]): Promise<void> {
     const named = wantedPdfPaths(given).slice(0, MAX_OPEN_AT_ONCE);
+    // A named file that is in the list already is one tab, not two: it takes no room of its own,
+    // unless the list is cut and leaves it out.
+    const savedPaths = new Set(saved?.paths ?? []);
+    const extra = named.filter((p) => !savedPaths.has(p)).length;
+    // Named files that the cut leaves out are opened as named files, so they take room too. Cutting
+    // more can leave out another named file, so the cut is made again until the count stops growing.
+    let cutNamed = 0;
+    let pick = pickSessionTabs(saved, MAX_TABS - extra);
+    for (;;) {
+      const now = named.filter((p) => savedPaths.has(p) && !pick.paths.includes(p)).length;
+      if (now <= cutNamed) break;
+      cutNamed = now;
+      pick = pickSessionTabs(saved, MAX_TABS - extra - cutNamed);
+    }
+    // A named file takes the place it had in the list.
+    this.sessionRanks = new Map(pick.paths.map((p, i) => [p, i]));
     const naming = given.length > 0 ? this.openChosen(given) : Promise.resolve();
-    const pick = pickSessionTabs(saved, MAX_TABS - named.length);
+    try {
+      await this.reopenPicked(pick, savedPaths, named, saved, naming);
+    } finally {
+      this.sessionRanks = new Map();
+    }
+  }
+
+  private async reopenPicked(
+    pick: { paths: string[]; active: number; left: number },
+    savedPaths: Set<string>,
+    named: string[],
+    saved: SessionTabs | null | undefined,
+    naming: Promise<void>,
+  ): Promise<void> {
     if (pick.paths.length === 0) {
       await naming;
       return;
@@ -383,7 +418,8 @@ export class App {
     // may have been down.
     const failedBefore = new Set(saved?.failed ?? []);
     this.kept = [];
-    let failed = pick.left;
+    // Named files that the list cut are opened as named files: they are not lost.
+    let failed = pick.left - named.filter((p) => savedPaths.has(p) && !pick.paths.includes(p)).length;
     let locked = 0;
     const count = (result: Reopened, path: string) => {
       if (result === "locked") locked++;
@@ -604,6 +640,8 @@ export class App {
     activate: boolean,
     rank = Infinity,
   ): void {
+    // A file named at the start that was in the last session's list goes back to its old place.
+    if (rank === Infinity) rank = this.sessionRanks.get(path) ?? Infinity;
     const openedAfter = this.deps.now() - started;
     const tab: Tab = {
       id: this.nextTabId++,
@@ -756,7 +794,7 @@ export class App {
     tab.limitTold = true;
     await showNotice(this.noticeLayer, {
       title: "Some pages have a lot of text",
-      detail: `Some pages of "${tab.name}" have more text or links than Patient Partridge keeps in memory at once. They look the same, but on those pages you cannot select text, see search matches or press links. Scrolling on can bring them back.`,
+      detail: `Some pages of "${tab.name}" have more text or links than Patient Partridge keeps in memory at once. They look the same, but on those pages some text may not be selectable, some search matches may not be marked and some links may not be pressable. Select all with Copy, and Find, still reach all of the text. Scrolling on can bring them back.`,
       buttons: [{ id: "ok", label: "OK", primary: true }],
     });
   }
@@ -1213,7 +1251,7 @@ export class App {
     const answer = await showNotice(this.noticeLayer, {
       title: "Forget remembered positions?",
       detail:
-        "Patient Partridge remembers where you stopped reading in each file, on this computer only. Forgetting them opens every file at the top again.",
+        "Patient Partridge remembers where you stopped reading in each file, on this computer only. Forgetting them opens every file at the top again. The list of tabs to reopen at the next start is cleared too, and starts again with the tabs that are open when you next open or close one.",
       buttons: [
         { id: "cancel", label: "Keep them", safe: true },
         { id: "forget", label: "Forget positions", primary: true },
@@ -1570,6 +1608,8 @@ export class App {
     const view = this.active?.view;
     if (!view?.hasSelection) return;
     const { text, missing, cut } = view.selectedText();
+    // A selection with no text in it (a scanned page) leaves the clipboard as it was.
+    if (missing.length === 0 && text.length === 0) return;
     if (missing.length === 0 && e.clipboardData) {
       e.clipboardData.setData("text/plain", text);
       e.preventDefault();
@@ -1590,7 +1630,28 @@ export class App {
    * way and a selection that was changed on the way write nothing.
    */
   private async copyFetched(view: DocumentView): Promise<void> {
-    const copy = await view.loadSelectedText();
+    let shown = -1;
+    const copy = await view.loadSelectedText((done, total) => {
+      // The line is updated in steps of 5 percent, so a screen reader is not told every page.
+      const step = Math.floor((done * 20) / total);
+      if (step === shown) return;
+      shown = step;
+      this.copyLines.set(view, `Copying the text: page ${done} of ${total}`);
+      this.showCopyLine();
+    });
+    // A press that found a copy already running did not start a line, so it leaves the line alone.
+    if (copy.status !== "busy") {
+      this.copyLines.delete(view);
+      this.showCopyLine();
+    }
+    if (copy.status === "changed") {
+      await showNotice(this.noticeLayer, {
+        title: "The text was not copied",
+        detail: "The selection changed while the text was being copied, so nothing was put on the clipboard. Select the text again and press Copy.",
+        buttons: [{ id: "ok", label: "OK", primary: true }],
+      });
+      return;
+    }
     if (copy.status !== "done") return;
     if (copy.text.length > 0) {
       try {
@@ -1610,6 +1671,13 @@ export class App {
       return;
     }
     await this.tellAboutCopy(copy, copy.text.length === 0);
+  }
+
+  /** Shows the line of the copy that started last and is still running, or hides the line. */
+  private showCopyLine(): void {
+    const last = [...this.copyLines.values()].at(-1);
+    this.copyStatus.textContent = last ?? "";
+    this.copyStatus.hidden = last === undefined;
   }
 
   /** Says what a copy left out, if anything. */
@@ -1693,6 +1761,8 @@ export class App {
       await this.copyFetched(view);
       return;
     }
+    // Nothing to copy (a scanned page): the clipboard keeps what it had.
+    if (text.length === 0) return;
     try {
       const clipboard = this.root.defaultView?.navigator.clipboard;
       if (!clipboard) throw new Error("no clipboard");

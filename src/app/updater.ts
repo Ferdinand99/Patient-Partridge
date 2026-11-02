@@ -62,6 +62,9 @@ export function notesToText(markdown: string): string {
   return text.trim();
 }
 
+/** What to tell when the app runs through a symbolic link (macOS), where it cannot update itself. */
+export const LOCATION_TEXT = "Automatic updates aren't available from this location. Move Patient Partridge to the Applications folder.";
+
 /** The sentence for a failure, in words the user can act on. */
 export function failureText(f: UpdateFailure): string {
   switch (f.kind) {
@@ -79,6 +82,8 @@ export function failureText(f: UpdateFailure): string {
       return "A document has changes that are not saved, so the update was not installed. Save them, then install the update.";
     case "manual":
       return "This copy of Patient Partridge cannot install an update by itself. Download the new version from the releases page.";
+    case "location":
+      return LOCATION_TEXT;
     default:
       return f.message ? `The update did not work: ${f.message}` : "The update did not work.";
   }
@@ -226,6 +231,8 @@ type State =
 export class Updater {
   private state: State = { kind: "idle" };
   private checking = false;
+  /** The sentence about the place of the app has been shown in this run. */
+  private locationTold = false;
   private autoUpdate = true;
   private method: InstallMethod = "automatic";
   private timers: ReturnType<typeof setTimeout>[] = [];
@@ -356,6 +363,15 @@ export class Updater {
     } catch (e) {
       const f = asFailure(e);
       if (f.kind === "disabled") return;
+      if (f.kind === "location") {
+        // Not an error of the check: the app runs from a place where it cannot update itself.
+        // A person's check always gets the sentence; the automatic ones say it once.
+        if (manual || !this.locationTold) {
+          this.locationTold = true;
+          await this.tell("Updates are not available here", LOCATION_TEXT);
+        }
+        return;
+      }
       // A check by itself stays quiet about trouble, except a wrong signature, which is worth a word.
       if (manual || f.kind === "invalidSignature") await this.tell("Could not check for updates", failureText(f));
     } finally {

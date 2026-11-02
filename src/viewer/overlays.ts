@@ -136,6 +136,16 @@ class Budget {
 /** The engine cuts the text of one page at this many characters (see MAX_PAGE_CHARS there). */
 const ENGINE_PAGE_CHARS = 100_000;
 
+/**
+ * True when the engine cut the text of the page and the selection runs to the end of what it gave:
+ * only then is the end of the page missing from a copy. A word picked on a long page is whole.
+ */
+function reachesCutEnd(sel: Selection, page: number, text: PageText | undefined): boolean {
+  if (!text || text.chars.length < ENGINE_PAGE_CHARS) return false;
+  const range = rangeOnPage(sel, page);
+  return range !== null && range[1] >= text.chars.length;
+}
+
 /** What a Copy of the selection gathered, and what it could not. */
 export interface CopyResult {
   text: string;
@@ -178,6 +188,11 @@ export class PageOverlays {
   private readonly linkSizes = new Map<number, number>();
   private linkChars = 0;
   private limitReported = false;
+  /** Mounted pages that were given fewer boxes or link buttons than they wanted. */
+  private readonly starved = new Set<number>();
+  private starvedPaint = false;
+  /** Set while a page is painted when a claim for room came back short. */
+  private shortOfRoom = false;
   private readonly boxBudget = new Budget(MAX_OVERLAY_BOXES);
   private readonly pickedBudget = new Budget(MAX_SELECTION_BOXES);
   private readonly linkBudget = new Budget(MAX_LINK_BUTTONS);
@@ -245,6 +260,25 @@ export class PageOverlays {
     // The links of a page that is off screen are not kept: they are asked for again when the page
     // is drawn again, so a long document does not pile them up.
     this.dropLinks(page);
+    this.starved.delete(page);
+    this.paintStarvedLater();
+  }
+
+  /**
+   * A page that left gave its room back, so pages that got less than they wanted get another try.
+   * Once for all the pages that leave in one step.
+   */
+  private paintStarvedLater(): void {
+    if (this.starved.size === 0 || this.starvedPaint) return;
+    this.starvedPaint = true;
+    queueMicrotask(() => {
+      this.starvedPaint = false;
+      if (this.destroyed) return;
+      for (const page of [...this.starved]) {
+        if (this.overlays.has(page)) this.paint(page);
+        else this.starved.delete(page);
+      }
+    });
   }
 
   private dropLinks(page: number): void {
@@ -263,6 +297,9 @@ export class PageOverlays {
   /** A page has been drawn: now is the time to ask for its text and its links. */
   pageDrawn(page: number): void {
     if (this.destroyed) return;
+    // A redraw (a new zoom) is a fresh try for a page that could not be read. A page that was
+    // refused for lack of room keeps waiting for room.
+    this.texts.retry(page);
     if (!this.texts.unavailable(page)) {
       void this.texts.load(page).then(() => {
         if (this.texts.refused(page)) this.reportLimit();
@@ -337,6 +374,7 @@ export class PageOverlays {
     const layer = this.overlays.get(page);
     if (!layer || this.destroyed) return;
     const [find, select, links] = [...layer.children] as HTMLElement[];
+    this.shortOfRoom = false;
     const text = this.texts.get(page);
     const size = this.pages[page];
 
@@ -395,7 +433,10 @@ export class PageOverlays {
     // Links
     const wantedLinks = this.links.get(page) ?? [];
     const allowedLinks = this.linkBudget.claim(String(page), wantedLinks.length);
-    if (allowedLinks < wantedLinks.length) this.reportLimit();
+    if (allowedLinks < wantedLinks.length) {
+      this.shortOfRoom = true;
+      this.reportLimit();
+    }
     const pageLinks = wantedLinks.slice(0, allowedLinks);
     links.replaceChildren(
       ...pageLinks.map((link) => {
@@ -407,7 +448,7 @@ export class PageOverlays {
         b.style.top = percent(t, size.height);
         b.style.width = percent(r - l, size.width);
         b.style.height = percent(bt - t, size.height);
-        // A web address is shown the way it would be opened, not as the document wrote it.
+        // Only the site a web address would open is named, not the address as the document wrote it.
         const label =
           link.page !== null ? `Go to page ${link.page + 1}` : `Link to ${describeLink(link.uri ?? "")}`;
         b.setAttribute("aria-label", label);
@@ -420,12 +461,17 @@ export class PageOverlays {
         return b;
       }),
     );
+    if (this.shortOfRoom) this.starved.add(page);
+    else this.starved.delete(page);
   }
 
   /** Asks for room for boxes of one kind on one page. When the document's boxes are used up, says so. */
   private claimBoxes(owner: string, wanted: number): number {
     const allowed = this.boxBudget.claim(owner, wanted);
-    if (allowed < wanted) this.reportLimit();
+    if (allowed < wanted) {
+      this.shortOfRoom = true;
+      this.reportLimit();
+    }
     return allowed;
   }
 
@@ -473,10 +519,11 @@ export class PageOverlays {
     const sel = this.selection;
     if (!sel || isEmptySelection(sel)) return { text: "", missing: [], cut: 0 };
     const { start, end } = orderSelection(sel);
-    // Pages the engine has cut (it gives 100,000 characters at most): their end is not in the text.
+    // Pages the engine has cut (it gives 100,000 characters at most) and whose end the selection
+    // reaches: the end is not in the text.
     let cut = 0;
     for (let page = start.page; page <= end.page; page++) {
-      if ((this.texts.get(page)?.chars.length ?? 0) >= ENGINE_PAGE_CHARS) cut++;
+      if (reachesCutEnd(sel, page, this.texts.get(page))) cut++;
     }
     return { ...selectionText(sel, (page) => this.texts.get(page)), cut };
   }
@@ -488,7 +535,7 @@ export class PageOverlays {
    * whether the engine had cut a page. Only one copy runs for a document at a time, so the limit
    * is for the document and not for each press of Copy.
    */
-  async loadSelectedText(): Promise<CopyResult> {
+  async loadSelectedText(onProgress?: (done: number, total: number) => void): Promise<CopyResult> {
     const result: CopyResult = {
       text: "",
       pages: 0,
@@ -503,13 +550,17 @@ export class PageOverlays {
     if (this.copying) return { ...result, status: "busy" };
     this.copying = true;
     try {
-      return await this.gather(sel, result);
+      return await this.gather(sel, result, onProgress);
     } finally {
       this.copying = false;
     }
   }
 
-  private async gather(sel: Selection, result: CopyResult): Promise<CopyResult> {
+  private async gather(
+    sel: Selection,
+    result: CopyResult,
+    onProgress?: (done: number, total: number) => void,
+  ): Promise<CopyResult> {
     const { start, end } = orderSelection(sel);
     result.total = end.page - start.page + 1;
     const parts: string[] = [];
@@ -518,11 +569,12 @@ export class PageOverlays {
       const text = this.texts.get(page) ?? (await this.texts.load(page));
       // A closed document gives nothing: half a text must not reach the clipboard.
       if (this.destroyed) return { ...result, text: "", pages: 0, status: "cancelled" };
+      onProgress?.(page - start.page + 1, result.total);
       if (!text) {
         result.failed.push(page);
         continue;
       }
-      if (text.chars.length >= ENGINE_PAGE_CHARS) result.cut++;
+      if (reachesCutEnd(sel, page, text)) result.cut++;
       const range = rangeOnPage(sel, page);
       const piece = range ? textInRange(text, range[0], Math.min(range[1], text.chars.length)) : "";
       if (piece.length > 0) {
@@ -618,6 +670,9 @@ export class PageOverlays {
         ? Math.min(last.count + 1, 3)
         : 1;
     this.lastPress = { time: p.timeStamp, x: p.clientX, y: p.clientY, count };
+    // A press is a fresh try for a page whose text could not be read.
+    const at = this.pointAt(p.clientX, p.clientY);
+    if (at) this.texts.retry(at.page);
     const caret = this.caretAt(p.clientX, p.clientY);
     this.pressed = { x: p.clientX, y: p.clientY, moved: false, detail: count };
     this.pointer = { x: p.clientX, y: p.clientY };

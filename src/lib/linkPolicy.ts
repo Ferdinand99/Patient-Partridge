@@ -96,10 +96,3 @@ export function describeLink(uri: string): string {
   const host = verdict.host;
   return host.length > MAX_SHOWN_HOST ? `…${host.slice(-MAX_SHOWN_HOST)}` : host;
 }
-
-/** A short form of an address for a button or a tooltip. The full address is always shown in the question. */
-export function shortAddress(url: string, max = 60): string {
-  if (url.length <= max) return url;
-  const half = Math.floor((max - 1) / 2);
-  return `${url.slice(0, half)}…${url.slice(url.length - half)}`;
-}
