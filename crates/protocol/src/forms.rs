@@ -49,8 +49,8 @@ pub enum FormKind {
     None = 0,
     /// A form of fields in the PDF itself (an AcroForm). The reader can fill it in.
     Acro = 1,
-    /// A form that carries XFA data, whole or next to ordinary fields. Acrobat shows the XFA part
-    /// and ignores the ordinary fields, so a value written to them would not show: the reader does
+    /// A form that carries XFA data, whole or next to ordinary fields. A reader with XFA support
+    /// shows the XFA part and ignores the ordinary fields, so a value written to them would not show: the reader does
     /// not fill these in.
     Xfa = 2,
 }

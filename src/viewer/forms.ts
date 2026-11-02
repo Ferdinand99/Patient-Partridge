@@ -100,7 +100,7 @@ export interface FormsEvents {
 
 /** What the form bar says about a form that cannot be filled in. */
 export const XFA_NOTICE =
-  "This is an XFA form, which Patient Partridge cannot fill in. The pages are shown as they are. Open the file in Adobe Acrobat to fill it in.";
+  "This is an XFA form, which Patient Partridge cannot fill in. The pages are shown as they are. Open the file in a PDF reader that supports XFA to fill it in.";
 
 /** What the form bar says about scripts and actions. */
 export const ACTIONS_NOTICE =
@@ -108,7 +108,7 @@ export const ACTIONS_NOTICE =
 
 /** What the form bar says about fields that are left alone for the action they carry. */
 export const BLOCKED_NOTICE =
-  "Some fields in this form cannot be filled in here. The form has a button that clears or hides fields, and these fields have actions or scripts of their own that Patient Partridge does not run and cannot check. It leaves them as they are, so that nothing you have typed gets cleared. To fill them in, use another reader, such as Adobe Acrobat.";
+  "Some fields in this form cannot be filled in here. The form has a button that clears or hides fields, and these fields have actions or scripts of their own that Patient Partridge does not run and cannot check. It leaves them as they are, so that nothing you have typed gets cleared. To fill them in, use another PDF reader.";
 
 /** What the form bar says when the form of a document cannot be read. */
 export const UNREADABLE_NOTICE = "The form of this document could not be read, so it cannot be filled in here.";
