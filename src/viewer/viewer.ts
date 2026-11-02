@@ -717,6 +717,17 @@ export class DocumentView {
     return this.forms?.hasPendingInput ?? false;
   }
 
+  /** The fields that hold text the document did not accept: where they are and what they are called. */
+  get refusedFormFields(): { page: number; index: number; label: string }[] {
+    return this.forms?.refusedFields ?? [];
+  }
+
+  /** Scrolls to a field of the form and puts the focus in it. */
+  revealFormField(page: number, index: number): void {
+    this.goToPage(page);
+    this.forms?.reveal(page, index);
+  }
+
   private async renderJob(job: RenderJob): Promise<void> {
     if (this.destroyed) return;
     const buffer = await this.api.render(this.info.doc, job.page, job.width, job.height);

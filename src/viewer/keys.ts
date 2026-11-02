@@ -43,16 +43,21 @@ export type Action =
 /** CSS pixels one arrow key press scrolls. */
 export const LINE_SCROLL = 48;
 
+/** A character of a script other than Latin. Punctuation, digits and marks belong to no script. */
+const OTHER_SCRIPT = /^[^\p{Script=Latin}\p{Script=Common}\p{Script=Inherited}]$/u;
+
 /**
- * The key a shortcut is matched on. A letter of the Latin alphabet is taken as it is, so Dvorak,
- * AZERTY and the other Latin layouts keep the letter they print. On a layout without Latin letters
- * (Russian, Greek, Hebrew, Arabic) the web view reports the letter of that layout, so the place of
- * the key stands in: the key that prints S on a US keyboard counts as S.
+ * The key a shortcut is matched on. What the key prints is taken as it is when the layout has
+ * Latin letters: a letter of the Latin alphabet, but also punctuation and accented letters (the
+ * comma of Dvorak, the e with an acute accent of the French BEPO layout), which are not the key
+ * that letter of the US layout stands for. Only a key that prints a letter of another script
+ * (Russian, Greek, Hebrew, Arabic) falls back to its place: the web view reports the letter of that
+ * layout, so the key that prints S on a US keyboard counts as S.
  */
 export function shortcutKey(e: KeyInfo): string {
   if (/^[a-z]$/i.test(e.key)) return e.key.toLowerCase();
   const place = /^Key([A-Z])$/.exec(e.code ?? "");
-  if (place && [...e.key].length === 1) return place[1].toLowerCase();
+  if (place && [...e.key].length === 1 && OTHER_SCRIPT.test(e.key)) return place[1].toLowerCase();
   return e.key;
 }
 

@@ -69,6 +69,18 @@
   min-width: 9.5rem;
 }
 
+/* In a narrow window the zoom list and the gaps give way, so that every button stays in the window. */
+@media (max-width: 640px) {
+  .toolbar {
+    gap: var(--sp-1);
+  }
+
+  .zoom-box .select {
+    min-width: 0;
+    width: 5.5rem;
+  }
+}
+
 /* Workspace: the side panel next to the stage */
 .workspace {
   display: flex;

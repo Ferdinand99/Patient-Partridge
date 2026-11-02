@@ -127,6 +127,9 @@ const CANNOT_UNCHECK = "A radio button cannot be turned off once it is on. Pick 
 const CANNOT_CHANGE = "That field could not be changed.";
 const TEXT_REFUSED =
   "That text is too long for the document, so it is not saved. It stays in the box. Shorten it or clear it before you save.";
+/** What the box of a field says while its text is refused. */
+const REFUSED_TITLE =
+  "This text is too long for the document, so it is not saved. Shorten it, or press Escape to put back what the document has.";
 const CANNOT_UNDO_RADIO = "A radio button cannot be turned off, so this choice cannot be taken back. Pick another one.";
 const CANNOT_UNDO_LIST = "A drop-down list cannot be cleared, so this choice cannot be taken back. Pick another one.";
 
@@ -135,6 +138,9 @@ const MAX_LENGTH = 0x7fffffff;
 
 /** How long a short message stays in the bar, in milliseconds. */
 const MESSAGE_MS = 6000;
+
+/** How long a request to go to a field waits for its page to show it, in milliseconds. */
+const WANTED_MS = 5000;
 
 /** How long a field that was changed keeps covering its picture while the page is drawn again. */
 const PENDING_MS = 4000;
@@ -151,6 +157,8 @@ interface FieldView {
   /** The reader is typing in it: what the engine says does not overwrite the box. */
   editing: boolean;
   pendingTimer?: ReturnType<typeof setTimeout>;
+  /** The title the box has when its text is not refused. */
+  baseTitle?: string;
 }
 
 interface PageState {
@@ -239,7 +247,10 @@ export class FormLayer {
    * as changed, until the reader changes or clears it: it must not vanish at a save, a close or a
    * quit. It is kept by place, not by box, so that it survives a page that is unmounted.
    */
-  private readonly refused = new Map<string, string>();
+  private readonly refused = new Map<string, { text: string; label: string }>();
+  /** A field the reader asked to be taken to, for a page that is not there yet. */
+  private wanted: { page: number; index: number } | null = null;
+  private wantedTimer?: ReturnType<typeof setTimeout>;
 
   constructor(
     private readonly doc: number,
@@ -296,6 +307,54 @@ export class FormLayer {
   /** True while a field holds text that the engine did not take. The document cannot be saved so. */
   get hasRefusedInput(): boolean {
     return this.refused.size > 0;
+  }
+
+  /** The fields that hold text the engine did not take, in the order of the document. */
+  get refusedFields(): { page: number; index: number; label: string }[] {
+    return [...this.refused]
+      .map(([key, entry]) => {
+        const [page, index] = key.split(":").map(Number);
+        return { page, index, label: entry.label };
+      })
+      .sort((a, b) => a.page - b.page || a.index - b.index);
+  }
+
+  /**
+   * Scrolls to a field and puts the focus in it. A page that is not on screen is asked for first;
+   * the field is reached when its box is there.
+   */
+  reveal(page: number, index: number): void {
+    this.wanted = { page, index };
+    clearTimeout(this.wantedTimer);
+    this.wantedTimer = setTimeout(() => (this.wanted = null), WANTED_MS);
+    this.focusWanted();
+  }
+
+  private focusWanted(): void {
+    const wanted = this.wanted;
+    if (!wanted) return;
+    const view = this.pages.get(wanted.page)?.views.get(wanted.index);
+    if (!view || !view.el.isConnected) return;
+    this.wanted = null;
+    clearTimeout(this.wantedTimer);
+    view.el.scrollIntoView({ block: "center", inline: "nearest" });
+    view.el.focus({ preventScroll: true });
+  }
+
+  /** Marks a box whose text the engine did not take, so that it shows the text and says why. */
+  private markRefused(view: FieldView, on: boolean): void {
+    const el = view.el;
+    el.classList.toggle("form-refused", on);
+    if (on) {
+      if (view.baseTitle === undefined) view.baseTitle = el.title;
+      el.setAttribute("aria-invalid", "true");
+      el.title = REFUSED_TITLE;
+    } else if (view.baseTitle !== undefined) {
+      el.removeAttribute("aria-invalid");
+      if (view.baseTitle) el.title = view.baseTitle;
+      else el.removeAttribute("title");
+      view.baseTitle = undefined;
+    }
   }
 
   private refusedKey(view: FieldView): string {
@@ -482,6 +541,7 @@ export class FormLayer {
         if (view) this.sync(view, field, force);
       }
       this.updateRadioStops(state);
+      this.focusWanted();
       return;
     }
     for (const view of state.views.values()) {
@@ -524,6 +584,7 @@ export class FormLayer {
       if (view.extra) parent.append(view.extra);
     }
     this.updateRadioStops(state);
+    this.focusWanted();
   }
 
   /** Puts the box of a field where the engine says, in percentages of the page. */
@@ -696,12 +757,13 @@ export class FormLayer {
           const kept = this.refused.get(this.refusedKey(view));
           if (kept !== undefined) {
             // The text the engine did not take stays where the reader put it.
-            el.value = kept;
-            view.lastSent = kept;
+            el.value = kept.text;
+            view.lastSent = kept.text;
           } else if (force || !view.editing) {
             el.value = field.value;
             view.lastSent = null;
           }
+          this.markRefused(view, kept !== undefined);
         }
         break;
       }
@@ -794,7 +856,7 @@ export class FormLayer {
       });
       el.addEventListener("input", () => {
         view.lastSent = null;
-        this.refused.delete(this.refusedKey(view));
+        if (this.refused.delete(this.refusedKey(view))) this.markRefused(view, false);
         const text = el.value.replace(/\r\n?/g, "\n");
         if (text !== view.field.value && !view.field.readOnly && !view.field.valueCut) this.typed.add(view);
         else this.typed.delete(view);
@@ -807,7 +869,7 @@ export class FormLayer {
           el.value = view.field.value;
           view.lastSent = null;
           this.typed.delete(view);
-          this.refused.delete(this.refusedKey(view));
+          if (this.refused.delete(this.refusedKey(view))) this.markRefused(view, false);
           this.updatePending();
         } else if (e.key === "Enter" && el instanceof HTMLInputElement) {
           // Enter ends the entry and keeps the focus where it is.
@@ -903,7 +965,10 @@ export class FormLayer {
         // document counts as changed, so that nothing is saved or closed over it unseen.
         const refusedText =
           value.kind === "text" && toAppError(error).code === "invalid_request" && this.stillInBox(view, value.text);
-        if (refusedText) this.refused.set(`${page}:${before.index}`, value.text);
+        if (refusedText) {
+          this.refused.set(`${page}:${before.index}`, { text: value.text, label: fieldLabel(before) });
+          this.markRefused(view, true);
+        }
         await this.resync(page);
         this.tell(refusedText ? TEXT_REFUSED : this.explain(before, error));
       } finally {

@@ -174,6 +174,31 @@ describe("pageScrollDistance", () => {
       expect(actionForKey({ ...key("o"), code: "KeyS", ctrlKey: true })).not.toEqual({ type: "save" });
     });
 
+    it("Dvorak: punctuation on a key does not stand for the letter of the US place", () => {
+      // The comma of Dvorak is in the W place, the semicolon in the Z place.
+      for (const extra of [{}, { shiftKey: true }, { metaKey: true, ctrlKey: false }]) {
+        expect(actionForKey({ ...key(",", extra), code: "KeyW", ctrlKey: true, ...extra })).toBeNull();
+        expect(actionForKey({ ...key("<", extra), code: "KeyW", ctrlKey: true, ...extra })).toBeNull();
+        expect(actionForKey({ ...key(";", extra), code: "KeyZ", ctrlKey: true, ...extra })).toBeNull();
+      }
+      expect(actionForKey({ ...key(","), code: "KeyW", ctrlKey: true })).toBeNull();
+    });
+
+    it("Colemak: the semicolon in the P place does not print", () => {
+      expect(actionForKey({ ...key(";"), code: "KeyP", ctrlKey: true })).toBeNull();
+    });
+
+    it("BEPO: an accented letter in the W or Z place does not close a tab or undo", () => {
+      expect(actionForKey({ ...key("é"), code: "KeyW", ctrlKey: true })).toBeNull();
+      expect(actionForKey({ ...key("à"), code: "KeyZ", ctrlKey: true })).toBeNull();
+      expect(actionForKey({ ...key("É"), code: "KeyW", ctrlKey: true, shiftKey: true })).toBeNull();
+    });
+
+    it("a digit or a symbol on a letter place is not taken for the letter", () => {
+      expect(actionForKey({ ...key("1"), code: "KeyW", ctrlKey: true })).toEqual({ type: "zoom-actual" });
+      expect(actionForKey({ ...key("-"), code: "KeyW", ctrlKey: true })).toEqual({ type: "zoom-out" });
+    });
+
     it("AZERTY: A and Q follow what is printed", () => {
       expect(actionForKey({ ...key("a"), code: "KeyQ", ctrlKey: true })).toEqual({ type: "select-all" });
       expect(actionForKey({ ...key("z"), code: "KeyW", ctrlKey: true })).toEqual({ type: "undo" });

@@ -438,3 +438,87 @@ test("a tab that goes behind another one sends what is typed in it", async ({ pa
   await expect(page.locator('.tab-title[aria-selected="true"]')).toHaveText("second.pdf");
   await expect.poll(async () => (await sets(page)).length).toBe(1);
 });
+
+// ---- text the document did not accept --------------------------------------------------------------
+
+test("text the document refused shows at rest, is flagged, and the Save notice names the field and takes the reader to it", async ({ page }) => {
+  await openForm(page);
+  await page.evaluate(
+    () => ((window as unknown as { __E2E__: Stand }).__E2E__.forms.failNext = { code: "invalid_request", message: "the name or the value is too long" }),
+  );
+  await fullname(page).click();
+  await page.keyboard.type("Ada Lovelace");
+  await page.keyboard.press("Tab");
+  const box = fullname(page);
+  await expect(box).toHaveClass(/form-refused/);
+  await expect(box).toHaveAttribute("aria-invalid", "true");
+  await expect(box).toHaveValue("Ada Lovelace");
+  // The reader has left the box, and the text is still there to read: dark on white, with an outline.
+  const style = await box.evaluate((el) => {
+    const s = getComputedStyle(el);
+    return { color: s.color, fill: s.webkitTextFillColor, background: s.backgroundColor, outline: s.outlineStyle, width: s.outlineWidth };
+  });
+  expect(style.fill).toBe("rgb(17, 17, 17)");
+  expect(style.color).toBe("rgb(17, 17, 17)");
+  expect(style.background).toBe("rgb(255, 255, 255)");
+  expect(style.outline).toBe("solid");
+  expect(style.width).toBe("2px");
+  // The other fields are as they were.
+  await expect(page.getByRole("textbox", { name: "notes" })).not.toHaveClass(/form-refused/);
+  // Wait until the short message in the bar is gone: the box still says it.
+  await page.locator(".form-bar-close").click();
+  await page.keyboard.press("Control+s");
+  const notice = page.getByRole("alertdialog");
+  await expect(notice).toContainText('The field "Full name" on page 1');
+  await expect(notice).toContainText("Escape");
+  expect((await stand(page)).saves).toBe(0);
+  await notice.getByRole("button", { name: "Go to the field" }).click();
+  await expect(box).toBeFocused();
+  // Escape puts the old text back, and the document can be saved again.
+  await page.keyboard.press("Escape");
+  await expect(box).not.toHaveClass(/form-refused/);
+  await expect(box).toHaveValue("");
+  await expect(page.locator(".tab-dirty")).toHaveCount(0);
+});
+
+test("a double click on a Save button does the work once", async ({ page }) => {
+  await openForm(page);
+  const asks = () =>
+    page.evaluate(() => (window as unknown as { __E2E__: Stand }).__E2E__.forms.calls.filter((c) => c.cmd === "save_pdf_as").length);
+  await page.evaluate(() => {
+    const b = document.getElementById("save-copy-button") as HTMLButtonElement;
+    b.click();
+    b.click();
+  });
+  await expect.poll(asks).toBe(1);
+  await page.waitForTimeout(200);
+  expect(await asks()).toBe(1);
+  // The next press is a new question.
+  await page.locator("#save-copy-button").click();
+  await expect.poll(asks).toBe(2);
+});
+
+test("the toolbar keeps every button in the window, down to the smallest width", async ({ page }) => {
+  await openForm(page);
+  for (const width of [480, 520, 560, 600, 640, 1000]) {
+    await page.setViewportSize({ width, height: 700 });
+    const rights = await page.evaluate(() =>
+      [...document.querySelectorAll<HTMLElement>("#toolbar button")].map((b) => ({ id: b.id, right: b.getBoundingClientRect().right })),
+    );
+    for (const b of rights) expect(b.right, `${b.id} at ${width}`).toBeLessThanOrEqual(width);
+  }
+});
+
+test("a key that prints punctuation or an accented letter does not close the tab, a Cyrillic one does", async ({ page }) => {
+  await openForm(page);
+  const press = (key: string, code: string) =>
+    page.evaluate(
+      ([k, c]) => document.body.dispatchEvent(new KeyboardEvent("keydown", { key: k, code: c, ctrlKey: true, bubbles: true, cancelable: true })),
+      [key, code],
+    );
+  await press(",", "KeyW");
+  await press("\u00e9", "KeyW");
+  await expect(page.locator(".tab-title")).toHaveText(["form.pdf"]);
+  await press("\u0446", "KeyW");
+  await expect(page.locator(".tab-title")).toHaveCount(0);
+});
