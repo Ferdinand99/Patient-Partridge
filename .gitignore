@@ -22,6 +22,10 @@ src-tauri/binaries
 src-tauri/tauri.bundle.generated.conf.json
 src-tauri/tauri.e2e.generated.conf.json
 
+# The beta build (scripts/beta-build.mjs) makes its icons here, and the previews of them
+src-tauri/icons-beta
+beta-preview
+
 # The update test (scripts/update-e2e.mjs) builds and runs here
 e2e-update
 
