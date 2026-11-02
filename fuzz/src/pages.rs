@@ -258,11 +258,11 @@ pub fn pages_over_cap_request_case(case: usize, id: u32) -> (&'static str, Vec<u
         p
     };
     match case % PAGES_OVER_REQUESTS {
-        0 => ("delete with one page too many in the list", list_over(60)),
-        1 => ("reorder with one page too many in the list", list_over(61)),
-        2 => ("export with one page too many in the list", list_over(71)),
+        0 => ("delete with one page too many in the list", list_over(80)),
+        1 => ("reorder with one page too many in the list", list_over(81)),
+        2 => ("export with one page too many in the list", list_over(91)),
         3 => {
-            let mut p = header(68, id);
+            let mut p = header(88, id);
             push_u32(&mut p, 1);
             push_u32(&mut p, 0);
             push_u32(&mut p, MAX_SAVE_CHUNK as u32 + 1);
@@ -270,13 +270,13 @@ pub fn pages_over_cap_request_case(case: usize, id: u32) -> (&'static str, Vec<u
             ("insert piece one byte too long", p)
         }
         4 => {
-            let mut p = header(67, id);
+            let mut p = header(87, id);
             push_u32(&mut p, 1);
             push_u32(&mut p, MAX_IMPORT_BYTES as u32 + 1);
             ("insert of a document one byte over the biggest file", p)
         }
         5 => {
-            let mut p = header(63, id);
+            let mut p = header(83, id);
             push_u32(&mut p, 1);
             push_u32(&mut p, 1);
             push_u32(&mut p, 0);
@@ -286,7 +286,7 @@ pub fn pages_over_cap_request_case(case: usize, id: u32) -> (&'static str, Vec<u
             ("crop margins that are not a number", p)
         }
         6 => {
-            let mut p = header(65, id);
+            let mut p = header(85, id);
             push_u32(&mut p, 1);
             push_u32(&mut p, 0);
             for v in [100.0f32, MAX_BOX_VALUE * 2.0] {
@@ -296,7 +296,7 @@ pub fn pages_over_cap_request_case(case: usize, id: u32) -> (&'static str, Vec<u
         }
         _ => {
             // One page named, and its box left out.
-            let mut p = header(64, id);
+            let mut p = header(84, id);
             push_u32(&mut p, 1);
             push_u32(&mut p, 1);
             push_u32(&mut p, 0);
@@ -313,7 +313,7 @@ pub const PAGES_OVER_RESPONSES: usize = 7;
 /// must accept it. The cases that list pages are 80 KB to 800 KB.
 pub fn pages_over_cap_response_case(case: usize, id: u32) -> (&'static str, Vec<u8>, bool) {
     let changed = |pages: usize| {
-        let mut p = header(190, id);
+        let mut p = header(200, id);
         push_u32(&mut p, pages as u32);
         p.resize(p.len() + pages * 8, 0);
         // The sizes are zeros: valid for the decoder, which leaves the check of sizes to the app.
@@ -323,7 +323,7 @@ pub fn pages_over_cap_response_case(case: usize, id: u32) -> (&'static str, Vec<
         p
     };
     let exported = |size: u32, pages: u32| {
-        let mut p = header(194, id);
+        let mut p = header(204, id);
         push_u32(&mut p, size);
         push_u32(&mut p, pages);
         push_u32(&mut p, 0);
@@ -335,7 +335,7 @@ pub fn pages_over_cap_response_case(case: usize, id: u32) -> (&'static str, Vec<
         0 => ("changed document with one page too many", changed(MAX_PAGES + 1), false),
         1 => ("changed document with the most pages", changed(MAX_PAGES), true),
         2 => {
-            let mut p = header(191, id);
+            let mut p = header(201, id);
             push_u32(&mut p, 0);
             push_u32(&mut p, MAX_EDIT_PAGES as u32 + 1);
             p.resize(p.len() + (MAX_EDIT_PAGES + 1) * 32, 0);
@@ -358,7 +358,7 @@ pub fn pages_over_cap_response_case(case: usize, id: u32) -> (&'static str, Vec<
         ),
         _ => {
             // Says 1000 pages and holds 3.
-            let mut p = header(190, id);
+            let mut p = header(200, id);
             push_u32(&mut p, 1000);
             p.resize(p.len() + 24, 0);
             ("changed document that says more pages than it holds", p, false)
