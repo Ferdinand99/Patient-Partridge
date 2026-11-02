@@ -242,7 +242,7 @@ export const api = {
     return invoke<PageLinkInfo[]>("get_page_links", { doc, page });
   },
 
-  /** What kind of form a document has, and whether it has scripts or actions that are never run. */
+  /** What kind of form a document has, and whether it has scripts or actions. */
   formInfo(doc: number): Promise<FormInfo> {
     return invoke<FormInfo>("form_info", { doc });
   },

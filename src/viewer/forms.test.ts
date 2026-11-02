@@ -782,6 +782,16 @@ describe("pages that come and go", () => {
   });
 });
 
+describe("what the notice about scripts and actions says", () => {
+  it("says that scripts are not run and that the PDF library can run other actions", () => {
+    expect(ACTIONS_NOTICE).toContain("does not run scripts");
+    expect(ACTIONS_NOTICE).toContain("The PDF library can run some other actions itself");
+    expect(ACTIONS_NOTICE).toContain("clear or hide other fields");
+    // Actions are not said to be left unrun as a whole.
+    expect(ACTIONS_NOTICE).not.toContain("actions that Patient Partridge does not run");
+  });
+});
+
 describe("going to a field", () => {
   beforeEach(() => {
     HTMLElement.prototype.scrollIntoView = vi.fn();

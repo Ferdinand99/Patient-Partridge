@@ -109,7 +109,7 @@ export const XFA_NOTICE =
 
 /** What the form bar says about scripts and actions. */
 export const ACTIONS_NOTICE =
-  "This form has scripts or actions that Patient Partridge does not run. Fields that add up, check or format values will not update.";
+  "This form has scripts or actions. Patient Partridge does not run scripts, so fields that add up, check or format values will not update. The PDF library can run some other actions itself, so fields that could clear or hide other fields are left as they are.";
 
 /** What the form bar says about fields that are left alone for the action they carry. */
 export const BLOCKED_NOTICE =

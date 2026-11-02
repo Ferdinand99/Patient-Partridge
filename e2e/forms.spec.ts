@@ -273,7 +273,8 @@ test("says an XFA form is not filled in, and shows no field", async ({ page }) =
 
 test("tells once, calmly, that scripts do not run, and still fills the form in", async ({ page }) => {
   await openForm(page, "/docs/scripts.pdf");
-  await expect(page.locator(".form-bar-text")).toContainText("does not run");
+  await expect(page.locator(".form-bar-text")).toContainText("does not run scripts");
+  await expect(page.locator(".form-bar-text")).toContainText("can run some other actions itself");
   await expect(page.locator(".form-bar")).toHaveCount(1);
   // It is a status line, not a question: nothing is covered and nothing waits for an answer.
   await expect(page.locator(".notice")).toHaveCount(0);
