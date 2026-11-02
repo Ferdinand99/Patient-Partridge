@@ -27,6 +27,7 @@ use tauri::{AppHandle, State};
 use tauri_plugin_updater::UpdaterExt;
 
 use crate::positions::{create_private_dir, write_private_file};
+use crate::unsaved::Unsaved;
 use crate::{links, locate, now_seconds, CommandError, Engine};
 
 /// Where a person goes to install an update by hand.
@@ -149,11 +150,20 @@ pub fn detect() -> InstallMethod {
 /// True on macOS when the app was started through a symbolic link. Tauri refuses the path of the
 /// running program then (a link can be pointed somewhere else), so the update plugin ends in an I/O
 /// error and a restart after an update would quit without starting the app again. The app itself
-/// works. The owner decided to keep Tauri's check; the window tells the person once.
+/// works. Tauri's check is kept on because it is what stops a restart from starting whatever a
+/// link has been pointed at; the window tells the person that updates are not possible here.
 pub fn runs_through_symlink() -> bool {
-    cfg!(target_os = "macos")
-        && tauri::utils::platform::current_exe().is_err()
-        && std::env::current_exe().is_ok()
+    through_symlink(
+        cfg!(target_os = "macos"),
+        tauri::utils::platform::current_exe().is_err(),
+        std::env::current_exe().is_ok(),
+    )
+}
+
+/// The rule of [`runs_through_symlink`] on its own: macOS only, and only when Tauri refuses the path
+/// while the standard library finds the program. If both fail, the path is broken for another reason.
+fn through_symlink(is_macos: bool, tauri_refuses: bool, std_finds: bool) -> bool {
+    is_macos && tauri_refuses && std_finds
 }
 
 // ---- no new engine while an update is installed --------------------------------------------
@@ -261,18 +271,19 @@ pub enum Stopped<X> {
 
 /// Runs `install` with no engine alive and no way for one to start.
 ///
-/// 1. The gate is closed, so no further document can be opened.
-/// 2. Every engine is stopped.
-/// 3. The opens that were already under way are waited for (at most `drain`). When one of them is
-///    still running after that, nothing is installed: its engine would keep the installer from
-///    replacing the program.
-/// 4. Every engine is stopped again: one of those opens may have started an engine after the first
-///    stop.
-/// 5. `prepare` runs (the app writes down which documents to bring back: the list is taken here,
+/// 1. The gate is closed, so no further document can be opened or saved.
+/// 2. The opens and saves that were already under way are waited for (at most `drain`). They hold
+///    a permit of the gate. Nothing has been stopped yet: a save that is running finishes, and an
+///    open that is running registers its engine. When one of them is still running after that,
+///    nothing is installed and nothing was stopped, so the user loses nothing.
+/// 3. Every engine is stopped. No permit is out and none can be given, so no engine can start
+///    after this.
+/// 4. `prepare` runs (the app writes down which documents to bring back: the list is taken here,
 ///    after nothing can be opened or closed by an open any more, and not before the download).
-/// 6. `install` runs.
+/// 5. `install` runs.
 ///
-/// When the wait or `install` fails the gate is opened again; the documents are gone either way.
+/// When the wait or `install` fails the gate is opened again. After a failed `install` the
+/// documents are gone; after a failed wait they are not.
 pub fn install_with_engines_stopped<E, T, X>(
     gate: &OpenGate,
     engines: &E,
@@ -284,7 +295,6 @@ where
     E: Engines + ?Sized,
 {
     gate.close();
-    engines.stop_all();
     if !gate.wait_idle(drain) {
         gate.reopen();
         return Err(Stopped::OpensStuck);
@@ -489,6 +499,9 @@ pub enum FailureKind {
     Disabled,
     /// An update is being installed already.
     Busy,
+    /// A document has changes that are not saved. The install would end its engine, and the
+    /// changes with it, so nothing is installed until the user has saved or given them up.
+    Unsaved,
     /// This copy cannot install by itself (a deb package).
     Manual,
     /// The app was started through a symbolic link (macOS): updates are not possible from there.
@@ -588,6 +601,8 @@ pub struct UpdateState {
     /// The documents that are open, by handle: kept here so that the list for the restart is taken
     /// at the moment of the install, from the app's own knowledge, not from the window's.
     open_docs: Arc<Mutex<Vec<(u64, String)>>>,
+    /// The documents with changes that are not saved (see the `unsaved` module).
+    unsaved: Arc<Unsaved>,
     /// The documents of the last run, to be handed to the window once.
     restored: Mutex<Vec<String>>,
     restore_file: Option<PathBuf>,
@@ -608,6 +623,7 @@ impl UpdateState {
             installing: AtomicBool::new(false),
             close_blocked: Arc::new(AtomicBool::new(false)),
             open_docs: Arc::new(Mutex::new(Vec::new())),
+            unsaved: Arc::new(Unsaved::default()),
             restored: Mutex::new(Vec::new()),
             restore_file: data_dir.map(|d| d.join("restore-after-update.json")),
             method,
@@ -652,6 +668,27 @@ impl UpdateState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|(d, _)| *d != doc);
+        self.unsaved.forget(doc);
+    }
+
+    /// A document now belongs to another file (it was saved under a new name), so that is the
+    /// one to open again after an update.
+    pub fn move_doc(&self, doc: u64, path: &str) {
+        for (d, p) in self
+            .open_docs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter_mut()
+        {
+            if *d == doc {
+                *p = path.to_string();
+            }
+        }
+    }
+
+    /// The documents with changes that are not saved.
+    pub fn unsaved(&self) -> &Arc<Unsaved> {
+        &self.unsaved
     }
 
     /// The window that knew the documents is gone (a reload).
@@ -660,11 +697,18 @@ impl UpdateState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.unsaved.clear();
     }
 
     /// True while an update is being installed and the window must stay open.
     pub fn is_close_blocked(&self) -> bool {
         self.close_blocked.load(Ordering::SeqCst)
+    }
+
+    /// Lets a test of the close guard put the program in the state of an install.
+    #[cfg(test)]
+    pub fn block_close_for_tests(&self, blocked: bool) {
+        self.close_blocked.store(blocked, Ordering::SeqCst);
     }
 
     fn auto_update(&self) -> bool {
@@ -813,6 +857,14 @@ pub async fn install(
     pool: Arc<EnginePool>,
     active: Option<String>,
 ) -> Result<(), UpdateFailure> {
+    // Before anything is taken or stopped: the engines hold the changes of the open documents.
+    // The download stays, so the install can be asked for again once the changes are saved.
+    if state.unsaved.any() {
+        return Err(failure(
+            FailureKind::Unsaved,
+            "a document has changes that are not saved, so nothing was installed",
+        ));
+    }
     let Some((update, bytes)) = state
         .downloaded
         .lock()
@@ -858,10 +910,15 @@ pub async fn install(
     let result = match outcome {
         Ok(Ok(())) => return Ok(()),
         Ok(Err(Stopped::Install(e))) => from_updater(e),
-        Ok(Err(Stopped::OpensStuck)) => failure(
-            FailureKind::Other,
-            "a file was still being opened, so nothing was installed",
-        ),
+        Ok(Err(Stopped::OpensStuck)) => {
+            // Nothing was stopped: the documents are as they were, and the app can be used.
+            state.installing.store(false, Ordering::SeqCst);
+            *state.downloaded.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            return Err(failure(
+                FailureKind::Busy,
+                "a file was still being opened or saved, so nothing was installed",
+            ));
+        }
         Err(e) => failure(FailureKind::Other, e.to_string()),
     };
     // The engines were stopped, and the program was not replaced: the app can be used again after
@@ -1292,9 +1349,46 @@ mod tests {
         late.join().unwrap();
         assert!(result.is_ok());
         assert_eq!(*seen.borrow(), vec!["prepare", "install"]);
-        assert_eq!(engines.stops.load(Ordering::SeqCst), 2);
+        assert_eq!(engines.stops.load(Ordering::SeqCst), 1);
         // After a good install the gate stays closed: the app is about to restart.
         assert!(gate.is_closed());
+    }
+
+    #[test]
+    fn a_save_that_is_running_is_waited_for_before_any_engine_is_stopped() {
+        let gate = Arc::new(OpenGate::default());
+        let engines = Arc::new(Counting {
+            live: AtomicUsize::new(1),
+            stops: AtomicUsize::new(0),
+        });
+        // A save holds a permit for a while. The engine of the document must stay alive until it
+        // is done: stopping it would end the save and the changes with it.
+        let permit = gate.enter().unwrap();
+        let alive_until_done = Arc::new(AtomicUsize::new(usize::MAX));
+        let saving = {
+            let engines = engines.clone();
+            let seen = alive_until_done.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                seen.store(engines.stops.load(Ordering::SeqCst), Ordering::SeqCst);
+                drop(permit);
+            })
+        };
+        let result: Result<(), Stopped<()>> = install_with_engines_stopped(
+            &gate,
+            &*engines,
+            Duration::from_secs(5),
+            || {},
+            || Ok(()),
+        );
+        saving.join().unwrap();
+        assert!(result.is_ok());
+        assert_eq!(
+            alive_until_done.load(Ordering::SeqCst),
+            0,
+            "an engine was stopped while a save was running"
+        );
+        assert_eq!(engines.stops.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1338,6 +1432,11 @@ mod tests {
         assert!(
             !*installed.borrow(),
             "nothing may be installed with an open still running"
+        );
+        assert_eq!(
+            engines.stops.load(Ordering::SeqCst),
+            0,
+            "an engine was stopped for an install that did not happen"
         );
         assert!(!gate.is_closed(), "the app is usable again");
         drop(permit);
@@ -1424,11 +1523,17 @@ mod tests {
         let refused = location_allows_update(true).unwrap_err();
         assert_eq!(refused.kind, FailureKind::Location);
         assert!(!refused.engines_stopped);
-        // Only macOS asks, and a normal start is never taken for a link.
-        assert!(!runs_through_symlink() || cfg!(target_os = "macos"));
-        assert!(
-            !UpdateState::new(None, InstallMethod::Manual).symlinked || cfg!(target_os = "macos")
-        );
+    }
+
+    #[test]
+    fn only_a_macos_start_that_tauri_refuses_but_the_system_finds_counts_as_a_link() {
+        assert!(through_symlink(true, true, true));
+        // Windows and Linux are never flagged.
+        assert!(!through_symlink(false, true, true));
+        // A normal start: Tauri accepts the path.
+        assert!(!through_symlink(true, false, true));
+        // Both fail: something else is wrong with the path, and the real error stays visible.
+        assert!(!through_symlink(true, true, false));
     }
 
     #[test]
@@ -1460,7 +1565,7 @@ mod tests {
                 Ok(())
             },
         );
-        assert_eq!(*order.borrow(), vec!["stop", "stop", "prepare", "install"]);
+        assert_eq!(*order.borrow(), vec!["stop", "prepare", "install"]);
     }
 
     fn fake_engine() -> PathBuf {
@@ -1683,6 +1788,28 @@ mod tests {
         let long = "é".repeat(MAX_NOTES_CHARS + 50);
         let cut = cut_notes(Some(long));
         assert_eq!(cut.chars().count(), MAX_NOTES_CHARS);
+    }
+
+    #[test]
+    fn an_update_is_not_installed_while_a_document_has_unsaved_changes() {
+        let state = UpdateState::new(None, InstallMethod::Automatic);
+        let pool = Arc::new(EnginePool::new(
+            partridge_engine_client::EngineConfig::new("no-such-engine"),
+            2,
+        ));
+        state.unsaved().set(7, true);
+        let err = tauri::async_runtime::block_on(install(&state, pool.clone(), None)).unwrap_err();
+        assert_eq!(err.kind, FailureKind::Unsaved);
+        // Nothing was stopped: the gate is open, and the engines were not told to end.
+        assert!(!state.gate().is_closed());
+        assert!(!err.engines_stopped);
+
+        // Once the changes are saved the install goes on to the next step (there is no download
+        // in this test, so it stops there).
+        state.unsaved().set(7, false);
+        let err = tauri::async_runtime::block_on(install(&state, pool, None)).unwrap_err();
+        assert_eq!(err.kind, FailureKind::Other);
+        assert!(err.message.contains("no update has been downloaded"));
     }
 
     #[test]

@@ -22,6 +22,12 @@ export interface SavedTabs {
   failed?: string[];
 }
 
+/** The file a save wrote. */
+export interface SavedFile {
+  path: string;
+  name: string;
+}
+
 export interface OpenedDocument {
   doc: number;
   pages: PageSizePt[];
@@ -64,6 +70,7 @@ export type UpdateFailureKind =
   | "badManifest"
   | "disabled"
   | "busy"
+  | "unsaved"
   | "manual"
   | "location"
   | "other";
@@ -93,6 +100,45 @@ export const api = {
       pages: wire.pages.map(([width, height]) => ({ width, height })),
       position: wire.position,
     };
+  },
+
+  /**
+   * Tells the app whether a document has changes that are not saved. The app then holds back
+   * closing, quitting and installing an update until the user has decided.
+   */
+  async setDirty(doc: number, dirty: boolean): Promise<void> {
+    await invoke<void>("set_dirty", { doc, dirty });
+  },
+
+  /**
+   * Saves a document to the file it was opened from. The app writes a new file next to it, checks
+   * it, and replaces the old one in one step; the old file is as it was if anything fails. The
+   * answers to the two questions a save can ask come in as flags: the file was changed by
+   * something else since it was opened (`overwriteChanged`), and the document is signed and a
+   * save breaks the signature (`allowSigned`). Without them the save fails with `save_changed`
+   * or `save_signed`.
+   */
+  save(doc: number, overwriteChanged: boolean, allowSigned: boolean): Promise<SavedFile> {
+    return invoke<SavedFile>("save_pdf", { doc, overwriteChanged, allowSigned });
+  },
+
+  /**
+   * Asks where to save a copy (the app opens the dialog of the system itself) and saves the
+   * document there; the document belongs to the new file afterwards. Null when the dialog is
+   * cancelled.
+   */
+  saveAs(doc: number, allowSigned: boolean): Promise<SavedFile | null> {
+    return invoke<SavedFile | null>("save_pdf_as", { doc, allowSigned });
+  },
+
+  /** Quits the app, after the user decided what happens to the changes that are not saved. */
+  async quitApp(): Promise<void> {
+    await invoke<void>("quit_app");
+  },
+
+  /** The user answered "stay" to the question before closing: the next request to close asks again. */
+  async stayOpen(): Promise<void> {
+    await invoke<void>("stay_open");
   },
 
   /** A page as raw RGBA bytes: `width * height * 4` of them. */

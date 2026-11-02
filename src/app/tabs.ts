@@ -8,6 +8,8 @@ export interface TabInfo {
   title: string;
   /** Shown as a tooltip: the full path. */
   path: string;
+  /** The document has changes that are not saved: a dot is shown next to the name. */
+  dirty?: boolean;
 }
 
 export interface TabHandlers {
@@ -64,6 +66,16 @@ export class TabStrip {
     label.textContent = tab.title;
     label.addEventListener("click", () => this.handlers.select(tab.id));
 
+    // The dot is not part of the title, so the title (and the label of the button) stay the name.
+    let dot: HTMLElement | null = null;
+    if (tab.dirty) {
+      dot = document.createElement("span");
+      dot.className = "tab-dirty";
+      dot.setAttribute("role", "img");
+      dot.setAttribute("aria-label", "Unsaved changes");
+      dot.title = "Unsaved changes";
+    }
+
     const close = document.createElement("button");
     close.type = "button";
     close.className = "tab-close";
@@ -76,7 +88,8 @@ export class TabStrip {
       this.handlers.close(tab.id);
     });
 
-    item.append(label, close);
+    if (dot) item.append(label, dot, close);
+    else item.append(label, close);
     return item;
   }
 

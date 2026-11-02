@@ -22,7 +22,9 @@ type Fakes = {
   [K in keyof UpdaterDeps["api"]]: ReturnType<typeof vi.fn>;
 };
 
-function make(opts: { settings?: Partial<UpdateSettings>; found?: UpdateInfo | null; paths?: string[] } = {}) {
+function make(
+  opts: { settings?: Partial<UpdateSettings>; found?: UpdateInfo | null; paths?: string[]; unsaved?: number } = {},
+) {
   const settings: UpdateSettings = { autoUpdate: true, method: "automatic", currentVersion: "0.1.0", ...opts.settings };
   const api: Fakes = {
     getUpdateSettings: vi.fn(async () => settings),
@@ -35,9 +37,31 @@ function make(opts: { settings?: Partial<UpdateSettings>; found?: UpdateInfo | n
   };
   const openPaths = vi.fn(() => opts.paths ?? ["/docs/a.pdf", "/docs/b.pdf"]);
   const closeMenu = vi.fn();
-  const updater = new Updater(document, { api: api as unknown as UpdaterDeps["api"], openPaths, closeMenu });
+  // The number of documents with changes that are not saved. `saveAll` brings it to 0 unless a test
+  // makes it fail.
+  let unsaved = opts.unsaved ?? 0;
+  const saveAll = vi.fn(async () => {
+    unsaved = 0;
+    return true;
+  });
+  const updater = new Updater(document, {
+    api: api as unknown as UpdaterDeps["api"],
+    openPaths,
+    closeMenu,
+    unsavedCount: () => unsaved,
+    saveAll,
+  });
   updater.init();
-  return { api, updater, openPaths, closeMenu };
+  return {
+    api,
+    updater,
+    openPaths,
+    closeMenu,
+    saveAll,
+    setUnsaved: (n: number) => {
+      unsaved = n;
+    },
+  };
 }
 
 const flush = () => vi.advanceTimersByTimeAsync(0);
@@ -93,7 +117,17 @@ describe("notesToText on a real changelog (Nimble Newt v0.3.0, written by releas
 
 describe("failureText", () => {
   it("has a sentence for every kind", () => {
-    const kinds = ["offline", "invalidSignature", "notConfigured", "badManifest", "busy", "manual", "location", "other"] as const;
+    const kinds = [
+      "offline",
+      "invalidSignature",
+      "notConfigured",
+      "badManifest",
+      "busy",
+      "unsaved",
+      "manual",
+      "location",
+      "other",
+    ] as const;
     for (const kind of kinds) {
       const f: UpdateFailure = { kind, message: "detail", enginesStopped: false };
       expect(failureText(f).length).toBeGreaterThan(20);
@@ -352,6 +386,107 @@ describe("installing", () => {
     expect(sheetText()).toContain("open documents were closed");
     await click(button("Restart"));
     expect(api.restartApp).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("changes that are not saved", () => {
+  /** Opens the question and presses Download and Install; the download is done at once. */
+  async function download() {
+    await vi.advanceTimersByTimeAsync(FIRST_CHECK_DELAY_MS);
+    await click(pill());
+    await click(button("Download and Install"));
+  }
+
+  it("does not install while a document has changes that are not saved: the install waits for the user", async () => {
+    const m = make({ unsaved: 2 });
+    await download();
+    expect(m.api.downloadUpdate).toHaveBeenCalledTimes(1);
+    // Nothing was stopped, nothing was asked of the open files, and the user is asked.
+    expect(m.api.installUpdate).not.toHaveBeenCalled();
+    expect(m.openPaths).not.toHaveBeenCalled();
+    expect(sheetText()).toContain("Save your changes first");
+    expect(sheetText()).toContain("2 documents have changes that are not saved");
+    expect(button("Save and install")).toBeDefined();
+  });
+
+  it("Install later keeps the download, leaves the documents alone and puts a pill in the toolbar", async () => {
+    const m = make({ unsaved: 1 });
+    await download();
+    await click(button("Install later"));
+    expect(m.api.installUpdate).not.toHaveBeenCalled();
+    expect(m.saveAll).not.toHaveBeenCalled();
+    expect(layer().hidden).toBe(true);
+    expect(pill().hidden).toBe(false);
+    expect(pill().textContent).toContain("Install update");
+    // A later check does not download again, and does not start a second install.
+    await vi.advanceTimersByTimeAsync(CHECK_INTERVAL_MS);
+    expect(m.api.checkUpdate).toHaveBeenCalledTimes(1);
+    expect(m.api.downloadUpdate).toHaveBeenCalledTimes(1);
+    expect(m.api.installUpdate).not.toHaveBeenCalled();
+  });
+
+  it("Escape is Install later too", async () => {
+    const m = make({ unsaved: 1 });
+    await download();
+    layer().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await flush();
+    expect(m.api.installUpdate).not.toHaveBeenCalled();
+    expect(pill().textContent).toContain("Install update");
+  });
+
+  it("from the pill the install can be asked for again, and goes on once everything is saved", async () => {
+    const m = make({ unsaved: 1 });
+    await download();
+    await click(button("Install later"));
+    // The user saves by hand, then presses the pill.
+    m.setUnsaved(0);
+    await click(pill());
+    expect(sheetText()).not.toContain("Save your changes first");
+    expect(m.api.installUpdate).toHaveBeenCalledTimes(1);
+    expect(m.api.downloadUpdate).toHaveBeenCalledTimes(1);
+    expect(sheetText()).toContain("Restart to update");
+  });
+
+  it("Save and install saves every document first, and installs only when all were saved", async () => {
+    const m = make({ unsaved: 3 });
+    await download();
+    await click(button("Save and install"));
+    expect(m.saveAll).toHaveBeenCalledTimes(1);
+    expect(m.api.installUpdate).toHaveBeenCalledTimes(1);
+    expect(m.saveAll.mock.invocationCallOrder[0]).toBeLessThan(m.api.installUpdate.mock.invocationCallOrder[0]);
+    expect(sheetText()).toContain("Restart to update");
+  });
+
+  it("a save that does not work stops the install and leaves the update waiting", async () => {
+    const m = make({ unsaved: 1 });
+    m.saveAll.mockResolvedValueOnce(false);
+    await download();
+    await click(button("Save and install"));
+    expect(m.saveAll).toHaveBeenCalledTimes(1);
+    expect(m.api.installUpdate).not.toHaveBeenCalled();
+    expect(pill().textContent).toContain("Install update");
+  });
+
+  it("when changes appear after the question, the app refuses and the update stays waiting", async () => {
+    const m = make({ unsaved: 0 });
+    m.api.installUpdate.mockRejectedValueOnce({ kind: "unsaved", message: "x", enginesStopped: false });
+    await download();
+    expect(sheetText()).toContain("The update was not installed");
+    expect(sheetText()).toContain("changes that are not saved");
+    expect(button("Restart")).toBeUndefined();
+    await click(button("OK"));
+    expect(pill().textContent).toContain("Install update");
+    // Saved now: the pill finishes the job without downloading again.
+    await click(pill());
+    expect(m.api.installUpdate).toHaveBeenCalledTimes(2);
+    expect(m.api.downloadUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it("with nothing unsaved the install goes on without a question", async () => {
+    const m = make({ unsaved: 0 });
+    await download();
+    expect(sheetText()).not.toContain("Save your changes first");
+    expect(m.api.installUpdate).toHaveBeenCalledTimes(1);
   });
 });
 

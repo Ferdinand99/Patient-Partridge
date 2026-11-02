@@ -1,12 +1,12 @@
 #![no_main]
-//! Valid responses of all nine kinds built from the fuzzer's bytes must come through encode,
+//! Valid responses of all thirteen kinds built from the fuzzer's bytes must come through encode,
 //! framing and decode unchanged (boxes that were not finite come back as zeros). Lists sometimes
 //! have the most entries the protocol allows.
 //!
 //! One run in eight builds a response that is one over a cap instead (an outline with 5001
 //! entries, an entry one level too deep, a title one byte too long, 501 links, an address one
 //! byte too long, 2001 matches, 100001 characters of page text, strings one byte too long, a
-//! bitmap one pixel too wide). The encoder cannot write such a response, so the bytes are written
+//! bitmap one pixel too wide, a saved file one byte over the biggest, a piece of it that is too long, reaches past the biggest file or is shorter than it says). The encoder cannot write such a response, so the bytes are written
 //! by hand, and the decoder must refuse it. Two cases sit exactly on a cap and must be accepted.
 
 use std::io::Cursor;

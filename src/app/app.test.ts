@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { OpenedDocument, SavedPosition } from "../lib/api";
+import type { OpenedDocument, SavedFile, SavedPosition } from "../lib/api";
 import { THEME_KEY } from "../lib/theme";
 import { App } from "./app";
 
@@ -154,6 +154,15 @@ function make(
     openLink: vi.fn((_doc: number, _url: string) => Promise.resolve()),
     measureMode: vi.fn(() => Promise.resolve(options.measureOn ?? false)),
     measureReport: vi.fn((_a: number, _b: number, _c: number) => Promise.resolve()),
+    setDirty: vi.fn((_doc: number, _dirty: boolean) => Promise.resolve()),
+    save: vi.fn((_doc: number, _overwrite: boolean, _allowSigned: boolean) =>
+      Promise.resolve<SavedFile>({ path: "/docs/book.pdf", name: "book.pdf" }),
+    ),
+    saveAs: vi.fn((_doc: number, _allowSigned: boolean) =>
+      Promise.resolve<SavedFile | null>({ path: "/docs/copy.pdf", name: "copy.pdf" }),
+    ),
+    quitApp: vi.fn(() => Promise.resolve()),
+    stayOpen: vi.fn(() => Promise.resolve()),
   };
   const storage = options.storage ?? new MemoryStorage();
   const deps = {
@@ -2002,5 +2011,612 @@ describe("App: a start that goes wrong", () => {
     });
     await flush();
     expect(second.api.saveSession.mock.calls.at(-1)).toEqual([["/docs/a.pdf"], 0, []]);
+  });
+});
+
+describe("App: changes that are not saved", () => {
+  /** Opens a file and makes one change to it, as a feature that edits the document will. */
+  async function openDirty(options: Parameters<typeof make>[0] = {}, path = "/docs/book.pdf") {
+    const m = make(options);
+    await m.app.openPath(path);
+    await flush();
+    const state = { value: 0 };
+    m.app.recordEdit({
+      label: "Change",
+      undo: () => {
+        state.value--;
+      },
+      redo: () => {
+        state.value++;
+      },
+    });
+    state.value++;
+    return { ...m, state };
+  }
+  const dot = () => document.querySelector(".tab-dirty");
+  const lastTitle = (deps: { setWindowTitle: ReturnType<typeof vi.fn> }) => deps.setWindowTitle.mock.calls.at(-1)?.[0];
+
+  it("marks the tab and the window title, and tells the app process, when a document has a change", async () => {
+    const { api, deps } = await openDirty();
+    expect(dot()).not.toBeNull();
+    expect(dot()?.getAttribute("aria-label")).toBe("Unsaved changes");
+    // The name of the tab is still just the name.
+    expect(tabTitles()).toEqual(["book.pdf"]);
+    expect(lastTitle(deps)).toBe("• book.pdf - Patient Partridge");
+    expect(api.setDirty).toHaveBeenCalledTimes(1);
+    expect(api.setDirty).toHaveBeenLastCalledWith(1, true);
+  });
+
+  it("is clean again when the change is taken back, and tells the app process", async () => {
+    const { app, api, deps, state } = await openDirty();
+    key("z", { ctrlKey: true });
+    await flush();
+    expect(state.value).toBe(0);
+    expect(dot()).toBeNull();
+    expect(lastTitle(deps)).toBe("book.pdf - Patient Partridge");
+    expect(api.setDirty).toHaveBeenLastCalledWith(1, false);
+    key("y", { ctrlKey: true });
+    await flush();
+    expect(state.value).toBe(1);
+    expect(app.unsavedCount).toBe(1);
+    key("z", { ctrlKey: true });
+    await flush();
+    expect(state.value).toBe(0);
+    key("Z", { ctrlKey: true, shiftKey: true });
+    await flush();
+    expect(state.value).toBe(1);
+  });
+
+  it("leaves undo and redo to a text box that has the focus", async () => {
+    const { state } = await openDirty();
+    const box = q<HTMLInputElement>("#page-input");
+    box.dispatchEvent(new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true }));
+    await flush();
+    expect(state.value).toBe(1);
+  });
+
+  it("does not mark a document that has no change", async () => {
+    const m = make();
+    await m.app.openPath("/docs/a.pdf");
+    await flush();
+    expect(dot()).toBeNull();
+    expect(m.api.setDirty).not.toHaveBeenCalled();
+    expect(m.app.unsavedCount).toBe(0);
+  });
+
+  describe("closing a tab", () => {
+    it("asks first, and Cancel keeps the tab, its change and the engine", async () => {
+      const { api } = await openDirty();
+      click(q(".tab-close"));
+      await flush();
+      expect(notice()?.textContent).toContain('Save changes to "book.pdf"?');
+      click(button("Cancel"));
+      await flush();
+      expect(tabTitles()).toEqual(["book.pdf"]);
+      expect(dot()).not.toBeNull();
+      expect(api.close).not.toHaveBeenCalled();
+      expect(api.save).not.toHaveBeenCalled();
+    });
+
+    it("Escape is Cancel", async () => {
+      await openDirty();
+      key("w", { ctrlKey: true });
+      await flush();
+      expect(notice()).not.toBeNull();
+      document
+        .getElementById("notice-layer")
+        ?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      await flush();
+      expect(tabTitles()).toEqual(["book.pdf"]);
+    });
+
+    it("Don't save closes it without writing anything", async () => {
+      const { api } = await openDirty();
+      click(q(".tab-close"));
+      await flush();
+      click(button("Don't save"));
+      await flush();
+      expect(tabTitles()).toEqual([]);
+      expect(api.save).not.toHaveBeenCalled();
+      expect(api.close).toHaveBeenCalledWith(1);
+    });
+
+    it("Save writes the file first and closes the tab when it worked", async () => {
+      const { api } = await openDirty();
+      click(q(".tab-close"));
+      await flush();
+      click(button("Save"));
+      await flush();
+      expect(api.save).toHaveBeenCalledWith(1, false, false);
+      expect(api.close).toHaveBeenCalledWith(1);
+      expect(tabTitles()).toEqual([]);
+    });
+
+    it("keeps the tab open, and says why, when the save does not work", async () => {
+      const { api } = await openDirty();
+      api.save.mockRejectedValueOnce({ code: "save_disk_full", message: "x" });
+      key("w", { ctrlKey: true });
+      await flush();
+      click(button("Save"));
+      await flush();
+      expect(notice()?.textContent).toContain("The disk is full");
+      click(button("OK"));
+      await flush();
+      expect(tabTitles()).toEqual(["book.pdf"]);
+      expect(dot()).not.toBeNull();
+      expect(api.close).not.toHaveBeenCalled();
+    });
+
+    it("a tab without changes closes at once, with no question", async () => {
+      const m = make();
+      await m.app.openPath("/docs/a.pdf");
+      await flush();
+      click(q(".tab-close"));
+      expect(notice()).toBeNull();
+      expect(tabTitles()).toEqual([]);
+    });
+  });
+
+  describe("saving", () => {
+    it("Ctrl+S saves the document in place, and it is clean afterwards", async () => {
+      const { api, deps, app } = await openDirty();
+      key("s", { ctrlKey: true });
+      await flush();
+      expect(api.save).toHaveBeenCalledWith(1, false, false);
+      expect(dot()).toBeNull();
+      expect(lastTitle(deps)).toBe("book.pdf - Patient Partridge");
+      expect(app.unsavedCount).toBe(0);
+      expect(api.setDirty).toHaveBeenLastCalledWith(1, false);
+      // Nothing to save any more: the key does nothing.
+      key("s", { ctrlKey: true });
+      await flush();
+      expect(api.save).toHaveBeenCalledTimes(1);
+    });
+
+    it("undoing past the saved state makes the document dirty again", async () => {
+      const { app, api } = await openDirty();
+      key("s", { ctrlKey: true });
+      await flush();
+      key("z", { ctrlKey: true });
+      await flush();
+      expect(app.unsavedCount).toBe(1);
+      expect(api.setDirty).toHaveBeenLastCalledWith(1, true);
+    });
+
+    it("a change made while the file is being written still counts as unsaved", async () => {
+      const { app, api } = await openDirty();
+      let finish!: (file: SavedFile) => void;
+      api.save.mockImplementationOnce(() => new Promise<SavedFile>((resolve) => (finish = resolve)));
+      key("s", { ctrlKey: true });
+      await flush();
+      app.recordEdit({ label: "Later", undo: () => undefined, redo: () => undefined });
+      finish({ path: "/docs/book.pdf", name: "book.pdf" });
+      await flush();
+      expect(app.unsavedCount).toBe(1);
+      expect(dot()).not.toBeNull();
+    });
+
+    it("does not start a second save while one is running", async () => {
+      const { api } = await openDirty();
+      let finish!: (file: SavedFile) => void;
+      api.save.mockImplementationOnce(() => new Promise<SavedFile>((resolve) => (finish = resolve)));
+      key("s", { ctrlKey: true });
+      key("s", { ctrlKey: true });
+      await flush();
+      expect(api.save).toHaveBeenCalledTimes(1);
+      finish({ path: "/docs/book.pdf", name: "book.pdf" });
+      await flush();
+    });
+
+    it("asks before it overwrites a file that something else changed, and Cancel saves nothing", async () => {
+      const { api, app } = await openDirty();
+      api.save.mockRejectedValueOnce({ code: "save_changed", message: "x" });
+      key("s", { ctrlKey: true });
+      await flush();
+      expect(notice()?.textContent).toContain("The file was changed by something else");
+      click(button("Cancel"));
+      await flush();
+      expect(api.save).toHaveBeenCalledTimes(1);
+      expect(api.saveAs).not.toHaveBeenCalled();
+      expect(app.unsavedCount).toBe(1);
+    });
+
+    it("Replace the file saves again with the answer", async () => {
+      const { api, app } = await openDirty();
+      api.save.mockRejectedValueOnce({ code: "save_changed", message: "x" });
+      key("s", { ctrlKey: true });
+      await flush();
+      click(button("Replace the file"));
+      await flush();
+      expect(api.save).toHaveBeenNthCalledWith(1, 1, false, false);
+      expect(api.save).toHaveBeenNthCalledWith(2, 1, true, false);
+      expect(app.unsavedCount).toBe(0);
+    });
+
+    it("Save a copy… from that question saves under another name instead", async () => {
+      const { api, app } = await openDirty();
+      api.save.mockRejectedValueOnce({ code: "save_changed", message: "x" });
+      key("s", { ctrlKey: true });
+      await flush();
+      click(button("Save a copy…"));
+      await flush();
+      expect(api.save).toHaveBeenCalledTimes(1);
+      expect(api.saveAs).toHaveBeenCalledWith(1, false);
+      expect(app.unsavedCount).toBe(0);
+      expect(tabTitles()).toEqual(["copy.pdf"]);
+    });
+
+    it("warns that a save breaks a signature, and offers a copy", async () => {
+      const { api, app } = await openDirty();
+      api.save.mockRejectedValueOnce({ code: "save_signed", message: "x" });
+      key("s", { ctrlKey: true });
+      await flush();
+      expect(notice()?.textContent).toContain("This document is signed");
+      expect(notice()?.textContent).toContain("breaks the signature");
+      click(button("Save a copy…"));
+      await flush();
+      // The copy was the user's choice, so the second question does not come.
+      expect(api.saveAs).toHaveBeenCalledWith(1, true);
+      expect(app.unsavedCount).toBe(0);
+    });
+
+    it("Save anyway saves in place with the answer; Cancel saves nothing", async () => {
+      const m = await openDirty();
+      m.api.save.mockRejectedValueOnce({ code: "save_signed", message: "x" });
+      key("s", { ctrlKey: true });
+      await flush();
+      click(button("Cancel"));
+      await flush();
+      expect(m.api.save).toHaveBeenCalledTimes(1);
+      expect(m.app.unsavedCount).toBe(1);
+
+      m.api.save.mockRejectedValueOnce({ code: "save_signed", message: "x" });
+      key("s", { ctrlKey: true });
+      await flush();
+      click(button("Save anyway"));
+      await flush();
+      expect(m.api.save).toHaveBeenLastCalledWith(1, false, true);
+      expect(m.app.unsavedCount).toBe(0);
+    });
+
+    it("tells the user what went wrong and keeps the change, for every other failure", async () => {
+      const { api, app } = await openDirty();
+      for (const [code, text] of [
+        ["save_verify_failed", "did not pass the check"],
+        ["save_protection_lost", "password protection would be lost"],
+        ["save_write_failed", "could not be saved"],
+      ]) {
+        api.save.mockRejectedValueOnce({ code, message: "detail" });
+        key("s", { ctrlKey: true });
+        await flush();
+        expect(notice()?.textContent).toContain(text);
+        click(button("OK"));
+        await flush();
+        expect(app.unsavedCount).toBe(1);
+      }
+    });
+
+    it("Save As (Ctrl+Shift+S) saves a copy and the tab follows the copy", async () => {
+      const { api, app, deps } = await openDirty();
+      key("S", { ctrlKey: true, shiftKey: true });
+      await flush();
+      expect(api.saveAs).toHaveBeenCalledWith(1, false);
+      expect(tabTitles()).toEqual(["copy.pdf"]);
+      expect(lastTitle(deps)).toBe("copy.pdf - Patient Partridge");
+      expect(tab("copy.pdf").title).toBe("/docs/copy.pdf");
+      expect(app.unsavedCount).toBe(0);
+      // The list of tabs for the next start names the copy.
+      expect(api.saveSession.mock.calls.at(-1)?.[0]).toEqual(["/docs/copy.pdf"]);
+    });
+
+    it("a cancelled Save As changes nothing", async () => {
+      const { api, app } = await openDirty();
+      api.saveAs.mockResolvedValueOnce(null);
+      key("S", { ctrlKey: true, shiftKey: true });
+      await flush();
+      expect(tabTitles()).toEqual(["book.pdf"]);
+      expect(app.unsavedCount).toBe(1);
+    });
+  });
+
+  describe("quitting", () => {
+    it("quits at once when nothing is unsaved", async () => {
+      const m = make();
+      await m.app.openPath("/docs/a.pdf");
+      await flush();
+      await m.app.requestQuit();
+      expect(m.api.quitApp).toHaveBeenCalledTimes(1);
+      expect(notice()).toBeNull();
+    });
+
+    it("asks first when a document has changes: Cancel stays, and tells the app process", async () => {
+      const { app, api } = await openDirty();
+      const asking = app.requestQuit();
+      await flush();
+      expect(notice()?.textContent).toContain('Save changes to "book.pdf"?');
+      click(button("Cancel"));
+      await asking;
+      expect(api.quitApp).not.toHaveBeenCalled();
+      expect(api.stayOpen).toHaveBeenCalledTimes(1);
+      expect(app.unsavedCount).toBe(1);
+    });
+
+    it("Quit without saving quits and writes nothing", async () => {
+      const { app, api } = await openDirty();
+      const asking = app.requestQuit();
+      await flush();
+      click(button("Quit without saving"));
+      await asking;
+      expect(api.quitApp).toHaveBeenCalledTimes(1);
+      expect(api.save).not.toHaveBeenCalled();
+    });
+
+    it("Save and quit saves every document with changes, then quits", async () => {
+      const { app, api } = await openDirty();
+      await app.openPath("/docs/other.pdf");
+      await flush();
+      app.recordEdit({ label: "Other", undo: () => undefined, redo: () => undefined });
+      await app.openPath("/docs/clean.pdf");
+      await flush();
+      const asking = app.requestQuit();
+      await flush();
+      expect(notice()?.textContent).toContain("Save changes to 2 documents?");
+      expect(notice()?.textContent).toContain('"book.pdf"');
+      expect(notice()?.textContent).toContain('"other.pdf"');
+      expect(notice()?.textContent).not.toContain('"clean.pdf"');
+      click(button("Save and quit"));
+      await asking;
+      expect(api.save.mock.calls.map(([doc]) => doc)).toEqual([1, 2]);
+      expect(api.quitApp).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not quit when a save fails or is cancelled: the changes stay", async () => {
+      const { app, api } = await openDirty();
+      api.save.mockRejectedValueOnce({ code: "save_disk_full", message: "x" });
+      const asking = app.requestQuit();
+      await flush();
+      click(button("Save and quit"));
+      await flush();
+      // The error of the save comes first, then the app stays open.
+      click(button("OK"));
+      await asking;
+      expect(api.quitApp).not.toHaveBeenCalled();
+      expect(api.stayOpen).toHaveBeenCalledTimes(1);
+      expect(app.unsavedCount).toBe(1);
+    });
+
+    it("asks only once when the app asks twice", async () => {
+      const { app } = await openDirty();
+      const first = app.requestQuit();
+      void app.requestQuit();
+      await flush();
+      expect(document.querySelectorAll(".notice")).toHaveLength(1);
+      click(button("Cancel"));
+      await first;
+    });
+  });
+
+  it("tells the user that changes are lost when the engine of a changed document stops", async () => {
+    const { app } = await openDirty();
+    // The view reports the lost engine the way a failed render does.
+    const internals = app as unknown as { tabs: unknown[]; documentLost(tab: unknown, error: unknown): Promise<void> };
+    void internals.documentLost(internals.tabs[0], { code: "engine_stopped", message: "it exited" });
+    await flush();
+    expect(notice()?.textContent).toContain("The changes that were not saved are lost.");
+    expect(tabTitles()).toEqual([]);
+  });
+});
+
+describe("App: a save that an edit overtakes", () => {
+  it("is reported as not saved, so closing the tab does not drop the edit", async () => {
+    const m = make();
+    await m.app.openPath("/docs/book.pdf");
+    await flush();
+    const edit = { label: "Change", undo: () => undefined, redo: () => undefined };
+    m.app.recordEdit(edit);
+    let finish!: (file: SavedFile) => void;
+    m.api.save.mockImplementationOnce(() => new Promise<SavedFile>((resolve) => (finish = resolve)));
+    click(q(".tab-close"));
+    await flush();
+    click(button("Save"));
+    await flush();
+    // An edit is made while the file is written.
+    m.app.recordEdit({ ...edit, label: "Later" });
+    finish({ path: "/docs/book.pdf", name: "book.pdf" });
+    await flush();
+    expect(tabTitles()).toEqual(["book.pdf"]);
+    expect(m.api.close).not.toHaveBeenCalled();
+    expect(m.app.unsavedCount).toBe(1);
+    // The app process was told the document is dirty and never that it is clean.
+    expect(m.api.setDirty).toHaveBeenLastCalledWith(1, true);
+    expect(m.api.setDirty).not.toHaveBeenCalledWith(1, false);
+  });
+
+  it("Save and quit does not quit over an edit made during the save", async () => {
+    const m = make();
+    await m.app.openPath("/docs/book.pdf");
+    await flush();
+    m.app.recordEdit({ label: "Change", undo: () => undefined, redo: () => undefined });
+    let finish!: (file: SavedFile) => void;
+    m.api.save.mockImplementationOnce(() => new Promise<SavedFile>((resolve) => (finish = resolve)));
+    const asking = m.app.requestQuit();
+    await flush();
+    click(button("Save and quit"));
+    await flush();
+    m.app.recordEdit({ label: "Later", undo: () => undefined, redo: () => undefined });
+    finish({ path: "/docs/book.pdf", name: "book.pdf" });
+    await asking;
+    expect(m.api.quitApp).not.toHaveBeenCalled();
+    expect(m.api.stayOpen).toHaveBeenCalledTimes(1);
+  });
+
+  it("waits for a save that is running instead of giving up with no message", async () => {
+    const m = make();
+    await m.app.openPath("/docs/book.pdf");
+    await flush();
+    m.app.recordEdit({ label: "Change", undo: () => undefined, redo: () => undefined });
+    let finish!: (file: SavedFile) => void;
+    m.api.save.mockImplementationOnce(() => new Promise<SavedFile>((resolve) => (finish = resolve)));
+    key("s", { ctrlKey: true });
+    await flush();
+    const asking = m.app.requestQuit();
+    await flush();
+    click(button("Save and quit"));
+    await flush();
+    finish({ path: "/docs/book.pdf", name: "book.pdf" });
+    await asking;
+    expect(m.api.save).toHaveBeenCalledTimes(1);
+    expect(m.api.quitApp).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("App: a save that does not end", () => {
+  /** A document with a change, and a save that stays stuck until the test lets it go. */
+  async function stuck() {
+    const m = make();
+    await m.app.openPath("/docs/book.pdf");
+    await flush();
+    m.app.recordEdit({ label: "Change", undo: () => undefined, redo: () => undefined });
+    let finish!: (file: SavedFile) => void;
+    m.api.save.mockImplementationOnce(() => new Promise<SavedFile>((resolve) => (finish = resolve)));
+    return { ...m, finish: (file: SavedFile) => finish(file) };
+  }
+  const slow = () => new Promise((r) => setTimeout(r, 600));
+  const sheet = () => document.querySelector<HTMLElement>(".notice .sheet-busy");
+
+  it("shows that the save goes on, with a way out, when Save and quit takes long", async () => {
+    const m = await stuck();
+    const asking = m.app.requestQuit();
+    await flush();
+    click(button("Save and quit"));
+    await flush();
+    // A quick save shows nothing.
+    expect(notice()).toBeNull();
+    await slow();
+    expect(notice()?.textContent).toContain('Saving "book.pdf"');
+    expect(sheet()).not.toBeNull();
+    expect(button("Cancel")).not.toBeNull();
+    click(button("Quit without saving"));
+    await asking;
+    expect(m.api.quitApp).toHaveBeenCalledTimes(1);
+    expect(notice()).toBeNull();
+  });
+
+  it("answers a second request to close or quit at once, while the first still waits", async () => {
+    const m = await stuck();
+    const asking = m.app.requestQuit();
+    await flush();
+    click(button("Save and quit"));
+    await flush();
+    expect(notice()).toBeNull();
+    // The close button or Cmd+Q again, long before the box would come up by itself.
+    void m.app.requestQuit();
+    await flush();
+    expect(notice()?.textContent).toContain('Saving "book.pdf"');
+    expect(document.querySelectorAll(".notice")).toHaveLength(1);
+    expect(document.activeElement?.textContent).toBe("Cancel");
+    click(button("Quit without saving"));
+    await asking;
+    expect(m.api.quitApp).toHaveBeenCalledTimes(1);
+  });
+
+  it("Cancel keeps the program open, and the save that was left running does not quit it", async () => {
+    const m = await stuck();
+    const asking = m.app.requestQuit();
+    await flush();
+    click(button("Save and quit"));
+    await flush();
+    void m.app.requestQuit();
+    await flush();
+    click(button("Cancel"));
+    await asking;
+    expect(m.api.quitApp).not.toHaveBeenCalled();
+    expect(m.api.stayOpen).toHaveBeenCalledTimes(1);
+    // The save ends later: nothing quits.
+    m.finish({ path: "/docs/book.pdf", name: "book.pdf" });
+    await flush();
+    expect(m.api.quitApp).not.toHaveBeenCalled();
+    expect(m.app.unsavedCount).toBe(0);
+    // And a new request works as a new request.
+    const again = m.app.requestQuit();
+    await flush();
+    await again;
+    expect(m.api.quitApp).toHaveBeenCalledTimes(1);
+  });
+
+  it("takes the box away by itself when the save ends", async () => {
+    const m = await stuck();
+    const asking = m.app.requestQuit();
+    await flush();
+    click(button("Save and quit"));
+    await flush();
+    void m.app.requestQuit();
+    await flush();
+    expect(sheet()).not.toBeNull();
+    m.finish({ path: "/docs/book.pdf", name: "book.pdf" });
+    await asking;
+    expect(notice()).toBeNull();
+    expect(m.api.quitApp).toHaveBeenCalledTimes(1);
+  });
+
+  it("does the same for Save when a tab is closed: the tab can be closed without waiting", async () => {
+    const m = await stuck();
+    click(q(".tab-close"));
+    await flush();
+    click(button("Save"));
+    await slow();
+    expect(notice()?.textContent).toContain('Saving "book.pdf"');
+    click(button("Don't save"));
+    await flush();
+    expect(tabTitles()).toEqual([]);
+    expect(m.api.close).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("App: a save that cannot replace the file", () => {
+  async function openDirty() {
+    const m = make();
+    await m.app.openPath("/docs/book.pdf");
+    await flush();
+    m.app.recordEdit({ label: "Change", undo: () => undefined, redo: () => undefined });
+    return m;
+  }
+
+  it("offers a copy when the file is held open, shared under several names, or someone else's", async () => {
+    for (const code of ["save_locked", "save_hard_link", "save_owner_changes", "save_access_kept", "save_read_only"]) {
+      document.body.replaceChildren();
+      installPage();
+      const m = await openDirty();
+      m.api.save.mockRejectedValueOnce({ code, message: "x" });
+      key("s", { ctrlKey: true });
+      await flush();
+      expect(button("Save a copy…"), code).not.toBeNull();
+      click(button("Save a copy…"));
+      await flush();
+      expect(m.api.saveAs, code).toHaveBeenCalledWith(1, false);
+      expect(m.app.unsavedCount, code).toBe(0);
+    }
+  });
+
+  it("does not say the file is read-only when it is not", async () => {
+    const m = await openDirty();
+    m.api.save.mockRejectedValueOnce({ code: "save_locked", message: "x" });
+    key("s", { ctrlKey: true });
+    await flush();
+    expect(notice()?.textContent).not.toContain("read-only");
+    expect(notice()?.textContent).toContain("USB stick or a network drive");
+  });
+
+  it("tells the user to open the file again when it changed in place, and offers no copy", async () => {
+    const m = await openDirty();
+    m.api.save.mockRejectedValueOnce({ code: "save_source_changed", message: "x" });
+    key("s", { ctrlKey: true });
+    await flush();
+    expect(notice()?.textContent).toContain("Close the tab and open the file again");
+    expect(button("Save a copy…")).toBeNull();
+    click(button("OK"));
+    await flush();
+    expect(m.api.saveAs).not.toHaveBeenCalled();
+    expect(m.app.unsavedCount).toBe(1);
   });
 });

@@ -33,7 +33,8 @@ The setting is kept in `settings.json` in the app's data folder, next to the fil
 
 | System | Update file | What happens |
 |---|---|---|
-| Windows | NSIS installer (`…-setup.exe`) | The installer runs in "passive" mode (a progress bar, no questions) and starts the new version. The app ends when the installer starts. |
+| Windows, **NSIS** installer | NSIS installer (`…-setup.exe`) | The installer runs in "passive" mode (a progress bar, no questions) and starts the new version. The app ends when the installer starts. |
+| Windows, **MSI** installer | the new `.msi` | Windows Installer runs the package and starts the new version. |
 | macOS | `….app.tar.gz` (a universal app, Apple silicon and Intel) | The app bundle is replaced and the app restarts. |
 | Linux, **AppImage** | the new `.AppImage` | The AppImage file you started is replaced and the app restarts from it. |
 | Linux, **deb** | none | A deb package cannot update itself. The pill opens a notice with the release notes and a button that opens the releases page (https://github.com/Ferdinand99/Patient-Partridge/releases/latest) in the browser. |
@@ -52,13 +53,26 @@ Tauri refuses the path of the running program on macOS when it went through a sy
 
 Everything else (a deb, a copy built from source, a program moved out of its bundle) is offered the notice and the link. The app also refuses the install on its own side, whatever the window asks for. `scripts/update-e2e.mjs --deb` runs the real deb with and without inherited AppImage variables.
 
+### Changes that are not saved
+
+The changes made to an open document live in its engine, so stopping the engines would throw them away. An update therefore never installs while a document has changes that are not saved:
+
+- The window tells the app whenever a document turns dirty or clean (`set_dirty`). The app keeps the set of dirty documents (`src-tauri/src/unsaved.rs`).
+- When the download is done and a document is dirty, the window asks: **Save and install** (saves every dirty document, then installs) or **Install later** (the download is kept, the pill in the toolbar reads "Install update" and asks again when pressed).
+- The app refuses on its own side too: `install_update` fails with the kind `unsaved` before it takes the download, closes the gate or stops an engine, so a change made after the question is not lost either. The window then goes back to "downloaded, waiting".
+- Closing the window or quitting is held back the same way while a document is dirty (the window asks Save, Quit without saving or Cancel).
+
+A save that is running is waited for, not cut off: it holds a permit of the gate, and the install closes the gate, then waits (up to 10 seconds) for every permit before it stops any engine. If a save or an open is still running after that, nothing is stopped and nothing is installed, and the window says so (the update then has to be downloaded again). The dialog of Save a copy does not hold a permit while it is open.
+
+This is tested with the window code (`src/app/updater.test.ts`), with the app-side checks (`an_update_is_not_installed_while_a_document_has_unsaved_changes`, `a_save_that_is_running_is_waited_for_before_any_engine_is_stopped`) and, for the close request, with the mock runtime of Tauri running the app's guard on a real window event. There is no editing feature yet that makes a document dirty, so it has not been tried in the running app.
+
 ### Stopping the engines, and the open files
 
 Windows cannot replace a program that is running, and each open document has an engine process of its own in the install folder. So before the install:
 
-1. A gate closes: no document can be opened any more, whether by the window, a drop, or a second copy of the app.
-2. Every engine is stopped.
-3. The opens that were already under way are waited for (up to 10 seconds; when one is still running after that, nothing is installed and the app reports it), and every engine is stopped again (one of them could have started an engine after the first stop).
+1. A gate closes: no document can be opened or saved any more, whether by the window, a drop, or a second copy of the app.
+2. The opens and saves that were already under way are waited for (up to 10 seconds; when one is still running after that, nothing was stopped, nothing is installed and the app reports it).
+3. Every engine is stopped (no open or save can start an engine after this).
 4. The open files are written down: the app keeps the list itself, so the list is that of this moment (a file opened while the download ran is in it, one closed is not), with the one in view first (`restore-after-update.json` in the app's data folder, paths only, valid for one hour, read once at the next start and deleted).
 5. The installer runs. While the program is being replaced the window cannot be closed, because a half written file would be left.
 
@@ -92,7 +106,7 @@ What this does **not** prove: the buttons of the window were pressed by the driv
 
 1. **release-please** keeps the release PR up to date. Merging that PR creates the tag and a **draft** release.
 2. **preflight** (only for a new release) fails with a clear message before anything is built if `TAURI_SIGNING_PRIVATE_KEY` or one of the six `APPLE_*` secrets is empty, if the public key in the configuration is a placeholder, or if the signing key does not belong to the public key in the configuration (it signs a small file and checks the signature, `scripts/updater-key.mjs`). With a key that does not match, every installed copy would refuse every update.
-3. **build-release** builds Windows (NSIS and MSI), macOS (one universal app and a disk image, signed and notarised) and Linux (deb and **AppImage**, on Ubuntu 22.04 so that the AppImage runs on older systems), one after the other: `tauri-action` adds each system to `latest.json` by downloading, changing and uploading it, and two jobs at the same time could lose an entry. The steps are split so that the secrets reach only the last one (see "Where the secrets are" in [signing.md](signing.md)): `npm ci`, the compile (which runs the build scripts of all dependencies and Vite) and the making of the installers and packages have none, and the last step signs the update files (Windows, Linux: `tauri signer sign`, bound to the version) or makes, signs and notarises the macOS bundle and disk image. The tools that make the AppImage are fetched in a step of their own and checked against SHA-256 values pinned in `scripts/linux-tools.lock.json`; the Tauri bundler would download them without any check.
+3. **build-release** builds Windows (NSIS and MSI), macOS (one universal app and a disk image, signed and notarised) and Linux (deb and **AppImage**, on Ubuntu 22.04 so that the AppImage runs on older systems), one after the other: `tauri-action` adds each system to `latest.json` by downloading, changing and uploading it, and two jobs at the same time could lose an entry. The steps are split so that the secrets reach only the last one (see "Where the secrets are" in [signing.md](signing.md)): `npm ci`, the compile (which runs the build scripts of all dependencies and Vite) and the making of the installers and packages have none, and the last step signs the update files (Windows, Linux: `tauri signer sign`, bound to the version) or makes, signs and notarises the macOS bundle and disk image. The tools that make the AppImage are fetched in a step of their own and checked against SHA-256 values pinned in `scripts/linux-tools.lock.json`; the Tauri bundler would download them without any check. One of them (`linuxdeploy-plugin-appimage`) comes from a rolling release that its authors replace from time to time, so `.github/workflows/linux-tools.yml` compares all three with their pins once a week and says which one changed and what to do, before a release build finds out after the macOS app is notarised.
 4. **publish** checks that `latest.json` and signatures exist, fills in the notes, checks that **every system is in `latest.json` with a signature and an asset** (`scripts/check-latest.mjs`: `tauri-action` writes the addresses as `api.github.com/.../releases/assets/<id>`, so each is followed by its id to the list of the assets of the release; the check is tested with the real `latest.json` of Nimble Newt v0.3.0), and only then publishes the draft.
 
 The site (`site/`) is deployed by its own workflow (`pages.yml`), which this one does not touch.

@@ -16,7 +16,11 @@ import { pathToFileURL } from "node:url";
 
 /** What every release must be able to update: system, and what its update file looks like. */
 export const REQUIRED = {
+  // A copy asks for the entry of the installer it came from, and for the plain one only when it
+  // does not know its installer (the plain entry holds whichever of the two tauri-action listed first).
   "windows-x86_64": /\.(exe|msi)$/i,
+  "windows-x86_64-nsis": /-setup\.exe$/i,
+  "windows-x86_64-msi": /\.msi$/i,
   "darwin-aarch64": /\.app\.tar\.gz$/,
   "darwin-x86_64": /\.app\.tar\.gz$/,
   "linux-x86_64": /\.AppImage(\.tar\.gz)?$/,
@@ -67,7 +71,8 @@ export function problemsOf(latest, assets, version, required = REQUIRED) {
     if (!names.has(`${asset.name}.sig`)) problems.push(`${asset.name} has no .sig asset next to it`);
   }
   if (!String(latest.notes ?? "").trim()) problems.push("latest.json has no release notes");
-  return problems;
+  // Several entries can name the same file (the plain Windows entry and the one of its installer).
+  return [...new Set(problems)];
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

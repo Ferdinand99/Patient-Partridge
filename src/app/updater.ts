@@ -32,6 +32,10 @@ export interface UpdaterDeps {
   openPaths(): string[];
   /** Closes the settings menu. */
   closeMenu(): void;
+  /** How many open documents have changes that are not saved. */
+  unsavedCount(): number;
+  /** Saves every document that has changes. Resolves with true when all were saved. */
+  saveAll(): Promise<boolean>;
 }
 
 function byId<T extends HTMLElement>(root: Document, id: string): T {
@@ -74,6 +78,8 @@ export function failureText(f: UpdateFailure): string {
       return "The update information could not be read, or has nothing for this computer.";
     case "busy":
       return "An update is being installed already.";
+    case "unsaved":
+      return "A document has changes that are not saved, so the update was not installed. Save them, then install the update.";
     case "manual":
       return "This copy of Patient Partridge cannot install an update by itself. Download the new version from the releases page.";
     case "location":
@@ -218,6 +224,8 @@ type State =
   | { kind: "idle" }
   | { kind: "available"; info: UpdateInfo }
   | { kind: "working" }
+  /** Downloaded and checked, and waiting for the user to save their changes and agree to install. */
+  | { kind: "downloaded"; info: UpdateInfo }
   | { kind: "ready"; info: UpdateInfo };
 
 export class Updater {
@@ -312,6 +320,9 @@ export class Updater {
     } else if (s.kind === "working") {
       this.pillLabel.textContent = "Updating…";
       this.pill.title = "An update is being installed";
+    } else if (s.kind === "downloaded") {
+      this.pillLabel.textContent = "Install update";
+      this.pill.title = `Version ${s.info.version} is downloaded. Save your changes, then install it.`;
     } else {
       this.pillLabel.textContent = `Update ${s.info.version}`;
       this.pill.title = `Version ${s.info.version} is available`;
@@ -321,13 +332,20 @@ export class Updater {
   private async pillClicked(): Promise<void> {
     const s = this.state;
     if (s.kind === "available") await this.offer(s.info);
+    else if (s.kind === "downloaded") await this.finishInstall(s.info);
     else if (s.kind === "ready") await this.askRestart();
   }
 
   /** Checks the update server. A person's check (`manual`) always tells the result. */
   async check(manual: boolean): Promise<void> {
-    if (this.checking || this.state.kind === "working" || this.state.kind === "ready") {
+    if (
+      this.checking ||
+      this.state.kind === "working" ||
+      this.state.kind === "downloaded" ||
+      this.state.kind === "ready"
+    ) {
       if (manual && this.state.kind === "ready") await this.askRestart();
+      else if (manual && this.state.kind === "downloaded") await this.finishInstall(this.state.info);
       return;
     }
     this.checking = true;
@@ -424,10 +442,44 @@ export class Updater {
       await this.installFailed(info, asFailure(e));
       return;
     }
-    // The download is done and checked. Only now is the reader's place saved and the file in view
-    // noted: a file opened or closed during the download counts.
+    sheet.close();
+    await this.finishInstall(info);
+  }
+
+  /**
+   * The update is downloaded. Installing it ends the engines, and with them the changes of every
+   * document that is not saved, so the install waits until there are none: the user saves them
+   * (here, in one step) or puts the install off. Nothing is ever dropped.
+   */
+  private async finishInstall(info: UpdateInfo): Promise<void> {
+    const unsaved = this.deps.unsavedCount();
+    if (unsaved > 0) {
+      this.state = { kind: "downloaded", info };
+      this.showPill();
+      const answer = await openSheet(this.layer, {
+        title: "Save your changes first",
+        text: `Version ${info.version} is ready. ${
+          unsaved === 1 ? "1 document has" : `${unsaved} documents have`
+        } changes that are not saved. Installing closes the open documents for a moment, so the changes would be lost. Save them now and install, or install later.`,
+        buttons: [
+          { id: "later", label: "Install later" },
+          { id: "save", label: "Save and install", primary: true },
+        ],
+        escape: "later",
+      }).answer;
+      if (answer !== "save") return;
+      if (!(await this.deps.saveAll())) return;
+    }
+    this.state = { kind: "working" };
+    this.showPill();
+    const sheet = openSheet(this.layer, {
+      title: `Installing version ${info.version}`,
+      text: "Installing. The open documents are closed for a moment.",
+      progress: true,
+    });
     sheet.setProgress(0, null);
-    sheet.setText("Installing. The open documents are closed for a moment.");
+    // Only now is the reader's place saved and the file in view noted: a file opened or closed
+    // during the download counts.
     const active = this.deps.openPaths()[0] ?? null;
     try {
       await this.deps.api.installUpdate(active);
@@ -454,6 +506,14 @@ export class Updater {
         buttons: [{ id: "restart", label: "Restart", primary: true }],
       }).answer;
       if (answer === "restart") await this.deps.api.restartApp();
+      return;
+    }
+    // Changes appeared after the question (or the app refused for them): the download is kept, and
+    // the install can be asked for again once they are saved.
+    if (f.kind === "unsaved") {
+      this.state = { kind: "downloaded", info };
+      this.showPill();
+      await this.tell("The update was not installed", failureText(f));
       return;
     }
     this.state = { kind: "available", info };

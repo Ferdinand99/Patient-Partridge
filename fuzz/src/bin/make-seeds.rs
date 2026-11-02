@@ -18,8 +18,8 @@ use partridge_protocol::{
     ErrorCode, FontScript, LinkTarget, OutlineItem, PageLink, PageSize, Request, RequestBody,
     Response,
     ResponseBody, TextMatch, MAX_FRAME_LEN, MAX_LINKS_PER_PAGE, MAX_MATCHES_PER_PAGE,
-    MAX_OUTLINE_DEPTH, MAX_OUTLINE_ITEMS, MAX_OUTLINE_TITLE, MAX_QUERY_LEN, MAX_URI_LEN,
-    PROTOCOL_VERSION,
+    MAX_OUTLINE_DEPTH, MAX_OUTLINE_ITEMS, MAX_OUTLINE_TITLE, MAX_QUERY_LEN, MAX_SAVE_BYTES,
+    MAX_SAVE_CHUNK, MAX_URI_LEN, PROTOCOL_VERSION,
 };
 use partridge_testkit as kit;
 
@@ -82,6 +82,21 @@ fn requests() -> Vec<(&'static str, Request)> {
                 },
             ),
         ),
+        ("doc_info", b(10, RequestBody::DocInfo { doc: 1 })),
+        ("save_begin", b(11, RequestBody::SaveBegin { doc: 1 })),
+        (
+            "save_chunk",
+            b(
+                12,
+                RequestBody::SaveChunk {
+                    doc: 1,
+                    offset: MAX_SAVE_CHUNK as u32,
+                    len: MAX_SAVE_CHUNK as u32,
+                },
+            ),
+        ),
+        ("save_end", b(13, RequestBody::SaveEnd { doc: 1 })),
+        ("fingerprint", b(14, RequestBody::Fingerprint { doc: 1 })),
     ]
 }
 
@@ -217,6 +232,52 @@ fn responses() -> Vec<(&'static str, Response)> {
                 ResponseBody::Error {
                     code: ErrorCode::Corrupt,
                     message: "the file is not a valid PDF or is damaged".into(),
+                },
+            ),
+        ),
+        (
+            "doc_info",
+            b(
+                10,
+                ResponseBody::DocInfo {
+                    pages: 12,
+                    security: 4,
+                    signatures: 1,
+                    maybe_signed: true,
+                },
+            ),
+        ),
+        ("save_ready", b(11, ResponseBody::SaveReady { size: 70_000 })),
+        (
+            "save_data",
+            b(
+                12,
+                ResponseBody::SaveData {
+                    offset: 65_536,
+                    data: (0..=255).collect(),
+                },
+            ),
+        ),
+        ("save_ended", b(13, ResponseBody::SaveEnded)),
+        ("progress", b(15, ResponseBody::Progress { done: 1_048_576 })),
+        (
+            "fingerprint",
+            b(
+                16,
+                ResponseBody::Fingerprint {
+                    pages: 12,
+                    failed: 0,
+                    digest: 0x0123_4567_89ab_cdef,
+                },
+            ),
+        ),
+        (
+            "error_save_too_large",
+            b(
+                14,
+                ResponseBody::Error {
+                    code: ErrorCode::SaveTooLarge,
+                    message: "the document is too big to be saved".into(),
                 },
             ),
         ),
@@ -394,7 +455,7 @@ fn main() {
     );
 
     // Round trips: one input per kind of message.
-    for kind in 0..8u8 {
+    for kind in 0..14u8 {
         write(
             &dir,
             "protocol_roundtrip_request",
@@ -402,7 +463,7 @@ fn main() {
             &generator_input(kind, kind as u32),
         );
     }
-    for kind in 0..9u8 {
+    for kind in 0..16u8 {
         write(
             &dir,
             "protocol_roundtrip_response",
@@ -495,6 +556,33 @@ fn main() {
                 })
                 .collect(),
         },
+    );
+    at_cap(
+        "cap_save_size_of_the_biggest_file",
+        ResponseBody::SaveReady {
+            size: MAX_SAVE_BYTES as u32,
+        },
+    );
+    at_cap(
+        "cap_save_piece_at_the_end_of_the_biggest_file",
+        ResponseBody::SaveData {
+            offset: MAX_SAVE_BYTES as u32 - 64,
+            data: vec![b'z'; 64],
+        },
+    );
+    write(
+        &dir,
+        "protocol_request_decode",
+        "cap_save_piece_of_the_longest_length",
+        &Request {
+            id: 1,
+            body: RequestBody::SaveChunk {
+                doc: 1,
+                offset: 0,
+                len: MAX_SAVE_CHUNK as u32,
+            },
+        }
+        .encode(),
     );
     write(
         &dir,

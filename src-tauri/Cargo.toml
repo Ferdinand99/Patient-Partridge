@@ -38,3 +38,9 @@ url = "=2.5.8"
 [dev-dependencies]
 # The test kit makes PDF files for the tests that run real engines.
 partridge-testkit = { path = "../crates/testkit" }
+
+# The mock runtime, to run the guard that holds back a close request on a window. Not on Windows:
+# the test program of the library does not start there once the mock runtime is part of it (an
+# import that needs the manifest of the app), and the guard is the same code on every system.
+[target.'cfg(not(windows))'.dev-dependencies]
+tauri = { version = "=2.12.5", features = ["test"] }
