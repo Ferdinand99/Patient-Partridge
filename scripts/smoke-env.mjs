@@ -30,3 +30,18 @@ export function launchEnvironment(base, dir, platform = process.platform) {
   }
   return env;
 }
+
+/** How long a smoke launch may take before it counts as failed. */
+export const LAUNCH_LIMIT_MS = 90_000;
+/**
+ * The first launch on a Windows runner starts the web view cold (its runtime and a new profile) on
+ * a machine that has not run anything of it yet. That took 3 s to 74 s in CI, once over the usual
+ * limit, while later launches of the same program take under 4 s. So that one launch gets more
+ * time; a real regression in the app still shows in the later launches and in the numbers.
+ */
+export const FIRST_WINDOWS_LAUNCH_LIMIT_MS = 180_000;
+
+/** The time limit of launch number `index` (0 for the first one). */
+export function launchLimitMs(index, platform = process.platform) {
+  return platform === "win32" && index === 0 ? FIRST_WINDOWS_LAUNCH_LIMIT_MS : LAUNCH_LIMIT_MS;
+}

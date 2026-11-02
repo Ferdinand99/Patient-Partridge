@@ -36,6 +36,7 @@ import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { signatureMatches } from "./updater-key.mjs";
 import { fileURLToPath } from "node:url";
+import { describeWindows } from "./windows-diagnostics.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const OLD = "0.0.1";
@@ -294,6 +295,10 @@ function makePdf() {
   sh("cargo", ["run", "--release", "--locked", "-p", "partridge-testkit", "--bin", "make-pdf", "--", "3", pdf]);
 }
 
+// The first start of the app on a Windows runner is a cold start of the web view and took up to
+// 131 s in CI (the other starts take a few seconds), so the first case gets twice the time there.
+const FIRST_CASE_SECONDS = win ? 300 : 150;
+
 async function runCase(name, setup, expectations, { seconds = 150 } = {}) {
   console.log(`\n=== ${name} ===`);
   killApps();
@@ -313,10 +318,28 @@ async function runCase(name, setup, expectations, { seconds = 150 } = {}) {
   const installed = installOld(join(dir, "install"));
   setup?.();
   const before = existsSync(installed.file) && !mac ? sha256(installed.file) : null;
-  const child = spawn(installed.command, [pdf], { env: appEnv(home, log), stdio: "ignore", detached: !win });
+  // On Windows the output of the app is kept, and so is how it ended, so that the log can tell an
+  // app that hung from one that exited. (The Windows build has no console, so it writes little.)
+  const child = spawn(installed.command, [pdf], { env: appEnv(home, log), stdio: win ? ["ignore", "pipe", "pipe"] : "ignore", detached: !win });
   child.unref();
+  let appOutput = "";
+  const startedAt = Date.now();
+  if (win) {
+    const keep = (chunk) => {
+      appOutput = (appOutput + chunk).slice(-4000);
+    };
+    child.stdout.on("data", keep);
+    child.stderr.on("data", keep);
+    child.on("exit", (code, signal) => {
+      keep(`\n[the app exited after ${((Date.now() - startedAt) / 1000).toFixed(1)} s: code ${code}, signal ${signal}]\n`);
+    });
+  }
   const done = await waitFor(log, expectations.finish, seconds);
   const startedByInstaller = done;
+  if (win && !done && !has(readLog(log), /^documents open before the stop/)) {
+    console.log(`    [windows] nothing finished the case within ${seconds} s`);
+    console.log(describeWindows("on the timeout"));
+  }
   if (win && !done && has(readLog(log), /^documents open before the stop/)) {
     // The app handed over to the installer. Say what the computer looks like.
     const ps = (command) => spawnSync("powershell", ["-NoProfile", "-Command", command], { encoding: "utf8" }).stdout.trim();
@@ -328,6 +351,11 @@ async function runCase(name, setup, expectations, { seconds = 150 } = {}) {
   await sleep(1500);
   const lines = readLog(log);
   console.log(lines.map((l) => `    ${l}`).join("\n"));
+  if (win) {
+    console.log(`    [windows] what the first process wrote and how it ended:\n${appOutput.trim() || "(nothing, and it had not exited)"}`);
+    child.stdout.destroy();
+    child.stderr.destroy();
+  }
   killApps();
   if (win) rmSync(join(process.env.APPDATA ?? "", "com.ferdinand99.patientpartridge", "update-driver.path"), { force: true });
   return { lines, done, installed, before, dir, startedByInstaller };
@@ -353,7 +381,7 @@ try {
 
   // 1. A good update.
   publish({ version: NEW, payload: goodPayload(), signature: goodSignature(), label: "good" });
-  const good = await runCase("update", null, { finish: (l) => /^up-to-date version=0\.0\.2/.test(l) });
+  const good = await runCase("update", null, { finish: (l) => /^up-to-date version=0\.0\.2/.test(l) }, { seconds: FIRST_CASE_SECONDS });
   const L = good.lines;
   check("the old version started", has(L, /^started version=0\.0\.1 method=Automatic restored=0/));
   check("it found the new version", has(L, /^found version=0\.0\.2 from=0\.0\.1/));

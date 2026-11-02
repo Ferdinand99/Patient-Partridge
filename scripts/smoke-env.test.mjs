@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { launchEnvironment } from "./smoke-env.mjs";
+import { FIRST_WINDOWS_LAUNCH_LIMIT_MS, LAUNCH_LIMIT_MS, launchEnvironment, launchLimitMs } from "./smoke-env.mjs";
 
 const isFolder = (path) => {
   try {
@@ -47,5 +47,20 @@ describe("launchEnvironment", () => {
     const base = { HOME: "/Users/someone" };
     launchEnvironment(base, folder(), "darwin");
     expect(base).toEqual({ HOME: "/Users/someone" });
+  });
+});
+
+describe("launchLimitMs", () => {
+  it("gives only the first launch on Windows more time", () => {
+    expect(launchLimitMs(0, "win32")).toBe(FIRST_WINDOWS_LAUNCH_LIMIT_MS);
+    expect(launchLimitMs(1, "win32")).toBe(LAUNCH_LIMIT_MS);
+    expect(launchLimitMs(2, "win32")).toBe(LAUNCH_LIMIT_MS);
+    expect(FIRST_WINDOWS_LAUNCH_LIMIT_MS).toBeGreaterThan(LAUNCH_LIMIT_MS);
+  });
+  it("leaves Linux and macOS at the usual limit", () => {
+    for (const platform of ["linux", "darwin"]) {
+      expect(launchLimitMs(0, platform)).toBe(LAUNCH_LIMIT_MS);
+      expect(launchLimitMs(1, platform)).toBe(LAUNCH_LIMIT_MS);
+    }
   });
 });
