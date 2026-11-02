@@ -479,11 +479,13 @@ impl EngineClient {
                     security,
                     signatures,
                     maybe_signed,
+                    touched,
                 } => Ok(DocInfo {
                     pages,
                     security,
                     signatures,
                     maybe_signed,
+                    touched,
                 }),
                 other => Err(other),
             },

@@ -22,7 +22,7 @@ import type { CopyResult, PageLinkInfo } from "../viewer/overlays";
 import { DocumentView, type ViewPosition, type ViewerOptions } from "../viewer/viewer";
 import { zoomLabel, type ZoomMode } from "../viewer/zoom";
 import { FindBar } from "./find";
-import { Annotator, type AnnotatorApi } from "./annotator";
+import { Annotator, CLEAN_REFUSALS, type AnnotatorApi } from "./annotator";
 import { AnnotBar } from "./annotbar";
 import { EditHistory, type Edit } from "./history";
 import { MenuController } from "./menu";
@@ -154,6 +154,7 @@ const COPY_REMEDY = new Set([
   "save_hard_link",
   "save_owner_changes",
   "save_access_kept",
+  "save_source_touched",
 ]);
 
 const ZOOM_CHOICES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
@@ -340,9 +341,17 @@ export class App {
     this.active?.history.push(edit);
   }
 
+  /**
+   * True when a document has changes that are not saved: the history says so, or a change is still
+   * being made, or text typed in the box of a note has not been saved yet.
+   */
+  private isDirty(tab: Tab): boolean {
+    return tab.history.dirty || (tab.annotator?.unsaved ?? false);
+  }
+
   /** How many documents have changes that are not saved. */
   get unsavedCount(): number {
-    return this.tabs.filter((t) => t.history.dirty).length;
+    return this.tabs.filter((t) => this.isDirty(t)).length;
   }
 
   /**
@@ -833,7 +842,7 @@ export class App {
   async requestClose(id: number): Promise<boolean> {
     const tab = this.tabs.find((t) => t.id === id);
     if (!tab) return true;
-    if (!tab.history.dirty) {
+    if (!this.isDirty(tab)) {
       this.closeTab(id);
       return true;
     }
@@ -879,6 +888,12 @@ export class App {
     const chosen = new Promise<"stay" | "leave">((resolve) => (choose = resolve));
     const reveal = () => {
       if (over.signal.aborted) return;
+      // The save waits for the answer to a question (or an error) that is open: a second box with
+      // a moving bar beside it, and the focus, would only be in the way. The question has the focus.
+      if (!shown && this.noticeLayer.childElementCount > 0) {
+        this.focusTopNotice();
+        return;
+      }
       if (!shown) {
         shown = true;
         void showNotice(this.noticeLayer, {
@@ -897,7 +912,15 @@ export class App {
       }
       this.focusTopNotice();
     };
-    const timer = setTimeout(reveal, SAVE_SHEET_DELAY_MS);
+    // While a question is open the timer is held: it looks again after the same time, so the box
+    // still comes up when the save goes on long after the answer.
+    let timer: ReturnType<typeof setTimeout>;
+    const tick = () => {
+      if (over.signal.aborted) return;
+      if (this.noticeLayer.childElementCount > 0) timer = setTimeout(tick, SAVE_SHEET_DELAY_MS);
+      else reveal();
+    };
+    timer = setTimeout(tick, SAVE_SHEET_DELAY_MS);
     const before = this.quitReveal;
     this.quitReveal = reveal;
     const finished = work(halt.signal).then(
@@ -962,16 +985,20 @@ export class App {
     ) {
       return null;
     }
-    return new Annotator(tab.doc, tab.view, tab.history, api as AnnotatorApi, {
+    const annotator = new Annotator(tab.doc, tab.view, tab.history, api as AnnotatorApi, {
       popovers: this.popovers,
       announce: (text) => this.announce(text),
       ask: (options) => showNotice(this.noticeLayer, options),
       failed: (error) => void this.annotationFailed(tab, error),
       changed: () => {
+        this.historyChanged(tab);
         if (this.active === tab) this.syncAnnotBar();
       },
       pageChanged: (page) => this.sidebar.pageChanged(tab.doc, page),
     });
+    // Reading is the way a page is shown until the bar is opened.
+    annotator.setReading(!this.annotOpen);
+    return annotator;
   }
 
   /** A change to an annotation failed. A lost engine ends the tab; anything else is told and forgotten. */
@@ -985,7 +1012,9 @@ export class App {
     const text = describeError(app, tab.name);
     await showNotice(this.noticeLayer, {
       title: text.title === "Something went wrong" ? "The annotation was not changed" : text.title,
-      detail: `${text.detail} The document is as it was before this change.`,
+      detail: CLEAN_REFUSALS.has(app.code)
+        ? `${text.detail} The document is as it was before this change.`
+        : `${text.detail} Part of the change may have been made, so the document is marked as changed.`,
       buttons: [{ id: "ok", label: "OK", primary: true }],
     });
   }
@@ -1002,6 +1031,7 @@ export class App {
     if (!open) {
       for (const tab of this.tabs) tab.annotator?.setTool("select");
     }
+    for (const tab of this.tabs) tab.annotator?.setReading(!open);
     this.syncAnnotBar();
     if (open && focus) this.annotbar.focusBar();
   }
@@ -1031,6 +1061,8 @@ export class App {
       color: annotator?.color ?? PALETTE[0].rgba,
       penWidth: annotator?.penWidth ?? PEN_WIDTHS[1].width,
       stamp: annotator?.stamp ?? "approved",
+      note: annotator?.blockedReason ?? annotator?.pickedReason ?? null,
+      blocked: annotator?.blockedReason != null,
       canEditText: picked?.can.editText ?? false,
       canRemove: picked?.can.remove ?? false,
       canUndo: tab?.history.canUndo ?? false,
@@ -1043,7 +1075,7 @@ export class App {
   /** The engine of one document stopped and took the document with it. The other tabs carry on. */
   private async documentLost(tab: Tab, error: AppErrorLike): Promise<void> {
     if (!this.tabs.includes(tab)) return;
-    const lostChanges = tab.history.dirty;
+    const lostChanges = this.isDirty(tab);
     this.closeTab(tab.id);
     const text = describeError(error, tab.name);
     const answer = await showNotice(this.noticeLayer, {
@@ -1062,7 +1094,7 @@ export class App {
   /** The history of a tab changed: tell the app process if the document turned dirty or clean. */
   private historyChanged(tab: Tab): void {
     if (!this.tabs.includes(tab)) return;
-    const dirty = tab.history.dirty;
+    const dirty = this.isDirty(tab);
     if (dirty !== tab.dirtyTold) {
       tab.dirtyTold = dirty;
       // If the app process does not get to know, the next change tries again.
@@ -1078,7 +1110,7 @@ export class App {
   /** Saves the document that is shown, if it has changes. Resolves with true when nothing is left unsaved. */
   async saveActive(): Promise<boolean> {
     const tab = this.active;
-    if (!tab || !tab.history.dirty) return true;
+    if (!tab || !this.isDirty(tab)) return true;
     return this.saveTab(tab, false);
   }
 
@@ -1091,7 +1123,7 @@ export class App {
 
   /** Saves every document that has changes. Resolves with true when all were saved. */
   async saveAllChanges(halt?: AbortSignal): Promise<boolean> {
-    for (const tab of this.tabs.filter((t) => t.history.dirty)) {
+    for (const tab of this.tabs.filter((t) => this.isDirty(t))) {
       // The user stopped waiting: what is running finishes, but no other document is begun.
       if (halt?.aborted) return false;
       if (!(await this.saveTab(tab, false))) return false;
@@ -1105,11 +1137,14 @@ export class App {
    * (a save breaks a signature). A failure is told to the user. Resolves with true when saved.
    */
   private async saveTab(tab: Tab, asCopy: boolean): Promise<boolean> {
+    // What is under way is done first (an open box of a note is saved, running changes finish),
+    // so that the file holds what the window shows.
+    await tab.annotator?.flush();
     // A save that is running is waited for, and then the state is looked at again: it may have
     // saved everything, or an edit may have come after it.
     while (tab.saving) {
       await tab.saving.catch(() => false);
-      if (!asCopy && !tab.history.dirty) return true;
+      if (!asCopy && !this.isDirty(tab)) return true;
     }
     const running = this.writeTab(tab, asCopy);
     tab.saving = running;
@@ -1128,7 +1163,14 @@ export class App {
    */
   private async writeTab(tab: Tab, asCopy: boolean): Promise<boolean> {
     const began = tab.history.revision;
-    const saved = asCopy ? await this.runSaveAs(tab, false) : await this.runSave(tab);
+    // The engine is not changed while the file is written; changes made meanwhile wait.
+    const release = tab.annotator?.hold();
+    let saved: SavedFile | null;
+    try {
+      saved = asCopy ? await this.runSaveAs(tab, false) : await this.runSave(tab);
+    } finally {
+      release?.();
+    }
     if (!saved) return false;
     tab.history.markSaved(began);
     if (saved.path !== tab.path || saved.name !== tab.name) {
@@ -1136,7 +1178,7 @@ export class App {
       tab.name = saved.name;
       this.syncChrome();
     }
-    return !tab.history.dirty;
+    return !this.isDirty(tab);
   }
 
   private async runSave(tab: Tab): Promise<SavedFile | null> {
@@ -1173,7 +1215,16 @@ export class App {
   private async runSaveAs(tab: Tab, allowSigned: boolean): Promise<SavedFile | null> {
     for (;;) {
       try {
-        return await this.deps.api.saveAs(tab.doc, allowSigned);
+        const saved = await this.deps.api.saveAs(tab.doc, allowSigned);
+        if (saved?.touched) {
+          // One calm line: nothing is wrong with the copy, but the user should know what it holds.
+          void showNotice(this.noticeLayer, {
+            title: "The file was touched since it was opened",
+            detail: `"${tab.name}" got a new time of change while it was open. "${saved.name}" holds what Patient Partridge had read of it, and the original was not replaced.`,
+            buttons: [{ id: "ok", label: "OK", primary: true }],
+          });
+        }
+        return saved;
       } catch (e) {
         const error = toAppError(e);
         if (error.code === "save_signed" && !allowSigned) {
@@ -1260,7 +1311,7 @@ export class App {
     this.quitting = true;
     this.quitReveal = () => this.focusTopNotice();
     try {
-      const dirty = this.tabs.filter((t) => t.history.dirty);
+      const dirty = this.tabs.filter((t) => this.isDirty(t));
       if (dirty.length === 0) {
         await this.deps.api.quitApp();
         return;
@@ -1313,12 +1364,16 @@ export class App {
   private async stepHistory(direction: "undo" | "redo"): Promise<void> {
     const tab = this.active;
     if (!tab || tab.saving) return;
+    const run = () => (direction === "undo" ? tab.history.undo() : tab.history.redo());
     try {
-      await (direction === "undo" ? tab.history.undo() : tab.history.redo());
-    } catch {
+      // After the changes asked for before it, and before the ones asked for later.
+      await (tab.annotator ? tab.annotator.sequenced(run) : run());
+    } catch (error) {
       await showNotice(this.noticeLayer, {
         title: direction === "undo" ? "The change could not be taken back" : "The change could not be made again",
-        detail: "The document is as it was before. Nothing was lost.",
+        detail: CLEAN_REFUSALS.has(toAppError(error).code)
+          ? "The document is as it was before. Nothing was lost."
+          : "Part of the change may have been made. The document is marked as changed; close it without saving to go back to the file.",
         buttons: [{ id: "ok", label: "OK", primary: true }],
       });
     }
@@ -1476,7 +1531,7 @@ export class App {
   /** Draws the tab strip: one tab for each document, with a dot on those with unsaved changes. */
   private drawTabs(): void {
     this.tabStrip.render(
-      this.tabs.map((t) => ({ id: t.id, title: t.name, path: t.path, dirty: t.history.dirty })),
+      this.tabs.map((t) => ({ id: t.id, title: t.name, path: t.path, dirty: this.isDirty(t) })),
       this.activeId,
     );
   }
@@ -1487,7 +1542,7 @@ export class App {
       this.deps.setWindowTitle(APP_NAME);
       return;
     }
-    this.deps.setWindowTitle(`${active.history.dirty ? "\u2022 " : ""}${active.name} - ${APP_NAME}`);
+    this.deps.setWindowTitle(`${this.isDirty(active) ? "\u2022 " : ""}${active.name} - ${APP_NAME}`);
   }
 
   private setControlsEnabled(on: boolean): void {

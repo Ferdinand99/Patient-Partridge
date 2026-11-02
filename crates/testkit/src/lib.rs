@@ -421,6 +421,222 @@ pub fn hostile_annots_pdf() -> Vec<u8> {
     build(&specs, "", "", extras)
 }
 
+/// Markers in the text of `foreign_annots_pdf`, for the tests to look for.
+pub const FOREIGN_LONG_END: &str = "LONGCOMMENTEND";
+
+/// The comment of the first highlight of `foreign_annots_pdf`: about 6 KiB, with lines ended by
+/// CR as Acrobat writes them.
+pub fn foreign_long_comment() -> String {
+    let mut text = String::new();
+    let mut n = 0;
+    while text.len() < 6000 {
+        text.push_str(&format!("paragraph {n} of the long comment\r"));
+        n += 1;
+    }
+    text.push_str(FOREIGN_LONG_END);
+    text
+}
+
+fn binary_stream(dict: &str, body: &[u8]) -> Vec<u8> {
+    let mut out = format!("<< {dict} /Length {} >>\nstream\n", body.len()).into_bytes();
+    out.extend_from_slice(body);
+    out.extend_from_slice(b"\nendstream");
+    out
+}
+
+fn deflate(data: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(data).expect("compressing in memory");
+    encoder.finish().expect("compressing in memory")
+}
+
+/// A one page document with annotations written the way Acrobat writes them, for the tests of
+/// what the reader must not lose or leave behind (objects 6 to 19 are the annotations):
+/// - 6: a highlight with a long comment (CR line ends), rich text, name, dates, opacity, a layer,
+///   a subject, an author and a popup (7); 8 is a reply to it.
+/// - 10, 12: text boxes whose words are in their appearance stream (11 plain, 13 compressed).
+/// - 14, 15: stamps that are locked and read-only; 16: a note whose contents are locked.
+/// - 17: a highlight whose comment has a CR; 18: a highlight with a comment, rich text and a
+///   subject that must be gone from the file when it is deleted, with a popup (19) that has text.
+pub fn foreign_annots_pdf() -> Vec<u8> {
+    let specs = [PageSpec {
+        width: 612,
+        height: 792,
+        content: Some(demo_content(1, 612, 792)),
+        extra:
+            "/Annots [6 0 R 7 0 R 8 0 R 10 0 R 12 0 R 14 0 R 15 0 R 16 0 R 17 0 R 18 0 R 19 0 R]"
+                .into(),
+    }];
+    let quad = |x0: u32, y0: u32| {
+        format!(
+            "/Rect [{x0} {y0} {} {}] /QuadPoints [{x0} {} {} {} {x0} {y0} {} {y0}]",
+            x0 + 128,
+            y0 + 20,
+            y0 + 20,
+            x0 + 128,
+            y0 + 20,
+            x0 + 128
+        )
+    };
+    let font =
+        "/Resources << /Font << /Helv << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >>";
+    let plain_ap = binary_stream(
+        &format!("/Type /XObject /Subtype /Form /BBox [0 0 228 40] {font}"),
+        b"BT /Helv 12 Tf 2 20 Td (APSECRETONE) Tj ET",
+    );
+    let packed_ap = binary_stream(
+        &format!("/Type /XObject /Subtype /Form /BBox [0 0 228 40] {font} /Filter /FlateDecode"),
+        &deflate(b"BT /Helv 12 Tf 2 20 Td (APSECRETTWO) Tj ET"),
+    );
+    let extras: Vec<Vec<u8>> = vec![
+        // 6
+        format!(
+            "<< /Type /Annot /Subtype /Highlight {} /C [1 0.5 0] /CA 0.5 /Contents {} /RC {} /NM (NMMARKER) /M (D:20240102030405Z) /CreationDate (D:20230101000000Z) /OC 9 0 R /Popup 7 0 R /Subj {} /T {} /F 4 >>",
+            quad(72, 700),
+            pdf_text(&foreign_long_comment()),
+            pdf_text("<?xml version=\"1.0\"?><body xmlns=\"http://www.w3.org/1999/xhtml\"><p>RCMARKERONE</p></body>"),
+            pdf_text("SUBJMARKERONE"),
+            pdf_text("Alice"),
+        )
+        .into_bytes(),
+        // 7
+        b"<< /Type /Annot /Subtype /Popup /Rect [300 700 400 780] /Parent 6 0 R /Open true /F 28 >>"
+            .to_vec(),
+        // 8: a reply
+        format!(
+            "<< /Type /Annot /Subtype /Text /Rect [210 700 230 720] /IRT 6 0 R /RT /R /Contents {} /T {} /F 28 >>",
+            pdf_text("REPLYMARKER"),
+            pdf_text("Bob")
+        )
+        .into_bytes(),
+        // 9
+        b"<< /Type /OCG /Name (Comments) >>".to_vec(),
+        // 10
+        format!(
+            "<< /Type /Annot /Subtype /FreeText /Rect [72 500 300 540] /Contents {} /Subj {} /RC {} /DA (/Helv 12 Tf 0 g) /F 4 /AP << /N 11 0 R >> >>",
+            pdf_text("FREECONTENTSONE"),
+            pdf_text("FREESUBJONE"),
+            pdf_text("<body xmlns=\"http://www.w3.org/1999/xhtml\"><p>FREERCONE</p></body>"),
+        )
+        .into_bytes(),
+        // 11
+        plain_ap,
+        // 12
+        format!(
+            "<< /Type /Annot /Subtype /FreeText /Rect [72 440 300 480] /Contents {} /DA (/Helv 12 Tf 0 g) /F 4 /AP << /N 13 0 R >> >>",
+            pdf_text("FREECONTENTSTWO"),
+        )
+        .into_bytes(),
+        // 13
+        packed_ap,
+        // 14: locked stamp
+        b"<< /Type /Annot /Subtype /Stamp /Rect [400 600 500 650] /Name /Approved /Contents (LOCKEDSTAMP) /F 132 >>".to_vec(),
+        // 15: read-only stamp
+        b"<< /Type /Annot /Subtype /Stamp /Rect [400 540 500 590] /Name /Draft /Contents (READONLYSTAMP) /F 68 >>".to_vec(),
+        // 16: a note whose contents are locked
+        format!(
+            "<< /Type /Annot /Subtype /Text /Rect [300 300 320 320] /Contents {} /T {} /F 516 >>",
+            pdf_text("LOCKEDCONTENTS"),
+            pdf_text("Carol")
+        )
+        .into_bytes(),
+        // 17
+        format!(
+            "<< /Type /Annot /Subtype /Highlight {} /C [0 1 0] /Contents {} /T {} /F 4 >>",
+            quad(72, 650),
+            pdf_text("line one\rline two"),
+            pdf_text("Dave")
+        )
+        .into_bytes(),
+        // 18
+        format!(
+            "<< /Type /Annot /Subtype /Highlight {} /C [0 0 1] /Contents {} /RC {} /Subj {} /T {} /Popup 19 0 R /F 4 >>",
+            quad(72, 600),
+            pdf_text("salary 90k"),
+            pdf_text("<body xmlns=\"http://www.w3.org/1999/xhtml\"><p>RCSALARY</p></body>"),
+            pdf_text("SUBJSALARY"),
+            pdf_text("Erin")
+        )
+        .into_bytes(),
+        // 19
+        format!(
+            "<< /Type /Annot /Subtype /Popup /Rect [300 600 400 680] /Parent 18 0 R /Contents {} /F 28 >>",
+            pdf_text("POPUPSECRET")
+        )
+        .into_bytes(),
+    ];
+    build(&specs, "", "", extras)
+}
+
+/// The forms in which a text can be in a saved file: as it is, as UTF-16 and as the hex strings
+/// of both. A text is there when any form is in the file or in a stream that has been inflated.
+pub fn text_in_file(file: &[u8], text: &str) -> bool {
+    fn find(haystack: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+    }
+    let ascii = text.as_bytes().to_vec();
+    let utf16: Vec<u8> = text.encode_utf16().flat_map(|u| u.to_be_bytes()).collect();
+    let hex_of = |bytes: &[u8], upper: bool| -> Vec<u8> {
+        bytes
+            .iter()
+            .flat_map(|b| {
+                if upper {
+                    format!("{b:02X}")
+                } else {
+                    format!("{b:02x}")
+                }
+                .into_bytes()
+            })
+            .collect()
+    };
+    let needles = [
+        ascii.clone(),
+        utf16.clone(),
+        hex_of(&ascii, true),
+        hex_of(&ascii, false),
+        hex_of(&utf16, true),
+        hex_of(&utf16, false),
+    ];
+    let mut haystacks: Vec<Vec<u8>> = vec![file.to_vec()];
+    // Every stream, inflated when it can be.
+    let mut at = 0;
+    while let Some(start) = file[at..]
+        .windows(6)
+        .position(|w| w == b"stream")
+        .map(|p| p + at)
+    {
+        let mut body = start + 6;
+        if file.get(body) == Some(&b'\r') {
+            body += 1;
+        }
+        if file.get(body) == Some(&b'\n') {
+            body += 1;
+        }
+        let Some(end) = file[body..]
+            .windows(9)
+            .position(|w| w == b"endstream")
+            .map(|p| p + body)
+        else {
+            break;
+        };
+        {
+            use std::io::Read as _;
+            let mut out = Vec::new();
+            if flate2::read::ZlibDecoder::new(&file[body..end])
+                .take(64 << 20)
+                .read_to_end(&mut out)
+                .is_ok()
+                && !out.is_empty()
+            {
+                haystacks.push(out);
+            }
+        }
+        at = end + 9;
+    }
+    haystacks.iter().any(|h| needles.iter().any(|n| find(h, n)))
+}
+
 /// A one page document with `count` sticky notes in a grid, numbered in their text.
 pub fn many_annots_pdf(count: usize) -> Vec<u8> {
     let first = 6;
@@ -908,6 +1124,16 @@ fn rc4(key: &[u8], data: &[u8]) -> Vec<u8> {
 /// `user_password` to open. The pages are blank so nothing has to be encrypted besides the
 /// handler's own entries.
 pub fn encrypted_pdf(user_password: &str, pages: usize) -> Vec<u8> {
+    encrypted_pdf_with_permissions(user_password, pages, -4)
+}
+
+/// As `encrypted_pdf`, with the permission bits the file grants (`-4` grants everything; clear
+/// bit 6, value 32, to forbid annotating).
+pub fn encrypted_pdf_with_permissions(
+    user_password: &str,
+    pages: usize,
+    permissions: i32,
+) -> Vec<u8> {
     let mut padded = [0u8; 32];
     let pw = user_password.as_bytes();
     let n = pw.len().min(32);
@@ -918,7 +1144,6 @@ pub fn encrypted_pdf(user_password: &str, pages: usize) -> Vec<u8> {
     let owner: Vec<u8> = (0u8..32)
         .map(|i| i.wrapping_mul(7).wrapping_add(3))
         .collect();
-    let permissions: i32 = -4;
     let id: [u8; 16] = *b"partridge-test-1";
 
     // Algorithm 2 for revision 2: the file key.

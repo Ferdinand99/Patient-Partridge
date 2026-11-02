@@ -12,6 +12,8 @@ export interface NoteEditorOptions {
   /** A place on the screen the box is put next to. */
   near: { x: number; y: number };
   saveLabel?: string;
+  /** Called when the text in the box changes. */
+  onChange?: () => void;
 }
 
 export interface NoteEditor {
@@ -19,6 +21,10 @@ export interface NoteEditor {
   result: Promise<string | null>;
   /** Closes the box as if it was cancelled (the document went away, say). */
   close(): void;
+  /** Closes the box as if Save was pressed, with the text that is in it now. */
+  commit(): void;
+  /** True when the text in the box differs from the text the box started with. */
+  readonly dirty: boolean;
 }
 
 const WIDTH = 288;
@@ -68,9 +74,11 @@ export function openNoteEditor(host: HTMLElement, options: NoteEditorOptions): N
     finish(value);
     previous?.focus({ preventScroll: true });
   };
+  const started = area.value;
   area.addEventListener("input", () => {
     // The limit is in bytes, as the engine counts. A paste that is too long is cut, not refused.
     if (utf8Length(area.value) > MAX_NOTE_BYTES) area.value = clampToBytes(area.value, MAX_NOTE_BYTES);
+    options.onChange?.();
   });
   form.addEventListener("submit", (e) => {
     e.preventDefault();
@@ -101,5 +109,12 @@ export function openNoteEditor(host: HTMLElement, options: NoteEditorOptions): N
   area.focus();
   area.setSelectionRange(area.value.length, area.value.length);
 
-  return { result, close: () => close(null) };
+  return {
+    result,
+    close: () => close(null),
+    commit: () => close(area.value),
+    get dirty() {
+      return form.isConnected && area.value !== started;
+    },
+  };
 }

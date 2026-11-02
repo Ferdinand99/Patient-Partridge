@@ -22,6 +22,8 @@ pub struct Abilities {
     movable: bool,
     remove: bool,
     restore: bool,
+    /// The file or the document forbids changing it.
+    locked: bool,
 }
 
 /// An annotation of a page as the window sees it. `rect` is `[left, top, right, bottom]` in points
@@ -49,6 +51,7 @@ impl From<AnnotInfo> for AnnotationInfo {
                 movable: item.abilities & ability::MOVE != 0,
                 remove: item.abilities & ability::REMOVE != 0,
                 restore: item.abilities & ability::RESTORE != 0,
+                locked: item.abilities & ability::LOCKED != 0,
             },
             rect: item.rect.map(round2),
             color: item.color,
@@ -290,7 +293,8 @@ mod tests {
                     "recolour": false,
                     "move": true,
                     "remove": true,
-                    "restore": false
+                    "restore": false,
+                    "locked": false
                 },
                 "rect": [10.5, 20.0, 30.25, 41.0],
                 "color": [1, 2, 3, 255],

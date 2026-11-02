@@ -448,6 +448,7 @@ pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
                 security: u.arbitrary()?,
                 signatures: u.arbitrary()?,
                 maybe_signed: u.arbitrary()?,
+                touched: u.arbitrary()?,
             };
             (b.clone(), b)
         }

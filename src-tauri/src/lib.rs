@@ -458,6 +458,9 @@ fn set_dirty(update_state: State<'_, UpdateState>, doc: u64, dirty: bool) {
 struct SavedInfo {
     path: String,
     name: String,
+    /// The file was touched while the document was open, with parts of it unread: this is a copy
+    /// of what the app had read of it.
+    touched: bool,
 }
 
 impl From<SaveOutcome> for SavedInfo {
@@ -469,6 +472,7 @@ impl From<SaveOutcome> for SavedInfo {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             path: outcome.path.to_string_lossy().into_owned(),
+            touched: outcome.touched,
         }
     }
 }
@@ -1049,6 +1053,7 @@ mod tests {
         let info = SavedInfo::from(SaveOutcome {
             path: PathBuf::from("/docs/report.pdf"),
             bytes: 10,
+            touched: false,
         });
         assert_eq!(info.name, "report.pdf");
         assert_eq!(info.path, "/docs/report.pdf");

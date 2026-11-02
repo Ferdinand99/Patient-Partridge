@@ -201,13 +201,13 @@
   let nextAnnot = 1;
 
   const ABILITIES = {
-    highlight: { editText: true, recolour: true, move: false, remove: true, restore: true },
-    underline: { editText: true, recolour: true, move: false, remove: true, restore: true },
-    strikeout: { editText: true, recolour: true, move: false, remove: true, restore: true },
-    note: { editText: true, recolour: false, move: true, remove: true, restore: true },
-    ink: { editText: true, recolour: false, move: false, remove: true, restore: false },
-    stamp: { editText: false, recolour: false, move: false, remove: true, restore: false },
-    other: { editText: false, recolour: false, move: false, remove: true, restore: false },
+    highlight: { editText: true, recolour: true, move: false, remove: true, restore: true, locked: false },
+    underline: { editText: true, recolour: true, move: false, remove: true, restore: true, locked: false },
+    strikeout: { editText: true, recolour: true, move: false, remove: true, restore: true, locked: false },
+    note: { editText: true, recolour: false, move: true, remove: true, restore: true, locked: false },
+    ink: { editText: true, recolour: false, move: false, remove: true, restore: false, locked: false },
+    stamp: { editText: false, recolour: false, move: false, remove: true, restore: false, locked: false },
+    other: { editText: false, recolour: false, move: false, remove: true, restore: false, locked: false },
   };
   const YELLOW = [255, 235, 59, 255];
 

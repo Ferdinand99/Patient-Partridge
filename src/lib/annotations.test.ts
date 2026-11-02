@@ -22,7 +22,7 @@ import {
 const note = (over: Partial<Annotation> = {}): Annotation => ({
   id: 1,
   kind: "note",
-  can: { editText: true, recolour: false, move: true, remove: true, restore: true },
+  can: { editText: true, recolour: false, move: true, remove: true, restore: true, locked: false },
   rect: [10, 20, 30, 40],
   color: [255, 235, 59, 255],
   text: "",

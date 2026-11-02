@@ -11,7 +11,7 @@ function annotation(over: Partial<Annotation> = {}): Annotation {
   return {
     id: 1,
     kind: "highlight",
-    can: { editText: true, recolour: true, move: false, remove: true, restore: true },
+    can: { editText: true, recolour: true, move: false, remove: true, restore: true, locked: false },
     rect: [10, 20, 30, 40],
     color: YELLOW,
     text: "",
@@ -71,7 +71,7 @@ function setup(initial: Annotation[] = []) {
     }),
     addNote: vi.fn((_d, page, x, y, _c, text) => {
       calls.push(`addNote ${page} ${Math.round(x)},${Math.round(y)} ${text}`);
-      const a = annotation({ id: next++, kind: "note", text, can: { editText: true, recolour: false, move: true, remove: true, restore: true } });
+      const a = annotation({ id: next++, kind: "note", text, can: { editText: true, recolour: false, move: true, remove: true, restore: true, locked: false } });
       v.list.set(`${page}:${a.id}`, a);
       return Promise.resolve(a);
     }),
@@ -282,7 +282,7 @@ describe("changing and removing", () => {
       id: 5,
       kind: "note",
       text: "before",
-      can: { editText: true, recolour: false, move: true, remove: true, restore: true },
+      can: { editText: true, recolour: false, move: true, remove: true, restore: true, locked: false },
     });
     const t = setup([note]);
     t.annotator.select(0, 5);
@@ -349,7 +349,7 @@ describe("changing and removing", () => {
     const drawing = annotation({
       id: 8,
       kind: "ink",
-      can: { editText: true, recolour: false, move: false, remove: true, restore: false },
+      can: { editText: true, recolour: false, move: false, remove: true, restore: false, locked: false },
     });
     const t = setup([drawing]);
     t.annotator.select(0, 8);
@@ -399,7 +399,8 @@ describe("changing and removing", () => {
     );
     const first = t.annotator.moveBy(0, 5, 1, 0);
     const second = t.annotator.moveBy(0, 5, 2, 0);
-    await Promise.resolve();
+    await vi.waitFor(() => expect(t.api.updateAnnotation).toHaveBeenCalledTimes(1));
+    await new Promise((resolve) => setTimeout(resolve, 20));
     expect(t.api.updateAnnotation).toHaveBeenCalledTimes(1);
     release();
     await first;
@@ -417,7 +418,7 @@ describe("the keyboard", () => {
       id: 5,
       kind: "note",
       text: "x",
-      can: { editText: true, recolour: false, move: true, remove: true, restore: true },
+      can: { editText: true, recolour: false, move: true, remove: true, restore: true, locked: false },
     });
     const t = setup([note]);
     t.annotator.select(0, 5);
@@ -464,5 +465,172 @@ describe("the keyboard", () => {
     area.value = "keyboard";
     area.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", ctrlKey: true, bubbles: true }));
     await vi.waitFor(() => expect(t.calls).toEqual(["addNote 0 290,390 keyboard"]));
+  });
+});
+
+describe("changes that are running, undo, and the unsaved state", () => {
+  it("undo waits for a change that is running and then takes back that change, not an older one", async () => {
+    const t = setup();
+    t.history.push({ label: "Old", undo: vi.fn(), redo: vi.fn() });
+    let finish: (a: Annotation) => void = () => undefined;
+    vi.mocked(t.api.addInk).mockImplementationOnce(
+      () =>
+        new Promise<Annotation>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    t.annotator.onStroke(0, [
+      [1, 1],
+      [5, 5],
+    ]);
+    expect(t.annotator.unsaved).toBe(true);
+    // Undo is asked for while the drawing is still on its way to the engine.
+    const undone = t.annotator.sequenced(() => t.history.undo());
+    await vi.waitFor(() => expect(t.api.addInk).toHaveBeenCalled());
+    finish(annotation({ id: 500, kind: "ink" }));
+    await undone;
+    expect(t.calls).toContain("remove 0 500");
+    expect(t.history.undoLabel).toBe("Old");
+    expect(t.history.redoLabel).toBe("Drawing");
+    expect(t.host.failures).toEqual([]);
+    expect(t.annotator.unsaved).toBe(false);
+  });
+
+  it("a change that is running or waiting counts as unsaved until it is in the history", async () => {
+    const t = setup();
+    let finish: (a: Annotation) => void = () => undefined;
+    vi.mocked(t.api.addInk).mockImplementationOnce(
+      () =>
+        new Promise<Annotation>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    t.annotator.onStroke(0, [[1, 1]]);
+    expect(t.annotator.unsaved).toBe(true);
+    expect(t.history.dirty).toBe(false);
+    const done = t.annotator.flush();
+    await vi.waitFor(() => expect(t.api.addInk).toHaveBeenCalled());
+    finish(annotation({ id: 501, kind: "ink" }));
+    await done;
+    expect(t.annotator.unsaved).toBe(false);
+    expect(t.history.dirty).toBe(true);
+  });
+
+  it("a change that fails in the middle leaves the document marked as changed, a clean refusal does not", async () => {
+    const t = setup();
+    vi.mocked(t.api.addInk).mockRejectedValueOnce({ code: "annotation_refused", message: "no" });
+    await t.annotator.flush();
+    t.annotator.onStroke(0, [[1, 1]]);
+    await t.annotator.flush();
+    expect(t.history.dirty).toBe(false);
+    vi.mocked(t.api.addInk).mockRejectedValueOnce({ code: "internal", message: "broke" });
+    t.annotator.onStroke(0, [[1, 1]]);
+    await t.annotator.flush();
+    expect(t.history.dirty).toBe(true);
+    expect(t.host.failures).toHaveLength(2);
+    // It stays changed until a save names a state.
+    t.history.markSaved();
+    expect(t.history.dirty).toBe(false);
+  });
+
+  it("a document that forbids annotating blocks the tools and says why", async () => {
+    const t = setup();
+    vi.mocked(t.api.addInk).mockRejectedValueOnce({ code: "annotations_not_allowed", message: "no" });
+    t.annotator.onStroke(0, [[1, 1]]);
+    await t.annotator.flush();
+    expect(t.annotator.blockedReason).toContain("does not allow");
+    expect(t.history.dirty).toBe(false);
+  });
+
+  it("text typed in the box of a note counts as unsaved, and a flush saves it as the note", async () => {
+    const t = setup();
+    t.annotator.setTool("note");
+    t.annotator.onPlace(0, 100, 100, { x: 0, y: 0 });
+    expect(t.annotator.unsaved).toBe(false);
+    const area = t.host.popovers.querySelector("textarea") as HTMLTextAreaElement;
+    area.value = "typed";
+    area.dispatchEvent(new Event("input", { bubbles: true }));
+    expect(t.annotator.unsaved).toBe(true);
+    await t.annotator.flush();
+    expect(t.calls).toEqual(["addNote 0 90,90 typed"]);
+    expect(t.host.popovers.querySelector("textarea")).toBeNull();
+    expect(t.annotator.unsaved).toBe(false);
+  });
+
+  it("an open box with no new text is closed by a flush and makes no note", async () => {
+    const t = setup();
+    t.annotator.setTool("note");
+    t.annotator.onPlace(0, 100, 100, { x: 0, y: 0 });
+    await t.annotator.flush();
+    expect(t.calls).toEqual([]);
+    expect(t.host.popovers.querySelector("textarea")).toBeNull();
+  });
+
+  it("an open box does not hold up undo", async () => {
+    const t = setup();
+    t.history.push({ label: "Old", undo: vi.fn(), redo: vi.fn() });
+    t.annotator.setTool("note");
+    t.annotator.onPlace(0, 100, 100, { x: 0, y: 0 });
+    await t.annotator.sequenced(() => t.history.undo());
+    expect(t.history.undoLabel).toBeNull();
+    // The box is still there, with the person's text to come.
+    expect(t.host.popovers.querySelector("textarea")).not.toBeNull();
+  });
+
+  it("an undo that failed on the second page can be tried again and does not repeat the first", async () => {
+    const t = setup();
+    t.setRanges([
+      { page: 0, start: 0, end: 4 },
+      { page: 1, start: 0, end: 4 },
+    ]);
+    await t.annotator.markSelection("highlight");
+    let calls = 0;
+    vi.mocked(t.api.removeAnnotation).mockImplementation((_d, page, id) => {
+      calls++;
+      t.calls.push(`remove ${page} ${id}`);
+      return calls === 2 ? Promise.reject({ code: "internal", message: "broke" }) : Promise.resolve();
+    });
+    await expect(t.annotator.sequenced(() => t.history.undo())).rejects.toBeTruthy();
+    expect(t.history.undoLabel).toBe("Highlight");
+    expect(t.history.dirty).toBe(true);
+    await t.annotator.sequenced(() => t.history.undo());
+    const removals = t.calls.filter((c) => c.startsWith("remove"));
+    expect(removals.filter((c) => c === "remove 1 101")).toHaveLength(1);
+    expect(removals.filter((c) => c === "remove 0 100")).toHaveLength(2);
+    expect(t.history.undoLabel).toBeNull();
+  });
+});
+
+describe("annotations the file or the document locks", () => {
+  const locked = annotation({
+    id: 9,
+    kind: "stamp",
+    can: { editText: false, recolour: false, move: false, remove: false, restore: false, locked: true },
+  });
+
+  it("says that a locked annotation is locked when it is picked, and why it cannot be removed", async () => {
+    const t = setup([locked]);
+    t.annotator.select(0, 9);
+    expect(t.host.told.at(-1)).toContain("locked in the file");
+    expect(t.annotator.pickedReason).toContain("locked");
+    await t.annotator.removeSelected();
+    expect(t.host.told.at(-1)).toContain("locked in the file");
+    expect(t.calls).toEqual([]);
+  });
+});
+
+describe("a save", () => {
+  it("holds back changes while the file is written, and they run when it lets go", async () => {
+    const t = setup();
+    const release = t.annotator.hold();
+    t.annotator.onStroke(0, [[1, 1]]);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(t.calls).toEqual([]);
+    expect(t.annotator.unsaved).toBe(true);
+    release();
+    await t.annotator.flush();
+    expect(t.calls).toEqual(["addInk 0 3 1"]);
+    expect(t.annotator.unsaved).toBe(false);
   });
 });

@@ -18,6 +18,8 @@
 //! - `annot-wrong-kind`, `annot-wrong-id`, `annot-wrong-answer`, `annot-big`: like `annot-good`,
 //!   but an addition is answered with an annotation of another kind, a change with another id, a
 //!   list with something that is not a list, or a list with a 10 MiB frame.
+//! - `save-touched`: like `save-good`, but the description says the file was touched while parts of
+//!   it were unread.
 //! - `save-short`, `save-wrong-offset`, `save-big`, `save-error`, `save-lies`: like `save-good`
 //!   but a piece is a byte too short, a piece comes from the wrong offset, a piece is a 10 MiB
 //!   frame, the save fails with an error, or the end of the file is missing (the last piece is
@@ -202,6 +204,7 @@ fn main() {
                     security: 0,
                     signatures: if mode == "save-signed" { 2 } else { 0 },
                     maybe_signed: false,
+                    touched: mode == "save-touched",
                 },
             ),
             RequestBody::SaveBegin { .. } => match mode.as_str() {

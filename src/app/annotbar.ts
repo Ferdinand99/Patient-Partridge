@@ -35,6 +35,10 @@ export interface AnnotBarState {
   color: Rgba;
   penWidth: number;
   stamp: StampName;
+  /** Why the annotations cannot be changed (or the picked one), in a line; null when nothing stands in the way. */
+  note: string | null;
+  /** The document does not allow annotations: only picking is left. */
+  blocked: boolean;
   /** The picked annotation can have its text changed. */
   canEditText: boolean;
   canRemove: boolean;
@@ -57,6 +61,7 @@ export class AnnotBar {
   private readonly swatches: HTMLButtonElement[] = [];
   private readonly widths: HTMLButtonElement[] = [];
   private readonly penGroup: HTMLElement;
+  private readonly noteLine: HTMLElement;
   private readonly editButton: HTMLButtonElement;
   private readonly deleteButton: HTMLButtonElement;
   private readonly undoButton: HTMLButtonElement;
@@ -74,6 +79,7 @@ export class AnnotBar {
     this.bar = byId(root, "annotbar");
     this.toggle = byId(root, "annotate-button");
     this.penGroup = byId(root, "pen-widths");
+    this.noteLine = byId(root, "annot-note");
     this.editButton = byId(root, "annot-edit");
     this.deleteButton = byId(root, "annot-delete");
     this.undoButton = byId(root, "annot-undo");
@@ -197,7 +203,7 @@ export class AnnotBar {
     this.toggle.setAttribute("aria-pressed", String(state.open && state.enabled));
     for (const [tool, button] of this.toolButtons) {
       button.setAttribute("aria-pressed", String(state.tool === tool));
-      button.disabled = !state.enabled;
+      button.disabled = !state.enabled || (state.blocked && tool !== "select");
     }
     this.swatches.forEach((b, i) => {
       const on = sameColor(PALETTE[i].rgba, state.color);
@@ -206,6 +212,8 @@ export class AnnotBar {
     this.penGroup.hidden = state.tool !== "pen";
     this.widths.forEach((b, i) => b.setAttribute("aria-pressed", String(PEN_WIDTHS[i].width === state.penWidth)));
     for (const [id, item] of this.stamps) item.setAttribute("aria-checked", String(id === state.stamp));
+    this.noteLine.textContent = state.note ?? "";
+    this.noteLine.hidden = state.note === null;
     this.editButton.disabled = !state.canEditText;
     this.deleteButton.disabled = !state.canRemove;
     this.undoButton.disabled = !state.canUndo;

@@ -108,6 +108,7 @@ fn a_document_is_saved_in_place_and_the_new_file_opens() {
             security: 0,
             signatures: 0,
             maybe_signed: false,
+            touched: false,
         }
     );
 
@@ -181,6 +182,7 @@ fn a_password_protected_document_is_saved_protected() {
             security: 2,
             signatures: 0,
             maybe_signed: false,
+            touched: false,
         }
     );
 }
@@ -198,6 +200,7 @@ fn the_check_refuses_a_file_that_lost_its_protection_or_is_not_the_document() {
         security,
         signatures,
         maybe_signed: false,
+        touched: false,
     };
     let check = |path: &Path, password: Option<&str>, expected: DocInfo| {
         verify_written(&config(), path, password, expected, None)
@@ -435,6 +438,55 @@ fn c1_a_same_size_rewrite_with_the_old_time_is_seen_in_the_part_that_was_read() 
     };
     let err = save_error(pool.save(handle, replace));
     assert_eq!(err.code(), "save_source_changed", "{err:?}");
+}
+
+#[test]
+fn m1_a_touch_before_the_first_save_still_lets_the_edits_out_as_a_copy() {
+    let dir = Dir::new("m1");
+    let original = kit::padded_pdf(1024 * 1024);
+    let path = dir.write("a.pdf", &original);
+    let before = fs::metadata(&path).unwrap().modified().unwrap();
+    let pool = pool();
+    let (handle, _) = pool.open(&text(&path), None).unwrap();
+
+    // A document that is mostly an object nobody reads: the engine has read little of it.
+    // Another program only touches the file: the same bytes, a new time of change. Most of the
+    // file was never read by the engine when this happens.
+    let file = fs::File::options().write(true).open(&path).unwrap();
+    file.set_modified(before + std::time::Duration::from_secs(3600))
+        .unwrap();
+    drop(file);
+
+    // The original is not replaced, whatever the user agreed to ...
+    for options in [
+        SaveOptions::default(),
+        SaveOptions {
+            overwrite_changed: true,
+            ..SaveOptions::default()
+        },
+    ] {
+        let err = save_error(pool.save(handle, options));
+        assert_eq!(err, SaveError::SourceTouched, "{err:?}");
+        let err = save_error(pool.save_as(handle, &path, options));
+        assert_eq!(err, SaveError::SourceTouched, "{err:?}");
+    }
+    assert_eq!(fs::read(&path).unwrap(), original);
+    // ... and the edits can always leave as a copy, which says the file was touched.
+    let copy = dir.0.join("copy.pdf");
+    let outcome = pool.save_as(handle, &copy, SaveOptions::default()).unwrap();
+    assert!(outcome.touched);
+    assert_eq!(describe(&copy, None).pages, 1);
+    assert_eq!(fs::read(&path).unwrap(), original);
+}
+
+#[test]
+fn m1_a_file_that_was_not_touched_is_replaced_and_says_nothing() {
+    let dir = Dir::new("m1b");
+    let path = dir.write("a.pdf", &kit::simple_pdf(2));
+    let pool = pool();
+    let (handle, _) = pool.open(&text(&path), None).unwrap();
+    let outcome = pool.save(handle, SaveOptions::default()).unwrap();
+    assert!(!outcome.touched);
 }
 
 #[test]

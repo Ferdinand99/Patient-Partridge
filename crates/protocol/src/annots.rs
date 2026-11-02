@@ -157,8 +157,11 @@ pub mod ability {
     pub const REMOVE: u8 = 8;
     /// The annotation can be put back after it was removed.
     pub const RESTORE: u8 = 16;
+    /// The file locks the annotation (its flags say read-only or locked), or the document does not
+    /// allow annotations to be changed. No other bit is set then, except possibly none.
+    pub const LOCKED: u8 = 32;
     /// All the bits that mean something.
-    pub const ALL: u8 = EDIT_TEXT | RECOLOUR | MOVE | REMOVE | RESTORE;
+    pub const ALL: u8 = EDIT_TEXT | RECOLOUR | MOVE | REMOVE | RESTORE | LOCKED;
 }
 
 /// One annotation of a page.

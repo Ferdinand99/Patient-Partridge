@@ -12,7 +12,9 @@ import {
   type Rgba,
   type Tool,
   clientToPage,
+  coversPage,
   describeAnnotation,
+  onPage,
   percentOf,
   rgbaCss,
   simplifyStroke,
@@ -54,6 +56,8 @@ export class AnnotationLayer {
   private readonly data = new Map<number, Annotation[]>();
   private readonly loading = new Map<number, Promise<void>>();
   private tool: Tool = "select";
+  /** Reading: the boxes take no clicks and no focus, so links and text work as they do without them. */
+  private reading = false;
   private selected: { page: number; id: number } | null = null;
   private ink: { color: Rgba; width: number } = { color: [20, 20, 22, 255], width: 3 };
   private stroke: { page: number; pointerId: number; points: [number, number][] } | null = null;
@@ -75,6 +79,7 @@ export class AnnotationLayer {
     root.dataset.tool = this.tool;
     const boxes = document.createElement("div");
     boxes.className = "annot-boxes";
+    boxes.inert = this.reading;
     const svg = document.createElementNS(SVG_NS, "svg");
     svg.setAttribute("class", "annot-ink");
     svg.setAttribute("viewBox", `0 0 ${size.width} ${size.height}`);
@@ -166,6 +171,13 @@ export class AnnotationLayer {
     if (this.stroke) this.cancelStroke();
   }
 
+  /** While reading, the boxes are inert: no pointer, no Tab stop, nothing for a screen reader to land on. */
+  setReading(reading: boolean): void {
+    this.reading = reading;
+    for (const layer of this.layers.values()) layer.boxes.inert = reading;
+    if (reading && this.stroke) this.cancelStroke();
+  }
+
   setSelected(selected: { page: number; id: number } | null): void {
     this.selected = selected;
     for (const [page, layer] of this.layers) {
@@ -201,12 +213,14 @@ export class AnnotationLayer {
   }
 
   private box(page: number, a: Annotation, size: PageSizePt): HTMLElement {
-    const [l, t, r, b] = a.rect;
+    const [l, t, r, b] = onPage(a.rect, size);
     const el = document.createElement("button");
     el.type = "button";
     el.className = "annot";
     el.dataset.id = String(a.id);
     el.dataset.kind = a.kind;
+    // A box over most of the page takes no pointer: it stays reachable from the keyboard.
+    if (coversPage([l, t, r, b], size)) el.dataset.big = "true";
     el.style.left = percentOf(l, size.width);
     el.style.top = percentOf(t, size.height);
     el.style.width = percentOf(Math.max(r - l, 0), size.width);

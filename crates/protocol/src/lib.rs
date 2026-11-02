@@ -22,7 +22,7 @@ pub use annots::*;
 mod annots_tests;
 
 /// Version of this protocol. Both sides check it in the `Hello` exchange.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Largest frame (payload) either side accepts: 128 MiB, enough for the biggest allowed bitmap.
 pub const MAX_FRAME_LEN: usize = 128 * 1024 * 1024;
@@ -217,6 +217,8 @@ pub enum ErrorCode {
     /// The annotation exists but does not allow this change (for example, a drawing has no colour
     /// to change), or nothing is left to put back.
     AnnotationRefused = 19,
+    /// The document's own permissions do not allow annotations to be added or changed.
+    AnnotationsNotAllowed = 20,
 }
 
 impl ErrorCode {
@@ -241,6 +243,7 @@ impl ErrorCode {
             17 => ErrorCode::SourceUnreadable,
             18 => ErrorCode::NoSuchAnnotation,
             19 => ErrorCode::AnnotationRefused,
+            20 => ErrorCode::AnnotationsNotAllowed,
             _ => return None,
         })
     }
@@ -267,6 +270,7 @@ impl ErrorCode {
             ErrorCode::SourceUnreadable => "source_unreadable",
             ErrorCode::NoSuchAnnotation => "no_such_annotation",
             ErrorCode::AnnotationRefused => "annotation_refused",
+            ErrorCode::AnnotationsNotAllowed => "annotations_not_allowed",
         }
     }
 }
@@ -467,12 +471,16 @@ pub enum ResponseBody {
     /// signatures PDFium finds, looking at the field list and at every widget on every page.
     /// `maybe_signed` is true when the bytes of the file mention anything that belongs to a
     /// signature (`/ByteRange`, `/DocMDP`, `/SigFlags`), whether PDFium found one or not: a
-    /// document is treated as signed when either says so.
+    /// document is treated as signed when either says so. `touched` is true when the time of
+    /// change of the file moved while parts of it had never been read: nothing seen so far differs,
+    /// but a part that was not read cannot be compared with what it was, so the engine's copy of
+    /// the document may not be the file's. It may be written to a new file, not over the original.
     DocInfo {
         pages: u32,
         security: u8,
         signatures: u32,
         maybe_signed: bool,
+        touched: bool,
     },
     /// Sent while a request takes long (`SaveBegin`, `DocInfo`, `Fingerprint`) to show the engine
     /// is working: `done` counts bytes written or pages looked at. Only the request in flight can
@@ -1007,6 +1015,7 @@ impl Response {
                 security,
                 signatures,
                 maybe_signed,
+                touched,
             } => {
                 out.push(TAG_RES_DOC_INFO);
                 put_u32(&mut out, self.id);
@@ -1014,6 +1023,7 @@ impl Response {
                 out.push(*security);
                 put_u32(&mut out, *signatures);
                 out.push(u8::from(*maybe_signed));
+                out.push(u8::from(*touched));
             }
             ResponseBody::Progress { done } => {
                 out.push(TAG_RES_PROGRESS);
@@ -1241,6 +1251,11 @@ impl Response {
                 security: r.u8()?,
                 signatures: r.u32()?,
                 maybe_signed: match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    other => return Err(ProtocolError::UnknownValue(other)),
+                },
+                touched: match r.u8()? {
                     0 => false,
                     1 => true,
                     other => return Err(ProtocolError::UnknownValue(other)),
@@ -1698,6 +1713,7 @@ mod tests {
                     security: 3,
                     signatures: 2,
                     maybe_signed: true,
+                    touched: true,
                 },
             },
             Response {
@@ -1845,11 +1861,19 @@ mod tests {
                 security: 0,
                 signatures: 0,
                 maybe_signed: true,
+                touched: true,
             },
         }
         .encode();
-        assert_eq!(*bytes.last().unwrap(), 1);
-        *bytes.last_mut().unwrap() = 2;
+        let end = bytes.len();
+        assert_eq!(bytes[end - 2..], [1, 1]);
+        bytes[end - 2] = 2;
+        assert!(matches!(
+            Response::decode(bytes.clone()),
+            Err(ProtocolError::UnknownValue(2))
+        ));
+        bytes[end - 2] = 1;
+        bytes[end - 1] = 2;
         assert!(matches!(
             Response::decode(bytes),
             Err(ProtocolError::UnknownValue(2))
@@ -2445,13 +2469,13 @@ mod tests {
 
     #[test]
     fn error_codes_round_trip_and_have_names() {
-        for v in 1..=19u8 {
+        for v in 1..=20u8 {
             let code = ErrorCode::from_u8(v).unwrap();
             assert_eq!(code as u8, v);
             assert!(!code.name().is_empty());
         }
         assert!(ErrorCode::from_u8(0).is_none());
-        assert!(ErrorCode::from_u8(20).is_none());
+        assert!(ErrorCode::from_u8(21).is_none());
         assert_eq!(ErrorCode::from_u8(16).unwrap().name(), "source_changed");
         assert_eq!(ErrorCode::from_u8(17).unwrap().name(), "source_unreadable");
         assert_eq!(ErrorCode::from_u8(14).unwrap().name(), "save_failed");

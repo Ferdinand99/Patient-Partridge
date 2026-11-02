@@ -15,6 +15,8 @@ export interface AnnotAbilities {
   move: boolean;
   remove: boolean;
   restore: boolean;
+  /** The file or the document forbids changing it (read-only, locked, or no permission). */
+  locked: boolean;
 }
 
 /** An annotation of a page as the engine reports it. */
@@ -164,8 +166,26 @@ export function describeAnnotation(a: Annotation, page: number): string {
   const author = snippet(a.author);
   const parts = [kindName(a.kind)];
   if (author) parts.push(`by ${author}`);
-  const head = `${parts.join(" ")}, page ${page + 1}`;
+  const head = `${parts.join(" ")}, page ${page + 1}${a.can.locked ? ", locked" : ""}`;
   return text ? `${head}: ${text}` : head;
+}
+
+/**
+ * The part of a box that lies on its page, as `[left, top, right, bottom]` in points. A box
+ * far outside the page (the file can say anything) is cut to the page, so it cannot cover other
+ * pages or make the area that scrolls bigger.
+ */
+export function onPage(rect: [number, number, number, number], page: { width: number; height: number }): [number, number, number, number] {
+  const cut = (v: number, limit: number) => (Number.isFinite(v) ? Math.min(Math.max(v, 0), limit) : 0);
+  const l = cut(rect[0], page.width);
+  const t = cut(rect[1], page.height);
+  return [l, t, Math.max(cut(rect[2], page.width), l), Math.max(cut(rect[3], page.height), t)];
+}
+
+/** True when a box covers so much of its page that it would hide the text and the links under it. */
+export function coversPage(rect: [number, number, number, number], page: { width: number; height: number }): boolean {
+  const area = Math.max(rect[2] - rect[0], 0) * Math.max(rect[3] - rect[1], 0);
+  return page.width > 0 && page.height > 0 && area > 0.35 * page.width * page.height;
 }
 
 /** A point on a page in points from its top left, from a point on the screen. */

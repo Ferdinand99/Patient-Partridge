@@ -9,7 +9,7 @@ function annotation(over: Partial<Annotation> = {}): Annotation {
   return {
     id: 1,
     kind: "highlight",
-    can: { editText: true, recolour: true, move: true, remove: true, restore: true },
+    can: { editText: true, recolour: true, move: true, remove: true, restore: true, locked: false },
     rect: [61.2, 79.2, 183.6, 158.4],
     color: [255, 235, 59, 255],
     text: "",
@@ -264,7 +264,7 @@ describe("the tools", () => {
 
   it("a box that cannot move is not dragged", async () => {
     const { layer, pageEl, events } = setup([
-      annotation({ id: 3, can: { editText: true, recolour: true, move: false, remove: true, restore: true } }),
+      annotation({ id: 3, can: { editText: true, recolour: true, move: false, remove: true, restore: true, locked: false } }),
     ]);
     place(pageEl, 1);
     layer.mount(0, pageEl);
@@ -275,5 +275,57 @@ describe("the tools", () => {
     window.dispatchEvent(pointer("pointermove", 200, 100));
     window.dispatchEvent(pointer("pointerup", 200, 100));
     expect(events.onMove).not.toHaveBeenCalled();
+  });
+});
+
+describe("reading and boxes that do not fit", () => {
+  it("in reading mode the boxes are inert, so links and text under them work as without them", async () => {
+    const { layer, pageEl } = setup([annotation()]);
+    layer.mount(0, pageEl);
+    layer.pageDrawn(0);
+    await vi.waitFor(() => expect(pageEl.querySelectorAll(".annot")).toHaveLength(1));
+    const boxes = pageEl.querySelector<HTMLElement>(".annot-boxes");
+    expect(boxes?.inert).toBe(false);
+    layer.setReading(true);
+    expect(boxes?.inert).toBe(true);
+    // A page that comes on screen afterwards, and boxes painted again, are inert too.
+    const later = document.createElement("div");
+    document.body.append(later);
+    layer.mount(1, later);
+    expect(later.querySelector<HTMLElement>(".annot-boxes")?.inert).toBe(true);
+    layer.setReading(false);
+    expect(boxes?.inert).toBe(false);
+  });
+
+  it("a box far outside its page is cut to the page", async () => {
+    const { layer, pageEl } = setup([
+      annotation({ id: 1, rect: [-1_000_000, -1_000_000, 1_000_000, 1_000_000] }),
+      annotation({ id: 2, rect: [600, 780, 5000, 9000] }),
+      annotation({ id: 3, rect: [Number.NaN, 10, 20, Number.POSITIVE_INFINITY] }),
+    ]);
+    layer.mount(0, pageEl);
+    layer.pageDrawn(0);
+    await vi.waitFor(() => expect(pageEl.querySelectorAll(".annot")).toHaveLength(3));
+    for (const box of pageEl.querySelectorAll<HTMLElement>(".annot")) {
+      const right = parseFloat(box.style.left) + parseFloat(box.style.width);
+      const bottom = parseFloat(box.style.top) + parseFloat(box.style.height);
+      expect(parseFloat(box.style.left)).toBeGreaterThanOrEqual(0);
+      expect(parseFloat(box.style.top)).toBeGreaterThanOrEqual(0);
+      expect(right).toBeLessThanOrEqual(100.001);
+      expect(bottom).toBeLessThanOrEqual(100.001);
+    }
+  });
+
+  it("a box over most of the page takes no pointer, and a small one does", async () => {
+    const { layer, pageEl } = setup([
+      annotation({ id: 1, kind: "other", rect: [0, 0, 612, 792] }),
+      annotation({ id: 2, kind: "highlight", rect: [10, 10, 100, 30] }),
+    ]);
+    layer.mount(0, pageEl);
+    layer.pageDrawn(0);
+    await vi.waitFor(() => expect(pageEl.querySelectorAll(".annot")).toHaveLength(2));
+    const [big, small] = [...pageEl.querySelectorAll<HTMLElement>(".annot")];
+    expect(big.dataset.big).toBe("true");
+    expect(small.dataset.big).toBeUndefined();
   });
 });

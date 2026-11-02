@@ -691,7 +691,11 @@ fn annotations_a_file_already_has_are_listed_changed_and_removed() {
         n.rect
     );
     // What can be done with each.
-    assert!(h.abilities & ability::RESTORE != 0);
+    assert_eq!(
+        h.abilities & ability::RESTORE,
+        0,
+        "a highlight from a file cannot be put back"
+    );
     assert!(
         ink.abilities & ability::RESTORE == 0,
         "a drawing from a file cannot be put back"
@@ -755,7 +759,7 @@ fn annotations_a_file_already_has_are_listed_changed_and_removed() {
 }
 
 #[test]
-fn a_foreign_highlight_comes_back_in_its_colour() {
+fn a_foreign_highlight_that_is_removed_leaves_the_page_and_is_not_copied_back() {
     let mut guard = engine();
     let e = &mut guard.0;
     let doc = open(e, &kit::annotated_pdf(), None).unwrap();
@@ -776,23 +780,20 @@ fn a_foreign_highlight_comes_back_in_its_colour() {
     );
     let gone = Shot::take(e, doc, 0, 612, 792);
     assert_eq!(gone.near(b, [255, 0, 0], 70), 0);
-    let back = annot(ask(
-        e,
-        RequestBody::RestoreAnnot {
-            doc,
-            page: 0,
-            id: h.id,
-        },
-    ));
-    assert!(
-        back.color[0] > 200 && back.color[1] < 60,
-        "{:?}",
-        back.color
+    // A copy would lose what the engine does not read, so a file's annotation is not copied back.
+    assert_eq!(
+        error_code(ask(
+            e,
+            RequestBody::RestoreAnnot {
+                doc,
+                page: 0,
+                id: h.id,
+            },
+        )),
+        ErrorCode::AnnotationRefused
     );
-    assert_eq!(back.text, "Check this title");
-    assert_eq!(back.author, "Alice");
     let after = Shot::take(e, doc, 0, 612, 792);
-    assert!(after.near(b, [255, 0, 0], 70) > 100);
+    assert_eq!(after.near(b, [255, 0, 0], 70), 0);
 }
 
 // ---- hostile annotations ----------------------------------------------------------------------

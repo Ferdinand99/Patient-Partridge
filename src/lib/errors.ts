@@ -128,6 +128,12 @@ export function describeError(error: AppErrorLike, fileName?: string): Described
         detail: `Another program changed ${file} in place while Patient Partridge had it open. The app reads a PDF as it needs it, so what it has now would be a mix of the old and the new file, and nothing was saved. The file on the disk was not touched. Close the tab and open the file again to keep working. Changes made here since it was opened cannot be saved.`,
         action: "none",
       };
+    case "save_source_touched":
+      return {
+        title: "The file was touched while it was open",
+        detail: `${file} got a new time of change while Patient Partridge had it open. Nothing seen differs, but parts of it had not been read yet, so the app cannot be sure that what it has is the file, and it does not replace it. Nothing was saved, and the file on the disk was not touched. Save a copy: it holds what the app had read, and your changes are still in the open document.`,
+        action: "none",
+      };
     case "save_source_unreadable":
       return {
         title: "The file could not be read",
@@ -192,6 +198,12 @@ export function describeError(error: AppErrorLike, fileName?: string): Described
       return {
         title: "The annotation was not changed",
         detail: "Patient Partridge could not make this change to the annotation. Nothing was lost.",
+        action: "none",
+      };
+    case "annotations_not_allowed":
+      return {
+        title: "This PDF does not allow annotations",
+        detail: "The permissions set in this file forbid adding or changing annotations. Nothing was changed.",
         action: "none",
       };
     case "updating":

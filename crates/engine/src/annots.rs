@@ -12,7 +12,8 @@
 //! place in the page's list, which shifts when one is removed, so the engine keeps a list of ids
 //! in step with each page's list (it is the only thing that changes the lists).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::os::raw::c_int;
 
 use partridge_protocol::{
     ability, AnnotInfo, AnnotKind, ErrorCode, StampKind, MAX_ANNOTS_PER_PAGE, MAX_ANNOT_AUTHOR,
@@ -27,13 +28,18 @@ use crate::{fail, Failure};
 const MAX_SCANNED: usize = 5_000;
 
 /// Most removed annotations the engine keeps so that they can be put back.
-const MAX_REMEMBERED: usize = 200;
+const MAX_REMEMBERED: usize = 1_000;
 
 /// Most boxes (quadrilaterals) one markup is made of: one for each line of text it covers.
 pub const MAX_MARKUP_BOXES: usize = 512;
 
 /// Side of a sticky note's icon, in points.
 const NOTE_SIDE: f32 = 20.0;
+
+/// The flags of an annotation (`/F`) that lock it: read-only and locked. A third keeps its text.
+const FLAG_READ_ONLY: i32 = 1 << 6;
+const FLAG_LOCKED: i32 = 1 << 7;
+const FLAG_LOCKED_CONTENTS: i32 = 1 << 9;
 
 /// Colour of a highlight, an underline or a strike-out that came without one.
 const DEFAULT_COLOR: [u8; 4] = [255, 235, 59, 255];
@@ -81,8 +87,15 @@ pub struct DocAnnots {
     next_id: u32,
     /// The ids of the annotations of each page, in the order of the page's list.
     pages: HashMap<u32, Vec<u32>>,
-    /// Annotations the engine made, by id.
+    /// Annotations the engine made, by id. Only these can be put back after a removal: for an
+    /// annotation that came with the file the engine would have to write a copy, and a copy
+    /// loses what the engine does not read (rich text, dates, replies, layers).
     made: HashMap<u32, Recipe>,
+    /// Pages whose annotations have been drawn once, so that each has an appearance stream.
+    settled: HashSet<u32>,
+    /// The text of an annotation as the file has it, kept when it differs from the text shown
+    /// (line ends written as CR), so that a change that is taken back writes the original.
+    texts: HashMap<u32, String>,
     /// Annotations that were removed, oldest first: `(page, id, what it was)`.
     removed: VecDeque<(u32, u32, Snapshot)>,
 }
@@ -105,18 +118,28 @@ fn pdf_color(c: [u8; 4]) -> PdfColor {
     PdfColor::new(c[0], c[1], c[2], c[3])
 }
 
-/// Text from a file made safe to hand on: control characters other than a line break are replaced
-/// by a space, and the length is cut to `max` bytes on a character boundary.
+/// Text from a file made safe to hand on: line ends of every kind become a line feed, control
+/// characters other than that are replaced by a space, and characters that change the direction of
+/// the text around them or hide are dropped. The length is cut to `max` bytes on a character
+/// boundary.
 pub fn clean_text(text: &str, max: usize) -> String {
     let mut out = String::with_capacity(text.len().min(max));
-    for c in text.chars() {
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
         let c = match c {
-            '\n' => '\n',
-            '\r' => continue,
+            // A CR LF pair is one line end; a CR alone is one too.
+            '\r' if chars.peek() == Some(&'\n') => continue,
+            '\r' | '\n' | '\u{2028}' | '\u{2029}' => '\n',
             c if c.is_control() => ' ',
             // Characters that change the direction of the text around them, or hide: a note
             // must not be able to make the window show something other than what it holds.
-            '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200B}' | '\u{FEFF}' => continue,
+            '\u{200E}'
+            | '\u{200F}'
+            | '\u{061C}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{200B}'
+            | '\u{FEFF}' => continue,
             c => c,
         };
         if out.len() + c.len_utf8() > max {
@@ -125,6 +148,15 @@ pub fn clean_text(text: &str, max: usize) -> String {
         out.push(c);
     }
     out
+}
+
+/// True when the text `clean_text` shows is the whole text of the file, apart from the line ends
+/// (which are shown as line feeds). A text that was cut, or had characters taken out, cannot be
+/// edited here: what the person saw is not what the file holds, and writing it back would lose
+/// the rest.
+fn text_is_whole(raw: &str) -> bool {
+    let lines = raw.replace("\r\n", "\n").replace('\r', "\n");
+    clean_text(raw, MAX_ANNOT_TEXT) == lines
 }
 
 fn kind_of(annotation: &PdfPageAnnotation) -> Option<AnnotKind> {
@@ -255,34 +287,55 @@ impl DocAnnots {
         id: u32,
         page: &PdfPage,
         mapper: &Mapper,
+        flags: i32,
+        allowed: bool,
     ) -> Option<AnnotInfo> {
         let kind = kind_of(annotation)?;
         if annotation.is_hidden() {
             return None;
         }
         let made = self.made.contains_key(&id);
+        let restore = if made { ability::RESTORE } else { 0 };
         let has_quads = !annotation.attachment_points().is_empty();
-        let abilities = match kind {
+        let raw = annotation.contents().unwrap_or_default();
+        let mut abilities = match kind {
             AnnotKind::Highlight | AnnotKind::Underline | AnnotKind::Strikeout => {
-                let mut a = ability::EDIT_TEXT | ability::REMOVE;
+                let mut a = ability::EDIT_TEXT | ability::REMOVE | restore;
                 if has_quads {
-                    a |= ability::RECOLOUR | ability::RESTORE;
+                    a |= ability::RECOLOUR;
                 }
                 a
             }
             // PDFium draws every note the same, whatever its colour, so a note has no colour to pick.
-            AnnotKind::Note => {
-                ability::EDIT_TEXT | ability::MOVE | ability::REMOVE | ability::RESTORE
-            }
-            AnnotKind::Ink => {
-                ability::EDIT_TEXT | ability::REMOVE | if made { ability::RESTORE } else { 0 }
-            }
-            AnnotKind::Stamp => ability::REMOVE | if made { ability::RESTORE } else { 0 },
+            AnnotKind::Note => ability::EDIT_TEXT | ability::MOVE | ability::REMOVE | restore,
+            AnnotKind::Ink => ability::EDIT_TEXT | ability::REMOVE | restore,
+            AnnotKind::Stamp => ability::REMOVE | restore,
             AnnotKind::Other => ability::REMOVE,
         };
+        // What the file or the document forbids comes first. Only an annotation the engine made
+        // can be put back, and the text of one is changed only when it is shown whole.
+        if !allowed || flags & (FLAG_READ_ONLY | FLAG_LOCKED) != 0 {
+            abilities = ability::LOCKED;
+        } else if flags & FLAG_LOCKED_CONTENTS != 0 || !text_is_whole(&raw) {
+            abilities &= !ability::EDIT_TEXT;
+        }
         let bounds = annotation.bounds().ok()?;
-        // A box far outside any page is cut to a size the window can lay out.
-        let rect = mapper.rect(page, &bounds)?.map(|v| v.clamp(-1.0e6, 1.0e6));
+        // A box is cut to its page: the window never gets a box far outside it.
+        let (width, height) = (page.width().value, page.height().value);
+        let rect = mapper.rect(page, &bounds)?;
+        let cut = |v: f32, limit: f32| {
+            if v.is_finite() {
+                v.clamp(0.0, limit)
+            } else {
+                0.0
+            }
+        };
+        let rect = [
+            cut(rect[0], width),
+            cut(rect[1], height),
+            cut(rect[2], width),
+            cut(rect[3], height),
+        ];
         let color = color_of(annotation, kind);
         Some(AnnotInfo {
             id,
@@ -290,7 +343,7 @@ impl DocAnnots {
             abilities,
             rect,
             color,
-            text: clean_text(&annotation.contents().unwrap_or_default(), MAX_ANNOT_TEXT),
+            text: clean_text(&raw, MAX_ANNOT_TEXT),
             author: clean_text(&annotation.creator().unwrap_or_default(), MAX_ANNOT_AUTHOR),
         })
     }
@@ -303,11 +356,15 @@ impl DocAnnots {
     ) -> Result<Vec<AnnotInfo>, Failure> {
         let page = load(document, page_index)?;
         // An annotation that came without an appearance gets one when the page is drawn; the colour
-        // of a highlight is read from it.
-        settle(&page);
+        // of a highlight is read from it. Once is enough: every change draws the page itself.
+        if self.settled.insert(page_index) {
+            settle(&page);
+        }
         let mapper = Mapper::new(&page);
         let count = page.annotations().len();
         let ids = self.ids(page_index, count).clone();
+        let allowed = changes_allowed(document);
+        let flags = flags_of(document, page_index, count);
         let mut out = Vec::new();
         #[allow(clippy::needless_range_loop)]
         for index in 0..count.min(MAX_SCANNED) {
@@ -317,7 +374,10 @@ impl DocAnnots {
             let Ok(annotation) = page.annotations().get(index) else {
                 continue;
             };
-            if let Some(info) = self.describe(&annotation, ids[index], &page, &mapper) {
+            let flag = flags.get(index).copied().unwrap_or(FLAG_LOCKED);
+            if let Some(info) =
+                self.describe(&annotation, ids[index], &page, &mapper, flag, allowed)
+            {
                 out.push(info);
             }
         }
@@ -327,6 +387,7 @@ impl DocAnnots {
     /// The annotation with `id`: its place in the list of the page, and what it is.
     fn find(
         &mut self,
+        document: &PdfDocument<'static>,
         page: &PdfPage,
         page_index: u32,
         id: u32,
@@ -339,8 +400,10 @@ impl DocAnnots {
             .position(|i| *i == id)
             .ok_or_else(no_such)?;
         let annotation = page.annotations().get(position).map_err(|_| no_such())?;
+        let flags = flags_at(document, page_index, position);
+        let allowed = changes_allowed(document);
         let info = self
-            .describe(&annotation, id, page, &mapper)
+            .describe(&annotation, id, page, &mapper, flags, allowed)
             .ok_or_else(no_such)?;
         Ok((position, info))
     }
@@ -363,7 +426,7 @@ impl DocAnnots {
         ids.push(new_id);
         let mapper = Mapper::new(page);
         let annotation = page.annotations().get(count - 1).map_err(refused)?;
-        self.describe(&annotation, new_id, page, &mapper)
+        self.describe(&annotation, new_id, page, &mapper, 0, true)
             .ok_or_else(|| {
                 (
                     ErrorCode::AnnotationRefused,
@@ -401,6 +464,7 @@ impl DocAnnots {
         start: u32,
         end: u32,
     ) -> Result<AnnotInfo, Failure> {
+        ensure_allowed(document)?;
         let mut page = load(document, page_index)?;
         let chars = text::page_chars(&page, true).map_err(|_| {
             (
@@ -454,6 +518,7 @@ impl DocAnnots {
         color: [u8; 4],
         text: &str,
     ) -> Result<AnnotInfo, Failure> {
+        ensure_allowed(document)?;
         let mut page = load(document, page_index)?;
         let mapper = Mapper::new(&page);
         let (width, height) = (page.width().value, page.height().value);
@@ -488,6 +553,7 @@ impl DocAnnots {
         width: f32,
         strokes: Vec<Vec<[f32; 2]>>,
     ) -> Result<AnnotInfo, Failure> {
+        ensure_allowed(document)?;
         let mut page = load(document, page_index)?;
         let (w, h) = (page.width().value, page.height().value);
         // Points outside the page are pulled to its edge: a stroke that leaves the page still
@@ -532,6 +598,7 @@ impl DocAnnots {
         y: f32,
         stamp: StampKind,
     ) -> Result<AnnotInfo, Failure> {
+        ensure_allowed(document)?;
         let mut page = load(document, page_index)?;
         let (w, h) = (page.width().value, page.height().value);
         let (sw, sh) = stamp_size(stamp);
@@ -569,8 +636,7 @@ impl DocAnnots {
         };
         // A drawing or a stamp can be put back only if the engine knows how it was made, and the
         // answer says so, so the recipe is kept before the answer is made.
-        let keeps =
-            remember && matches!(snapshot.recipe, Recipe::Ink { .. } | Recipe::Stamp { .. });
+        let keeps = remember;
         if keeps {
             self.made.insert(new_id, snapshot.recipe.clone());
         }
@@ -599,8 +665,9 @@ impl DocAnnots {
         dx: f32,
         dy: f32,
     ) -> Result<AnnotInfo, Failure> {
-        let mut page = load(document, page_index)?;
-        let (position, info) = self.find(&page, page_index, id)?;
+        ensure_allowed(document)?;
+        let page = load(document, page_index)?;
+        let (position, info) = self.find(document, &page, page_index, id)?;
         let wants_move = dx != 0.0 || dy != 0.0;
         if (text.is_some() && info.abilities & ability::EDIT_TEXT == 0)
             || (color.is_some() && info.abilities & ability::RECOLOUR == 0)
@@ -612,15 +679,33 @@ impl DocAnnots {
             );
         }
         let mapper = Mapper::new(&page);
+        let mut rich = None;
         {
             let mut annotation = page.annotations().get(position).map_err(|_| no_such())?;
             if let Some(text) = text {
-                annotation
-                    .set_contents(&clean_text(text, MAX_ANNOT_TEXT))
-                    .map_err(refused)?;
+                // The text goes into the one key the person edits. Line ends the file writes as CR
+                // are shown as line feeds, so the text of the file is kept and written back when
+                // a change is taken back to the text that was shown.
+                let raw = annotation.contents().unwrap_or_default();
+                if !self.texts.contains_key(&id) && clean_text(&raw, MAX_ANNOT_TEXT) != raw {
+                    self.texts.insert(id, raw);
+                }
+                let wanted = clean_text(text, MAX_ANNOT_TEXT);
+                let value = match self.texts.get(&id) {
+                    Some(original) if clean_text(original, MAX_ANNOT_TEXT) == wanted => {
+                        original.clone()
+                    }
+                    _ => wanted,
+                };
+                annotation.set_contents(&value).map_err(refused)?;
+                rich = Some(value);
             }
             if wants_move {
                 let from = mapper.to_page(&page, 0.0, 0.0);
+                // The box stays on the page: a note cannot be pushed out of reach.
+                let (width, height) = (page.width().value, page.height().value);
+                let dx = keep_within(dx, -info.rect[0], width - info.rect[2]);
+                let dy = keep_within(dy, -info.rect[1], height - info.rect[3]);
                 let to = mapper.to_page(&page, dx, dy);
                 let (Some(from), Some(to), Some(bounds)) = (from, to, bounds_of(&annotation))
                 else {
@@ -638,38 +723,18 @@ impl DocAnnots {
                 annotation.set_bounds(rect_of(moved)).map_err(refused)?;
             }
         }
+        if let Some(value) = rich {
+            // A comment with rich text (`/RC`) is kept in step with its plain text.
+            set_rich_text(document, page_index, position, &value)?;
+        }
         if let Some(color) = color {
-            // PDFium cannot change the colour of an annotation that has its appearance stream, so
-            // the annotation is made again with the new colour, and takes the place of the old one.
-            let (snapshot, _) = self.snapshot_of(&page, position, &info)?;
-            let Some(mut snapshot) = snapshot else {
-                return fail(
-                    ErrorCode::AnnotationRefused,
-                    "this annotation does not allow that change",
-                );
-            };
-            match &mut snapshot.recipe {
-                Recipe::Markup { color: c, .. } | Recipe::Note { color: c, .. } => *c = color,
-                _ => {
-                    return fail(
-                        ErrorCode::AnnotationRefused,
-                        "this annotation does not allow that change",
-                    )
-                }
-            }
-            let before = page.annotations().len();
-            let old = page
-                .annotations_mut()
-                .get(position)
-                .map_err(|_| no_such())?;
-            page.annotations_mut()
-                .delete_annotation(old)
-                .map_err(refused)?;
-            self.ids(page_index, before).remove(position);
-            return self.create_from(&mut page, document, page_index, &snapshot, Some(id), false);
+            // PDFium cannot change the colour of an annotation that has its appearance stream. The
+            // appearance is taken off, the colour is set on the same annotation, and PDFium makes
+            // the appearance again when the page is drawn: every other entry stays as it was.
+            recolour_raw(document, page_index, position, color)?;
         }
         settle(&page);
-        let (_, info) = self.find(&page, page_index, id)?;
+        let (_, info) = self.find(document, &page, page_index, id)?;
         Ok(info)
     }
 
@@ -721,33 +786,34 @@ impl DocAnnots {
         page_index: u32,
         id: u32,
     ) -> Result<(), Failure> {
-        let mut page = load(document, page_index)?;
-        let (position, info) = self.find(&page, page_index, id)?;
+        ensure_allowed(document)?;
+        let page = load(document, page_index)?;
+        let (position, info) = self.find(document, &page, page_index, id)?;
         if info.abilities & ability::REMOVE == 0 {
             return fail(
                 ErrorCode::AnnotationRefused,
                 "this annotation does not allow that change",
             );
         }
+        // Only what the engine made is kept for a later restore: a copy of an annotation from the
+        // file would lose what the engine does not read.
         let snapshot = if info.abilities & ability::RESTORE != 0 {
             self.snapshot_of(&page, position, &info)?.0
         } else {
             None
         };
         let before = page.annotations().len();
-        let mut annotation = page
-            .annotations_mut()
-            .get(position)
-            .map_err(|_| no_such())?;
         // PDFium takes the annotation off the page but leaves its dictionary in the document, and
-        // a save writes it as an object nobody refers to. What the person wrote is cleared first,
-        // so that a note that was taken away does not stay in the file.
-        let _ = annotation.set_contents("");
-        let _ = annotation.set_creator("");
-        page.annotations_mut()
-            .delete_annotation(annotation)
-            .map_err(refused)?;
-        self.ids(page_index, before).remove(position);
+        // a save writes it as an object nobody refers to. What the person wrote is overwritten
+        // first, with the rich text, the subject, the appearance and the popup of the annotation.
+        let gone = remove_raw(document, page_index, position)?;
+        let ids = self.ids(page_index, before);
+        for place in gone.iter().rev() {
+            if *place < ids.len() {
+                ids.remove(*place);
+            }
+        }
+        self.texts.remove(&id);
         if let Some(snapshot) = snapshot {
             self.remember(page_index, id, snapshot);
         } else {
@@ -763,6 +829,7 @@ impl DocAnnots {
         page_index: u32,
         id: u32,
     ) -> Result<AnnotInfo, Failure> {
+        ensure_allowed(document)?;
         let Some(at) = self
             .removed
             .iter()
@@ -785,7 +852,265 @@ impl DocAnnots {
         self.pages.clear();
         self.made.clear();
         self.removed.clear();
+        self.settled.clear();
+        self.texts.clear();
     }
+}
+
+// ---- what the file and PDFium's own calls are asked ----------------------------------------------
+
+/// `delta` held between `low` and `high` (nothing moves when there is no room).
+fn keep_within(delta: f32, low: f32, high: f32) -> f32 {
+    if low > high || !delta.is_finite() {
+        0.0
+    } else {
+        delta.clamp(low, high)
+    }
+}
+
+/// True when the document allows annotations to be added and changed: it is not protected, or
+/// the bit for annotating is set in the permissions it grants the user.
+fn changes_allowed(document: &PdfDocument<'_>) -> bool {
+    if let Ok(PdfSecurityHandlerRevision::Unprotected) =
+        document.permissions().security_handler_revision()
+    {
+        return true;
+    }
+    let Some(handle) = raw_document(document) else {
+        return false;
+    };
+    // SAFETY: the handle is the live document's.
+    let bits = unsafe { document.bindings().FPDF_GetDocUserPermissions(handle) };
+    bits & 0x20 != 0
+}
+
+fn ensure_allowed(document: &PdfDocument<'_>) -> Result<(), Failure> {
+    if changes_allowed(document) {
+        Ok(())
+    } else {
+        fail(
+            ErrorCode::AnnotationsNotAllowed,
+            "the document does not allow annotations to be changed",
+        )
+    }
+}
+
+/// Runs `work` with PDFium's own handle of a page, closed again after it. `pdfium-render` keeps
+/// the handles of annotations to itself, and PDFium's functions are the only way to some of what
+/// an annotation holds. They are called only with handles that PDFium gave out here.
+fn with_raw_page<R>(
+    document: &PdfDocument<'static>,
+    page_index: u32,
+    work: impl FnOnce(&dyn PdfiumLibraryBindings, FPDF_PAGE) -> R,
+) -> Result<R, Failure> {
+    let Some(handle) = raw_document(document) else {
+        return fail(
+            ErrorCode::AnnotationRefused,
+            "the document cannot be changed",
+        );
+    };
+    let bindings = document.bindings();
+    // SAFETY: `handle` is the live document's handle; the page is opened and closed here.
+    unsafe {
+        let page = bindings.FPDF_LoadPage(handle, page_index as c_int);
+        if page.is_null() {
+            return fail(ErrorCode::Corrupt, "the page could not be read");
+        }
+        let out = work(bindings, page);
+        bindings.FPDF_ClosePage(page);
+        Ok(out)
+    }
+}
+
+/// Runs `work` with the handle of the annotation at `position`, closed again after it.
+///
+/// # Safety
+/// `page` must be a live page handle of `bindings`.
+unsafe fn with_annot<R>(
+    bindings: &dyn PdfiumLibraryBindings,
+    page: FPDF_PAGE,
+    position: usize,
+    work: impl FnOnce(FPDF_ANNOTATION) -> R,
+) -> Option<R> {
+    let annotation = bindings.FPDFPage_GetAnnot(page, position as c_int);
+    if annotation.is_null() {
+        return None;
+    }
+    let out = work(annotation);
+    bindings.FPDFPage_CloseAnnot(annotation);
+    Some(out)
+}
+
+/// The flags (`/F`) of the first `count` annotations of a page. When they cannot be read, every
+/// annotation counts as locked.
+fn flags_of(document: &PdfDocument<'static>, page_index: u32, count: usize) -> Vec<i32> {
+    let n = count.min(MAX_SCANNED);
+    with_raw_page(document, page_index, |bindings, page| {
+        (0..n)
+            .map(|i| {
+                // SAFETY: `page` is live.
+                unsafe { with_annot(bindings, page, i, |a| bindings.FPDFAnnot_GetFlags(a)) }
+                    .unwrap_or(FLAG_LOCKED)
+            })
+            .collect()
+    })
+    .unwrap_or_else(|_| vec![FLAG_LOCKED; n])
+}
+
+fn flags_at(document: &PdfDocument<'static>, page_index: u32, position: usize) -> i32 {
+    with_raw_page(document, page_index, |bindings, page| {
+        // SAFETY: `page` is live.
+        unsafe { with_annot(bindings, page, position, |a| bindings.FPDFAnnot_GetFlags(a)) }
+    })
+    .ok()
+    .flatten()
+    .unwrap_or(FLAG_LOCKED)
+}
+
+/// Changes the colour of the annotation at `position` where it is: the appearance stream is taken
+/// off (PDFium refuses a colour while there is one), the colour is set, and PDFium makes a new
+/// appearance when the page is drawn. The opacity (`/CA`) the annotation has is kept, and so is
+/// every other entry of its dictionary.
+fn recolour_raw(
+    document: &PdfDocument<'static>,
+    page_index: u32,
+    position: usize,
+    color: [u8; 4],
+) -> Result<(), Failure> {
+    let done = with_raw_page(document, page_index, |bindings, page| {
+        // SAFETY: `page` is live, and so is the annotation inside the closure.
+        unsafe {
+            with_annot(bindings, page, position, |a| {
+                let mut opacity = 0.0f32;
+                let alpha = if bindings.FPDFAnnot_GetNumberValue(a, "CA", &mut opacity) != 0 {
+                    (opacity.clamp(0.0, 1.0) * 255.0).round() as u32
+                } else {
+                    color[3] as u32
+                };
+                bindings.FPDFAnnot_SetAP(a, 0 as FPDF_ANNOT_APPEARANCEMODE, std::ptr::null()) != 0
+                    && bindings.FPDFAnnot_SetColor(
+                        a,
+                        0 as FPDFANNOT_COLORTYPE,
+                        color[0] as _,
+                        color[1] as _,
+                        color[2] as _,
+                        alpha as _,
+                    ) != 0
+            })
+        }
+    })?;
+    if done == Some(true) {
+        Ok(())
+    } else {
+        fail(
+            ErrorCode::AnnotationRefused,
+            "the colour could not be changed",
+        )
+    }
+}
+
+/// The rich text of a comment, as the file's own program reads it: one paragraph for each line.
+fn rich_text(text: &str) -> String {
+    let mut out =
+        String::from("<?xml version=\"1.0\"?><body xmlns=\"http://www.w3.org/1999/xhtml\">");
+    for line in text.split('\n') {
+        out.push_str("<p>");
+        for c in line.chars() {
+            match c {
+                '&' => out.push_str("&amp;"),
+                '<' => out.push_str("&lt;"),
+                '>' => out.push_str("&gt;"),
+                c => out.push(c),
+            }
+        }
+        out.push_str("</p>");
+    }
+    out.push_str("</body>");
+    out
+}
+
+/// Writes `text` as the rich text of the annotation if it has any, so that the two do not tell
+/// different things.
+fn set_rich_text(
+    document: &PdfDocument<'static>,
+    page_index: u32,
+    position: usize,
+    text: &str,
+) -> Result<(), Failure> {
+    let rich = rich_text(text);
+    with_raw_page(document, page_index, |bindings, page| {
+        // SAFETY: `page` is live, and so is the annotation inside the closure.
+        unsafe {
+            with_annot(bindings, page, position, |a| {
+                if bindings.FPDFAnnot_HasKey(a, "RC") != 0 {
+                    bindings.FPDFAnnot_SetStringValue_str(a, "RC", &rich) != 0
+                } else {
+                    true
+                }
+            })
+        }
+    })
+    .map(|_| ())
+}
+
+/// Overwrites the text an annotation holds: comment, author, rich text, subject.
+///
+/// # Safety
+/// `annotation` must be a live annotation handle of `bindings`.
+unsafe fn blank(bindings: &dyn PdfiumLibraryBindings, annotation: FPDF_ANNOTATION) {
+    for key in ["Contents", "T", "RC", "Subj"] {
+        if bindings.FPDFAnnot_HasKey(annotation, key) != 0 {
+            bindings.FPDFAnnot_SetStringValue_str(annotation, key, "");
+        }
+    }
+}
+
+/// Takes the annotation at `position` off the page, with the popup it owns, after overwriting
+/// what the person wrote and detaching the appearance. Returns the places that were taken off,
+/// lowest first. PDFium still writes the dictionaries (and the old appearance streams, which no
+/// call can overwrite) as objects that nothing refers to.
+fn remove_raw(
+    document: &PdfDocument<'static>,
+    page_index: u32,
+    position: usize,
+) -> Result<Vec<usize>, Failure> {
+    let gone = with_raw_page(document, page_index, |bindings, page| {
+        // SAFETY: `page` is live; every annotation handle is closed before the page is.
+        unsafe {
+            let annotation = bindings.FPDFPage_GetAnnot(page, position as c_int);
+            if annotation.is_null() {
+                return None;
+            }
+            let mut places = vec![position];
+            let popup = bindings.FPDFAnnot_GetLinkedAnnot(annotation, "Popup");
+            if !popup.is_null() {
+                let at = bindings.FPDFPage_GetAnnotIndex(page, popup);
+                blank(bindings, popup);
+                bindings.FPDFPage_CloseAnnot(popup);
+                if at >= 0 && at as usize != position {
+                    places.push(at as usize);
+                }
+            }
+            blank(bindings, annotation);
+            bindings.FPDFAnnot_SetAP(annotation, 0 as FPDF_ANNOT_APPEARANCEMODE, std::ptr::null());
+            bindings.FPDFPage_CloseAnnot(annotation);
+            // The higher place first, so that the lower one does not move.
+            places.sort_unstable_by(|a, b| b.cmp(a));
+            for place in &places {
+                if bindings.FPDFPage_RemoveAnnot(page, *place as c_int) == 0 {
+                    return None;
+                }
+            }
+            places.reverse();
+            Some(places)
+        }
+    })?;
+    gone.ok_or_else(|| {
+        (
+            ErrorCode::AnnotationRefused,
+            "the annotation could not be taken off the page".to_string(),
+        )
+    })
 }
 
 // ---- writing an annotation -----------------------------------------------------
@@ -871,7 +1196,14 @@ pub fn raw_document(document: &PdfDocument<'_>) -> Option<FPDF_DOCUMENT> {
         .take_while(char::is_ascii_hexdigit)
         .collect();
     let value = usize::from_str_radix(&hex, 16).ok()?;
-    (value != 0).then_some(value as FPDF_DOCUMENT)
+    if value == 0 || value % std::mem::align_of::<usize>() != 0 {
+        return None;
+    }
+    // The handle must be the one of this document: it has as many pages as the document.
+    let handle = value as FPDF_DOCUMENT;
+    // SAFETY: the value was printed by the document for its own handle; PDFium only reads it.
+    let pages = unsafe { document.bindings().FPDF_GetPageCount(handle) };
+    (pages >= 0 && pages as usize == document.pages().len() as usize).then_some(handle)
 }
 
 /// A drawing is an ink annotation with a list of strokes (`InkList`), a colour and a line width, as
@@ -1024,13 +1356,23 @@ fn write_stamp(
     // The stamp is drawn upright on the page as it is seen: its own frame has the origin at the
     // bottom left of the stamp as drawn, and goes to page space through three points.
     let corner = |dx: f32, dy: f32| mapper.to_page(page, x + dx, y + height - dy);
-    let (Some(o), Some(u), Some(v)) = (corner(0.0, 0.0), corner(1.0, 0.0), corner(0.0, 1.0)) else {
+    let (Some(o), Some(u), Some(v)) = (corner(0.0, 0.0), corner(width, 0.0), corner(0.0, height))
+    else {
         return fail(
             ErrorCode::AnnotationRefused,
             "that place is not on the page",
         );
     };
-    let matrix = PdfMatrix::new(u.0 - o.0, u.1 - o.1, v.0 - o.0, v.1 - o.1, o.0, o.1);
+    // The axes are measured over the whole width and height, where the rounding of the points to
+    // 1/16 of a point matters least.
+    let matrix = PdfMatrix::new(
+        (u.0 - o.0) / width,
+        (u.1 - o.1) / width,
+        (v.0 - o.0) / height,
+        (v.1 - o.1) / height,
+        o.0,
+        o.1,
+    );
     let corners: Vec<(f32, f32)> = [(0.0, 0.0), (width, 0.0), (0.0, height), (width, height)]
         .iter()
         .filter_map(|(dx, dy)| corner(*dx, *dy))
@@ -1200,6 +1542,12 @@ mod tests {
     fn text_from_a_file_loses_its_controls_and_its_length() {
         assert_eq!(clean_text("a\u{0}b\tc\r\nd", 100), "a b c\nd");
         assert_eq!(clean_text("x\u{202E}y\u{200B}z", 100), "xyz");
+        // Every kind of line end is a line feed; marks that steer the direction are dropped.
+        assert_eq!(
+            clean_text("a\rb\r\nc\u{2028}d\u{2029}e", 100),
+            "a\nb\nc\nd\ne"
+        );
+        assert_eq!(clean_text("a\u{200E}b\u{200F}c\u{061C}d", 100), "abcd");
         let cut = clean_text(&"é".repeat(50), 11);
         assert_eq!(cut.len(), 10);
         assert!(cut.chars().all(|c| c == 'é'));

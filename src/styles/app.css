@@ -493,6 +493,11 @@ button.outline-toggle {
   display: none;
 }
 
+.annotbar-note {
+  margin-inline-start: 8px;
+  font-size: 12px;
+}
+
 .annotbar .segmented > button {
   min-width: 34px;
   padding: 0 8px;
@@ -588,6 +593,8 @@ button.outline-toggle {
   position: absolute;
   inset: 0;
   pointer-events: none;
+  /* A box the file puts far outside its page is cut at the page. */
+  overflow: hidden;
 }
 
 .annot-boxes {
@@ -606,12 +613,12 @@ button.outline-toggle {
   pointer-events: none;
 }
 
-.annot-layer[data-tool="select"] .annot {
+.annot-layer[data-tool="select"] .annot:not([data-big]) {
   pointer-events: auto;
   cursor: pointer;
 }
 
-.annot-layer[data-tool="select"] .annot[data-kind="note"] {
+.annot-layer[data-tool="select"] .annot[data-kind="note"]:not([data-big]) {
   cursor: move;
 }
 

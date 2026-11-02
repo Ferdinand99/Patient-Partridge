@@ -333,6 +333,7 @@ test("a stamp is chosen from a menu and placed with a click", async ({ page }) =
 
 test("annotations a file already has are shown, can be changed, and removed with a warning", async ({ page }) => {
   await openFile(page, "/docs/annotated.pdf", "annotated.pdf");
+  await openBar(page);
   const boxes = page.locator(".annot");
   await expect(boxes).toHaveCount(4);
   await expect(boxes.nth(0)).toHaveAttribute("aria-label", "Highlight by Alice, page 1: Check this title");
@@ -377,6 +378,7 @@ test("annotations a file already has are shown, can be changed, and removed with
 
 test("a note can be moved with the arrow keys and with the pointer, and put back with undo", async ({ page }) => {
   await openFile(page, "/docs/annotated.pdf", "annotated.pdf");
+  await openBar(page);
   const note = page.locator(".annot[data-kind='note']");
   await note.focus();
   await page.keyboard.press("ArrowRight");
@@ -492,4 +494,69 @@ test("toolbar buttons, the stamp menu and the note box work in the dark theme an
   await page.screenshot({ path: "e2e/artifacts/annotation-bar-dark-narrow.png" });
   const bar = await page.locator("#annotbar").boundingBox();
   expect(bar?.width ?? 0).toBeLessThanOrEqual(560);
+});
+
+test("with the bar closed the boxes take no pointer, so links and text work as without annotations", async ({ page }) => {
+  await openFile(page, "/docs/annotated.pdf", "annotated.pdf");
+  const box = page.locator(".annot").nth(0);
+  await expect(box).toBeAttached();
+  // The top element at the middle of the box, found afresh each time (the bar moves the page).
+  const hit = async () => {
+    const rect = await box.boundingBox();
+    if (!rect) throw new Error("the box has no place");
+    const at = { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+    return page.evaluate(({ x, y }) => document.elementFromPoint(x, y)?.closest(".annot") != null, at);
+  };
+  // Closed: the press goes through to whatever is under the box.
+  expect(await hit()).toBe(false);
+  await expect(page.locator(".annot-boxes").first()).toHaveAttribute("inert", "");
+  // Open: a box can be picked.
+  await openBar(page);
+  expect(await hit()).toBe(true);
+  // Closed again: reading as before.
+  await page.locator("#annotate-button").click();
+  await expect(page.locator("#annotbar")).toBeHidden();
+  expect(await hit()).toBe(false);
+});
+
+test("text typed in an open note box counts as unsaved: quitting asks, and Save and quit keeps the note", async ({ page }) => {
+  await openBook(page);
+  await openBar(page);
+  await page.locator(".viewer").focus();
+  await page.keyboard.press("n");
+  const at = await onPage(page, 0, 300, 200);
+  await page.mouse.click(at.x, at.y);
+  const editor = page.getByRole("dialog", { name: "New note" });
+  await expect(editor).toBeVisible();
+  // An empty box is not a change.
+  await expect(page.locator(".tab-dirty")).toHaveCount(0);
+  await editor.getByRole("textbox", { name: "Text of the note" }).fill("typed and not saved");
+  await expect(page.locator(".tab-dirty")).toHaveCount(1);
+  await expect.poll(() => page.evaluate(() => Object.values((window as unknown as { __E2E__: Stand }).__E2E__.dirty)[0])).toBe(true);
+
+  await page.evaluate(() => (window as unknown as { __E2E__: Stand }).__E2E__.emit("quit-requested", null));
+  const quitting = page.getByRole("alertdialog");
+  await expect(quitting).toContainText('Save changes to "book.pdf"?');
+  await quitting.getByRole("button", { name: "Save and quit" }).click();
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __E2E__: Stand }).__E2E__.quits)).toBe(1);
+  // The text was made a note first, and the file was saved after it.
+  const [note] = await calls(page, "add_note");
+  expect(note.args).toMatchObject({ page: 0, text: "typed and not saved" });
+  expect(await page.evaluate(() => (window as unknown as { __E2E__: Stand }).__E2E__.saves.length)).toBe(1);
+});
+
+test("Ctrl+S with an open note box saves the text as a note first", async ({ page }) => {
+  await openBook(page);
+  await openBar(page);
+  await page.locator(".viewer").focus();
+  await page.keyboard.press("n");
+  const at = await onPage(page, 0, 300, 200);
+  await page.mouse.click(at.x, at.y);
+  const editor = page.getByRole("dialog", { name: "New note" });
+  await editor.getByRole("textbox", { name: "Text of the note" }).fill("kept by the save");
+  await page.locator(".viewer").evaluate((el) => (el as HTMLElement).focus());
+  await page.evaluate(() => document.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, bubbles: true })));
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __E2E__: Stand }).__E2E__.saves.length)).toBe(1);
+  expect((await calls(page, "add_note")).length).toBe(1);
+  await expect(page.locator(".tab-dirty")).toHaveCount(0);
 });

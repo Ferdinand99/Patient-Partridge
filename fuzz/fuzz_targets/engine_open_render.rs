@@ -330,6 +330,7 @@ impl State {
                         code:
                             ErrorCode::InvalidRequest
                             | ErrorCode::AnnotationRefused
+                            | ErrorCode::AnnotationsNotAllowed
                             | ErrorCode::Corrupt,
                         ..
                     } => {}
