@@ -46,8 +46,8 @@ jobs:
         shell: bash
     env:
       # "1" for a beta build, empty otherwise (a push never makes one). Not a secret.
-      BETA: ${{ true && '1' || '' }} # TEMPORARY-BETA-TEST
-      APP_NAME: ${{ true && 'Patient Partridge Beta' || 'Patient Partridge' }}
+      BETA: ${{ inputs.beta && '1' || '' }} # TEMPORARY-BETA-TEST
+      APP_NAME: ${{ inputs.beta && 'Patient Partridge Beta' || 'Patient Partridge' }}
     # No secret is set for the job. Each is set on the one step that reads it; the steps that run
     # third-party code (npm, the build scripts of the Rust dependencies, Vite) have none.
     steps:
