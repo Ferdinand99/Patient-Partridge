@@ -742,6 +742,12 @@ fn main() {
         ("form_signed", kit::forms_signed_pdf()),
         ("form_nested", kit::forms_nested_pdf()),
         ("form_many", kit::forms_many_pdf(40)),
+        ("form_actions", kit::forms_actions_pdf()),
+        ("form_harmless_actions", kit::forms_harmless_actions_pdf()),
+        ("form_multipage", kit::forms_multipage_pdf(false)),
+        ("form_multipage_no_page", kit::forms_multipage_pdf(true)),
+        ("form_loop", kit::forms_loop_pdf()),
+        ("form_awkward_values", kit::forms_awkward_values_pdf()),
         ("corrupt", kit::corrupt_pdf()),
     ];
 

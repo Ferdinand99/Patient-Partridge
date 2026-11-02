@@ -40,6 +40,8 @@ pub struct FieldOut {
     comb: bool,
     /// The field has an action that is never run.
     action: bool,
+    /// The field has an action that could change the form, so it is left alone (and read only).
+    action_blocked: bool,
     /// Quarter turns clockwise.
     turns: u8,
     /// Left, top, right and bottom in points from the top left of the page as it is drawn.
@@ -97,6 +99,7 @@ pub fn field_out(field: FormField) -> FieldOut {
         no_toggle_off: has(field_flag::NO_TOGGLE_OFF),
         comb: has(field_flag::COMB),
         action: has(field_flag::ACTION),
+        action_blocked: has(field_flag::ACTION_BLOCKED),
         turns: field.turns,
         rect: field.rect.map(round2),
         font_size: round2(field.font_size),

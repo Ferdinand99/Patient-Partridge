@@ -222,7 +222,7 @@ jobs:
       - name: Fill in and save the test forms
         env:
           PARTRIDGE_FORMS_OUT: ${{ runner.temp }}/forms
-        run: cargo test -p partridge-engine --locked --test forms --test forms_process
+        run: cargo test -p partridge-engine --locked --test forms --test forms_process --test forms_actions
       - name: Read them with other tools
         run: scripts/check-forms.sh "$RUNNER_TEMP/forms"
 

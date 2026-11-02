@@ -17,7 +17,7 @@
   const base = window.__TAURI_INTERNALS__;
   const baseInvoke = base.invoke;
   const stand = window.__E2E__;
-  const forms = { calls: [], saves: 0, failNext: null, delay: 0 };
+  const forms = { calls: [], saves: 0, quits: 0, failNext: null, delay: 0, emit: null };
   stand.forms = forms;
 
   const PAGE = { w: 612, h: 792 };
@@ -35,6 +35,7 @@
     noToggleOff: false,
     comb: false,
     action: false,
+    actionBlocked: false,
     turns: 0,
     fontSize: 12,
     tooltip: "",
@@ -152,7 +153,26 @@
     return structuredClone(entry.fields);
   }
 
+  // The callbacks of the page, so that a test can send an event the app process would send.
+  const callbacks = new Map();
+  const listeners = [];
+  const baseTransform = base.transformCallback;
+  base.transformCallback = (callback, once) => {
+    const id = baseTransform.call(base, callback, once);
+    callbacks.set(id, callback);
+    return id;
+  };
+  forms.emit = (event, payload = null) => {
+    for (const l of listeners) if (l.event === event) callbacks.get(l.handler)?.({ event, id: 1, payload });
+  };
+
   base.invoke = async (cmd, args = {}) => {
+    if (cmd === "plugin:event|listen") listeners.push({ event: args.event, handler: args.handler });
+    if (cmd === "quit_app") {
+      forms.quits += 1;
+      return null;
+    }
+    if (cmd === "stay_open") return null;
     if (cmd === "open_pdf" && SPECS[args.path]) return openForm(args.path);
     const mine = docs.has(args.doc);
     if (mine) {
@@ -175,6 +195,9 @@
           forms.saves += 1;
           forms.calls.push({ cmd, args });
           return { path: docs.get(args.doc).path, name: docs.get(args.doc).path.split("/").pop() };
+        case "save_pdf_as":
+          forms.calls.push({ cmd, args });
+          return { path: "/docs/copy.pdf", name: "copy.pdf" };
         case "form_info":
           return structuredClone(docs.get(args.doc).spec.info);
         case "get_form_fields":

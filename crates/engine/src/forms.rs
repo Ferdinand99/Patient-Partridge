@@ -7,10 +7,31 @@
 //! that right when the change is made the way a person makes it: focus the field, type, leave it.
 //! So that is what `set` does, with the focus, the typing and the click done by function calls.
 //!
-//! PDF JavaScript is off. The form environment is made without a JavaScript platform, so no action
-//! can run: not a format, not a calculation, not a button. This module never calls the functions
-//! that run the document actions, and it never clicks a push button. A field that has an action is
-//! marked, and the window tells the reader that the action does not run.
+//! # Actions
+//!
+//! PDF JavaScript is off: the form environment is made without a JavaScript platform, so no script
+//! runs. That is all that switch does. PDFium runs the other actions of a field itself when the
+//! field gets the focus, is pressed or is left, and two of them change the document: a reset of the
+//! form (`ResetForm`) clears fields, and a hide (`Hide`) writes the hidden flag into the widgets of
+//! other fields. The rest (a link, a jump, a launch, a submit, a named action) end in a callback
+//! that this module does not give, so they do nothing.
+//!
+//! So the module makes sure that no action that changes the document can fire:
+//!
+//! - When the environment is made, the document is written out once and searched for the names
+//!   `/ResetForm` and `/Hide` (the written file has every object in the open, also those the
+//!   original keeps in compressed streams). A document that has neither cannot reset or hide
+//!   anything, and nothing more is needed.
+//! - In a document that has one of them, a widget that has an action of its own (`/A` or `/AA`) is
+//!   not filled in: it is listed read only and marked, and a request for it is refused. A widget
+//!   that has none is safe, because the events of a widget are read from the widget's own
+//!   dictionary. (The actions of a field above a widget are for keystroke, format, validate and
+//!   calculate, which are scripts; the test fixture `par` holds a reset on the field above its
+//!   widget to show it.)
+//! - The widget that is named is the one that gets the focus and the key, never the widget found at
+//!   a point, so a button that lies over a field is never pressed.
+//! - No push button is listed, and nothing calls the functions that run the actions of a document
+//!   or of a page.
 //!
 //! Everything a field says about itself (name, tooltip, value, the labels of its choices) is
 //! untrusted. Strings are read with a limit and cut again by the protocol, and the number of fields
@@ -27,6 +48,7 @@
 //! The two environments do not interfere: pages are loaded again for every request, and everything
 //! PDFium keeps for a loaded page goes away with it.
 
+use std::cell::Cell;
 use std::os::raw::{c_int, c_ulong};
 use std::pin::Pin;
 use std::ptr;
@@ -34,7 +56,7 @@ use std::ptr;
 use partridge_protocol::{
     field_flag, ErrorCode, FormField, FormFieldKind, FormKind, FormOption, FormValue, ResponseBody,
     MAX_FORM_FIELDS_PER_PAGE, MAX_FORM_NAME, MAX_FORM_OPTIONS, MAX_FORM_OPTION_LABEL,
-    MAX_FORM_TOOLTIP, MAX_FORM_VALUE,
+    MAX_FORM_TOOLTIP, MAX_FORM_VALUE, MAX_SAVE_BYTES,
 };
 use pdfium_render::prelude::*;
 
@@ -69,6 +91,21 @@ const FF_COMBO_EDITABLE: i32 = 1 << 18;
 const FF_MULTISELECT: i32 = 1 << 21;
 const FF_COMB: i32 = 1 << 24;
 
+/// The names of the two actions that change a document when they fire.
+const STATE_ACTIONS: [&[u8]; 2] = [b"/ResetForm", b"/Hide"];
+
+/// Most bytes (UTF-16) of text that one listing of a page reads from PDFium. A hostile document can
+/// make a thousand fields share one list of choices; this keeps the work of a listing bounded.
+const MAX_LIST_READ_BYTES: usize = 4 * 1024 * 1024;
+
+/// Most pages looked at for the other widgets of a field, and most that are kept loaded.
+const MAX_SIBLING_SCAN: usize = 5_000;
+const MAX_SIBLING_PAGES: usize = 64;
+
+/// `/P` bits of the permissions: fill in form fields (9) and change annotations, which includes
+/// filling in forms in older files (6).
+const PERMIT_FILL: u32 = (1 << 8) | (1 << 5);
+
 /// The words of a script, wherever the file keeps them.
 const ACTION_WORDS: [&[u8]; 2] = [b"/JavaScript", b"/JS"];
 
@@ -91,6 +128,10 @@ pub struct FormEnv {
     handle: FPDF_FORMHANDLE,
     /// PDFium keeps the pointer to this until the environment is closed, so it must not move.
     _info: Pin<Box<FPDF_FORMFILLINFO>>,
+    /// The document holds a reset or a hide action somewhere (or could not be searched).
+    state_actions: bool,
+    /// The permissions of the document allow filling in forms.
+    may_fill: bool,
 }
 
 impl Drop for FormEnv {
@@ -124,6 +165,48 @@ pub fn document_handle(
     (count >= 0 && count as usize == document.pages().len() as usize).then_some(handle)
 }
 
+/// True when `bytes` holds the PDF name `name` (such as `/Hide`) as a whole name: the byte after it
+/// is white space or a delimiter, so `/HideToolbar` is not `/Hide`.
+fn has_name(bytes: &[u8], name: &[u8]) -> bool {
+    let regular = |b: u8| {
+        !matches!(
+            b,
+            0 | 9
+                | 10
+                | 12
+                | 13
+                | 32
+                | b'('
+                | b')'
+                | b'<'
+                | b'>'
+                | b'['
+                | b']'
+                | b'{'
+                | b'}'
+                | b'/'
+                | b'%'
+        )
+    };
+    let mut from = 0;
+    while let Some(at) = bytes[from..]
+        .windows(name.len())
+        .position(|window| window == name)
+    {
+        let end = from + at + name.len();
+        if bytes.get(end).is_none_or(|b| !regular(*b)) {
+            return true;
+        }
+        from = from + at + 1;
+    }
+    false
+}
+
+/// Whether a document written out holds an action that changes a document when it fires.
+fn holds_state_action(bytes: &[u8]) -> bool {
+    STATE_ACTIONS.iter().any(|name| has_name(bytes, name))
+}
+
 fn refused(message: &str) -> Failure {
     (ErrorCode::FormFieldRefused, message.to_string())
 }
@@ -138,13 +221,11 @@ pub fn info(
     document: &PdfDocument<'_>,
     source: Option<&std::sync::Mutex<SourceGuard>>,
     progress: &mut dyn FnMut(u32),
-) -> ResponseBody {
+) -> Result<ResponseBody, Failure> {
     let bindings = pdfium.bindings();
+    // A document whose handle cannot be found out is not a document without a form: say so.
     let Some(handle) = document_handle(bindings, document) else {
-        return ResponseBody::FormInfo {
-            kind: FormKind::None,
-            has_actions: false,
-        };
+        return Err(unsupported("the form of this document cannot be reached"));
     };
     let kind = form_kind(bindings, handle);
     // The words of a script, wherever the file keeps them. PDFium's own count is of the document
@@ -161,7 +242,7 @@ pub fn info(
                 None => false,
             }
     };
-    ResponseBody::FormInfo { kind, has_actions }
+    Ok(ResponseBody::FormInfo { kind, has_actions })
 }
 
 fn form_kind(bindings: &dyn PdfiumLibraryBindings, handle: FPDF_DOCUMENT) -> FormKind {
@@ -189,6 +270,15 @@ impl FormEnv {
             }
             FormKind::None => return Err(unsupported("this document has no form")),
         }
+        // Written out once, the document shows every action it holds, also those kept in compressed
+        // parts of the original. If it cannot be written, it is treated as holding one.
+        let state_actions =
+            match crate::save::serialise_up_to(document, MAX_SAVE_BYTES, &mut |_| {}) {
+                Ok(bytes) => holds_state_action(&bytes),
+                Err(_) => true,
+            };
+        // SAFETY: a read of the permissions.
+        let may_fill = unsafe { bindings.FPDF_GetDocPermissions(handle) } as u32 & PERMIT_FILL != 0;
         // SAFETY: every field of the structure is a number, a pointer or an optional function, and
         // zero is a valid value for all of them: no function is given, and the platform for
         // JavaScript (`m_pJsPlatform`) is null, which is what keeps PDF scripts from running.
@@ -206,6 +296,8 @@ impl FormEnv {
             document: handle,
             handle: form,
             _info: info,
+            state_actions,
+            may_fill,
         })
     }
 
@@ -220,7 +312,11 @@ impl FormEnv {
         }
         // SAFETY: the page was just loaded.
         unsafe { self.bindings.FORM_OnAfterLoadPage(page, self.handle) };
-        Ok(LoadedPage { env: self, page })
+        Ok(LoadedPage {
+            env: self,
+            page,
+            spent: Cell::new(0),
+        })
     }
 
     /// The fillable fields of a page.
@@ -234,7 +330,7 @@ impl FormEnv {
             }
             let at = ordinal;
             ordinal += 1;
-            if fields.len() >= MAX_FORM_FIELDS_PER_PAGE {
+            if fields.len() >= MAX_FORM_FIELDS_PER_PAGE || page.spent.get() > MAX_LIST_READ_BYTES {
                 break;
             }
             if let Some(field) = page.describe(at, &annot) {
@@ -275,9 +371,18 @@ impl FormEnv {
         if field.name != cut(name, MAX_FORM_NAME) {
             return Err(refused("the field on the page is not the one named"));
         }
+        if field.has(field_flag::ACTION_BLOCKED) {
+            return Err(refused(
+                "the field has an action that is not run, so it is left alone",
+            ));
+        }
         if field.has(field_flag::READ_ONLY) || field.has(field_flag::VALUE_CUT) {
             return Err(refused("the field is read only"));
         }
+        // The other widgets of the field, on other pages, are kept loaded until the field has been
+        // left: PDFium draws a new appearance for the widgets it has a page for, and a widget on a
+        // page that is not loaded would keep its old one.
+        let _siblings = self.siblings(&page, index, &annot, &field.name);
         let result = match (field.kind, value) {
             (FormFieldKind::Text, FormValue::Text(text)) => page.set_text(&annot, text),
             (FormFieldKind::Combo, FormValue::Text(text)) if field.has(field_flag::EDITABLE) => {
@@ -304,9 +409,57 @@ impl FormEnv {
     }
 }
 
+impl FormEnv {
+    /// The pages, other than `index`, that hold other widgets of the field of `annot`, loaded. Empty
+    /// for a field that has all its widgets on its own page (the usual case, also for radio
+    /// groups), so that nothing but the page itself is read then.
+    fn siblings(
+        &self,
+        page: &LoadedPage<'_>,
+        index: u32,
+        annot: &Annot<'_>,
+        name: &str,
+    ) -> Vec<LoadedPage<'_>> {
+        // SAFETY: a read.
+        let total = unsafe {
+            self.bindings
+                .FPDFAnnot_GetFormControlCount(self.handle, annot.handle)
+        }
+        .max(0) as usize;
+        let here = page.count_named(name);
+        if total <= here {
+            return Vec::new();
+        }
+        // SAFETY: a read.
+        let pages = unsafe { self.bindings.FPDF_GetPageCount(self.document) }.max(0) as usize;
+        let mut kept = Vec::new();
+        let mut found = here;
+        for other in 0..pages.min(MAX_SIBLING_SCAN) {
+            if other as u32 == index {
+                continue;
+            }
+            let Ok(loaded) = self.load(other as u32) else {
+                continue;
+            };
+            let count = loaded.count_named(name);
+            if count == 0 {
+                continue;
+            }
+            found += count;
+            kept.push(loaded);
+            if found >= total || kept.len() >= MAX_SIBLING_PAGES {
+                break;
+            }
+        }
+        kept
+    }
+}
+
 struct LoadedPage<'e> {
     env: &'e FormEnv,
     page: FPDF_PAGE,
+    /// Bytes of text read from PDFium for this page so far (see `MAX_LIST_READ_BYTES`).
+    spent: Cell<usize>,
 }
 
 impl Drop for LoadedPage<'_> {
@@ -374,20 +527,33 @@ impl<'e> LoadedPage<'e> {
         })
     }
 
+    /// A string from PDFium. `None` when it is longer than `MAX_READ_BYTES`, when this page has
+    /// used up its share of reading, or when it holds a zero character with more after it (what
+    /// follows would be lost).
     fn string(&self, read: impl Fn(*mut FPDF_WCHAR, c_ulong) -> c_ulong) -> Option<String> {
         let len = read(ptr::null_mut(), 0) as usize;
         if len <= 2 {
             return Some(String::new());
         }
-        if len > MAX_READ_BYTES {
+        if len > MAX_READ_BYTES || self.spent.get() > MAX_LIST_READ_BYTES {
             return None;
         }
+        self.spent.set(self.spent.get() + len);
         let mut buffer = vec![0u16; len.div_ceil(2)];
         let got = read(buffer.as_mut_ptr(), len as c_ulong) as usize;
         if got == 0 {
             return Some(String::new());
         }
-        let end = buffer.iter().position(|c| *c == 0).unwrap_or(buffer.len());
+        // The text ends at the zero that PDFium puts at the end; a zero before that is a character
+        // of the text.
+        let text_len = (got / 2).min(buffer.len());
+        let end = buffer[..text_len]
+            .iter()
+            .rposition(|c| *c != 0)
+            .map_or(0, |i| i + 1);
+        if buffer[..end].contains(&0) {
+            return None;
+        }
         Some(String::from_utf16_lossy(&buffer[..end]))
     }
 
@@ -464,6 +630,14 @@ impl<'e> LoadedPage<'e> {
         if unsafe { b.FPDFAnnot_HasKey(a, "AA") } != 0 || unsafe { b.FPDFAnnot_HasKey(a, "A") } != 0
         {
             flags |= field_flag::ACTION;
+            // In a document that holds a reset or a hide, a widget with an action of its own could
+            // fire it when it gets the focus, is pressed or is left: it is left alone.
+            if self.env.state_actions {
+                flags |= field_flag::ACTION_BLOCKED | field_flag::READ_ONLY;
+            }
+        }
+        if !self.env.may_fill {
+            flags |= field_flag::READ_ONLY;
         }
         let name = self
             .string(|buffer, len| unsafe { b.FPDFAnnot_GetFormFieldName(form, a, buffer, len) })
@@ -498,7 +672,7 @@ impl<'e> LoadedPage<'e> {
         if unsafe { b.FPDFAnnot_GetNumberValue(a, "MaxLen", &mut max) } != 0
             && max.is_finite()
             && max >= 1.0
-            && max < u32::MAX as f32
+            && max < i32::MAX as f32
         {
             field.max_len = max as u32;
         }
@@ -538,11 +712,13 @@ impl<'e> LoadedPage<'e> {
                     field.flags |= field_flag::READ_ONLY;
                 }
                 for i in 0..count.min(MAX_FORM_OPTIONS) {
-                    let label = self
-                        .string(|buffer, len| unsafe {
-                            b.FPDFAnnot_GetOptionLabel(form, a, i as c_int, buffer, len)
-                        })
-                        .unwrap_or_default();
+                    let Some(label) = self.string(|buffer, len| unsafe {
+                        b.FPDFAnnot_GetOptionLabel(form, a, i as c_int, buffer, len)
+                    }) else {
+                        // Choices that cannot be read in full cannot be changed safely.
+                        field.flags |= field_flag::READ_ONLY;
+                        break;
+                    };
                     field.options.push(FormOption {
                         selected: unsafe { b.FPDFAnnot_IsOptionSelected(form, a, i as c_int) } != 0,
                         label: cut(&label, MAX_FORM_OPTION_LABEL),
@@ -568,6 +744,27 @@ impl<'e> LoadedPage<'e> {
             }
             None => field.flags |= field_flag::VALUE_CUT,
         }
+    }
+
+    /// How many widgets of the page belong to the field with this full name.
+    fn count_named(&self, name: &str) -> usize {
+        let b = self.bindings();
+        let form = self.env.handle;
+        let mut count = 0;
+        for annot in self.annots() {
+            if !annot.is_widget() {
+                continue;
+            }
+            let full = self
+                .string(|buffer, len| unsafe {
+                    b.FPDFAnnot_GetFormFieldName(form, annot.handle, buffer, len)
+                })
+                .unwrap_or_default();
+            if cut(&full, MAX_FORM_NAME) == name {
+                count += 1;
+            }
+        }
+        count
     }
 
     fn focus(&self, annot: &Annot<'_>) -> Result<(), Failure> {
@@ -609,22 +806,12 @@ impl<'e> LoadedPage<'e> {
         if !on && field.has(field_flag::NO_TOGGLE_OFF) {
             return Err(refused("this button cannot be turned off"));
         }
-        // The click of a person: down and up in the middle of the widget.
-        let mut raw = FS_RECTF {
-            left: 0.0,
-            top: 0.0,
-            right: 0.0,
-            bottom: 0.0,
-        };
-        if unsafe { b.FPDFAnnot_GetRect(annot.handle, &mut raw) } == 0 {
-            return Err(refused("the field has no place on the page"));
-        }
-        let x = f64::from(raw.left + raw.right) / 2.0;
-        let y = f64::from(raw.top + raw.bottom) / 2.0;
+        // The space bar of a person, in the widget that has the focus. (A click would go to the
+        // widget found at a point, and that can be another one, such as a button over this one.)
+        self.focus(annot)?;
         // SAFETY: the page and the form are loaded.
         unsafe {
-            b.FORM_OnLButtonDown(self.env.handle, self.page, 0, x, y);
-            b.FORM_OnLButtonUp(self.env.handle, self.page, 0, x, y);
+            b.FORM_OnChar(self.env.handle, self.page, 32, 0);
         }
         if is_on(annot) != on {
             return Err(refused("the field did not change"));
@@ -673,4 +860,10 @@ impl<'e> LoadedPage<'e> {
         }
         Ok(())
     }
+}
+
+/// For the tests of the engine: whether a written document holds a reset or a hide.
+#[doc(hidden)]
+pub fn holds_state_action_for_tests(bytes: &[u8]) -> bool {
+    holds_state_action(bytes)
 }

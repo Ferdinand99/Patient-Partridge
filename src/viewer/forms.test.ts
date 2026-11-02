@@ -70,6 +70,7 @@ function field(over: Partial<FormFieldInfo> & Pick<FormFieldInfo, "index" | "nam
     noToggleOff: false,
     comb: false,
     action: false,
+    actionBlocked: false,
     turns: 0,
     rect: [150, 68, 400, 92],
     fontSize: 12,
@@ -107,6 +108,15 @@ function fake(pages: FormFieldInfo[][], info: FormInfo = { kind: "acro", actions
             for (const f of list) if (f.kind === "radio" && f.name === name) f.checked = false;
           }
           target.checked = value.on;
+        }
+        // The widgets of the same field on other pages show the same value.
+        for (const other of state) {
+          if (other === list) continue;
+          for (const f of other) {
+            if (f.name !== name || f.kind !== target.kind) continue;
+            f.value = target.value;
+            f.options.forEach((o, i) => (o.selected = target.options[i]?.selected ?? false));
+          }
         }
         return Promise.resolve(structuredClone(list));
       },
@@ -521,6 +531,32 @@ describe("filling in", () => {
     await flush();
     expect(r.api.setFormField.mock.calls.map((c) => c[3])).toEqual(["a", "b"]);
     expect(r.edits).toHaveLength(2);
+  });
+});
+
+describe("a field with widgets on more than one page", () => {
+  it("shows a text that is set in the widget of another page too, and has that page drawn again", async () => {
+    const r = await rig([[field({ index: 0, name: "applicant" })], [field({ index: 0, name: "applicant" })]]);
+    const input = r.control(0) as HTMLInputElement;
+    input.value = "Ada";
+    change(input);
+    await flush();
+    const second = r.host.querySelectorAll(".form-layer")[1].querySelector("input") as HTMLInputElement;
+    expect(second.value).toBe("Ada");
+    expect(r.redraws).toEqual([0, 1]);
+  });
+
+  it("does the same for a drop-down list", async () => {
+    const list = (selected: boolean) =>
+      field({ index: 0, name: "country", kind: "combo", options: [opt("Norway", selected), opt("Sweden")] });
+    const r = await rig([[list(true)], [list(true)]]);
+    const select = r.control(0) as HTMLSelectElement;
+    select.value = "1";
+    change(select);
+    await flush();
+    const second = r.host.querySelectorAll(".form-layer")[1].querySelector("select") as HTMLSelectElement;
+    expect(second.value).toBe("1");
+    expect(r.redraws).toEqual([0, 1]);
   });
 });
 

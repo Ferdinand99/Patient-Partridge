@@ -73,7 +73,7 @@ export interface ViewerOptions {
    * Lets the reader fill in the form of the document, if it has one. `record` is given every change,
    * for undo and redo and for the mark that the document has changes that are not saved.
    */
-  forms?: { api: FormsApi; record(edit: FormEdit): void };
+  forms?: { api: FormsApi; record(edit: FormEdit): void; pending?(pending: boolean): void };
 }
 
 export interface DocumentInfo {
@@ -171,6 +171,7 @@ export class DocumentView {
       ? new FormLayer(info.doc, info.pages, options.forms.api, this.element, {
           onEdit: (edit) => options.forms?.record(edit),
           onRedraw: (page) => this.redrawPage(page),
+          onPending: (pending) => options.forms?.pending?.(pending),
         })
       : null;
     this.forms?.start();
@@ -581,6 +582,19 @@ export class DocumentView {
     this.overlays.unmount(index);
     m.el.remove();
     this.mounted.delete(index);
+  }
+
+  /**
+   * Sends what was typed in a field of the form that was not left, and waits until every change of
+   * the form is made. Call it before anything that looks at the document.
+   */
+  flushForms(): Promise<void> {
+    return this.forms?.flush() ?? Promise.resolve();
+  }
+
+  /** True while a field of the form holds text that is not in the document yet. */
+  get hasPendingFormInput(): boolean {
+    return this.forms?.hasPendingInput ?? false;
   }
 
   /**

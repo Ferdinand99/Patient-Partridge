@@ -47,6 +47,8 @@ export interface FormFieldInfo {
   noToggleOff: boolean;
   comb: boolean;
   action: boolean;
+  /** The field has an action that could change the form: it is left alone (and read only). */
+  actionBlocked: boolean;
   /** Quarter turns clockwise. */
   turns: number;
   /** Left, top, right and bottom in points from the top left of the page as it is drawn. */
@@ -89,6 +91,11 @@ export interface FormsEvents {
   onEdit(edit: FormEdit): void;
   /** The picture of this page is out of date: draw it again. */
   onRedraw(page: number): void;
+  /**
+   * Whether the layer holds input that is not in the document yet: text typed and not sent, or a
+   * change on its way. Told each time the answer changes.
+   */
+  onPending?(pending: boolean): void;
 }
 
 /** What the form bar says about a form that cannot be filled in. */
@@ -99,11 +106,21 @@ export const XFA_NOTICE =
 export const ACTIONS_NOTICE =
   "This form has scripts or actions that Patient Partridge does not run. Fields that add up, check or format values will not update.";
 
+/** What the form bar says about fields that are left alone for the action they carry. */
+export const BLOCKED_NOTICE =
+  "Some fields have an action that could change the form (reset or hide fields), and Patient Partridge does not run actions. Those fields are left as they are and cannot be filled in here.";
+
+/** What the form bar says when the form of a document cannot be read. */
+export const UNREADABLE_NOTICE = "The form of this document could not be read, so it cannot be filled in here.";
+
 const CANNOT_CLEAR = "A drop-down list cannot be cleared once a choice is made. Pick another choice.";
 const CANNOT_UNCHECK = "A radio button cannot be turned off once it is on. Pick another one.";
 const CANNOT_CHANGE = "That field could not be changed.";
 const CANNOT_UNDO_RADIO = "A radio button cannot be turned off, so this choice cannot be taken back. Pick another one.";
 const CANNOT_UNDO_LIST = "A drop-down list cannot be cleared, so this choice cannot be taken back. Pick another one.";
+
+/** The longest `maxLength` a box takes: more makes the browser refuse it. */
+const MAX_LENGTH = 0x7fffffff;
 
 /** How long a short message stays in the bar, in milliseconds. */
 const MESSAGE_MS = 6000;
@@ -113,6 +130,8 @@ const PENDING_MS = 4000;
 
 interface FieldView {
   field: FormFieldInfo;
+  /** The page the field is on. */
+  page: number;
   el: HTMLElement;
   /** A part that sits next to the control: the suggestions of a drop-down list with a box. */
   extra?: HTMLElement;
@@ -199,6 +218,11 @@ export class FormLayer {
   private readonly messages: { text: string; timer?: ReturnType<typeof setTimeout> }[] = [];
   private readonly observer: ResizeObserver | null;
   private groupCounter = 0;
+  /** Boxes with text that was typed and not sent. */
+  private readonly typed = new Set<FieldView>();
+  /** Changes that are sent or waiting to be sent. */
+  private inFlight = 0;
+  private pendingTold = false;
 
   constructor(
     private readonly doc: number,
@@ -236,12 +260,40 @@ export class FormLayer {
           }
         }
       })
-      .catch(() => undefined);
+      .catch(() => {
+        // A form that cannot be read is not a document without a form.
+        if (!this.destroyed) this.say("unreadable", UNREADABLE_NOTICE);
+      });
   }
 
   /** True when the document has a form the reader can fill in. */
   get fillable(): boolean {
     return this.enabled;
+  }
+
+  /** True while text that was typed is not in the document yet, or a change is on its way. */
+  get hasPendingInput(): boolean {
+    return this.inFlight > 0 || this.typed.size > 0;
+  }
+
+  /**
+   * Sends the text that was typed in a box (the one that has the focus, if the reader did not leave
+   * it) and waits until every change has been made. Call it before anything that looks at the
+   * document: a save, a close, a quit, an update, a print.
+   */
+  async flush(): Promise<void> {
+    for (const view of [...this.typed]) this.commitText(view.page, view);
+    // A change that is on its way may be followed by another that was queued behind it.
+    do {
+      await this.chain;
+    } while (this.inFlight > 0);
+  }
+
+  private updatePending(): void {
+    const now = this.hasPendingInput;
+    if (now === this.pendingTold) return;
+    this.pendingTold = now;
+    this.events.onPending?.(now);
   }
 
   // ---- the pages -------------------------------------------------------------------------------
@@ -271,6 +323,11 @@ export class FormLayer {
   unmount(page: number): void {
     const state = this.pages.get(page);
     if (!state) return;
+    // What was typed in a box of this page is sent before the box goes: a page that scrolls out of
+    // the range of the mounted pages must not take a value with it.
+    for (const view of [...state.views.values()]) {
+      if (this.typed.has(view)) this.commitText(page, view);
+    }
     this.observer?.unobserve(state.layer);
     for (const view of state.views.values()) clearTimeout(view.pendingTimer);
     state.layer.remove();
@@ -315,6 +372,7 @@ export class FormLayer {
         state.list = list;
         this.render(page, state);
         if (list.some((f) => f.action)) this.say("actions", ACTIONS_NOTICE);
+        if (list.some((f) => f.actionBlocked)) this.say("blocked", BLOCKED_NOTICE);
       })
       .catch(() => {
         if (this.pages.get(page) === state) {
@@ -397,7 +455,10 @@ export class FormLayer {
       this.updateRadioStops(state);
       return;
     }
-    for (const view of state.views.values()) clearTimeout(view.pendingTimer);
+    for (const view of state.views.values()) {
+      clearTimeout(view.pendingTimer);
+      this.typed.delete(view);
+    }
     state.layer.replaceChildren();
     state.views.clear();
     const groups = new Map<string, HTMLElement>();
@@ -495,10 +556,13 @@ export class FormLayer {
     if (field.valueCut) {
       el.title = `${field.tooltip ? `${field.tooltip} - ` : ""}The value of this field is too long to change here.`;
     }
+    if (field.actionBlocked) {
+      el.title = `${field.tooltip ? `${field.tooltip} - ` : ""}This field has an action that is not run, so it is left as it is.`;
+    }
     if (field.required) el.setAttribute("aria-required", "true");
     if (field.readOnly || field.valueCut) el.setAttribute("aria-readonly", "true");
     this.place(el, field, state.size);
-    const view: FieldView = { field, el, lastSent: null, editing: false };
+    const view: FieldView = { field, page, el, lastSent: null, editing: false };
     if (field.kind === "combo" && field.editable) view.extra = this.buildSuggestions(el, field);
     this.attach(page, state, view);
     this.sync(view, field);
@@ -511,7 +575,7 @@ export class FormLayer {
       const area = document.createElement("textarea");
       area.readOnly = locked;
       area.spellcheck = false;
-      if (field.maxLen > 0) area.maxLength = field.maxLen;
+      if (field.maxLen > 0) area.maxLength = Math.min(field.maxLen, MAX_LENGTH);
       return area;
     }
     const input = document.createElement("input");
@@ -519,7 +583,7 @@ export class FormLayer {
     input.readOnly = locked;
     input.spellcheck = false;
     input.autocomplete = "off";
-    if (field.maxLen > 0) input.maxLength = field.maxLen;
+    if (field.maxLen > 0) input.maxLength = Math.min(field.maxLen, MAX_LENGTH);
     return input;
   }
 
@@ -529,7 +593,7 @@ export class FormLayer {
     input.readOnly = field.readOnly || field.valueCut;
     input.spellcheck = false;
     input.autocomplete = "off";
-    if (field.maxLen > 0) input.maxLength = field.maxLen;
+    if (field.maxLen > 0) input.maxLength = Math.min(field.maxLen, MAX_LENGTH);
     return input;
   }
 
@@ -671,10 +735,18 @@ export class FormLayer {
       el.addEventListener("blur", () => {
         view.editing = false;
         // What the engine has is shown again, whatever was typed and not sent.
-        if (view.lastSent === null) el.value = view.field.value;
+        if (view.lastSent === null) {
+          el.value = view.field.value;
+          this.typed.delete(view);
+          this.updatePending();
+        }
       });
       el.addEventListener("input", () => {
         view.lastSent = null;
+        const text = el.value.replace(/\r\n?/g, "\n");
+        if (text !== view.field.value && !view.field.readOnly && !view.field.valueCut) this.typed.add(view);
+        else this.typed.delete(view);
+        this.updatePending();
       });
       el.addEventListener("change", () => this.commitText(page, view));
       el.addEventListener("keydown", (event) => {
@@ -682,6 +754,8 @@ export class FormLayer {
         if (e.key === "Escape") {
           el.value = view.field.value;
           view.lastSent = null;
+          this.typed.delete(view);
+          this.updatePending();
         } else if (e.key === "Enter" && el instanceof HTMLInputElement) {
           // Enter ends the entry and keeps the focus where it is.
           e.preventDefault();
@@ -710,12 +784,17 @@ export class FormLayer {
 
   private commitText(page: number, view: FieldView): void {
     const el = view.el as HTMLInputElement | HTMLTextAreaElement;
+    this.typed.delete(view);
     if (view.field.readOnly || view.field.valueCut) {
       el.value = view.field.value;
+      this.updatePending();
       return;
     }
     const text = el.value.replace(/\r\n?/g, "\n");
-    if (text === view.field.value || text === view.lastSent) return;
+    if (text === view.field.value || text === view.lastSent) {
+      this.updatePending();
+      return;
+    }
     view.lastSent = text;
     void this.commit(page, view, { kind: "text", text });
   }
@@ -725,6 +804,8 @@ export class FormLayer {
     const before = view.field;
     const state = this.pages.get(page);
     const previous = state?.list ?? [];
+    this.inFlight += 1;
+    this.updatePending();
     return this.enqueue(async () => {
       view.el.classList.add("form-pending");
       clearTimeout(view.pendingTimer);
@@ -746,6 +827,9 @@ export class FormLayer {
         view.el.classList.remove("form-pending");
         await this.resync(page);
         this.tell(this.explain(before, error));
+      } finally {
+        this.inFlight -= 1;
+        this.updatePending();
       }
     });
   }
@@ -772,17 +856,20 @@ export class FormLayer {
     const state = this.pages.get(page);
     if (!state) return;
     try {
-      this.accept(page, await this.api.getFormFields(this.doc, page));
+      this.accept(page, await this.api.getFormFields(this.doc, page), true);
     } catch {
       // The page keeps what it shows.
     }
   }
 
-  /** A radio button can turn off a button on another page: those pages are asked again. */
+  /**
+   * A field can have widgets on more than one page (a radio button turns off the others of its
+   * group, and a text that is set shows in every widget of the field): the other pages that show
+   * the field are asked again and drawn again.
+   */
   private async refreshGroup(page: number, field: FormFieldInfo): Promise<void> {
-    if (field.kind !== "radio") return;
     for (const [other, state] of this.pages) {
-      if (other === page || !state.list?.some((f) => f.kind === "radio" && f.name === field.name)) continue;
+      if (other === page || !state.list?.some((f) => f.name === field.name && f.kind === field.kind)) continue;
       await this.resync(other);
       this.events.onRedraw(other);
     }

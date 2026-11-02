@@ -14,9 +14,12 @@ type Stand = {
   forms: {
     calls: { cmd: string; args: Record<string, unknown> }[];
     saves: number;
+    quits: number;
     failNext: unknown;
     delay: number;
+    emit(event: string): void;
   };
+  update: { found: unknown; installDelay: number };
 };
 
 test.beforeEach(async ({ page }) => {
@@ -331,4 +334,107 @@ test("takes screenshots of a form in light and dark (nothing is checked about th
     await page.emulateMedia({ colorScheme: scheme });
     await page.screenshot({ path: `e2e/artifacts/forms-${scheme}.png` });
   }
+});
+
+// ---- text that is typed and not left -------------------------------------------------------------
+
+const stand = (page: Page) => page.evaluate(() => (window as unknown as { __E2E__: Stand }).__E2E__.forms);
+const sequence = (page: Page) =>
+  page.evaluate(() =>
+    (window as unknown as { __E2E__: Stand }).__E2E__.forms.calls
+      .map((c) => c.cmd)
+      .filter((c) => c === "set_form_field" || c === "save_pdf" || c === "save_pdf_as"),
+  );
+
+/** Types in the field `Full name` and does not leave it: the text is in the box, not in the document. */
+async function typeWithoutLeaving(page: Page) {
+  await fullname(page).click();
+  await page.keyboard.type("Ada");
+  expect(await sets(page)).toHaveLength(0);
+  // The tab already counts as changed.
+  await expect(page.locator(".tab-dirty")).toHaveCount(1);
+}
+
+test("Ctrl+S saves what is typed in the field that still has the focus", async ({ page }) => {
+  await openForm(page);
+  await typeWithoutLeaving(page);
+  await page.keyboard.press("Control+s");
+  await expect.poll(async () => (await stand(page)).saves).toBe(1);
+  // The value went to the document first, and then the document was saved.
+  expect(await sequence(page)).toEqual(["set_form_field", "save_pdf"]);
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __E2E__: Stand }).__E2E__.title)).toBe("form.pdf - Patient Partridge");
+  await expect(fullname(page)).toHaveValue("Ada");
+});
+
+test("Ctrl+Shift+S saves a copy with what is typed in the field that still has the focus", async ({ page }) => {
+  await openForm(page);
+  await typeWithoutLeaving(page);
+  await page.keyboard.press("Control+Shift+S");
+  await expect.poll(async () => (await sequence(page)).length).toBe(2);
+  expect(await sequence(page)).toEqual(["set_form_field", "save_pdf_as"]);
+});
+
+test("closing a tab with text typed in a field asks whether to save, and does not close it silently", async ({ page }) => {
+  await openForm(page);
+  await typeWithoutLeaving(page);
+  await page.keyboard.press("Control+w");
+  await expect(page.getByRole("alertdialog")).toContainText('Save changes to "form.pdf"?');
+  // The value was sent before the question.
+  expect(await sets(page)).toHaveLength(1);
+  await page.getByRole("button", { name: "Cancel" }).click();
+  await expect(page.locator(".tab-title")).toHaveText(["form.pdf"]);
+  await page.keyboard.press("Control+w");
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect.poll(async () => (await stand(page)).saves).toBe(1);
+  await expect(page.locator(".tab-title")).toHaveCount(0);
+});
+
+test("quitting with text typed in a field asks whether to save", async ({ page }) => {
+  await openForm(page);
+  await typeWithoutLeaving(page);
+  await page.evaluate(() => (window as unknown as { __E2E__: Stand }).__E2E__.forms.emit("quit-requested"));
+  await expect(page.getByRole("alertdialog")).toContainText('Save changes to "form.pdf"?');
+  expect(await sets(page)).toHaveLength(1);
+  expect((await stand(page)).quits).toBe(0);
+  await page.getByRole("button", { name: "Save and quit" }).click();
+  await expect.poll(async () => (await stand(page)).quits).toBe(1);
+  expect((await stand(page)).saves).toBe(1);
+});
+
+test("an update waits for text that is typed in a field, and saves it first", async ({ page }) => {
+  await openForm(page);
+  await typeWithoutLeaving(page);
+  await page.evaluate(() => {
+    const e2e = (window as unknown as { __E2E__: Stand & { update: Record<string, unknown> } }).__E2E__;
+    e2e.update.found = {
+      version: "0.2.0",
+      currentVersion: "0.1.0",
+      notes: "Notes",
+      method: "automatic",
+    };
+  });
+  await page.locator("#menu-button").click();
+  await page.getByRole("menuitem", { name: "Check for Updates…" }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Download and Install" }).click();
+  // The update is downloaded; installing would close the document and lose the typed text.
+  await expect(page.getByRole("alertdialog")).toContainText("Save your changes first");
+  await expect(page.getByRole("alertdialog")).toContainText("1 document has changes that are not saved");
+  expect((await stand(page)).saves).toBe(0);
+  await page.getByRole("button", { name: "Save and install" }).click();
+  await expect.poll(async () => (await stand(page)).saves).toBe(1);
+  expect(await sequence(page)).toEqual(["set_form_field", "save_pdf"]);
+  await expect.poll(() =>
+    page.evaluate(() =>
+      (window as unknown as { __E2E__: Stand }).__E2E__.calls.some((c) => c.cmd === "install_update"),
+    ),
+  ).toBe(true);
+});
+
+test("a tab that goes behind another one sends what is typed in it", async ({ page }) => {
+  await openForm(page);
+  await typeWithoutLeaving(page);
+  await page.evaluate(() => ((window as unknown as { __E2E__: Stand }).__E2E__.dialog = ["/docs/second.pdf"]));
+  await page.keyboard.press("Control+o");
+  await expect(page.locator('.tab-title[aria-selected="true"]')).toHaveText("second.pdf");
+  await expect.poll(async () => (await sets(page)).length).toBe(1);
 });

@@ -320,7 +320,21 @@ export class App {
 
   /** How many documents have changes that are not saved. */
   get unsavedCount(): number {
-    return this.tabs.filter((t) => t.history.dirty).length;
+    return this.tabs.filter((t) => this.tabDirty(t)).length;
+  }
+
+  /**
+   * Whether a tab has changes that are not saved: edits that are not saved, or text typed in a
+   * field of a form that has not been sent yet (it will be, before anything looks at the document,
+   * but the tab counts as changed from the first key).
+   */
+  private tabDirty(tab: Tab): boolean {
+    return tab.history.dirty || tab.view.hasPendingFormInput;
+  }
+
+  /** Sends what was typed in the forms of every tab, and waits for the changes to be made. */
+  private async flushForms(tabs: Tab[] = this.tabs): Promise<void> {
+    await Promise.all(tabs.map((t) => t.view.flushForms().catch(() => undefined)));
   }
 
   /**
@@ -743,7 +757,11 @@ export class App {
       setFormField: (doc, page, index, name, value) =>
         (api.setFormField as NonNullable<typeof api.setFormField>)(doc, page, index, name, value),
     };
-    return { api: forms, record: (edit) => this.recordFormEdit(tab, edit, 0) };
+    return {
+      api: forms,
+      record: (edit) => this.recordFormEdit(tab, edit, 0),
+      pending: () => this.historyChanged(tab),
+    };
   }
 
   /**
@@ -754,7 +772,8 @@ export class App {
     try {
       tab.history.push(edit);
     } catch {
-      if (attempt < 100 && this.tabs.includes(tab)) {
+      // The change is made, so it is recorded however long the undo or redo takes.
+      if (this.tabs.includes(tab)) {
         setTimeout(() => this.recordFormEdit(tab, edit, attempt + 1), 20);
       }
     }
@@ -828,6 +847,9 @@ export class App {
   async requestClose(id: number): Promise<boolean> {
     const tab = this.tabs.find((t) => t.id === id);
     if (!tab) return true;
+    // What was typed and not left yet is part of the document before the question is asked.
+    if (tab.view.hasPendingFormInput) await this.flushForms([tab]);
+    if (!this.tabs.includes(tab)) return true;
     if (!tab.history.dirty) {
       this.closeTab(id);
       return true;
@@ -975,7 +997,7 @@ export class App {
   /** The history of a tab changed: tell the app process if the document turned dirty or clean. */
   private historyChanged(tab: Tab): void {
     if (!this.tabs.includes(tab)) return;
-    const dirty = tab.history.dirty;
+    const dirty = this.tabDirty(tab);
     if (dirty !== tab.dirtyTold) {
       tab.dirtyTold = dirty;
       // If the app process does not get to know, the next change tries again.
@@ -990,7 +1012,9 @@ export class App {
   /** Saves the document that is shown, if it has changes. Resolves with true when nothing is left unsaved. */
   async saveActive(): Promise<boolean> {
     const tab = this.active;
-    if (!tab || !tab.history.dirty) return true;
+    if (!tab) return true;
+    if (tab.view.hasPendingFormInput) await this.flushForms([tab]);
+    if (!this.tabs.includes(tab) || !tab.history.dirty) return true;
     return this.saveTab(tab, false);
   }
 
@@ -998,11 +1022,13 @@ export class App {
   async saveActiveAs(): Promise<boolean> {
     const tab = this.active;
     if (!tab || tab.view.pageCount === 0) return false;
+    if (tab.view.hasPendingFormInput) await this.flushForms([tab]);
     return this.saveTab(tab, true);
   }
 
   /** Saves every document that has changes. Resolves with true when all were saved. */
   async saveAllChanges(halt?: AbortSignal): Promise<boolean> {
+    if (this.tabs.some((t) => t.view.hasPendingFormInput)) await this.flushForms();
     for (const tab of this.tabs.filter((t) => t.history.dirty)) {
       // The user stopped waiting: what is running finishes, but no other document is begun.
       if (halt?.aborted) return false;
@@ -1181,6 +1207,7 @@ export class App {
     this.quitting = true;
     this.quitReveal = () => this.focusTopNotice();
     try {
+      if (this.tabs.some((t) => t.view.hasPendingFormInput)) await this.flushForms();
       const dirty = this.tabs.filter((t) => t.history.dirty);
       if (dirty.length === 0) {
         await this.deps.api.quitApp();
@@ -1396,7 +1423,7 @@ export class App {
   /** Draws the tab strip: one tab for each document, with a dot on those with unsaved changes. */
   private drawTabs(): void {
     this.tabStrip.render(
-      this.tabs.map((t) => ({ id: t.id, title: t.name, path: t.path, dirty: t.history.dirty })),
+      this.tabs.map((t) => ({ id: t.id, title: t.name, path: t.path, dirty: this.tabDirty(t) })),
       this.activeId,
     );
   }
@@ -1407,7 +1434,7 @@ export class App {
       this.deps.setWindowTitle(APP_NAME);
       return;
     }
-    this.deps.setWindowTitle(`${active.history.dirty ? "\u2022 " : ""}${active.name} - ${APP_NAME}`);
+    this.deps.setWindowTitle(`${this.tabDirty(active) ? "\u2022 " : ""}${active.name} - ${APP_NAME}`);
   }
 
   private setControlsEnabled(on: boolean): void {
@@ -1544,8 +1571,9 @@ export class App {
       e.preventDefault();
       void this.saveActiveAs();
     } else if (action.type === "undo" || action.type === "redo") {
-      // In a text box, undo and redo belong to the box.
-      if (typing) return;
+      // In a text box, undo and redo belong to the box. A drop-down list has no undo of its own,
+      // and the focus stays in it after a choice.
+      if (typing && !(target instanceof HTMLSelectElement)) return;
       e.preventDefault();
       void (action.type === "undo" ? this.undoActive() : this.redoActive());
     } else if (action.type === "next-tab" || action.type === "previous-tab") {
@@ -1563,6 +1591,8 @@ export class App {
     const tab = this.active;
     if (!tab || this.printing || tab.view.pageCount === 0) return;
     this.printing = true;
+    // The pages are drawn from the document, so what was typed must be in it.
+    if (tab.view.hasPendingFormInput) await this.flushForms([tab]);
     try {
       const choice = await showPrintDialog(this.noticeLayer, {
         name: tab.name,

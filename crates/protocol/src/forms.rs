@@ -139,6 +139,9 @@ pub mod field_flag {
     /// The field has an action of its own (a script, a format, a button action). The reader never
     /// runs it.
     pub const ACTION: u16 = 1024;
+    /// The field has an action of its own that could change the document (a reset or a hide are in
+    /// the document), so it is left alone: it is also marked read only.
+    pub const ACTION_BLOCKED: u16 = 2048;
     /// All the bits that mean something.
     pub const ALL: u16 = READ_ONLY
         | REQUIRED
@@ -150,7 +153,8 @@ pub mod field_flag {
         | VALUE_CUT
         | NO_TOGGLE_OFF
         | COMB
-        | ACTION;
+        | ACTION
+        | ACTION_BLOCKED;
 }
 
 /// One choice of a combo box or a list box.

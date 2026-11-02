@@ -207,6 +207,11 @@ impl State {
 
         let form = match self.ask(RequestBody::FormInfo { doc }) {
             ResponseBody::FormInfo { kind, .. } => kind,
+            // A form whose handle cannot be reached is told, not taken for a document without a form.
+            ResponseBody::Error {
+                code: ErrorCode::FormUnsupported,
+                ..
+            } => FormKind::None,
             other => panic!("unexpected answer to FormInfo: {other:?}"),
         };
         let mut wanted: Vec<u32> = (0..count.min(PAGES_PER_FILE)).collect();

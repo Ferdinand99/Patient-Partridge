@@ -200,7 +200,7 @@ fn the_decoder_refuses_a_field_that_is_over_a_cap_or_has_a_value_it_does_not_kno
     // A kind, flag bits and a turn that do not exist.
     assert!(Response::decode(raw_field(0, 0, 0, 3, 3, 0)).is_err());
     assert!(Response::decode(raw_field(6, 0, 0, 3, 3, 0)).is_err());
-    assert!(Response::decode(raw_field(1, 1 << 11, 0, 3, 3, 0)).is_err());
+    assert!(Response::decode(raw_field(1, 1 << 12, 0, 3, 3, 0)).is_err());
     assert!(Response::decode(raw_field(1, 0x8000, 0, 3, 3, 0)).is_err());
     assert!(Response::decode(raw_field(1, 0, 4, 3, 3, 0)).is_err());
     assert!(Response::decode(raw_field(1, field_flag::ALL, 3, 3, 3, 0)).is_ok());

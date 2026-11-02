@@ -398,12 +398,7 @@ impl Engine {
             }
             RequestBody::FormInfo { doc } => {
                 let document = self.document(doc)?;
-                Ok(forms::info(
-                    pdfium,
-                    document,
-                    self.source.as_deref(),
-                    progress,
-                ))
+                forms::info(pdfium, document, self.source.as_deref(), progress)
             }
             RequestBody::ListFormFields { doc, page } => self.with_form(pdfium, doc, |env| {
                 Ok(ResponseBody::FormFields {

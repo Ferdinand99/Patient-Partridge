@@ -116,3 +116,33 @@ for box in "fullname 150 68 250 24" "notes 150 108 300 84" "agree 150 248 16 16"
   fi
 done
 echo "ok: poppler draws what was filled in"
+
+# ---- a field with widgets on two pages ----------------------------------------------------------
+# The field `applicant` and the drop-down list `country` of the test form have a widget on page 1
+# and another on page 3. Both widgets must carry the new appearance: a reader draws the stream of
+# the widget, not the value of the field.
+if [ ! -f multipage-filled.pdf ]; then
+  fail "the test did not write multipage-filled.pdf"
+fi
+qpdf --check multipage-filled.pdf >multipage.check 2>&1 || { cat multipage.check >&2; fail "qpdf --check multipage-filled.pdf"; }
+if grep -qi "warning" multipage.check; then cat multipage.check >&2; fail "qpdf warns about multipage-filled.pdf"; fi
+check_values multipage-filled.pdf multipage-expected.txt
+qpdf --qdf --object-streams=disable multipage-filled.pdf multipage-filled.qdf
+for text in "Ada Lovelace" "Sweden"; do
+  found=$(grep -aFc -- "($text" multipage-filled.qdf || true)
+  [ "$found" -ge 2 ] || fail "only $found appearance streams show '$text' (a widget on each of two pages should)"
+done
+page_box() { # file page -> the file that holds the box of the field `applicant` on that page
+  local out="mp-${1%.pdf}-$2"
+  pdftoppm -r 72 -f "$2" -l "$2" -x 100 -y 72 -W 200 -H 20 -singlefile "$1" "$out"
+  [ -s "$out.ppm" ] || fail "poppler drew nothing for page $2 of $1"
+  echo "$out.ppm"
+}
+for page in 1 3; do
+  empty=$(page_box multipage-empty.pdf "$page")
+  filled=$(page_box multipage-filled.pdf "$page")
+  if cmp -s "$empty" "$filled"; then
+    fail "poppler draws the field on page $page the same as in the empty form"
+  fi
+done
+echo "ok: both widgets of a field on two pages carry the new appearance"
