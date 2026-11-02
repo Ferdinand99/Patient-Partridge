@@ -553,13 +553,7 @@ fn japanese_fonts_pdf(fonts: usize, distinct_names: bool) -> Vec<u8> {
         } else {
             "SimSun".to_string()
         };
-        let (font, descendant, _) = cid_font(
-            &name,
-            "90ms-RKSJ-H",
-            "Japan1",
-            2,
-            "",
-        );
+        let (font, descendant, _) = cid_font(&name, "90ms-RKSJ-H", "Japan1", 2, "");
         // The font object is object 5 + 2i and its descendant 6 + 2i.
         objects.push(
             font.replace("[6 0 R]", &format!("[{} 0 R]", 6 + 2 * i))

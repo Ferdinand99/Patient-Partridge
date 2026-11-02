@@ -287,7 +287,10 @@ fn a_page_with_40_font_objects_of_one_name_is_drawn_and_nothing_is_refused() {
     // 40 lines of text 4 points high, one under the other, from the top.
     let ink = ink_anywhere(&bitmap);
     println!("40 font objects of one name: {ink} marked pixels");
-    assert!(ink > 500, "{ink} marked pixels: the lines are not all drawn");
+    assert!(
+        ink > 500,
+        "{ink} marked pixels: the lines are not all drawn"
+    );
     assert!(
         client.font_report(doc.doc).unwrap().is_empty(),
         "a font was refused"

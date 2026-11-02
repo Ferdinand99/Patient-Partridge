@@ -617,14 +617,19 @@ mod tests {
         set.set_budget(size * 3);
         // A document merged from ten parts: ten font objects that ask alike make one copy.
         for i in 0..10 {
-            assert!(set.serve(b"SimSun", 400, false, CHARSET_SHIFTJIS).is_some(), "{i}");
+            assert!(
+                set.serve(b"SimSun", 400, false, CHARSET_SHIFTJIS).is_some(),
+                "{i}"
+            );
         }
         // Three copies in all fit: this name, the same name in bold, and one more name.
         assert!(set.serve(b"SimSun", 700, false, CHARSET_SHIFTJIS).is_some());
         assert!(set.serve(b"SimHei", 400, false, CHARSET_SHIFTJIS).is_some());
         assert_eq!(set.missed.load(Ordering::Relaxed), 0);
         // A fourth copy does not, and the script is reported; the ones charged still work.
-        assert!(set.serve(b"FangSong", 400, false, CHARSET_SHIFTJIS).is_none());
+        assert!(set
+            .serve(b"FangSong", 400, false, CHARSET_SHIFTJIS)
+            .is_none());
         assert_eq!(
             scripts_of_bits(set.missed.load(Ordering::Relaxed)),
             vec![FontScript::Japanese]
@@ -653,7 +658,9 @@ mod tests {
         set.add_system(FontScript::Japanese, temp_file("j", &small_font(2)));
         let long = vec![b'a'; MAX_FACE_NAME + 1];
         assert!(set.serve(&long, 400, false, CHARSET_SHIFTJIS).is_none());
-        assert!(set.serve(&long[1..], 400, false, CHARSET_SHIFTJIS).is_some());
+        assert!(set
+            .serve(&long[1..], 400, false, CHARSET_SHIFTJIS)
+            .is_some());
     }
 
     #[test]
