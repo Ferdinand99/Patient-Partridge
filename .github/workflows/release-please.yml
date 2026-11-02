@@ -267,7 +267,11 @@ jobs:
           releaseId: ${{ needs.release-please.outputs.release_id }}
           tagName: ${{ needs.release-please.outputs.tag_name }}
           uploadUpdaterJson: true
-          updaterJsonPreferNsis: true
+          # No `updaterJsonPreferNsis`: with the update files signed in the step above, the bundler
+          # does not make them (`createUpdaterArtifacts` is false on Windows), and the option then
+          # picks nothing. What decides is the installer type: tauri-action writes
+          # `windows-x86_64-nsis` and `windows-x86_64-msi` next to the plain `windows-x86_64`, the
+          # app asks for the one of the installer it came from, and `check-latest.mjs` requires both.
           args: --config src-tauri/tauri.bundle.generated.conf.json ${{ matrix.args }}
 
   publish:

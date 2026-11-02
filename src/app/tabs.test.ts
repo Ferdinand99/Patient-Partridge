@@ -18,6 +18,17 @@ beforeEach(() => {
 });
 
 describe("TabStrip", () => {
+  it("shows a dot, apart from the title, on a tab with changes that are not saved", () => {
+    strip.render([info(1, "a.pdf"), { ...info(2, "b.pdf"), dirty: true }], 1);
+    const dots = [...root.querySelectorAll<HTMLElement>(".tab-dirty")];
+    expect(dots).toHaveLength(1);
+    expect(dots[0].closest(".tab")?.getAttribute("data-id")).toBe("2");
+    expect(dots[0].getAttribute("aria-label")).toBe("Unsaved changes");
+    // The name of the tab and its close button are not changed by it.
+    expect([...root.querySelectorAll('[role="tab"]')].map((t) => t.textContent)).toEqual(["a.pdf", "b.pdf"]);
+    expect(root.querySelector('[aria-label="Close b.pdf"]')).not.toBeNull();
+  });
+
   it("draws one tab for each document and marks the selected one", () => {
     strip.render([info(1, "a.pdf"), info(2, "b.pdf")], 2);
     const tabs = [...root.querySelectorAll<HTMLElement>('[role="tab"]')];

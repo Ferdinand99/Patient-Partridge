@@ -28,6 +28,11 @@
 //!   search text (checked with a second, separate way of folding case and white space). Besides
 //!   fixed words, two searches are for pieces of the page itself, so matches do happen.
 //! - Render: a bitmap of exactly the size asked for.
+//! - Save: `DocInfo` names the pages the document has. `SaveBegin` gives a size within the cap, and
+//!   the pieces asked for one after the other add up to a file that starts like a PDF. A piece past
+//!   the end, or longer than a piece may be, is refused. The saved file opens again (with the
+//!   password, for the encrypted seed) with the same number of pages and the same kind of
+//!   protection. A document that PDFium cannot write fails only with `SaveFailed`.
 //! - Every answer can be encoded and decoded by the app, and the encoder cuts nothing.
 //! - A page that exists fails only with `Corrupt` or `RenderFailed`; a page past the end gives
 //!   `PageOutOfRange`.
@@ -39,7 +44,8 @@ use libfuzzer_sys::fuzz_target;
 use partridge_engine::Engine;
 use partridge_fuzz::check_response_caps;
 use partridge_protocol::{
-    ErrorCode, LinkTarget, PageSize, Request, RequestBody, Response, ResponseBody, PROTOCOL_VERSION,
+    ErrorCode, LinkTarget, PageSize, Request, RequestBody, Response, ResponseBody, MAX_SAVE_BYTES,
+    MAX_SAVE_CHUNK, PROTOCOL_VERSION,
 };
 
 /// Longest side of the bitmaps the target draws. Small, so that an iteration is fast.
@@ -209,6 +215,8 @@ impl State {
             height: 10,
         });
 
+        self.save(doc, count);
+
         match self.ask(RequestBody::Close { doc }) {
             ResponseBody::Closed => {}
             other => panic!("unexpected answer to Close: {other:?}"),
@@ -220,6 +228,128 @@ impl State {
             } => {}
             other => panic!("a closed document answered: {other:?}"),
         }
+    }
+
+    /// The three requests of a save, and a look at the file that comes out.
+    fn save(&mut self, doc: u32, count: u32) {
+        let (pages, security) = match self.ask(RequestBody::DocInfo { doc }) {
+            ResponseBody::DocInfo {
+                pages, security, ..
+            } => (pages, security),
+            other => panic!("unexpected answer to DocInfo: {other:?}"),
+        };
+        let print = match self.ask(RequestBody::Fingerprint { doc }) {
+            ResponseBody::Fingerprint {
+                pages: seen,
+                failed,
+                digest,
+            } => {
+                assert_eq!(seen, count, "the fingerprint names another number of pages");
+                (failed, digest)
+            }
+            other => panic!("unexpected answer to Fingerprint: {other:?}"),
+        };
+        assert_eq!(pages, count, "DocInfo names another number of pages");
+        let size = match self.ask(RequestBody::SaveBegin { doc }) {
+            ResponseBody::SaveReady { size } => size as usize,
+            ResponseBody::Error {
+                code: ErrorCode::SaveFailed,
+                ..
+            } => return,
+            other => panic!("unexpected answer to SaveBegin: {other:?}"),
+        };
+        assert!(size <= MAX_SAVE_BYTES);
+        // Pieces of a size that is not a divisor of anything.
+        let mut bytes: Vec<u8> = Vec::with_capacity(size);
+        while bytes.len() < size {
+            let len = (size - bytes.len()).min(4099);
+            match self.ask(RequestBody::SaveChunk {
+                doc,
+                offset: bytes.len() as u32,
+                len: len as u32,
+            }) {
+                ResponseBody::SaveData { offset, data } => {
+                    assert_eq!(offset as usize, bytes.len());
+                    assert_eq!(data.len(), len);
+                    bytes.extend_from_slice(&data);
+                }
+                other => panic!("unexpected answer to SaveChunk: {other:?}"),
+            }
+        }
+        assert!(bytes.starts_with(b"%PDF-"), "a saved file that is no PDF");
+        // The end of the file, a piece past it, and a piece longer than a piece may be.
+        for body in [
+            RequestBody::SaveChunk {
+                doc,
+                offset: size as u32,
+                len: 1,
+            },
+            RequestBody::SaveChunk {
+                doc,
+                offset: u32::MAX,
+                len: 2,
+            },
+            RequestBody::SaveChunk {
+                doc,
+                offset: 0,
+                len: MAX_SAVE_CHUNK as u32 + 1,
+            },
+        ] {
+            match self.ask(body) {
+                ResponseBody::Error {
+                    code: ErrorCode::InvalidRequest,
+                    ..
+                } => {}
+                other => panic!("a piece that cannot exist gave {other:?}"),
+            }
+        }
+        match self.ask(RequestBody::SaveEnd { doc }) {
+            ResponseBody::SaveEnded => {}
+            other => panic!("unexpected answer to SaveEnd: {other:?}"),
+        }
+        match self.ask(RequestBody::SaveChunk {
+            doc,
+            offset: 0,
+            len: 1,
+        }) {
+            ResponseBody::Error {
+                code: ErrorCode::InvalidRequest,
+                ..
+            } => {}
+            other => panic!("the buffer outlived SaveEnd: {other:?}"),
+        }
+
+        // The saved file opens again. (A file that PDFium had to repair may not; then the app's
+        // check would refuse the save. One that opens must be the same document.)
+        let saved = self.file.with_extension("saved.pdf");
+        std::fs::write(&saved, &bytes).expect("write the saved file");
+        for password in [None, Some(PASSWORD.to_string())] {
+            self.engine
+                .set_document(std::fs::File::open(&saved).expect("open the saved file"));
+            if let ResponseBody::Opened { doc: again, pages } = self.ask(RequestBody::Open { password }) {
+                assert_eq!(pages.len() as u32, count, "the saved file has other pages");
+                match self.ask(RequestBody::DocInfo { doc: again }) {
+                    ResponseBody::DocInfo {
+                        security: now, ..
+                    } => assert_eq!(now, security, "the saved file is protected differently"),
+                    other => panic!("unexpected answer to DocInfo: {other:?}"),
+                }
+                // What a reader sees of the saved file is what it saw of the document. (A page that
+                // could not be read before cannot be expected to read now.)
+                if print.0 == 0 {
+                    match self.ask(RequestBody::Fingerprint { doc: again }) {
+                        ResponseBody::Fingerprint { failed, digest, .. } => {
+                            assert_eq!(failed, 0, "pages of the saved file cannot be read");
+                            assert_eq!(digest, print.1, "the saved file is another document");
+                        }
+                        other => panic!("unexpected answer to Fingerprint: {other:?}"),
+                    }
+                }
+                self.ask(RequestBody::Close { doc: again });
+                break;
+            }
+        }
+        let _ = std::fs::remove_file(&saved);
     }
 
     fn expect_range_error(&mut self, body: RequestBody) {

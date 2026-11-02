@@ -17,6 +17,61 @@ describe("toAppError", () => {
   });
 });
 
+describe("describeError: saving", () => {
+  it("has words for every way a save can fail, and says the file was not changed", () => {
+    const codes = [
+      "save_read_only",
+      "save_disk_full",
+      "save_write_failed",
+      "save_verify_failed",
+      "save_protection_lost",
+      "save_not_a_file",
+      "save_busy",
+      "save_failed",
+      "save_too_large",
+      "save_source_changed",
+      "save_source_unreadable",
+      "save_locked",
+      "save_hard_link",
+      "save_owner_changes",
+      "save_access_kept",
+    ];
+    for (const code of codes) {
+      const d = describeError({ code, message: "detail" }, "tax.pdf");
+      expect(d.title, code).not.toBe("Something went wrong");
+      expect(d.action).toBe("none");
+    }
+    for (const code of [
+      "save_read_only",
+      "save_disk_full",
+      "save_verify_failed",
+      "save_failed",
+      "save_too_large",
+      "save_source_changed",
+      "save_source_unreadable",
+      "save_locked",
+      "save_hard_link",
+      "save_owner_changes",
+      "save_access_kept",
+    ]) {
+      expect(describeError({ code, message: "" }, "tax.pdf").detail, code).toContain('"tax.pdf"');
+    }
+    expect(describeError({ code: "save_write_failed", message: "no luck" }, "tax.pdf").detail).toContain("no luck");
+  });
+});
+
+describe("describeError: a save that took too long", () => {
+  it("says the time ran out, that the file is as it was and that the changes are lost, and counts as a lost engine", () => {
+    const error = { code: "save_took_too_long", message: "it was still working" };
+    expect(isEngineLost(error)).toBe(true);
+    const d = describeError(error, "tax.pdf");
+    expect(d.title).toBe("The save took too long");
+    expect(d.detail).toContain('"tax.pdf"');
+    expect(d.detail).toContain("was not changed");
+    expect(d.detail).toContain("changes made since it was opened are lost");
+  });
+});
+
 describe("describeError", () => {
   it("asks for a password when the file needs one", () => {
     const d = describeError({ code: "password_required", message: "" }, "tax.pdf");
