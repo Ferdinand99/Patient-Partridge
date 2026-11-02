@@ -31,24 +31,26 @@ jobs:
           echo '<!doctype html><title>stub</title>' > dist/index.html
       - name: Build
         run: cargo test -p partridge-engine --locked --no-run
-      - name: Imports of the engine
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          $dumpbin = Get-ChildItem 'C:\Program Files\Microsoft Visual Studio' -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue | Where-Object { $_.FullName -like '*Hostx64*x64*' } | Select-Object -First 1
-          & $dumpbin.FullName /dependents target\debug\partridge-engine.exe
-          & $dumpbin.FullName /dependents target\debug\examples\engine_selftest.exe
-          $pdfium = Get-ChildItem vendor/pdfium -Recurse -Filter pdfium.dll | Select-Object -First 1
-          & $dumpbin.FullName /dependents $pdfium.FullName
-          icacls C:\Windows\System32\vcruntime140.dll
-          icacls C:\Windows\System32\bcryptprimitives.dll
       - name: How starts end with layers taken away
         continue-on-error: true
         run: cargo test -p partridge-engine --locked --test windows_start_variants -- --ignored --nocapture
+      - name: Same, with one loader thread
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          foreach ($name in 'partridge-engine.exe') {
+            $key = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\$name"
+            New-Item -Path $key -Force | Out-Null
+            New-ItemProperty -Path $key -Name MaxLoaderThreads -Value 1 -PropertyType DWord -Force | Out-Null
+          }
+          cargo test -p partridge-engine --locked --test windows_start_variants -- --ignored --nocapture
+          Remove-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\partridge-engine.exe" -Recurse -Force
       - name: Sandbox proof
+        timeout-minutes: 4
         run: cargo test -p partridge-engine --locked --test sandbox -- --nocapture --test-threads 1
       - name: The other engine tests
         if: always()
+        timeout-minutes: 8
         run: cargo test -p partridge-engine -p partridge-engine-client --locked --no-fail-fast
       - name: Access lists after the run
         if: always()
@@ -57,6 +59,4 @@ jobs:
         run: |
           icacls target\debug
           icacls target\debug\partridge-engine.exe
-          icacls target\debug\examples\engine_selftest.exe
           icacls vendor\pdfium\win-x64
-          icacls vendor\pdfium\win-x64\pdfium.dll
