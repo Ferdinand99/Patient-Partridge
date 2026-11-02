@@ -1,7 +1,7 @@
 {
   "name": "Patient Partridge",
   "short_name": "Partridge",
-  "description": "An open source PDF reader and editor for Windows, macOS and Linux. Reading works today; editing tools are planned. Nothing is released yet.",
+  "description": "An open source PDF reader and editor for Windows, macOS and Linux. Reading, annotations and form filling work today; more editing tools are planned.",
   "start_url": "./",
   "scope": "./",
   "display": "browser",
