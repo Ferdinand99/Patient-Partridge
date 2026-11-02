@@ -146,6 +146,7 @@ const COPY_REMEDY = new Set([
   "save_hard_link",
   "save_owner_changes",
   "save_access_kept",
+  "save_source_touched",
 ]);
 
 const ZOOM_CHOICES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
@@ -1005,7 +1006,16 @@ export class App {
   private async runSaveAs(tab: Tab, allowSigned: boolean): Promise<SavedFile | null> {
     for (;;) {
       try {
-        return await this.deps.api.saveAs(tab.doc, allowSigned);
+        const saved = await this.deps.api.saveAs(tab.doc, allowSigned);
+        if (saved?.touched) {
+          // One calm line: nothing is wrong with the copy, but the user should know what it holds.
+          void showNotice(this.noticeLayer, {
+            title: "The file was touched since it was opened",
+            detail: `"${tab.name}" got a new time of change while it was open. "${saved.name}" holds what Patient Partridge had read of it, and the original was not replaced.`,
+            buttons: [{ id: "ok", label: "OK", primary: true }],
+          });
+        }
+        return saved;
       } catch (e) {
         const error = toAppError(e);
         if (error.code === "save_signed" && !allowSigned) {

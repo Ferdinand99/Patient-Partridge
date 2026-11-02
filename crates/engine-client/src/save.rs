@@ -35,6 +35,7 @@ use std::time::{Duration, SystemTime};
 
 use partridge_protocol::ErrorCode;
 
+use crate::pool::same_file;
 use crate::{ClientError, EngineClient, EngineConfig, SaveStreamError};
 
 /// What the app needs to know about a document before it saves it.
@@ -47,6 +48,9 @@ pub struct DocInfo {
     pub signatures: u32,
     /// The bytes of the file mention something that belongs to a signature.
     pub maybe_signed: bool,
+    /// The file was touched while parts of it were unread: nothing seen differs, but the engine's
+    /// copy of the document may not be the file's. It may be copied, not written over the file.
+    pub touched: bool,
 }
 
 impl DocInfo {
@@ -80,6 +84,9 @@ pub struct SaveOutcome {
     /// The file that was written.
     pub path: PathBuf,
     pub bytes: u64,
+    /// The file the document comes from was touched since it was opened, while parts of it were
+    /// unread, and this is a copy of what the engine had read (see [`DocInfo::touched`]).
+    pub touched: bool,
 }
 
 /// Why a save did not happen. Whatever the reason, the file it was meant for is as it was.
@@ -106,6 +113,10 @@ pub enum SaveError {
     /// The file the document is read from was changed in place after the document was opened, so
     /// what the engine has of it may be a mix of two versions. Nothing can be saved from it.
     SourceChanged,
+    /// The file the document is read from was touched after the document was opened (a new time of
+    /// change, nothing seen that differs), but parts of it had never been read, so the file cannot
+    /// be told from what the engine has. It is not replaced; a copy is allowed.
+    SourceTouched,
     /// A read of the file the document comes from failed, so the document may be missing parts.
     SourceUnreadable,
     /// The file is open in a way that does not let it be replaced here.
@@ -133,6 +144,7 @@ impl SaveError {
             SaveError::ProtectionLost => "save_protection_lost",
             SaveError::Busy => "save_busy",
             SaveError::SourceChanged => "save_source_changed",
+            SaveError::SourceTouched => "save_source_touched",
             SaveError::SourceUnreadable => "save_source_unreadable",
             SaveError::Locked => "save_locked",
             SaveError::HardLink => "save_hard_link",
@@ -168,6 +180,10 @@ impl fmt::Display for SaveError {
             SaveError::SourceChanged => write!(
                 f,
                 "the file was changed while it was open, so what is open is no longer safe to save"
+            ),
+            SaveError::SourceTouched => write!(
+                f,
+                "the file was touched while it was open, so it is not replaced, but a copy can be saved"
             ),
             SaveError::SourceUnreadable => write!(
                 f,
@@ -590,6 +606,7 @@ pub fn verify_written(
 /// the document was opened (or chosen), `None` when it did not exist then. `verify` is given the
 /// new file and the description of the document (see [`verify_written`]); a file it refuses is
 /// never put in place.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn save_document(
     client: &EngineClient,
     doc: u64,
@@ -598,8 +615,15 @@ pub(crate) fn save_document(
     options: SaveOptions,
     verify: &dyn Fn(&Path, DocInfo, &Fingerprint) -> Result<(), SaveError>,
     still_open: &dyn Fn() -> bool,
+    original: Option<&Path>,
 ) -> Result<SaveOutcome, ClientError> {
     let info = client.doc_info(doc).map_err(from_engine)?;
+    // A file that was touched while parts of it were unread is not replaced: the engine's document
+    // may not be the file's. A copy is the way out.
+    let replaces_original = original.is_some_and(|o| same_file(o, target));
+    if info.touched && replaces_original {
+        return Err(SaveError::SourceTouched.into());
+    }
     if info.is_signed() && !options.allow_signed {
         return Err(SaveError::Signed {
             signatures: info.signatures.max(1),
@@ -687,6 +711,7 @@ pub(crate) fn save_document(
     Ok(SaveOutcome {
         path: requested.to_path_buf(),
         bytes: total,
+        touched: info.touched,
     })
 }
 
@@ -1143,6 +1168,7 @@ mod tests {
             SaveError::ProtectionLost,
             SaveError::Busy,
             SaveError::SourceChanged,
+            SaveError::SourceTouched,
             SaveError::SourceUnreadable,
             SaveError::Locked,
             SaveError::HardLink,
@@ -1242,7 +1268,16 @@ mod tests {
         expected: Option<&FileStamp>,
         options: SaveOptions,
     ) -> Result<SaveOutcome, ClientError> {
-        save_document(client, doc, target, expected, options, &accept, &|| true)
+        save_document(
+            client,
+            doc,
+            target,
+            expected,
+            options,
+            &accept,
+            &|| true,
+            None,
+        )
     }
 
     fn save_error(result: Result<SaveOutcome, ClientError>) -> SaveError {
@@ -1339,6 +1374,7 @@ mod tests {
                     Err(refusal.clone())
                 },
                 &|| true,
+                None,
             );
             assert_eq!(save_error(result), refusal);
             assert_untouched(&dir, &path);
@@ -1358,6 +1394,7 @@ mod tests {
             SaveOptions::default(),
             &accept,
             &|| false,
+            None,
         );
         match result {
             Err(ClientError::Engine { code, .. }) => assert_eq!(code, ErrorCode::UnknownDocument),
@@ -1384,13 +1421,15 @@ mod tests {
                         pages: 1,
                         security: 0,
                         signatures: 0,
-                        maybe_signed: false
+                        maybe_signed: false,
+                        touched: false
                     }
                 );
                 assert_eq!(print.pages, 1);
                 Ok(())
             },
             &|| true,
+            None,
         )
         .unwrap();
     }
@@ -1426,6 +1465,58 @@ mod tests {
             ..SaveOptions::default()
         };
         save(&client, doc, &path, None, allowed).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), fake_bytes());
+    }
+
+    #[test]
+    fn a_touched_document_is_copied_but_never_put_over_the_original() {
+        let dir = Dir::new("touched");
+        let path = original_in(&dir);
+        let (client, doc) = client("save-touched");
+        let go = |target: &Path, options: SaveOptions| {
+            save_document(
+                &client,
+                doc,
+                target,
+                None,
+                options,
+                &accept,
+                &|| true,
+                Some(&path),
+            )
+        };
+        let everything = SaveOptions {
+            allow_signed: true,
+            overwrite_changed: true,
+        };
+        for options in [SaveOptions::default(), everything] {
+            assert_eq!(
+                save_error(go(&path, options)),
+                SaveError::SourceTouched,
+                "{options:?}"
+            );
+        }
+        assert_untouched(&dir, &path);
+        // A copy always works, and says that the original was touched.
+        let copy = dir.file("copy.pdf");
+        let outcome = go(&copy, SaveOptions::default()).unwrap();
+        assert!(outcome.touched);
+        assert_eq!(fs::read(&copy).unwrap(), fake_bytes());
+        assert_eq!(fs::read(&path).unwrap(), ORIGINAL);
+        // A document that was not touched replaces the original as before.
+        let (plain, plain_doc) = self::client("save-good");
+        let outcome = save_document(
+            &plain,
+            plain_doc,
+            &path,
+            None,
+            SaveOptions::default(),
+            &accept,
+            &|| true,
+            Some(&path),
+        )
+        .unwrap();
+        assert!(!outcome.touched);
         assert_eq!(fs::read(&path).unwrap(), fake_bytes());
     }
 
@@ -1504,6 +1595,7 @@ mod tests {
                 Ok(())
             },
             &|| true,
+            None,
         );
         assert_eq!(save_error(result), SaveError::Changed);
         assert_eq!(
@@ -1641,6 +1733,7 @@ mod tests {
                 SaveOptions::default(),
                 &|_, _, _| std::process::abort(),
                 &|| true,
+                None,
             );
             return;
         }

@@ -108,6 +108,7 @@ fn a_document_is_saved_in_place_and_the_new_file_opens() {
             security: 0,
             signatures: 0,
             maybe_signed: false,
+            touched: false,
         }
     );
 
@@ -181,6 +182,7 @@ fn a_password_protected_document_is_saved_protected() {
             security: 2,
             signatures: 0,
             maybe_signed: false,
+            touched: false,
         }
     );
 }
@@ -198,6 +200,7 @@ fn the_check_refuses_a_file_that_lost_its_protection_or_is_not_the_document() {
         security,
         signatures,
         maybe_signed: false,
+        touched: false,
     };
     let check = |path: &Path, password: Option<&str>, expected: DocInfo| {
         verify_written(&config(), path, password, expected, None)
@@ -453,10 +456,36 @@ fn m1_a_touch_before_the_first_save_still_lets_the_edits_out_as_a_copy() {
         .unwrap();
     drop(file);
 
+    // The original is not replaced, whatever the user agreed to ...
+    for options in [
+        SaveOptions::default(),
+        SaveOptions {
+            overwrite_changed: true,
+            ..SaveOptions::default()
+        },
+    ] {
+        let err = save_error(pool.save(handle, options));
+        assert_eq!(err, SaveError::SourceTouched, "{err:?}");
+        let err = save_error(pool.save_as(handle, &path, options));
+        assert_eq!(err, SaveError::SourceTouched, "{err:?}");
+    }
+    assert_eq!(fs::read(&path).unwrap(), original);
+    // ... and the edits can always leave as a copy, which says the file was touched.
     let copy = dir.0.join("copy.pdf");
-    pool.save_as(handle, &copy, SaveOptions::default()).unwrap();
+    let outcome = pool.save_as(handle, &copy, SaveOptions::default()).unwrap();
+    assert!(outcome.touched);
     assert_eq!(describe(&copy, None).pages, 3);
     assert_eq!(fs::read(&path).unwrap(), original);
+}
+
+#[test]
+fn m1_a_file_that_was_not_touched_is_replaced_and_says_nothing() {
+    let dir = Dir::new("m1b");
+    let path = dir.write("a.pdf", &kit::simple_pdf(2));
+    let pool = pool();
+    let (handle, _) = pool.open(&text(&path), None).unwrap();
+    let outcome = pool.save(handle, SaveOptions::default()).unwrap();
+    assert!(!outcome.touched);
 }
 
 #[test]

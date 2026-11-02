@@ -13,6 +13,8 @@
 //! - `no-sandbox`: like `good`, but greets without naming a sandbox.
 //! - `save-good`: like `good`, and saves a made-up file of 2 500 000 bytes (byte `i` is `i % 251`).
 //! - `save-signed`: like `save-good`, but the document holds two signatures.
+//! - `save-touched`: like `save-good`, but the description says the file was touched while parts of
+//!   it were unread.
 //! - `save-short`, `save-wrong-offset`, `save-big`, `save-error`, `save-lies`: like `save-good`
 //!   but a piece is a byte too short, a piece comes from the wrong offset, a piece is a 10 MiB
 //!   frame, the save fails with an error, or the end of the file is missing (the last piece is
@@ -184,6 +186,7 @@ fn main() {
                     security: 0,
                     signatures: if mode == "save-signed" { 2 } else { 0 },
                     maybe_signed: false,
+                    touched: mode == "save-touched",
                 },
             ),
             RequestBody::SaveBegin { .. } => match mode.as_str() {

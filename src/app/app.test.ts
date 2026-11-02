@@ -2633,6 +2633,24 @@ describe("App: a save that cannot replace the file", () => {
     expect(notice()?.textContent).toContain("USB stick or a network drive");
   });
 
+  it("offers a copy when the file was touched, and the copy says so in one line", async () => {
+    const m = await openDirty();
+    m.api.save.mockRejectedValueOnce({ code: "save_source_touched", message: "x" });
+    m.api.saveAs.mockResolvedValueOnce({ path: "/docs/copy.pdf", name: "copy.pdf", touched: true });
+    key("s", { ctrlKey: true });
+    await flush();
+    expect(button("Save a copy…")).not.toBeNull();
+    click(button("Save a copy…"));
+    await flush();
+    expect(m.api.saveAs).toHaveBeenCalledWith(1, false);
+    expect(m.app.unsavedCount).toBe(0);
+    expect(notice()?.textContent).toContain("touched");
+    expect(notice()?.textContent).toContain("copy.pdf");
+    click(button("OK"));
+    await flush();
+    expect(notice()).toBeNull();
+  });
+
   it("tells the user to open the file again when it changed in place, and offers no copy", async () => {
     const m = await openDirty();
     m.api.save.mockRejectedValueOnce({ code: "save_source_changed", message: "x" });
