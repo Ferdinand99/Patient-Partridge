@@ -242,6 +242,8 @@ for (const zoom of ["0.5", "1", "2"]) {
     expect(Math.abs(last[0] - 300)).toBeLessThan(tolerance);
     expect(Math.abs(last[1] - 200)).toBeLessThan(tolerance);
     expect(ink.args.width).toBe(3);
+    // The pen did not select the text under the line.
+    await expect(page.locator(".hl-select")).toHaveCount(0);
     // The line is on the page, in the colour of the bar.
     await expect(page.locator(".annot")).toHaveAttribute("aria-label", "Drawing, page 1");
     await expect.poll(async () => isYellow(await pixelAt(page, 0, 200, 150, 792))).toBe(true);
