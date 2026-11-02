@@ -288,6 +288,16 @@ struct CommandError {
 impl From<ClientError> for CommandError {
     fn from(err: ClientError) -> Self {
         match err {
+            // An engine that was stopped because a save or a description of the document went
+            // on for too long: the window says so, instead of that the file may be damaged.
+            ClientError::EngineStopped(why)
+                if why.starts_with(partridge_engine_client::TOOK_TOO_LONG) =>
+            {
+                CommandError {
+                    code: "save_took_too_long".into(),
+                    message: why,
+                }
+            }
             ClientError::EngineStopped(why) => CommandError {
                 code: "engine_stopped".into(),
                 message: why,
@@ -914,8 +924,9 @@ pub fn run() {
         .expect("error while building the app");
 
     app.run(|handle, event| {
-        // Quitting from the menu or the keyboard (Cmd+Q) does not go through the window's close
-        // request: changes that are not saved hold it back here too.
+        // A request to exit that does not come from closing the window (the last window being
+        // gone, or `exit` being called) is held back here while changes are not saved. Cmd+Q on
+        // macOS does not arrive here: its entry in the menu is the app's own (`quit_from_menu`).
         if let tauri::RunEvent::ExitRequested {
             api, code: None, ..
         } = &event
@@ -1249,10 +1260,21 @@ mod tests {
         app.state::<UpdateState>().unsaved().set(3, true);
         quit_from_menu(app.handle());
         assert_eq!(asked.load(Ordering::SeqCst), 1);
-        // While the program is being replaced it does nothing at all.
+        // While the program is being replaced it does nothing at all: it does not even ask.
         let blocked = mock_app();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let seen = counter.clone();
+        blocked.listen(QUIT_REQUESTED, move |_| {
+            seen.fetch_add(1, Ordering::SeqCst);
+        });
         blocked.state::<UpdateState>().unsaved().set(3, true);
+        blocked.state::<UpdateState>().block_close_for_tests(true);
+        assert_eq!(
+            exit_action(blocked.try_state::<UpdateState>().as_deref()),
+            ExitAction::Refuse
+        );
         quit_from_menu(blocked.handle());
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -1395,6 +1417,11 @@ mod tests {
     fn engine_errors_reach_the_frontend_with_stable_codes() {
         let stopped = CommandError::from(ClientError::EngineStopped("it exited".into()));
         assert_eq!(stopped.code, "engine_stopped");
+        let too_long = CommandError::from(ClientError::EngineStopped(format!(
+            "{} (17 minutes)",
+            partridge_engine_client::TOOK_TOO_LONG
+        )));
+        assert_eq!(too_long.code, "save_took_too_long");
         let password = CommandError::from(ClientError::Engine {
             code: ErrorCode::PasswordRequired,
             message: "locked".into(),

@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use partridge_protocol::{
     read_frame_limited, write_request, ErrorCode, PageSize, Request, RequestBody, Response,
@@ -54,6 +54,14 @@ const MAX_SMALL_ANSWER: usize = 9 * 1024 * 1024;
 const IDLE_LIMIT: usize = 70 * 1024;
 /// Header of a `Rendered` answer in front of the pixels.
 const RENDERED_HEADER: usize = 17;
+/// How many times a long request (`DocInfo`, `Fingerprint`, `SaveBegin`) may have to read the
+/// whole document: the check of the file before and after, and the serialising itself.
+const SAVE_PASSES: u64 = 4;
+
+/// What the error of an engine that was stopped for taking too long starts with. The app turns it
+/// into its own error code, so that the window can say what happened.
+pub const TOOK_TOO_LONG: &str = "it was still working when the overall time limit ended";
+
 /// Largest outline answer: 5 000 entries of at most 512 bytes of title and 9 bytes of framing.
 const MAX_OUTLINE_ANSWER: usize = 3 * 1024 * 1024;
 /// Largest page text answer: 100 000 characters of at most 4 bytes and 16 bytes of box each.
@@ -71,9 +79,20 @@ pub struct EngineConfig {
     /// Longest the engine may go without a sign of life while it describes or serialises a
     /// document (`DocInfo`, `Fingerprint`, `SaveBegin`). These requests can take minutes for a
     /// large document on a slow disk, so the engine reports progress while it works (about every
-    /// MiB written or 32 pages looked at), and every report starts this wait afresh. A slow save
-    /// is therefore never taken for a hung engine; one that says nothing for this long is.
+    /// MiB written, 32 pages looked at or MiB of the file read), and every report starts this
+    /// wait afresh. An engine that makes progress is not taken for a hung one for being slow;
+    /// one that says nothing for this long is. Only `save_floor` and `save_slowest` set an end to
+    /// an engine that keeps reporting.
     pub save_stall: Duration,
+    /// The signs of life renew `save_stall` and so could go on for ever (an engine that is hostile,
+    /// or a document with pages that take minutes each). One of these requests therefore also has
+    /// an overall limit: `save_floor` plus the time that the document would take to be read
+    /// `SAVE_PASSES` times at `save_slowest`. An engine that is still at it when the limit is up
+    /// is stopped, and the error says that it took too long.
+    pub save_floor: Duration,
+    /// The slowest speed, in bytes a second, at which a long request still has to get through the
+    /// document (see `save_floor`). A slow drive or a share is allowed to be this slow.
+    pub save_slowest: u64,
     /// Most memory the engine may use, in bytes. `None` leaves the engine's own limit (3 GiB).
     pub memory_limit: Option<u64>,
     /// Whether an engine without a working sandbox is refused. Release builds always insist.
@@ -93,6 +112,8 @@ impl EngineConfig {
             args: Vec::new(),
             timeout: Duration::from_secs(60),
             save_stall: Duration::from_secs(300),
+            save_floor: Duration::from_secs(600),
+            save_slowest: 1024 * 1024,
             memory_limit: None,
             sandbox: SandboxPolicy::default_for_build(),
             system_fonts: true,
@@ -194,6 +215,8 @@ struct Running {
     in_flight: Arc<AtomicBool>,
     /// Largest frame the reader thread accepts right now.
     limit: Arc<AtomicUsize>,
+    /// Size of the file the document was opened from, in bytes (0 before there is a document).
+    document_len: u64,
 }
 
 #[derive(Default)]
@@ -650,8 +673,19 @@ impl EngineClient {
         // the one before) or a failure.
         let may_report = patience != self.config.timeout;
         let mut last_done = 0u32;
+        // The signs of life renew the patience, but not the overall time.
+        let started = Instant::now();
+        let overall = if may_report {
+            self.overall_limit(running.document_len)
+        } else {
+            Duration::MAX
+        };
         loop {
-            match running.events.recv_timeout(patience) {
+            let left = overall.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                return Err(too_long(overall));
+            }
+            match running.events.recv_timeout(patience.min(left)) {
                 Ok(Event::Response(Response {
                     id: reported,
                     body: ResponseBody::Progress { done },
@@ -670,13 +704,23 @@ impl EngineClient {
                     return Err(exit_text(&running.child))
                 }
                 Err(RecvTimeoutError::Timeout) => {
+                    if started.elapsed() >= overall {
+                        return Err(too_long(overall));
+                    }
                     return Err(format!(
                         "it did not answer within {} seconds",
                         patience.as_secs_f32().ceil()
-                    ))
+                    ));
                 }
             }
         }
+    }
+
+    /// The longest a long request may take altogether, for a document of `len` bytes.
+    fn overall_limit(&self, len: u64) -> Duration {
+        let slowest = self.config.save_slowest.max(1);
+        let reading = Duration::from_secs(len.saturating_mul(SAVE_PASSES) / slowest);
+        self.config.save_floor.saturating_add(reading)
     }
 
     /// Makes sure an engine runs. An engine that ended by itself while idle is replaced quietly;
@@ -756,6 +800,9 @@ impl EngineClient {
             generation: inner.spawns,
             in_flight,
             limit,
+            document_len: document
+                .and_then(|file| file.metadata().ok())
+                .map_or(0, |meta| meta.len()),
         });
 
         match self.exchange(
@@ -878,6 +925,14 @@ pub fn sandbox_in_force(report: &str) -> bool {
 
 /// Says how the engine ended. The pipe closes a moment before the system reports the exit, so this
 /// waits a little for the exit status.
+/// The error of a long request that was still going when its overall limit ended.
+fn too_long(limit: Duration) -> String {
+    format!(
+        "{TOOK_TOO_LONG} ({} minutes)",
+        limit.as_secs().div_ceil(60).max(1)
+    )
+}
+
 fn exit_text(child: &SharedProcess) -> String {
     for _ in 0..40 {
         if let Ok(Some(status)) = lock(child).try_wait() {
