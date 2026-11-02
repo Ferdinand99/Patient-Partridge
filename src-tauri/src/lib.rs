@@ -1197,6 +1197,9 @@ mod tests {
         assert_eq!(asked.load(Ordering::SeqCst), 0);
     }
 
+    // The menus of macOS may be made on the main thread only, and tests run on others, so this
+    // runs on the other systems; the function is the same code on all of them.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn the_quit_entry_of_the_application_menu_is_replaced_by_one_that_goes_through_the_guard() {
         use tauri::menu::{Menu, MenuItemKind, PredefinedMenuItem, Submenu};
