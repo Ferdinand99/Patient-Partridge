@@ -45,10 +45,11 @@ use windows_sys::Win32::Foundation::{
     HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::{
-    CreateRestrictedToken, DuplicateTokenEx, GetTokenInformation, SecurityImpersonation,
-    TokenGroups, TokenImpersonation, TokenPrimary, TokenUser, DISABLE_MAX_PRIVILEGE,
-    SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES, TOKEN_ADJUST_DEFAULT, TOKEN_ALL_ACCESS,
-    TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER,
+    AdjustTokenPrivileges, CreateRestrictedToken, DuplicateTokenEx, GetTokenInformation,
+    LookupPrivilegeValueW, SecurityImpersonation, TokenGroups, TokenImpersonation, TokenPrimary,
+    TokenUser, DISABLE_MAX_PRIVILEGE, LUID_AND_ATTRIBUTES, SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES,
+    TOKEN_ADJUST_DEFAULT, TOKEN_ALL_ACCESS, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_GROUPS,
+    TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE,
@@ -438,6 +439,7 @@ fn make_tokens() -> io::Result<(Owned, Owned)> {
             "DuplicateTokenEx (primary)",
         )?;
         let lockdown = Owned::new(primary)?;
+        remove_bypass_traverse_checking(&lockdown)?;
 
         // The integrity level stays the app's own for now. The system lets the first thread
         // impersonate a token only if its integrity level is not above that of the process, so
@@ -465,6 +467,44 @@ fn make_tokens() -> io::Result<(Owned, Owned)> {
         let initial = Owned::new(imp)?;
         Ok((lockdown, initial))
     }
+}
+
+/// `SE_PRIVILEGE_REMOVED`: the privilege is taken out of the token for good.
+const SE_PRIVILEGE_REMOVED: u32 = 0x0000_0004;
+
+/// Takes `SeChangeNotifyPrivilege` ("bypass traverse checking") out of the token of the engine.
+/// `DISABLE_MAX_PRIVILEGE` keeps exactly that one privilege. Without it a process cannot open an
+/// object whose path runs through directories it has no traverse right on, and with the null SID as
+/// restricting SID it has none. Opening `\Device\Afd\Endpoint`, which is the first thing creating
+/// any socket does, is such an open. The first thread's start identity keeps the privilege, so
+/// loading PDFium and the fonts is not affected.
+fn remove_bypass_traverse_checking(token: &Owned) -> io::Result<()> {
+    let name = wide(OsStr::new("SeChangeNotifyPrivilege"));
+    // SAFETY: documented Win32 calls with live, correctly sized structures.
+    unsafe {
+        let mut privilege: TOKEN_PRIVILEGES = zeroed();
+        privilege.PrivilegeCount = 1;
+        check(
+            LookupPrivilegeValueW(null(), name.as_ptr(), &mut privilege.Privileges[0].Luid),
+            "LookupPrivilegeValue",
+        )?;
+        privilege.Privileges[0] = LUID_AND_ATTRIBUTES {
+            Luid: privilege.Privileges[0].Luid,
+            Attributes: SE_PRIVILEGE_REMOVED,
+        };
+        check(
+            AdjustTokenPrivileges(token.raw(), 0, &privilege, 0, null_mut(), null_mut()),
+            "AdjustTokenPrivileges",
+        )?;
+        // The call succeeds with `ERROR_NOT_ALL_ASSIGNED` when the privilege was not in the token.
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(1300) {
+            return Err(io::Error::other(
+                "AdjustTokenPrivileges: the privilege is not in the token",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The job: one process, a memory limit, no UI access, ended when the handle closes.

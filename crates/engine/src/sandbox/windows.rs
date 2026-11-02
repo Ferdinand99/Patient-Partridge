@@ -153,6 +153,28 @@ fn check_layers() -> Result<Vec<&'static str>, String> {
             return Err("the engine is not in an AppContainer".to_string());
         }
         layers.push("appcontainer");
+
+        // TokenPrivileges (3): the token of the engine holds none (the app removed even
+        // `SeChangeNotifyPrivilege`, which `DISABLE_MAX_PRIVILEGE` keeps). The list starts with a
+        // count of the entries.
+        let mut needed = 0u32;
+        GetTokenInformation(own_token(), 3, null_mut(), 0, &mut needed);
+        let mut buffer = vec![0u8; needed.max(4) as usize];
+        let ok = GetTokenInformation(
+            own_token(),
+            3,
+            buffer.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        );
+        if ok == 0 {
+            return Err(format!("GetTokenInformation: {}", last_error()));
+        }
+        let count = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
+        if count != 0 {
+            return Err(format!("the token of the engine holds {count} privilege(s)"));
+        }
+        layers.push("no-privileges");
     }
     Ok(layers)
 }
