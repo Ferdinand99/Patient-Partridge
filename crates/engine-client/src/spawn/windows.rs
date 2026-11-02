@@ -492,6 +492,9 @@ fn startup_processors() -> io::Result<Processors> {
         .filter(|bit| all & bit != 0)
         .nth(wanted)
         .unwrap_or(all);
+    if cfg!(debug_assertions) && std::env::var_os("PARTRIDGE_DIAG_NO_PIN").is_some() {
+        return Ok(Processors { one: all, all });
+    }
     Ok(Processors { one, all })
 }
 

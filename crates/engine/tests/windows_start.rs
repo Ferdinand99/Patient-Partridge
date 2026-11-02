@@ -19,7 +19,7 @@ fn config() -> EngineConfig {
 
 #[test]
 fn the_engine_starts_every_time_with_all_its_layers() {
-    for run in 0..100 {
+    for run in 0..300 {
         // A new client every time: a new engine process every time.
         let info = EngineClient::new(config())
             .info()
