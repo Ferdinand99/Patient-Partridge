@@ -491,15 +491,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: windows-latest, state: default, expect: record }
-          - { os: windows-latest, state: profiles-off, expect: record }
-          - { os: windows-latest, state: outbound-allowed, expect: record }
-          - { os: windows-latest, state: package-allowed, expect: record }
-          - { os: windows-latest, state: loopback-exempt, expect: record }
-          - { os: windows-latest, state: firewall-service-stopped, expect: record }
-          - { os: windows-latest, state: filtering-engine-stopped, expect: record }
-          - { os: windows-2022, state: default, expect: record }
-          - { os: windows-2022, state: profiles-off, expect: record }
+          # In every state that a hosted runner allows, the block still holds and the engine proves it.
+          - { os: windows-latest, state: default, expect: proved }
+          - { os: windows-latest, state: profiles-off, expect: proved }
+          - { os: windows-latest, state: outbound-allowed, expect: proved }
+          - { os: windows-latest, state: package-allowed, expect: proved }
+          - { os: windows-latest, state: loopback-exempt, expect: proved }
+          - { os: windows-2022, state: default, expect: proved }
+          - { os: windows-2022, state: profiles-off, expect: proved }
+          # The runner refuses to stop either service, for an administrator and for the system
+          # account alike (the log of the first step says so), so these two stay as they were. They
+          # are kept to show it and to try again when an image allows it.
+          - { os: windows-latest, state: firewall-service-stopped, expect: any }
+          - { os: windows-latest, state: filtering-engine-stopped, expect: any }
+          # A debug engine told to take the answer of the network check as one that is not "blocked":
+          # the whole path after it (greeting, client, document) must work and say so.
+          - { os: windows-latest, state: simulated-answer, expect: not-proved }
     defaults:
       run:
         shell: pwsh
@@ -522,18 +529,26 @@ jobs:
           cargo test -p partridge-engine --locked --no-run --test sandbox --test windows_start --test windows_network_states --test sandbox_refusal
       - name: Put the runner in the state
         run: ./scripts/windows-firewall-state.ps1 ${{ matrix.state }}
+      # A native command's exit code is checked by hand: a pipe into Tee-Object hides it.
       - name: What the engine does in this state
-        continue-on-error: true
         env:
           PARTRIDGE_FIREWALL_STATE: ${{ matrix.state }}
           PARTRIDGE_NETWORK_EXPECT: ${{ matrix.expect }}
-        run: cargo test -p partridge-engine --locked --test windows_network_states -- --nocapture 2>&1 | Tee-Object -FilePath logs/engine.txt
+          PARTRIDGE_TEST_NETWORK_UNPROVED: ${{ matrix.state == 'simulated-answer' && '1' || '' }}
+        run: |
+          cargo test -p partridge-engine --locked --test windows_network_states -- --nocapture 2>&1 | Tee-Object -FilePath logs/engine.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: The sandbox proof in this state
-        continue-on-error: true
-        run: cargo test -p partridge-engine --locked --test sandbox -- --nocapture --test-threads 1 2>&1 | Tee-Object -FilePath logs/sandbox.txt
+        if: matrix.state != 'simulated-answer'
+        run: |
+          cargo test -p partridge-engine --locked --test sandbox -- --nocapture --test-threads 1 2>&1 | Tee-Object -FilePath logs/sandbox.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Many starts in this state
-        continue-on-error: true
-        run: cargo test -p partridge-engine --locked --test windows_start -- --nocapture 2>&1 | Tee-Object -FilePath logs/starts.txt
+        env:
+          PARTRIDGE_TEST_NETWORK_UNPROVED: ${{ matrix.state == 'simulated-answer' && '1' || '' }}
+        run: |
+          cargo test -p partridge-engine --locked --test windows_start -- --nocapture 2>&1 | Tee-Object -FilePath logs/starts.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Put the services back
         if: always()
         run: |

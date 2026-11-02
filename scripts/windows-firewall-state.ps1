@@ -56,6 +56,7 @@ Say (Get-CimInstance -Namespace root/SecurityCenter2 -ClassName FirewallProduct 
 
 switch ($State) {
   'default' { }
+  'simulated-answer' { Say 'Nothing is changed on the runner: the engine is told to take the answer of the check as not proving the block.' }
   'profiles-off' {
     Set-NetFirewallProfile -Profile Domain, Public, Private -Enabled False
   }

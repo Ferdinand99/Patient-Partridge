@@ -278,7 +278,7 @@ pub fn network_note() -> Option<String> {
 /// blocked network, to try what happens then.
 fn network_proof() -> Result<(), String> {
     #[cfg(debug_assertions)]
-    if std::env::var_os("PARTRIDGE_TEST_NETWORK_UNPROVED").is_some() {
+    if std::env::var_os("PARTRIDGE_TEST_NETWORK_UNPROVED").is_some_and(|v| !v.is_empty()) {
         return Err("a TCP connection failed, but not with the answer of a blocked network (access denied): forced by a test".to_string());
     }
     network_is_blocked()

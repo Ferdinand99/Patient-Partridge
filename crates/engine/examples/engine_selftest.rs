@@ -522,7 +522,8 @@ fn windows_probes(title: &str, say: &mut dyn FnMut(String)) {
 ///   the point that the bind-first attempt never reaches): to the loopback address, to an address on
 ///   another computer (the TEST-NET-1 address, which the stack sends to the gateway) and to `[::1]`.
 /// - A TCP connection to `[::1]`, and to an address on another computer.
-/// - A raw socket, and an ICMP echo through the ICMP service of the system.
+/// - A raw socket, an echo request sent from it, and an ICMP echo through the ICMP service of the
+///   system.
 /// - A path on another computer: the kernel connects to it without any socket of ours.
 /// - A named pipe whose access list is NULL, which any program of the user could talk to: a local
 ///   proxy would be one.
@@ -561,7 +562,15 @@ fn windows_network_probes(
         );
         report("icmp_echo_remote", icmp_echo(target.ip()));
     }
-    report("raw_socket", raw_socket());
+    report("raw_socket", raw_socket(None));
+    report(
+        "raw_socket_send_loopback",
+        raw_socket(Some(SocketAddr::from(([127, 0, 0, 1], 0)))),
+    );
+    report(
+        "raw_socket_send_remote",
+        raw_socket(Some(SocketAddr::from(([192, 0, 2, 1], 0)))),
+    );
     report(
         "icmp_echo_loopback",
         icmp_echo(std::net::IpAddr::from([127, 0, 0, 1])),
@@ -653,22 +662,52 @@ fn sendto_unbound(target: std::net::SocketAddr) -> std::io::Result<()> {
     Ok(())
 }
 
-/// A raw ICMP socket. (An account without administrator rights cannot make one anywhere.)
+/// A raw ICMP socket, and an echo request sent from it. `send` is where the attempt ends if the
+/// socket could be made. An account without administrator rights cannot make a raw socket anywhere.
+/// The error says which call failed.
 #[cfg(windows)]
-fn raw_socket() -> std::io::Result<()> {
+fn raw_socket(send_to: Option<std::net::SocketAddr>) -> std::io::Result<()> {
     use windows_sys::Win32::Networking::WinSock::{
-        closesocket, socket, WSAGetLastError, INVALID_SOCKET,
+        closesocket, sendto, socket, WSAGetLastError, INVALID_SOCKET, SOCKADDR,
     };
-    // SAFETY: documented Winsock calls.
+    // SAFETY: documented Winsock calls; the buffers live through the calls.
     unsafe {
         let s = socket(2, 3, 1);
         if s == INVALID_SOCKET {
             let e = std::io::Error::from_raw_os_error(WSAGetLastError());
             return Err(std::io::Error::other(format!("socket: {e}")));
         }
+        let result = match send_to {
+            None => Ok(()),
+            Some(std::net::SocketAddr::V4(v4)) => {
+                let mut address = Vec::new();
+                address.extend_from_slice(&2u16.to_le_bytes());
+                address.extend_from_slice(&0u16.to_be_bytes());
+                address.extend_from_slice(&v4.ip().octets());
+                address.extend_from_slice(&[0u8; 8]);
+                // An ICMP echo request: type 8, code 0, checksum, identifier 1, sequence 1.
+                let packet = [8u8, 0, 0xF7, 0xFD, 0, 1, 0, 1];
+                let sent = sendto(
+                    s,
+                    packet.as_ptr(),
+                    packet.len() as i32,
+                    0,
+                    address.as_ptr().cast::<SOCKADDR>(),
+                    address.len() as i32,
+                );
+                let code = WSAGetLastError();
+                if sent < 0 {
+                    let e = std::io::Error::from_raw_os_error(code);
+                    Err(std::io::Error::other(format!("sendto: {e}")))
+                } else {
+                    Ok(())
+                }
+            }
+            Some(_) => Err(std::io::Error::other("only IPv4")),
+        };
         closesocket(s);
+        result
     }
-    Ok(())
 }
 
 /// The ICMP functions of `iphlpapi.dll`. The library is loaded by name before the lock-in: it is
@@ -721,11 +760,18 @@ mod icmp_api {
                 if create.is_null() || send.is_null() || close.is_null() {
                     return None;
                 }
-                Some(Api {
+                let api = Api {
                     create: std::mem::transmute::<*mut c_void, Create>(create),
                     send_echo: std::mem::transmute::<*mut c_void, SendEcho>(send),
                     close: std::mem::transmute::<*mut c_void, Close>(close),
-                })
+                };
+                // The library loads parts of itself the first time it is used; a locked-in
+                // program cannot load them, so the first use is made here.
+                let handle = (api.create)();
+                if !handle.is_null() && handle as isize != -1 {
+                    (api.close)(handle);
+                }
+                Some(api)
             }
         });
     }

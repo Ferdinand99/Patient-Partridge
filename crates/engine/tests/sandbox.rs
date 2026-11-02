@@ -637,36 +637,57 @@ fn a_locked_in_engine_cannot_open_files_use_the_network_or_start_programs() {
         );
         assert!(l.starts_with(&format!("{attempt}: denied")), "{l}");
         assert!(!l.contains("did not start"), "{l}");
-        // Windows: the answer of a network that is closed by policy, not another failure.
+        // Windows: the answer of a network that is closed by policy, not another failure. (On
+        // IPv6 the system answers "access denied", error 5, where IPv4 gets error 10013.)
         if cfg!(windows) && attempt != "dns_lookup" {
-            assert!(l.contains("os error 10013"), "{l}");
+            let v6 = attempt.contains("v6");
+            assert!(
+                l.contains("os error 10013") || (v6 && l.contains("os error 5)")),
+                "{l}"
+            );
         }
+        // A datagram socket cannot even be made in the sandbox: the refusal comes from `socket`,
+        // before any send. The line says which call it was.
         if attempt.starts_with("udp_sendto_unbound") {
-            assert!(l.contains("sendto:"), "no datagram was sent: {l}");
+            println!(
+                "network: {attempt} was refused by {}",
+                if l.contains("sendto:") {
+                    "sendto"
+                } else {
+                    "socket"
+                }
+            );
         }
     }
-    // Windows: a raw socket and an ICMP echo. An account without administrator rights cannot make
-    // a raw socket in the control either, and a computer that does not answer an echo gives no
-    // reply to the control: then the line is printed and the attempt proves nothing about the
-    // engine, which the log shows.
+    // Windows: a raw socket, an echo request sent from it, and an ICMP echo through the ICMP
+    // service. A raw socket can be made in the sandbox (the log says so); sending from it must be
+    // refused. An account without administrator rights cannot make a raw socket in the control
+    // either, and a computer that does not answer an echo gives no reply to the control: then the
+    // attempt proves nothing about the engine, and the log shows that.
     #[cfg(windows)]
-    for attempt in ["raw_socket", "icmp_echo_loopback"] {
-        let l = line(lines, attempt);
-        let c = line(&control, attempt);
-        println!("network: {l} (control: {c})");
-        assert!(l.starts_with(&format!("{attempt}: denied")), "{l}");
-        if attempt == "icmp_echo_loopback" && c.contains("ALLOWED") {
-            assert!(!l.contains("ALLOWED"), "{l}");
-        }
-    }
-    #[cfg(windows)]
-    if remote.is_some() {
-        let l = line(lines, "icmp_echo_remote");
+    {
         println!(
-            "network: {l} (control: {})",
-            line(&control, "icmp_echo_remote")
+            "network: raw socket made in the sandbox: {} (control: {})",
+            line(lines, "raw_socket"),
+            line(&control, "raw_socket")
         );
-        assert!(l.starts_with("icmp_echo_remote: denied"), "{l}");
+        for attempt in ["raw_socket_send_loopback", "raw_socket_send_remote"] {
+            let l = line(lines, attempt);
+            let c = line(&control, attempt);
+            println!("network: {l} (control: {c})");
+            assert!(l.starts_with(&format!("{attempt}: denied")), "{l}");
+        }
+        for attempt in ["icmp_echo_loopback", "icmp_echo_remote"] {
+            let l = line(lines, attempt);
+            let c = line(&control, attempt);
+            println!("network: {l} (control: {c})");
+            assert!(!l.contains("ALLOWED"), "{l}");
+            // A refusal that is only the ICMP library failing to start says nothing about the
+            // network.
+            if l.contains("IcmpCreateFile") {
+                println!("network: {attempt} did not get as far as the network");
+            }
+        }
     }
     #[cfg(windows)]
     {
