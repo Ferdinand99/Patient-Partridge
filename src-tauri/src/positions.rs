@@ -191,7 +191,11 @@ pub(crate) fn read_plain_file(file: &Path, cap: u64) -> Option<Vec<u8>> {
         return None;
     }
     let mut bytes = Vec::new();
-    fs::File::open(file).ok()?.take(cap + 1).read_to_end(&mut bytes).ok()?;
+    fs::File::open(file)
+        .ok()?
+        .take(cap + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
     (bytes.len() as u64 <= cap).then_some(bytes)
 }
 
@@ -398,7 +402,10 @@ mod tests {
         fs::write(&file, b"12345").unwrap();
         assert_eq!(read_plain_file(&file, 5).as_deref(), Some(&b"12345"[..]));
         assert_eq!(read_plain_file(&file, 4), None);
-        assert_eq!(read_plain_file(&dir.file().with_extension("missing"), 5), None);
+        assert_eq!(
+            read_plain_file(&dir.file().with_extension("missing"), 5),
+            None
+        );
         // A folder is not a file.
         assert_eq!(read_plain_file(file.parent().unwrap(), 1 << 20), None);
     }
