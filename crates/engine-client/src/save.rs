@@ -1814,6 +1814,18 @@ mod tests {
         lines
     }
 
+    /// A folder whose rights pass to the files made in it (all users may read them), like the
+    /// folders of a shared drive. Without it the folder of a test run hands down nothing, and a
+    /// file made there has only the default rights of the user's token, whether or not the rights
+    /// are protected from inheritance.
+    #[cfg(windows)]
+    fn share_with_users(dir: &Dir) {
+        assert!(
+            icacls(&dir.0, &["/grant", "*S-1-5-32-545:(OI)(CI)(R)"]),
+            "grant on the folder"
+        );
+    }
+
     #[cfg(windows)]
     fn icacls(path: &Path, args: &[&str]) -> bool {
         std::process::Command::new("icacls")
@@ -1843,8 +1855,18 @@ mod tests {
     #[test]
     fn n3_a_protected_dacl_is_kept_with_its_protection() {
         let dir = Dir::new("dacl");
+        share_with_users(&dir);
         let path = original_in(&dir);
         let user = std::env::var("USERNAME").expect("the user's name");
+        // The folder hands its rights down: a new file there starts with them.
+        let probe = dir.file("probe.pdf");
+        fs::write(&probe, ORIGINAL).unwrap();
+        assert!(
+            rights_of(&probe).iter().any(|l| l.contains("(I)")),
+            "the folder passes nothing down: {:?}",
+            rights_of(&probe)
+        );
+        fs::remove_file(&probe).unwrap();
         // Cut off from the folder's rights, with a short list of its own: the user, the system,
         // and the group of all users (read only).
         assert!(icacls(&path, &["/inheritance:r"]), "inheritance:r");
@@ -1879,6 +1901,7 @@ mod tests {
     #[test]
     fn n3_an_unprotected_dacl_still_follows_the_folder() {
         let dir = Dir::new("dacl-open");
+        share_with_users(&dir);
         let path = original_in(&dir);
         let before = rights_of(&path);
         assert!(
