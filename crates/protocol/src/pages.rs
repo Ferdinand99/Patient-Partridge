@@ -6,9 +6,7 @@
 //! engine reports holds at most [`MAX_PAGES`] pages, and the bytes of an inserted document come in
 //! pieces of at most [`MAX_SAVE_CHUNK`] up to [`MAX_IMPORT_BYTES`] altogether.
 
-use super::{
-    put_f32, put_u32, PageSize, ProtocolError, Reader, MAX_SAVE_BYTES, MAX_SAVE_CHUNK,
-};
+use super::{put_f32, put_u32, PageSize, ProtocolError, Reader, MAX_SAVE_BYTES, MAX_SAVE_CHUNK};
 
 /// Most pages a document may have for the engine to open it. A document with more is refused: the
 /// answer to `Open` lists every page, and the window lays every page out.
@@ -77,7 +75,11 @@ pub enum PagesRequest {
     /// that goes there: it holds every page number once.
     Reorder { doc: u32, order: Vec<u32> },
     /// Turn pages clockwise by `turns` quarter turns (1 to 3).
-    Rotate { doc: u32, pages: Vec<u32>, turns: u8 },
+    Rotate {
+        doc: u32,
+        pages: Vec<u32>,
+        turns: u8,
+    },
     /// Set the crop box of pages so that the visible page is smaller by `margins`, which are
     /// `[left, top, right, bottom]` in points on the page as it is drawn. This hides the edges;
     /// it removes nothing from the page.
@@ -142,7 +144,9 @@ pub enum PagesResponse {
     },
     ImportReady,
     /// How many bytes of the document to insert the engine holds now.
-    ImportAck { received: u32 },
+    ImportAck {
+        received: u32,
+    },
     /// A document built by `ExportBegin`, `size` bytes, with what the check of the written file
     /// needs: its pages, its signatures, the kind of protection of the source (the new document
     /// has none), and a digest of what a reader sees of the pages.
@@ -484,12 +488,8 @@ impl PagesResponse {
                 if n > r.remaining() / 32 {
                     return Err(ProtocolError::Truncated);
                 }
-                let before = (0..n)
-                    .map(|_| get_box(r))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let after = (0..n)
-                    .map(|_| get_box(r))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let before = (0..n).map(|_| get_box(r)).collect::<Result<Vec<_>, _>>()?;
+                let after = (0..n).map(|_| get_box(r)).collect::<Result<Vec<_>, _>>()?;
                 PagesResponse::Cropped {
                     pages,
                     before,

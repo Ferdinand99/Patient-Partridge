@@ -126,11 +126,17 @@ fn every_answer_survives_the_wire() {
 fn every_request_and_answer_tag_is_inside_the_range_the_dispatch_looks_at() {
     for body in requests() {
         let tag = request(body).encode()[0];
-        assert!((FIRST_REQUEST_TAG..=LAST_REQUEST_TAG).contains(&tag), "{tag}");
+        assert!(
+            (FIRST_REQUEST_TAG..=LAST_REQUEST_TAG).contains(&tag),
+            "{tag}"
+        );
     }
     for body in responses() {
         let tag = response(body).encode()[0];
-        assert!((FIRST_RESPONSE_TAG..=LAST_RESPONSE_TAG).contains(&tag), "{tag}");
+        assert!(
+            (FIRST_RESPONSE_TAG..=LAST_RESPONSE_TAG).contains(&tag),
+            "{tag}"
+        );
     }
     // The ends of the range are real messages, so a tag past them is unknown.
     for tag in [FIRST_REQUEST_TAG - 1, LAST_REQUEST_TAG + 1] {
@@ -215,7 +221,12 @@ fn a_list_that_claims_more_than_the_frame_holds_is_refused_before_anything_is_re
 
 #[test]
 fn numbers_that_are_not_finite_or_absurd_are_refused() {
-    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, MAX_BOX_VALUE * 2.0] {
+    for bad in [
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        MAX_BOX_VALUE * 2.0,
+    ] {
         let sent = request(PagesRequest::Crop {
             doc: 1,
             pages: vec![0],

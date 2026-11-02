@@ -8,8 +8,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU8;
 use std::sync::{Arc, Mutex};
 
 mod pages;
@@ -489,7 +489,10 @@ mod tests {
         busy(pool.pages_reorder(handle, &[0]).map(|_| ()));
         busy(pool.pages_rotate(handle, &[0], 1).map(|_| ()));
         busy(pool.pages_crop(handle, &[0], [1.0; 4]).map(|_| ()));
-        busy(pool.pages_set_boxes(handle, &[0], &[[0.0, 0.0, 9.0, 9.0]]).map(|_| ()));
+        busy(
+            pool.pages_set_boxes(handle, &[0], &[[0.0, 0.0, 9.0, 9.0]])
+                .map(|_| ()),
+        );
         busy(pool.pages_insert_blank(handle, 0, 100.0, 100.0).map(|_| ()));
         busy(pool.pages_restore(handle, 1).map(|_| ()));
         busy(
@@ -508,7 +511,12 @@ mod tests {
         );
         // Nothing started an engine for any of them.
         assert_eq!(
-            state(&pool.state).docs.get(&handle).unwrap().client.spawn_count(),
+            state(&pool.state)
+                .docs
+                .get(&handle)
+                .unwrap()
+                .client
+                .spawn_count(),
             0
         );
     }

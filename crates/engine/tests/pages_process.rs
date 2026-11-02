@@ -108,7 +108,9 @@ fn every_tool_works_in_the_sandbox_and_a_save_writes_the_result() {
     let moved = pool.pages_reorder(handle, &order).unwrap();
     assert_eq!(moved.pages.len(), 5);
     pool.pages_rotate(handle, &[0], 1).unwrap();
-    let cropped = pool.pages_crop(handle, &[1], [10.0, 20.0, 30.0, 40.0]).unwrap();
+    let cropped = pool
+        .pages_crop(handle, &[1], [10.0, 20.0, 30.0, 40.0])
+        .unwrap();
     assert_eq!(cropped.pages[1].width, 612.0 - 40.0);
     let blank = pool.pages_insert_blank(handle, 2, 300.0, 400.0).unwrap();
     assert_eq!(blank.pages.len(), 6);
@@ -177,11 +179,7 @@ fn pages_of_another_file_are_inserted_by_an_engine_of_its_own() {
     assert_eq!(outcome.inserted, 4);
     assert_eq!(outcome.changed.pages.len(), 7);
     assert!(last.load(Ordering::SeqCst) > 0);
-    assert!(pool
-        .page_text(handle, 1)
-        .unwrap()
-        .text
-        .contains("Page 1"));
+    assert!(pool.page_text(handle, 1).unwrap().text.contains("Page 1"));
     assert!(has_page_text(&pool, handle, 5, 1));
     // The engine that read the other file is gone; the pool holds the one document.
     assert_eq!(pool.len(), 1);
@@ -218,7 +216,7 @@ fn a_protected_file_asks_for_its_password_and_its_pages_do_not_join_without_a_wo
         other => panic!("{other:?}"),
     }
     // Nothing was inserted.
-    assert_eq!(pool.page_text(handle, 2).map(|_| ()).unwrap_err().to_string().is_empty(), false);
+    assert!(pool.page_text(handle, 2).is_err(), "the document still has two pages");
     let outcome = ask(
         Some("secret"),
         InsertOptions {
@@ -241,8 +239,15 @@ fn pages_of_a_protected_document_get_the_protection_of_the_document_they_join() 
     let other = dir.write("b.pdf", &kit::simple_pdf(1));
     let pool = pool();
     let (handle, _) = pool.open(&text(&target), Some("secret")).unwrap();
-    pool.insert_pdf(handle, 2, &text(&other), None, InsertOptions::default(), &nothing)
-        .unwrap();
+    pool.insert_pdf(
+        handle,
+        2,
+        &text(&other),
+        None,
+        InsertOptions::default(),
+        &nothing,
+    )
+    .unwrap();
     pool.pages_delete(handle, &[0]).unwrap();
     pool.save(handle, SaveOptions::default()).unwrap();
     // Still needs the password, and has the pages.
@@ -407,8 +412,15 @@ fn extracted_pages_are_written_through_the_save_path_and_checked() {
         }
     }
     // Nothing is left beside it, and the document is as it was.
-    assert_eq!(dir.names(), vec!["a.pdf".to_string(), "part.pdf".to_string()]);
-    assert_eq!(pool.page_text(handle, 4).unwrap().text.contains(&kit::page_text(4)), true);
+    assert_eq!(
+        dir.names(),
+        vec!["a.pdf".to_string(), "part.pdf".to_string()]
+    );
+    assert!(pool
+        .page_text(handle, 4)
+        .unwrap()
+        .text
+        .contains(&kit::page_text(4)));
     let (copy, sizes) = pool.open(&text(&out), None).unwrap();
     assert_eq!(sizes.len(), 2);
     assert!(has_page_text(&pool, copy, 0, 3));
@@ -419,7 +431,10 @@ fn extracted_pages_are_written_through_the_save_path_and_checked() {
     let (copy2, sizes) = pool.open(&text(&out), None).unwrap();
     assert_eq!(sizes.len(), 1);
     assert!(has_page_text(&pool, copy2, 0, 0));
-    assert_eq!(dir.names(), vec!["a.pdf".to_string(), "part.pdf".to_string()]);
+    assert_eq!(
+        dir.names(),
+        vec!["a.pdf".to_string(), "part.pdf".to_string()]
+    );
 }
 
 #[test]
@@ -597,16 +612,33 @@ fn the_files_for_other_tools_are_written() {
     let (path, h) = open(&kit::marked_pdf(2));
     pool.pages_crop(h, &[0], [10.0, 20.0, 30.0, 40.0]).unwrap();
     pool.save(h, SaveOptions::default()).unwrap();
-    keep("cropped.pdf", &path, 2, "cropbox=10,40,582,772 size=572x732 text=0,1");
+    keep(
+        "cropped.pdf",
+        &path,
+        2,
+        "cropbox=10,40,582,772 size=572x732 text=0,1",
+    );
 
     // A blank page in the middle, and pages of another file.
     let (path, h) = open(&kit::marked_pdf(3));
     pool.pages_insert_blank(h, 1, 300.0, 400.0).unwrap();
     let other = dir.write("other.pdf", &kit::simple_pdf(2));
-    pool.insert_pdf(h, 4, &text(&other), None, InsertOptions::default(), &nothing)
-        .unwrap();
+    pool.insert_pdf(
+        h,
+        4,
+        &text(&other),
+        None,
+        InsertOptions::default(),
+        &nothing,
+    )
+    .unwrap();
     pool.save(h, SaveOptions::default()).unwrap();
-    keep("inserted.pdf", &path, 6, "blank=1 size1=300x400 text=0,x,1,2");
+    keep(
+        "inserted.pdf",
+        &path,
+        6,
+        "blank=1 size1=300x400 text=0,x,1,2",
+    );
 
     // Two pages copied out in the other order.
     let (path, h) = open(&kit::marked_pdf(5));

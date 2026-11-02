@@ -27,9 +27,9 @@
 use std::collections::VecDeque;
 
 use partridge_protocol::{
-    ErrorCode, PageSize, PagesRequest, PagesResponse, ResponseBody, MAX_BLANK_SIDE,
-    MAX_EDIT_PAGES, MAX_IMPORT_BYTES, MAX_SAVE_BYTES, MAX_SAVE_CHUNK, MAX_UNDO_BYTES,
-    MAX_UNDO_STEPS, MIN_BLANK_SIDE, MIN_CROP_SIDE,
+    ErrorCode, PageSize, PagesRequest, PagesResponse, ResponseBody, MAX_BLANK_SIDE, MAX_EDIT_PAGES,
+    MAX_IMPORT_BYTES, MAX_SAVE_BYTES, MAX_SAVE_CHUNK, MAX_UNDO_BYTES, MAX_UNDO_STEPS,
+    MIN_BLANK_SIDE, MIN_CROP_SIDE,
 };
 use pdfium_render::prelude::*;
 
@@ -289,7 +289,10 @@ fn page_list(pages: &[u32], count: usize) -> Result<Vec<u32>, Failure> {
     sorted.sort_unstable();
     sorted.dedup();
     if sorted.last().is_some_and(|&p| p as usize >= count) {
-        return fail(ErrorCode::PageOutOfRange, "a page that was named does not exist");
+        return fail(
+            ErrorCode::PageOutOfRange,
+            "a page that was named does not exist",
+        );
     }
     Ok(sorted)
 }
@@ -321,7 +324,9 @@ pub(crate) fn handle(
             width,
             height,
         } => insert_blank(engine, pdfium, doc, at, width, height, progress)?,
-        PagesRequest::Restore { doc, snapshot } => restore(engine, pdfium, doc, snapshot, progress)?,
+        PagesRequest::Restore { doc, snapshot } => {
+            restore(engine, pdfium, doc, snapshot, progress)?
+        }
         PagesRequest::ImportBegin { doc, size } => import_begin(engine, doc, size)?,
         PagesRequest::ImportChunk { doc, offset, data } => import_chunk(engine, doc, offset, data)?,
         PagesRequest::ImportEnd { doc, at } => import_end(engine, pdfium, doc, at, progress)?,
@@ -331,7 +336,9 @@ pub(crate) fn handle(
             }
             PagesResponse::Done
         }
-        PagesRequest::ExportBegin { doc, pages } => export_begin(engine, pdfium, doc, &pages, progress)?,
+        PagesRequest::ExportBegin { doc, pages } => {
+            export_begin(engine, pdfium, doc, &pages, progress)?
+        }
     };
     Ok(ResponseBody::Pages(response))
 }
@@ -472,7 +479,10 @@ fn delete(
     let count = editable(engine, doc)?;
     let sorted = page_list(pages, count)?;
     if sorted.len() >= count {
-        return fail(ErrorCode::InvalidRequest, "a document needs at least one page");
+        return fail(
+            ErrorCode::InvalidRequest,
+            "a document needs at least one page",
+        );
     }
     let token = take_snapshot(engine, doc, progress)?;
     let mut form_fields = 0;
@@ -493,7 +503,9 @@ fn delete(
             }
         }
         if document.pages().len() as usize != count - sorted.len() {
-            return Err(failed("the document has the wrong number of pages after the delete"));
+            return Err(failed(
+                "the document has the wrong number of pages after the delete",
+            ));
         }
         Ok(())
     })();
@@ -517,13 +529,21 @@ fn reorder(
 ) -> Result<PagesResponse, Failure> {
     let count = editable(engine, doc)?;
     if order.len() != count {
-        return fail(ErrorCode::InvalidRequest, "the new order must name every page once");
+        return fail(
+            ErrorCode::InvalidRequest,
+            "the new order must name every page once",
+        );
     }
     let mut seen = vec![false; count];
     for &p in order {
         match seen.get_mut(p as usize) {
             Some(slot) if !*slot => *slot = true,
-            _ => return fail(ErrorCode::InvalidRequest, "the new order must name every page once"),
+            _ => {
+                return fail(
+                    ErrorCode::InvalidRequest,
+                    "the new order must name every page once",
+                )
+            }
         }
     }
     if order.iter().enumerate().all(|(i, &p)| p as usize == i) {
@@ -532,7 +552,10 @@ fn reorder(
     // The document as it is now: the source of the pages that move, and the copy that takes the
     // move back. A document that cannot be saved cannot be reordered either.
     let Some(bytes) = serialise(engine, doc, MAX_SAVE_BYTES, progress)? else {
-        return fail(ErrorCode::SaveTooLarge, "the document is too big to be reordered");
+        return fail(
+            ErrorCode::SaveTooLarge,
+            "the document is too big to be reordered",
+        );
     };
     let stable = stable_places(order);
     let password = password_of(engine, doc);
@@ -544,7 +567,10 @@ fn reorder(
         let document = engine.docs.get_mut(&doc).ok_or_else(gone)?;
         // The pages that move leave first (the last ones first, so the numbers of the others
         // stay what they are) ...
-        let mut leaving: Vec<u32> = (0..count).filter(|i| !stable[*i]).map(|i| order[i]).collect();
+        let mut leaving: Vec<u32> = (0..count)
+            .filter(|i| !stable[*i])
+            .map(|i| order[i])
+            .collect();
         leaving.sort_unstable_by(|a, b| b.cmp(a));
         for (i, &index) in leaving.iter().enumerate() {
             let page = document
@@ -580,7 +606,9 @@ fn reorder(
             place = end;
         }
         if document.pages().len() as usize != count {
-            return Err(failed("the document has the wrong number of pages after the move"));
+            return Err(failed(
+                "the document has the wrong number of pages after the move",
+            ));
         }
         Ok(())
     })();
@@ -608,7 +636,10 @@ fn rotate(
 ) -> Result<PagesResponse, Failure> {
     let count = editable(engine, doc)?;
     if !(1..=3).contains(&turns) {
-        return fail(ErrorCode::InvalidRequest, "a page turns by 1 to 3 quarter turns");
+        return fail(
+            ErrorCode::InvalidRequest,
+            "a page turns by 1 to 3 quarter turns",
+        );
     }
     let sorted = page_list(pages, count)?;
     {
@@ -649,7 +680,10 @@ fn crop(
         .iter()
         .any(|m| !m.is_finite() || *m < 0.0 || *m > MAX_BLANK_SIDE)
     {
-        return fail(ErrorCode::InvalidRequest, "the margins of a crop are not usable");
+        return fail(
+            ErrorCode::InvalidRequest,
+            "the margins of a crop are not usable",
+        );
     }
     let (before, after) = {
         let document = engine.document(doc)?;
@@ -710,7 +744,10 @@ fn set_boxes(
     let mut seen = std::collections::HashSet::new();
     for &p in pages {
         if p as usize >= count {
-            return fail(ErrorCode::PageOutOfRange, "a page that was named does not exist");
+            return fail(
+                ErrorCode::PageOutOfRange,
+                "a page that was named does not exist",
+            );
         }
         if !seen.insert(p) {
             return fail(ErrorCode::InvalidRequest, "a page was named twice");
@@ -748,7 +785,10 @@ fn insert_blank(
 ) -> Result<PagesResponse, Failure> {
     let count = editable(engine, doc)?;
     if at as usize > count {
-        return fail(ErrorCode::PageOutOfRange, "there is no such place for a page");
+        return fail(
+            ErrorCode::PageOutOfRange,
+            "there is no such place for a page",
+        );
     }
     if count + 1 > MAX_EDIT_PAGES {
         return fail(
@@ -758,7 +798,10 @@ fn insert_blank(
     }
     let usable_side = |v: f32| v.is_finite() && (MIN_BLANK_SIDE..=MAX_BLANK_SIDE).contains(&v);
     if !usable_side(width) || !usable_side(height) {
-        return fail(ErrorCode::InvalidRequest, "the size of the page is not usable");
+        return fail(
+            ErrorCode::InvalidRequest,
+            "the size of the page is not usable",
+        );
     }
     let token = take_snapshot(engine, doc, progress)?;
     let result = (|| {
@@ -771,7 +814,9 @@ fn insert_blank(
             )
             .map_err(|_| failed("PDFium could not add a page"))?;
         if document.pages().len() as usize != count + 1 {
-            return Err(failed("the document has the wrong number of pages after the insert"));
+            return Err(failed(
+                "the document has the wrong number of pages after the insert",
+            ));
         }
         Ok(())
     })();
@@ -811,7 +856,10 @@ fn restore(
             "the engine no longer holds a copy of the document to go back to",
         );
     };
-    let target = tools.snapshots.remove(at).expect("the position was just found");
+    let target = tools
+        .snapshots
+        .remove(at)
+        .expect("the position was just found");
     let loaded = pdfium
         .load_pdf_from_byte_vec(target.bytes, password.as_deref())
         .map_err(|_| failed("the copy of the document could not be read"))?;
@@ -823,7 +871,10 @@ fn import_begin(engine: &mut Engine, doc: u32, size: u32) -> Result<PagesRespons
     editable(engine, doc)?;
     let size = size as usize;
     if size == 0 || size > MAX_IMPORT_BYTES {
-        return fail(ErrorCode::InvalidRequest, "the size of the document is not usable");
+        return fail(
+            ErrorCode::InvalidRequest,
+            "the size of the document is not usable",
+        );
     }
     let mut bytes = Vec::new();
     if bytes.try_reserve_exact(size).is_err() {
@@ -847,10 +898,16 @@ fn import_chunk(
         return fail(ErrorCode::InvalidRequest, "no insert is under way");
     };
     if offset as usize != import.bytes.len() {
-        return fail(ErrorCode::InvalidRequest, "the piece does not start where the last ended");
+        return fail(
+            ErrorCode::InvalidRequest,
+            "the piece does not start where the last ended",
+        );
     }
     if import.bytes.len() + data.len() > import.size {
-        return fail(ErrorCode::InvalidRequest, "the pieces are more than the size announced");
+        return fail(
+            ErrorCode::InvalidRequest,
+            "the pieces are more than the size announced",
+        );
     }
     import.bytes.extend_from_slice(&data);
     Ok(PagesResponse::ImportAck {
@@ -873,7 +930,10 @@ fn import_end(
         return fail(ErrorCode::InvalidRequest, "the document is not complete");
     }
     if at as usize > count {
-        return fail(ErrorCode::PageOutOfRange, "there is no such place for the pages");
+        return fail(
+            ErrorCode::PageOutOfRange,
+            "there is no such place for the pages",
+        );
     }
     // The document to insert is untrusted bytes, even though another engine wrote them: it is read
     // here, in this sandbox, and nothing else looks at it.
@@ -887,7 +947,10 @@ fn import_end(
         })?;
     let added = source.pages().len() as usize;
     if added == 0 {
-        return fail(ErrorCode::ImportFailed, "the document to insert has no pages");
+        return fail(
+            ErrorCode::ImportFailed,
+            "the document to insert has no pages",
+        );
     }
     if count + added > MAX_EDIT_PAGES {
         return fail(
@@ -900,10 +963,16 @@ fn import_end(
         let document = engine.docs.get_mut(&doc).ok_or_else(gone)?;
         document
             .pages_mut()
-            .copy_page_range_from_document(&source, 0..=(added as PdfPageIndex - 1), at as PdfPageIndex)
+            .copy_page_range_from_document(
+                &source,
+                0..=(added as PdfPageIndex - 1),
+                at as PdfPageIndex,
+            )
             .map_err(|_| failed("PDFium could not insert the pages"))?;
         if document.pages().len() as usize != count + added {
-            return Err(failed("the document has the wrong number of pages after the insert"));
+            return Err(failed(
+                "the document has the wrong number of pages after the insert",
+            ));
         }
         Ok(())
     })();
@@ -923,14 +992,22 @@ fn export_begin(
 ) -> Result<PagesResponse, Failure> {
     let count = editable(engine, doc)?;
     if pages.is_empty() || pages.len() > MAX_EDIT_PAGES {
-        return fail(ErrorCode::InvalidRequest, "the pages to copy are not usable");
+        return fail(
+            ErrorCode::InvalidRequest,
+            "the pages to copy are not usable",
+        );
     }
     if pages.iter().any(|&p| p as usize >= count) {
-        return fail(ErrorCode::PageOutOfRange, "a page that was named does not exist");
+        return fail(
+            ErrorCode::PageOutOfRange,
+            "a page that was named does not exist",
+        );
     }
     engine.check_source(progress)?;
     let document = engine.document(doc)?;
-    let mut fresh = pdfium.create_new_pdf().map_err(|_| failed("PDFium could not make a new document"))?;
+    let mut fresh = pdfium
+        .create_new_pdf()
+        .map_err(|_| failed("PDFium could not make a new document"))?;
     fresh
         .pages_mut()
         .copy_pages_from_document(document, &range_string(pages), 0)

@@ -50,10 +50,23 @@ fn the_good_stand_in_works_through_every_tool() {
     let client = client_with("good");
     let doc = client.open(&doc_path(), None).unwrap().doc;
     let changed = client.pages_delete(doc, &[1]).unwrap();
-    assert_eq!((changed.pages.len(), changed.snapshot, changed.count), (2, 1, 1));
+    assert_eq!(
+        (changed.pages.len(), changed.snapshot, changed.count),
+        (2, 1, 1)
+    );
     assert_eq!(client.pages_rotate(doc, &[0], 1).unwrap().snapshot, 0);
-    assert_eq!(client.pages_insert_blank(doc, 0, 100.0, 100.0).unwrap().pages.len(), 3);
-    assert_eq!(client.pages_reorder(doc, &[2, 1, 0]).unwrap().pages.len(), 3);
+    assert_eq!(
+        client
+            .pages_insert_blank(doc, 0, 100.0, 100.0)
+            .unwrap()
+            .pages
+            .len(),
+        3
+    );
+    assert_eq!(
+        client.pages_reorder(doc, &[2, 1, 0]).unwrap().pages.len(),
+        3
+    );
     assert_eq!(client.pages_restore(doc, 1).unwrap().snapshot, 2);
     let cropped = client.pages_crop(doc, &[0, 1], [1.0; 4]).unwrap();
     assert_eq!((cropped.before.len(), cropped.after.len()), (2, 2));
@@ -135,11 +148,17 @@ fn lists_and_sizes_that_do_not_fit_are_refused_before_anything_is_sent() {
     let doc = (1u64 << 32) | 1;
     for result in [
         client.pages_delete(doc, &[]).map(|_| ()),
-        client.pages_delete(doc, &vec![0; MAX_EDIT_PAGES + 1]).map(|_| ()),
+        client
+            .pages_delete(doc, &vec![0; MAX_EDIT_PAGES + 1])
+            .map(|_| ()),
         client.pages_reorder(doc, &[]).map(|_| ()),
         client.pages_rotate(doc, &[], 1).map(|_| ()),
-        client.pages_crop(doc, &[0], [f32::NAN, 0.0, 0.0, 0.0]).map(|_| ()),
-        client.pages_set_boxes(doc, &[0, 1], &[[0.0; 4]]).map(|_| ()),
+        client
+            .pages_crop(doc, &[0], [f32::NAN, 0.0, 0.0, 0.0])
+            .map(|_| ()),
+        client
+            .pages_set_boxes(doc, &[0, 1], &[[0.0; 4]])
+            .map(|_| ()),
         client.import_begin(doc, 0),
         client.import_begin(doc, u64::MAX),
     ] {
@@ -166,11 +185,18 @@ fn a_tool_that_works_for_ever_is_stopped_by_the_overall_limit() {
     let started = Instant::now();
     match client.pages_delete(doc, &[0]) {
         Err(ClientError::EngineStopped(why)) => {
-            assert!(why.starts_with(partridge_engine_client::TOOK_TOO_LONG), "{why}")
+            assert!(
+                why.starts_with(partridge_engine_client::TOOK_TOO_LONG),
+                "{why}"
+            )
         }
         other => panic!("{other:?}"),
     }
-    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
 }
 
 #[test]
@@ -203,7 +229,14 @@ fn pages_are_inserted_from_another_file_and_progress_is_told() {
         calls.fetch_add(1, Ordering::SeqCst);
     };
     let outcome = pool
-        .insert_pdf(handle, 1, &doc_path(), None, InsertOptions::default(), &progress)
+        .insert_pdf(
+            handle,
+            1,
+            &doc_path(),
+            None,
+            InsertOptions::default(),
+            &progress,
+        )
         .unwrap();
     assert_eq!(outcome.inserted, 3);
     assert_eq!(outcome.changed.count, 2);
@@ -254,7 +287,10 @@ fn a_change_that_hangs_can_be_stopped_by_stopping_the_engine() {
     });
     let started = Instant::now();
     let result = pool.pages_rotate(handle, &[0], 1);
-    assert!(matches!(result, Err(ClientError::EngineStopped(_))), "{result:?}");
+    assert!(
+        matches!(result, Err(ClientError::EngineStopped(_))),
+        "{result:?}"
+    );
     assert_eq!(thread.join().unwrap(), Cancelled::EngineStopped);
     assert!(started.elapsed() < Duration::from_secs(10));
 }

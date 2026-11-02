@@ -19,8 +19,12 @@ import {
 import { actionForKey } from "../viewer/keys";
 import type { CopyResult, PageLinkInfo } from "../viewer/overlays";
 import { DocumentView, type ViewPosition, type ViewerOptions } from "../viewer/viewer";
+import type { PageSizePt } from "../viewer/layout";
 import { zoomLabel, type ZoomMode } from "../viewer/zoom";
 import { FindBar } from "./find";
+import type { PageToolsApi } from "../lib/pagesapi";
+import { PageOps, type PageHost } from "./pageops";
+import { PagePanel, type PagePanelHost } from "./pagepanel";
 import { EditHistory, type Edit } from "./history";
 import { MenuController } from "./menu";
 import {
@@ -85,6 +89,10 @@ export interface AppDeps {
   sessionOpenLimitMs?: number;
   /** Limits on the text kept for each document. For tests; the defaults are meant for the app. */
   viewLimits?: ViewerOptions["limits"];
+  /** The page tools (delete, move, turn, crop, insert, copy out). Without it the page panel only shows the pages. */
+  pages?: PageToolsApi;
+  /** How long a page tool may work before the box with the bar shows, in milliseconds. For tests. */
+  pageBusyDelayMs?: number;
 }
 
 interface Tab {
@@ -209,6 +217,10 @@ export class App {
   private readonly tabStrip: TabStrip;
   private readonly menu: MenuController;
   private readonly sidebar: Sidebar;
+  private readonly pageOps: PageOps | null;
+  private readonly pagePanel: PagePanel | null;
+  private readonly pageAnnounce: HTMLElement;
+  private pageAnnounceFlip = false;
   private readonly find: FindBar;
   private readonly selectionProxy: HTMLElement;
   private readonly copyStatus: HTMLElement;
@@ -251,11 +263,66 @@ export class App {
       },
       debounceMs: deps.findDebounceMs,
     });
+    this.pageAnnounce = byId(root, "pt-announce");
+    this.pageOps = null;
+    this.pagePanel = null;
+    if (deps.pages) {
+      const host: PageHost & PagePanelHost = {
+        target: () => {
+          const t = this.active;
+          return t ? { doc: t.doc, name: t.name, history: t.history, pages: t.sidebarDoc.pages } : null;
+        },
+        applyPages: (doc, pages, show) => this.applyPages(doc, pages, show),
+        notice: (options) => showNotice(this.noticeLayer, options),
+        lost: async (doc, error) => {
+          const tab = this.tabs.find((t) => t.doc === doc);
+          if (tab) await this.documentLost(tab, error);
+        },
+        pickFiles: () => deps.pickFiles(),
+        announce: (text) => this.announcePages(text),
+        layer: this.noticeLayer,
+        currentPage: () => this.active?.view.currentPageIndex ?? 0,
+        goToPage: (index) => this.active?.view.goToPage(index),
+        render: (doc, page, width, height) => deps.api.render(doc, page, width, height),
+      };
+      const ops = new PageOps(deps.pages, host, {
+        busyChanged: (busy) => this.pagePanel?.setBusy(busy),
+        busyDelayMs: deps.pageBusyDelayMs,
+      });
+      this.pageOps = ops;
+      this.pagePanel = new PagePanel(root, ops, host);
+    }
     this.sidebar = new Sidebar(root, {
       api: deps.api,
       storage: deps.storage ?? null,
       thumbs: deps.thumbSettleMs === undefined ? undefined : { settleMs: deps.thumbSettleMs },
+      pagePanel: this.pagePanel ?? undefined,
     });
+  }
+
+  /**
+   * The pages of a document changed (a page tool, or taking one back): the view and the side panel
+   * lay out again for the new list, and a search of the old pages is dropped, because page numbers
+   * now mean other pages.
+   */
+  private applyPages(doc: number, pages: PageSizePt[], show?: number): void {
+    const tab = this.tabs.find((t) => t.doc === doc);
+    if (!tab) return;
+    tab.sidebarDoc.pages = pages;
+    tab.view.replacePages(pages, show);
+    this.find.forget(tab.view);
+    if (this.active === tab) {
+      this.find.setTarget(null);
+      this.find.setTarget({ doc: tab.doc, view: tab.view });
+      this.pageTotal.textContent = `/ ${pages.length}`;
+      this.showCurrentPage();
+    }
+    this.sidebar.pagesChanged(doc);
+  }
+
+  private announcePages(text: string): void {
+    this.pageAnnounceFlip = !this.pageAnnounceFlip;
+    this.pageAnnounce.textContent = this.pageAnnounceFlip ? text : `${text}\u00a0`;
   }
 
   init(): void {
@@ -976,6 +1043,8 @@ export class App {
    * (a save breaks a signature). A failure is told to the user. Resolves with true when saved.
    */
   private async saveTab(tab: Tab, asCopy: boolean): Promise<boolean> {
+    // A page tool that is still working would make the bytes of the save those of no one state.
+    if (this.pageOps?.busy) await this.pageOps.whenIdle();
     // A save that is running is waited for, and then the state is looked at again: it may have
     // saved everything, or an edit may have come after it.
     while (tab.saving) {
@@ -1192,7 +1261,7 @@ export class App {
 
   private async stepHistory(direction: "undo" | "redo"): Promise<void> {
     const tab = this.active;
-    if (!tab || tab.saving) return;
+    if (!tab || tab.saving || this.pageOps?.busy) return;
     try {
       await (direction === "undo" ? tab.history.undo() : tab.history.redo());
     } catch {

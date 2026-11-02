@@ -59,7 +59,10 @@ pub fn contains(hay: &[u8], needle: &str) -> bool {
 }
 
 fn hex_stream(dict: &str, text: &str) -> Vec<u8> {
-    stream_object(&format!("{dict} /Filter /ASCIIHexDecode"), &format!("{}>", hex_form(text)))
+    stream_object(
+        &format!("{dict} /Filter /ASCIIHexDecode"),
+        &format!("{}>", hex_form(text)),
+    )
 }
 
 const PER_PAGE: usize = 9;
@@ -102,9 +105,7 @@ pub fn marked_pdf(pages: usize) -> Vec<u8> {
     );
     objects.push(format!("<< /Type /Pages /Kids [{kids}] /Count {pages} >>").into_bytes());
     objects.push(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec());
-    objects.push(
-        b"<< /Title (INFO-TITLE-MARKER) /Author (INFO-AUTHOR-MARKER) >>".to_vec(),
-    );
+    objects.push(b"<< /Title (INFO-TITLE-MARKER) /Author (INFO-AUTHOR-MARKER) >>".to_vec());
     objects.push(
         format!(
             "<< /Type /Outlines /First {} 0 R /Last {} 0 R /Count {pages} >>",
@@ -238,9 +239,17 @@ pub fn deep_tree_pdf(depth: usize) -> Vec<u8> {
     let mut objects: Vec<Vec<u8>> = vec![b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()];
     for level in 0..depth {
         let id = 2 + level;
-        let parent = if level == 0 { String::new() } else { format!("/Parent {} 0 R", id - 1) };
+        let parent = if level == 0 {
+            String::new()
+        } else {
+            format!("/Parent {} 0 R", id - 1)
+        };
         objects.push(
-            format!("<< /Type /Pages {parent} /Kids [{} 0 R] /Count 1 >>", id + 1).into_bytes(),
+            format!(
+                "<< /Type /Pages {parent} /Kids [{} 0 R] /Count 1 >>",
+                id + 1
+            )
+            .into_bytes(),
         );
     }
     objects.push(
@@ -267,7 +276,17 @@ pub fn page_count_lie_pdf(claim: u64) -> Vec<u8> {
 /// Pages with odd `/Rotate` values: not a multiple of 90, negative, past 360, huge, and a real
 /// number. Each page is 200 by 100 points and has the text "rotate N" where it can be read.
 pub fn odd_rotation_pdf() -> Vec<u8> {
-    let values = ["45", "-90", "450", "2147483647", "-2147483648", "90.5", "(x)", "null", "270"];
+    let values = [
+        "45",
+        "-90",
+        "450",
+        "2147483647",
+        "-2147483648",
+        "90.5",
+        "(x)",
+        "null",
+        "270",
+    ];
     let mut objects: Vec<Vec<u8>> = vec![
         b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
         Vec::new(),
@@ -285,7 +304,10 @@ pub fn odd_rotation_pdf() -> Vec<u8> {
             )
             .into_bytes(),
         );
-        objects.push(stream_object("", &format!("BT /F1 12 Tf 10 50 Td (rotate {i}) Tj ET")));
+        objects.push(stream_object(
+            "",
+            &format!("BT /F1 12 Tf 10 50 Td (rotate {i}) Tj ET"),
+        ));
     }
     objects[1] = format!("<< /Type /Pages /Kids [{kids}] /Count {} >>", values.len()).into_bytes();
     assemble(&objects, "")
@@ -298,9 +320,18 @@ pub fn odd_boxes() -> Vec<(&'static str, &'static str)> {
         ("zero area", "/MediaBox [0 0 0 0]"),
         ("huge", "/MediaBox [0 0 1e12 1e12]"),
         ("negative origin", "/MediaBox [-300 -400 300 400]"),
-        ("crop outside media", "/MediaBox [0 0 200 200] /CropBox [-500 -500 900 900]"),
-        ("crop apart from media", "/MediaBox [0 0 200 200] /CropBox [500 500 600 600]"),
-        ("crop inverted", "/MediaBox [0 0 200 200] /CropBox [150 150 50 50]"),
+        (
+            "crop outside media",
+            "/MediaBox [0 0 200 200] /CropBox [-500 -500 900 900]",
+        ),
+        (
+            "crop apart from media",
+            "/MediaBox [0 0 200 200] /CropBox [500 500 600 600]",
+        ),
+        (
+            "crop inverted",
+            "/MediaBox [0 0 200 200] /CropBox [150 150 50 50]",
+        ),
         ("tiny", "/MediaBox [0 0 0.5 0.5]"),
         ("no media box", ""),
         ("media box of strings", "/MediaBox [(a) (b) (c) (d)]"),
@@ -313,10 +344,7 @@ pub fn odd_boxes() -> Vec<(&'static str, &'static str)> {
 /// A document with one page for each of [`odd_boxes`].
 pub fn odd_boxes_pdf() -> Vec<u8> {
     let cases = odd_boxes();
-    let mut objects: Vec<Vec<u8>> = vec![
-        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
-        Vec::new(),
-    ];
+    let mut objects: Vec<Vec<u8>> = vec![b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), Vec::new()];
     let mut kids = String::new();
     for (i, (_, boxes)) in cases.iter().enumerate() {
         let _ = write!(kids, "{} 0 R ", 3 + i);

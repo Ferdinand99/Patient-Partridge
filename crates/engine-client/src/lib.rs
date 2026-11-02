@@ -43,9 +43,7 @@ pub use partridge_protocol::{FontScript, LinkTarget, OutlineItem, PageLink, Text
 mod pages;
 pub use pages::{ExportError, Exported, PagesChanged, PagesCropped};
 mod pool;
-pub use pool::{
-    Cancelled, EnginePool, ExtractOptions, InsertOptions, InsertOutcome, PageProgress,
-};
+pub use pool::{Cancelled, EnginePool, ExtractOptions, InsertOptions, InsertOutcome, PageProgress};
 mod save;
 pub use save::{verify_written, DocInfo, Fingerprint, SaveError, SaveOptions, SaveOutcome};
 mod spawn;

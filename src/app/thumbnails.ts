@@ -69,6 +69,10 @@ export interface ThumbApi {
 export interface ThumbOptions {
   /** How long the list must rest before thumbnails are asked for, in milliseconds. */
   settleMs?: number;
+  /** Called for every thumbnail as it gets its element, so that the page tools can mark it. */
+  decorate?: (el: HTMLElement, index: number) => void;
+  /** Called first for a click on a thumbnail; true means the click was dealt with and no page is gone to. */
+  pick?: (page: number, event: MouseEvent) => boolean;
 }
 
 interface Mounted {
@@ -96,7 +100,7 @@ export class ThumbnailList {
     private readonly pages: PageSizePt[],
     private readonly api: ThumbApi,
     private readonly onSelect: (page: number) => void,
-    options: ThumbOptions = {},
+    private readonly options: ThumbOptions = {},
   ) {
     this.settleMs = options.settleMs ?? 120;
     this.layout = thumbLayout(pages);
@@ -146,6 +150,73 @@ export class ThumbnailList {
     }
   }
 
+  /** The element of a thumbnail, when it exists (only the ones near the visible part do). */
+  elementOf(index: number): HTMLElement | null {
+    return this.mounted.get(index)?.el ?? null;
+  }
+
+  /** Gives every thumbnail that exists another look from `decorate` (its marks changed). */
+  redecorate(): void {
+    for (const [index, m] of this.mounted) this.options.decorate?.(m.el, index);
+  }
+
+  /** Scrolls the list so that a thumbnail is in view, by the least it takes. */
+  scrollToPage(index: number): void {
+    if (this.destroyed || index < 0 || index >= this.pages.length) return;
+    const top = this.layout.tops[index];
+    const bottom = top + this.layout.heights[index];
+    const view = this.root.scrollTop;
+    const height = this.root.clientHeight || 600;
+    if (top < view) this.root.scrollTop = Math.max(0, top - GAP);
+    else if (bottom > view + height) this.root.scrollTop = bottom - height + GAP;
+    this.refresh();
+  }
+
+  /** The place a thumbnail dropped at this height would take: 0 is before the first, the number of pages is after the last. */
+  insertionAt(clientY: number): number {
+    const rect = this.root.getBoundingClientRect();
+    const y = clientY - rect.top + this.root.scrollTop;
+    for (let i = 0; i < this.pages.length; i++) {
+      if (y < this.layout.tops[i] + this.layout.heights[i] / 2) return i;
+    }
+    return this.pages.length;
+  }
+
+  /** Shows (or, with null, hides) the line that says where a dragged thumbnail would go. */
+  showDrop(index: number | null): void {
+    if (this.destroyed) return;
+    let line = this.sizer.querySelector<HTMLElement>(".thumb-drop");
+    if (index === null) {
+      line?.remove();
+      return;
+    }
+    if (!line) {
+      line = document.createElement("div");
+      line.className = "thumb-drop";
+      line.setAttribute("aria-hidden", "true");
+      this.sizer.append(line);
+    }
+    const at =
+      index >= this.pages.length
+        ? this.layout.totalHeight - MARGIN + GAP / 2
+        : this.layout.tops[index] - GAP / 2;
+    line.style.top = `${at - 1}px`;
+  }
+
+  /** Scrolls the list while a drag is near its top or bottom edge. Returns true when it moved. */
+  autoScroll(clientY: number): boolean {
+    const rect = this.root.getBoundingClientRect();
+    const edge = 36;
+    let by = 0;
+    if (clientY < rect.top + edge) by = -Math.ceil((rect.top + edge - clientY) / 3);
+    else if (clientY > rect.bottom - edge) by = Math.ceil((clientY - (rect.bottom - edge)) / 3);
+    if (by === 0) return false;
+    const before = this.root.scrollTop;
+    this.root.scrollTop = before + by;
+    this.refresh();
+    return this.root.scrollTop !== before;
+  }
+
   get scrollTop(): number {
     return this.root.scrollTop;
   }
@@ -184,7 +255,10 @@ export class ThumbnailList {
     if (!(target instanceof Element)) return;
     const item = target.closest<HTMLElement>(".thumb");
     const page = Number(item?.dataset.page);
-    if (item && Number.isInteger(page)) this.onSelect(page);
+    if (!item || !Number.isInteger(page)) return;
+    // The page tools may take the click (a pick with Ctrl or Shift stays in the panel).
+    if (e instanceof MouseEvent && this.options.pick?.(page, e)) return;
+    this.onSelect(page);
   };
 
   /** Mounts the thumbnails near the visible part, unmounts the others. Draws nothing by itself. */
@@ -227,6 +301,7 @@ export class ThumbnailList {
     item.append(paper, label);
     this.sizer.append(item);
     this.mounted.set(index, { el: item, canvas, drawn: false, wantKey: "" });
+    this.options.decorate?.(item, index);
   }
 
   private unmount(index: number): void {

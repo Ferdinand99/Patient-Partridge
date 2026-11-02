@@ -211,17 +211,22 @@ impl EngineClient {
         width: f32,
         height: f32,
     ) -> Result<PagesChanged, ClientError> {
-        self.pages_changed(doc, "insert a blank page", |doc| PagesRequest::InsertBlank {
-            doc,
-            at,
-            width,
-            height,
+        self.pages_changed(doc, "insert a blank page", |doc| {
+            PagesRequest::InsertBlank {
+                doc,
+                at,
+                width,
+                height,
+            }
         })
     }
 
     /// Goes back to the copy of the document with this number.
     pub fn pages_restore(&self, doc: u64, snapshot: u32) -> Result<PagesChanged, ClientError> {
-        self.pages_changed(doc, "restore", |doc| PagesRequest::Restore { doc, snapshot })
+        self.pages_changed(doc, "restore", |doc| PagesRequest::Restore {
+            doc,
+            snapshot,
+        })
     }
 
     /// Begins to hand over a document whose pages are to be inserted. `size` is its length.
@@ -304,19 +309,16 @@ impl EngineClient {
                 signatures,
                 source_security,
                 digest,
-            }) if size as usize <= MAX_SAVE_BYTES && count as usize == pages.len() => {
-                Exported {
-                    size,
-                    pages: count,
-                    signatures,
-                    source_security,
-                    digest,
-                }
-            }
+            }) if size as usize <= MAX_SAVE_BYTES && count as usize == pages.len() => Exported {
+                size,
+                pages: count,
+                signatures,
+                source_security,
+                digest,
+            },
             _ => {
                 return Err(ExportError::Client(
-                    self.unexpected::<()>(&mut inner, "copy pages")
-                        .unwrap_err(),
+                    self.unexpected::<()>(&mut inner, "copy pages").unwrap_err(),
                 ))
             }
         };
@@ -339,8 +341,7 @@ impl EngineClient {
                     }
                     Ok(_) => {
                         return Err(ExportError::Client(
-                            self.unexpected::<()>(&mut inner, "copy pages")
-                                .unwrap_err(),
+                            self.unexpected::<()>(&mut inner, "copy pages").unwrap_err(),
                         ))
                     }
                     Err(e) => return Err(ExportError::Client(e)),

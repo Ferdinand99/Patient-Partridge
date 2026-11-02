@@ -688,6 +688,11 @@ pub(crate) fn save_document(
     })
 }
 
+/// Something that hands the bytes of a new file to the function it is given, piece by piece, and
+/// says how many there were.
+pub(crate) type Streamer<'a> =
+    dyn FnMut(&mut dyn FnMut(&[u8]) -> io::Result<()>) -> Result<u64, SaveStreamError> + 'a;
+
 /// The common end of a save and of copying pages out to a new file: the bytes that `stream` hands
 /// over go to a new file next to `target`, which is flushed, read back, checked by `verify`, and
 /// only then put in place of `target` in one step (see the rules at the top of this module). `info`
@@ -699,9 +704,7 @@ pub(crate) fn write_checked(
     options: SaveOptions,
     info: DocInfo,
     print: Fingerprint,
-    stream: &mut dyn FnMut(
-        &mut dyn FnMut(&[u8]) -> io::Result<()>,
-    ) -> Result<u64, SaveStreamError>,
+    stream: &mut Streamer<'_>,
     verify: &dyn Fn(&Path, DocInfo, &Fingerprint) -> Result<(), SaveError>,
     still_open: &dyn Fn() -> bool,
 ) -> Result<SaveOutcome, ClientError> {

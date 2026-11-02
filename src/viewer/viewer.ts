@@ -100,7 +100,7 @@ export class DocumentView {
   private readonly sizer: HTMLElement;
   private readonly mounted = new Map<number, Mounted>();
   private readonly scheduler: RenderScheduler;
-  private readonly overlays: PageOverlays;
+  private overlays: PageOverlays;
   private readonly resizeObserver?: ResizeObserver;
   private layout: Layout;
   private zoom = 1;
@@ -118,7 +118,7 @@ export class DocumentView {
   private hiddenLeft = 0;
 
   constructor(
-    private readonly info: DocumentInfo,
+    private info: DocumentInfo,
     private readonly api: ViewerApi,
     private readonly events: ViewerEvents,
     private readonly options: ViewerOptions = {},
@@ -138,9 +138,23 @@ export class DocumentView {
       onError: (job, error) => this.renderFailed(job, error),
     });
 
-    this.overlays = new PageOverlays(
-      info.doc,
-      info.pages,
+    this.overlays = this.makeOverlays();
+
+    this.element.addEventListener("scroll", this.onScroll, { passive: true });
+    this.element.addEventListener("wheel", this.onWheel, { passive: false });
+    if (typeof ResizeObserver !== "undefined") {
+      this.resizeObserver = new ResizeObserver(() => this.onResize());
+      this.resizeObserver.observe(this.element);
+    }
+    window.addEventListener("resize", this.onWindowResize);
+  }
+
+  /** The layers on top of the pages (selection, search matches, links) for the pages now in the view. */
+  private makeOverlays(): PageOverlays {
+    const { events, options, api } = this;
+    return new PageOverlays(
+      this.info.doc,
+      this.info.pages,
       api,
       {
         element: this.element,
@@ -157,14 +171,30 @@ export class DocumentView {
       },
       options.limits,
     );
+  }
 
-    this.element.addEventListener("scroll", this.onScroll, { passive: true });
-    this.element.addEventListener("wheel", this.onWheel, { passive: false });
-    if (typeof ResizeObserver !== "undefined") {
-      this.resizeObserver = new ResizeObserver(() => this.onResize());
-      this.resizeObserver.observe(this.element);
-    }
-    window.addEventListener("resize", this.onWindowResize);
+  /**
+   * The pages of the document changed (some were deleted, moved, turned, cropped or added): lays
+   * the view out again for the new list. What was drawn, selected or found on the old pages, and
+   * the text kept for them, is dropped, because page numbers now mean other pages. The view goes
+   * to page `show` of the new list, or stays near the page number it was at.
+   */
+  replacePages(pages: PageSizePt[], show?: number): void {
+    if (this.destroyed) return;
+    const had = this.started && this.pageCount > 0 ? Math.max(0, this.lastPage) : 0;
+    this.scheduler.setWanted([]);
+    for (const index of [...this.mounted.keys()]) this.unmount(index);
+    this.overlays.destroy();
+    this.info = { doc: this.info.doc, pages };
+    this.overlays = this.makeOverlays();
+    this.lastPage = -1;
+    const page = pages.length === 0 ? 0 : Math.min(Math.max(0, show ?? had), pages.length - 1);
+    this.hiddenAnchor = { page, fraction: 0 };
+    this.layout = computeLayout(pages, this.zoom);
+    // A view that was not laid out yet, or is behind another tab, lays out when it is shown.
+    if (!this.started || !this.active) return;
+    this.applyMode();
+    this.relayout({ page, fraction: 0 });
   }
 
   get pageCount(): number {

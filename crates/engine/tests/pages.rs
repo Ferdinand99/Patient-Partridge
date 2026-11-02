@@ -264,8 +264,14 @@ fn the_form_fields_of_a_deleted_page_are_counted_and_their_text_is_cleared() {
     // and the window tells the user. This is asserted so that a PDFium that drops the field (or
     // keeps the text) is noticed.
     for page in [1, 2] {
-        assert!(!contains(&saved, &format!("VALUE-{page}-SECRET")), "text of page {page}");
-        assert!(contains(&saved, &format!("field{page}")), "name of field {page}");
+        assert!(
+            !contains(&saved, &format!("VALUE-{page}-SECRET")),
+            "text of page {page}"
+        );
+        assert!(
+            contains(&saved, &format!("field{page}")),
+            "name of field {page}"
+        );
     }
     assert!(contains(&saved, "VALUE-0-SECRET"));
 }
@@ -325,7 +331,10 @@ fn what_stays_after_a_delete_still_works() {
     assert_eq!(links(e, doc, 2)[0].target, LinkTarget::Page(0));
     // Notes and form fields stay on their pages.
     assert_eq!(notes_on(e, doc, 0), 1);
-    assert_eq!(field_values_on(e, doc, 1), vec!["VALUE-2-SECRET".to_string()]);
+    assert_eq!(
+        field_values_on(e, doc, 1),
+        vec!["VALUE-2-SECRET".to_string()]
+    );
     // The information dictionary and the viewer settings are kept.
     let saved = save_all(e, doc);
     assert!(contains(&saved, "INFO-TITLE-MARKER"));
@@ -382,7 +391,10 @@ fn pages_move_to_their_new_places() {
     assert_eq!(order_of(e, doc, 5), vec![4, 2, 0, 3, 1]);
     // Links to and from a page that moved stop working: they pointed at the page that was there
     // before, and the copy that took its place is not what they name.
-    assert!(links(e, doc, 0).is_empty(), "the link of the moved last page");
+    assert!(
+        links(e, doc, 0).is_empty(),
+        "the link of the moved last page"
+    );
     // Everything of every page is still in the file, once.
     let saved = save_all(e, doc);
     for page in 0..5 {
@@ -393,7 +405,10 @@ fn pages_move_to_their_new_places() {
         assert_eq!(notes_on(e, doc, place), 1, "the note of place {place}");
         assert_eq!(field_values_on(e, doc, place).len(), 1);
     }
-    assert_eq!(field_values_on(e, doc, 0), vec!["VALUE-4-SECRET".to_string()]);
+    assert_eq!(
+        field_values_on(e, doc, 0),
+        vec!["VALUE-4-SECRET".to_string()]
+    );
 }
 
 #[test]
@@ -473,8 +488,8 @@ fn reversing_a_long_document_finishes_in_reasonable_time() {
         "{:?}",
         started.elapsed()
     );
-    assert_eq!(text(e, doc, 0).contains(&page_text(n - 1)), true);
-    assert_eq!(text(e, doc, n as u32 - 1).contains(&page_text(0)), true);
+    assert!(text(e, doc, 0).contains(&page_text(n - 1)));
+    assert!(text(e, doc, n as u32 - 1).contains(&page_text(0)));
 }
 
 // ---- rotate ------------------------------------------------------------------------------------
@@ -493,7 +508,11 @@ fn rotating_swaps_the_sides_and_three_quarter_turns_undo_one() {
             turns: 1,
         },
     ));
-    assert_eq!((snapshot, count), (0, 2), "a turn needs no copy of the document");
+    assert_eq!(
+        (snapshot, count),
+        (0, 2),
+        "a turn needs no copy of the document"
+    );
     assert_eq!((sizes[0].width, sizes[0].height), (792.0, 612.0));
     assert_eq!((sizes[1].width, sizes[1].height), (842.0, 595.0));
     assert_eq!((sizes[3].width, sizes[3].height), (1000.0, 200.0));
@@ -628,7 +647,11 @@ fn a_crop_takes_the_margins_off_the_page_as_it_is_drawn_whatever_its_turn() {
         };
         assert_eq!(
             (whole[0].width, whole[0].height),
-            if turns % 2 == 0 { (612.0, 792.0) } else { (792.0, 612.0) }
+            if turns % 2 == 0 {
+                (612.0, 792.0)
+            } else {
+                (792.0, 612.0)
+            }
         );
         let first = word(e);
         let PagesResponse::Cropped {
@@ -643,19 +666,34 @@ fn a_crop_takes_the_margins_off_the_page_as_it_is_drawn_whatever_its_turn() {
                 margins: [10.0, 20.0, 30.0, 40.0],
             },
         )
-        .unwrap() else {
+        .unwrap()
+        else {
             panic!("no crop answer");
         };
         // The drawn page lost exactly the margins: left and right from the width, top and bottom
         // from the height.
-        assert_eq!(pages[0].width, whole[0].width - 40.0, "width at {turns} turns");
-        assert_eq!(pages[0].height, whole[0].height - 60.0, "height at {turns} turns");
+        assert_eq!(
+            pages[0].width,
+            whole[0].width - 40.0,
+            "width at {turns} turns"
+        );
+        assert_eq!(
+            pages[0].height,
+            whole[0].height - 60.0,
+            "height at {turns} turns"
+        );
         assert_ne!(before[0], after[0]);
         // The text moved by the left and the top margin on the drawn page, so each margin was
         // taken from its own side.
         let moved = word(e);
-        assert!((first[0] - moved[0] - 10.0).abs() < 0.5, "left, {turns} turns: {first:?} {moved:?}");
-        assert!((first[1] - moved[1] - 20.0).abs() < 0.5, "top, {turns} turns: {first:?} {moved:?}");
+        assert!(
+            (first[0] - moved[0] - 10.0).abs() < 0.5,
+            "left, {turns} turns: {first:?} {moved:?}"
+        );
+        assert!(
+            (first[1] - moved[1] - 20.0).abs() < 0.5,
+            "top, {turns} turns: {first:?} {moved:?}"
+        );
     }
 }
 
@@ -682,7 +720,9 @@ fn a_crop_hides_the_edges_and_removes_nothing() {
         assert_has(&saved, page);
     }
     // ... the media box did not change, and the crop box is there ...
-    assert!(contains(&saved, "/MediaBox[ 0 0 612 792]") || contains(&saved, "/MediaBox [0 0 612 792]"));
+    assert!(
+        contains(&saved, "/MediaBox[ 0 0 612 792]") || contains(&saved, "/MediaBox [0 0 612 792]")
+    );
     assert!(contains(&saved, "/CropBox"));
     // ... and the text is still on the page for anything that reads it.
     assert!(text(e, doc, 0).contains(&page_text(0)));
@@ -708,7 +748,8 @@ fn a_crop_can_be_taken_back_and_made_again_with_the_boxes_it_reported() {
             margins: [5.0, 6.0, 7.0, 8.0],
         },
     )
-    .unwrap() else {
+    .unwrap()
+    else {
         panic!("no crop answer");
     };
     let mid = fingerprint(e, doc);
@@ -819,7 +860,10 @@ fn odd_boxes_are_cropped_or_refused_but_never_crash_or_hang() {
             }
             Ok(other) => panic!("{label}: {other:?}"),
             Err(code) => assert!(
-                matches!(code, ErrorCode::InvalidRequest | ErrorCode::PageChangeFailed),
+                matches!(
+                    code,
+                    ErrorCode::InvalidRequest | ErrorCode::PageChangeFailed
+                ),
                 "{label}: {code:?}"
             ),
         }
@@ -1191,7 +1235,10 @@ fn pages_of_another_document_are_inserted_in_the_place_asked() {
     assert!(text(e, target, 3).contains(&page_text(1)));
     // The pages that were there keep their notes, fields and links.
     assert_eq!(notes_on(e, target, 0), 1);
-    assert_eq!(field_values_on(e, target, 3), vec!["VALUE-1-SECRET".to_string()]);
+    assert_eq!(
+        field_values_on(e, target, 3),
+        vec!["VALUE-1-SECRET".to_string()]
+    );
     assert_eq!(links(e, target, 0)[0].target, LinkTarget::Page(3));
     // The inserted pages are in the saved file, and taking the insert back removes them again.
     let saved = save_all(e, target);
@@ -1484,7 +1531,10 @@ fn a_protected_document_stays_protected_through_every_page_change() {
     let saved = save_all(e, doc);
     assert_eq!(info(e, doc).0, 4);
     // The saved file still needs the password, and opens with it.
-    assert_eq!(open(e, &saved, None).unwrap_err(), ErrorCode::PasswordRequired);
+    assert_eq!(
+        open(e, &saved, None).unwrap_err(),
+        ErrorCode::PasswordRequired
+    );
     assert_eq!(
         open(e, &saved, Some("wrong")).unwrap_err(),
         ErrorCode::PasswordIncorrect
@@ -1610,7 +1660,12 @@ fn a_document_with_too_many_pages_is_not_opened_and_a_long_one_is_not_edited() {
         ErrorCode::TooManyPages
     );
     // A tree that says it holds millions of pages in a few bytes.
-    for claim in [1_000_000u64, 2_000_000_000, u64::from(u32::MAX), u64::MAX / 2] {
+    for claim in [
+        1_000_000u64,
+        2_000_000_000,
+        u64::from(u32::MAX),
+        u64::MAX / 2,
+    ] {
         match open(e, &kit::page_count_lie_pdf(claim), None) {
             Ok(doc) => assert!(info(e, doc).0 as usize <= MAX_PAGES),
             Err(code) => assert!(
@@ -1737,7 +1792,11 @@ fn a_circular_page_tree_and_a_very_deep_one_do_not_hang_the_tools() {
                 );
             }
         }
-        assert!(started.elapsed() < Duration::from_secs(30), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "{:?}",
+            started.elapsed()
+        );
         // The engine still answers.
         let _ = info(e, doc);
     }

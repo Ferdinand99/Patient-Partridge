@@ -76,7 +76,11 @@ impl Drop for Work<'_> {
             client.kill();
         }
         if !self.others.is_empty() {
-            let mut list = self.ops.transients.lock().unwrap_or_else(|e| e.into_inner());
+            let mut list = self
+                .ops
+                .transients
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             list.retain(|c| !self.others.iter().any(|o| Arc::ptr_eq(c, o)));
         }
         self.ops.phase.store(0, Ordering::SeqCst);
@@ -246,12 +250,10 @@ impl EnginePool {
                 if cancelled() {
                     return Err(io::Error::other("stopped"));
                 }
-                h.client
-                    .import_piece(h.doc, offset, piece)
-                    .map_err(|e| {
-                        *target_error.borrow_mut() = Some(e);
-                        io::Error::other("the document could not take the pages")
-                    })?;
+                h.client.import_piece(h.doc, offset, piece).map_err(|e| {
+                    *target_error.borrow_mut() = Some(e);
+                    io::Error::other("the document could not take the pages")
+                })?;
                 offset += piece.len() as u64;
                 progress(offset, total.get());
                 Ok(())
@@ -390,7 +392,9 @@ impl EnginePool {
             },
             &|path, _, _| {
                 let Some(ex) = header.get() else {
-                    return Err(SaveError::Verify("the engine did not describe the pages".into()));
+                    return Err(SaveError::Verify(
+                        "the engine did not describe the pages".into(),
+                    ));
                 };
                 verify_written(
                     &config,
