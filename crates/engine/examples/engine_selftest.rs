@@ -10,6 +10,7 @@
 //! `engine_selftest [--pdfium-dir D] [--document N] [--memory-limit B] probe FILE DIR EXE PID PORT TITLE`
 //! `engine_selftest [...] memory MIB HOLD_SECONDS [app-only]`
 //! `engine_selftest [...] document`
+//! `engine_selftest [...] descriptors`
 //! `engine_selftest control FILE DIR EXE PID PORT TITLE` runs the probes of `probe` in a program
 //! that is not locked in, to show that each attempt is one that works without the sandbox.
 
@@ -35,7 +36,7 @@ fn main() {
         let text = word.to_string_lossy().into_owned();
         if matches!(
             text.as_str(),
-            "--pdfium-dir" | "--fonts-dir" | "--document" | "--memory-limit"
+            "--pdfium-dir" | "--fonts-dir" | "--document" | "--memory-limit" | "--font"
         ) {
             engine_options.push(word);
             engine_options.extend(raw.next());
@@ -105,6 +106,32 @@ fn main() {
             &mut say,
         ),
         "document" => document(&mut engine, &mut say),
+        "descriptors" => {
+            // How many descriptors (handles on Windows) are open: the ones the engine was given
+            // and what the system and the libraries hold, which is the same for every run.
+            #[cfg(unix)]
+            {
+                // SAFETY: asking about a descriptor number only reads the descriptor table.
+                let open = (0..1024)
+                    .filter(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } >= 0)
+                    .count();
+                say(format!("descriptors: {open}"));
+            }
+            #[cfg(windows)]
+            {
+                use windows_sys::Win32::System::Threading::{
+                    GetCurrentProcess, GetProcessHandleCount,
+                };
+                let mut count = 0u32;
+                // SAFETY: the pseudo handle of this process and a number to write into.
+                let ok = unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) };
+                if ok == 0 {
+                    say("descriptors: unknown".to_string());
+                } else {
+                    say(format!("descriptors: {count}"));
+                }
+            }
+        }
         _ => unreachable!(),
     }
     say("done".to_string());

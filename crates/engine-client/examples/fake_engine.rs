@@ -156,6 +156,9 @@ fn main() {
             RequestBody::PageLinks { .. } => {
                 reply(&mut output, id, ResponseBody::PageLinks { links: vec![] })
             }
+            RequestBody::FontReport => {
+                reply(&mut output, id, ResponseBody::FontReport { missed: vec![] })
+            }
             RequestBody::Search { .. } => match mode.as_str() {
                 "text-wrong-id" => reply(
                     &mut output,

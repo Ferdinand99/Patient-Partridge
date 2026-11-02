@@ -173,6 +173,8 @@ try {
   Log '=== 4. The sandbox tests of the engine, as this user ==='
   Log (Get-SessionInfo)
   $env:PARTRIDGE_PDFIUM_DIR = Join-Path $Root 'pdfium'
+  # The system fonts test must find a font for every script here too (a missing one is a failure, not a skip).
+  $env:PARTRIDGE_REQUIRE_FONT_SCRIPTS = 'all'
   foreach ($test in (Get-Content -LiteralPath (Join-Path $Root 'tests.txt'))) {
     $name = [IO.Path]::GetFileNameWithoutExtension($test)
     $stdout = Join-Path $out "test-$name.txt"

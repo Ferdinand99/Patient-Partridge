@@ -11,6 +11,8 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
 
+use partridge_protocol::FontScript;
+
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]
@@ -52,6 +54,9 @@ pub struct SpawnRequest<'a> {
     /// Most memory the engine may use, in bytes. `None` leaves the engine's default.
     pub memory_limit: Option<u64>,
     pub policy: SandboxPolicy,
+    /// System fonts, each a single file opened read-only by the app (see `system_fonts`). The
+    /// engine gets its own copy of every handle.
+    pub fonts: &'a [(FontScript, File)],
 }
 
 /// A running engine process.
@@ -94,11 +99,19 @@ pub fn spawn_engine(request: &SpawnRequest<'_>) -> io::Result<SpawnedEngine> {
 }
 
 /// The command line options that tell the engine about the handle and the limit.
-pub(crate) fn engine_args(request: &SpawnRequest<'_>, document: Option<u64>) -> Vec<OsString> {
+pub(crate) fn engine_args(
+    request: &SpawnRequest<'_>,
+    document: Option<u64>,
+    fonts: &[(FontScript, u64)],
+) -> Vec<OsString> {
     let mut args: Vec<OsString> = request.args.to_vec();
     if let Some(document) = document {
         args.push("--document".into());
         args.push(document.to_string().into());
+    }
+    for (script, number) in fonts {
+        args.push("--font".into());
+        args.push(format!("{}={number}", script.name()).into());
     }
     if let Some(limit) = request.memory_limit {
         args.push("--memory-limit".into());

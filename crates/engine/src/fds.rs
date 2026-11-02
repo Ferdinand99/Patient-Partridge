@@ -1,9 +1,10 @@
 //! Closes the descriptors the engine did not ask for.
 //!
-//! The app starts the engine with the three standard descriptors and the document on descriptor 3.
+//! The app starts the engine with the three standard descriptors, the document on descriptor 3 and
+//! the system fonts on the descriptors after it (one read-only handle each, at most seven).
 //! A descriptor that leaked in from the app (a file, a socket, the window system) would stay
 //! usable from inside the sandbox, because the sandbox does not take back what is already open.
-//! The engine closes everything above the document before it does anything else.
+//! The engine closes everything above the last of them before it does anything else.
 
 /// Closes every open descriptor above `highest_kept`.
 pub fn close_all_above(highest_kept: i32) {

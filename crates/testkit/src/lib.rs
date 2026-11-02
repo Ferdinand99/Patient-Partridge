@@ -450,6 +450,187 @@ BT /F2 20 Tf 50 640 Td (Latin text next to it) Tj ET\n";
     assemble(&objects, "")
 }
 
+/// The scripts of `script_pdf`, by the names `partridge_protocol::FontScript` has.
+pub const SCRIPT_NAMES: [&str; 7] = [
+    "japanese",
+    "korean",
+    "chinese-simplified",
+    "chinese-traditional",
+    "arabic",
+    "hebrew",
+    "thai",
+];
+
+/// One Letter page with a line of large text in a script that needs a font the page does not carry,
+/// in a font that is not embedded. The CJK pages name their font the way such files do and use
+/// the predefined encodings of their collections (Japan1, GB1, CNS1, Korea1); the others use an
+/// identity encoding with a table of the characters. The text is at the top of the page, at 48
+/// points, from 700 points up from the bottom.
+pub fn script_pdf(script: &str) -> Vec<u8> {
+    script_pdf_with_font(script, default_font_name(script))
+}
+
+/// The font name `script_pdf` gives the text of a script.
+pub fn default_font_name(script: &str) -> &'static str {
+    match script {
+        "japanese" => "MS-Mincho",
+        "korean" => "Batang",
+        "chinese-simplified" => "SimSun",
+        "chinese-traditional" => "MingLiU",
+        "arabic" => "TraditionalArabic",
+        "hebrew" => "David",
+        "thai" => "Angsana",
+        other => panic!("no page for the script {other}"),
+    }
+}
+
+/// As `script_pdf`, with the text in an unembedded font of another name (as documents made on
+/// other systems and by other programs name them). A name with a space is written the way a PDF
+/// writes it (`#20`).
+pub fn script_pdf_with_font(script: &str, name: &str) -> Vec<u8> {
+    let name = &name.replace(' ', "#20");
+    let (font, descendant, content) = match script {
+        "japanese" => cid_font(name, "90ms-RKSJ-H", "Japan1", 2, "93FA967B8CEA"),
+        "korean" => cid_font(name, "KSCms-UHC-H", "Korea1", 1, "C7D1B1B9BEEE"),
+        "chinese-simplified" => cid_font(name, "GBK-EUC-H", "GB1", 2, "D6D0CEC4"),
+        "chinese-traditional" => cid_font(name, "ETen-B5-H", "CNS1", 0, "A4A4A4E5"),
+        "arabic" => identity_font(name, &[0x645, 0x631, 0x62D, 0x628, 0x627]),
+        "hebrew" => identity_font(name, &[0x5E9, 0x5DC, 0x5D5, 0x5DD]),
+        "thai" => identity_font(name, &[0xE2A, 0xE27, 0xE31, 0xE2A, 0xE14, 0xE35]),
+        other => panic!("no page for the script {other}"),
+    };
+    let page_content = format!(
+        "BT /F1 48 Tf 60 700 Td <{content}> Tj ET
+"
+    );
+    let mut objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>".to_vec(),
+        stream_object("", &page_content),
+        font.into_bytes(),
+        descendant.into_bytes(),
+    ];
+    if script == "arabic" || script == "hebrew" || script == "thai" {
+        objects.push(to_unicode(script).into_bytes());
+    }
+    assemble(&objects, "")
+}
+
+/// One Letter page with `fonts` unembedded Japanese fonts of different names (`CJKFont0001` ...),
+/// each with a line of text in the page. A reader that serves a system font for each name holds a
+/// copy of that font for each of them, in a file of a few hundred bytes per font.
+pub fn many_fonts_pdf(fonts: usize) -> Vec<u8> {
+    japanese_fonts_pdf(fonts, true)
+}
+
+/// As `many_fonts_pdf`, with every font object named alike (`SimSun`), the way a PDF merged from
+/// many parts has them: `fonts` objects, one font to ask for.
+pub fn same_name_fonts_pdf(fonts: usize) -> Vec<u8> {
+    japanese_fonts_pdf(fonts, false)
+}
+
+fn japanese_fonts_pdf(fonts: usize, distinct_names: bool) -> Vec<u8> {
+    let mut resources = String::new();
+    let mut content = String::new();
+    for i in 0..fonts {
+        resources.push_str(&format!("/F{i} {} 0 R ", 5 + 2 * i));
+        content.push_str(&format!(
+            "BT /F{i} 4 Tf 20 {} Td <93FA967B8CEA> Tj ET
+",
+            780 - 5 * i as i32
+        ));
+    }
+    let mut objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << {resources}>> >> >>").into_bytes(),
+        stream_object("", &content),
+    ];
+    for i in 0..fonts {
+        let name = if distinct_names {
+            format!("CJKFont{:04}", i + 1)
+        } else {
+            "SimSun".to_string()
+        };
+        let (font, descendant, _) = cid_font(&name, "90ms-RKSJ-H", "Japan1", 2, "");
+        // The font object is object 5 + 2i and its descendant 6 + 2i.
+        objects.push(
+            font.replace("[6 0 R]", &format!("[{} 0 R]", 6 + 2 * i))
+                .into_bytes(),
+        );
+        objects.push(descendant.into_bytes());
+    }
+    assemble(&objects, "")
+}
+
+/// A Type 0 font with a predefined encoding of an Adobe collection, not embedded: the font object,
+/// its descendant, and the hex string of the text in that encoding.
+fn cid_font(
+    name: &str,
+    encoding: &str,
+    ordering: &str,
+    supplement: u32,
+    hex: &str,
+) -> (String, String, String) {
+    (
+        format!("<< /Type /Font /Subtype /Type0 /BaseFont /{name} /Encoding /{encoding} /DescendantFonts [6 0 R] >>"),
+        format!("<< /Type /Font /Subtype /CIDFontType2 /BaseFont /{name} /CIDSystemInfo << /Registry (Adobe) /Ordering ({ordering}) /Supplement {supplement} >> /DW 1000 >>"),
+        hex.to_string(),
+    )
+}
+
+/// A Type 0 font with identity encoding, not embedded, whose character codes 1, 2, 3 ... are the
+/// letters of the text (a `ToUnicode` table says which). The text is the codes in hex.
+fn identity_font(name: &str, letters: &[u32]) -> (String, String, String) {
+    let hex: String = (1..=letters.len()).map(|i| format!("{i:04X}")).collect();
+    (
+        format!("<< /Type /Font /Subtype /Type0 /BaseFont /{name} /Encoding /Identity-H /DescendantFonts [6 0 R] /ToUnicode 7 0 R >>"),
+        format!("<< /Type /Font /Subtype /CIDFontType2 /BaseFont /{name} /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /DW 1000 >>"),
+        hex,
+    )
+}
+
+/// The `ToUnicode` table of `identity_font` for the text of a script.
+fn to_unicode(script: &str) -> String {
+    let letters: &[u32] = match script {
+        "arabic" => &[0x645, 0x631, 0x62D, 0x628, 0x627],
+        "hebrew" => &[0x5E9, 0x5DC, 0x5D5, 0x5DD],
+        _ => &[0xE2A, 0xE27, 0xE31, 0xE2A, 0xE14, 0xE35],
+    };
+    let map: String = letters
+        .iter()
+        .enumerate()
+        .map(|(i, u)| {
+            format!(
+                "<{:04X}> <{:04X}>
+",
+                i + 1,
+                u
+            )
+        })
+        .collect();
+    let cmap = format!(
+        "/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def
+/CMapName /Adobe-Identity-UCS def
+/CMapType 2 def
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+{} beginbfchar
+{map}endbfchar
+endcmap
+CMapName currentdict /CMap defineresource pop
+end
+end",
+        letters.len()
+    );
+    String::from_utf8(stream_object("", &cmap)).unwrap()
+}
+
 /// Starts like a PDF but is not one: the structure is cut off in the middle of the catalog.
 pub fn corrupt_pdf() -> Vec<u8> {
     b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R\n".to_vec()

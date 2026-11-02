@@ -37,11 +37,12 @@ use partridge_protocol::{
 
 pub use spawn::{spawn_engine, EngineProcess, SandboxPolicy, SpawnRequest, SpawnedEngine};
 
-pub use partridge_protocol::{LinkTarget, OutlineItem, PageLink, TextMatch};
+pub use partridge_protocol::{FontScript, LinkTarget, OutlineItem, PageLink, TextMatch};
 
 mod pool;
 pub use pool::EnginePool;
 mod spawn;
+pub mod system_fonts;
 
 /// Largest answer to an open request. An `Opened` answer holds 8 bytes per page, so this allows
 /// more than a million pages.
@@ -68,6 +69,12 @@ pub struct EngineConfig {
     pub memory_limit: Option<u64>,
     /// Whether an engine without a working sandbox is refused. Release builds always insist.
     pub sandbox: SandboxPolicy,
+    /// Whether the app hands the engine system fonts for the scripts that PDFium's own fonts do not
+    /// cover (see `system_fonts`). On by default; a test can turn it off.
+    pub system_fonts: bool,
+    /// Font files to hand over instead of the ones the table finds (for tests of damaged and
+    /// odd fonts). The app never sets this; nothing a PDF says reaches it.
+    pub system_font_files: Option<Vec<(partridge_protocol::FontScript, std::path::PathBuf)>>,
 }
 
 impl EngineConfig {
@@ -78,6 +85,8 @@ impl EngineConfig {
             timeout: Duration::from_secs(60),
             memory_limit: None,
             sandbox: SandboxPolicy::default_for_build(),
+            system_fonts: true,
+            system_font_files: None,
         }
     }
 }
@@ -317,6 +326,21 @@ impl EngineClient {
         )
     }
 
+    /// The scripts for which PDFium asked the engine of this document for a font and the engine had
+    /// none to give: text in them, in a font the PDF does not carry, is drawn as blanks. Empty when
+    /// every font that was asked for was found (or none was asked for).
+    pub fn font_report(&self, doc: u64) -> Result<Vec<FontScript>, ClientError> {
+        self.call(
+            doc,
+            "font report",
+            |_| RequestBody::FontReport,
+            |body| match body {
+                ResponseBody::FontReport { missed } => Ok(missed),
+                other => Err(other),
+            },
+        )
+    }
+
     /// The text of one page with the box of every character.
     pub fn page_text(&self, doc: u64, page: u32) -> Result<PageText, ClientError> {
         self.call(
@@ -514,12 +538,27 @@ impl EngineClient {
     }
 
     fn start(&self, inner: &mut Inner, document: Option<&File>) -> Result<(), ClientError> {
+        // The fonts are opened for this engine only and closed again when it has them.
+        let fonts = if document.is_none() {
+            // An engine that only says what it is has no document and needs no fonts.
+            Vec::new()
+        } else if let Some(files) = &self.config.system_font_files {
+            files
+                .iter()
+                .filter_map(|(script, path)| Some((*script, File::open(path).ok()?)))
+                .collect()
+        } else if self.config.system_fonts {
+            system_fonts::open_all()
+        } else {
+            Vec::new()
+        };
         let spawned = spawn_engine(&SpawnRequest {
             program: &self.config.program,
             args: &self.config.args,
             document,
             memory_limit: self.config.memory_limit,
             policy: self.config.sandbox,
+            fonts: &fonts,
         })
         .map_err(|e| {
             ClientError::EngineStopped(format!(

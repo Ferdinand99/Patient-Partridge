@@ -6,6 +6,7 @@
 // markup, only as text content, and nothing here follows a link by itself.
 
 import { describeLink } from "../lib/linkPolicy";
+import { scriptsIn, type TextScript } from "../lib/scripts";
 import type { PageSizePt } from "./layout";
 import type { SearchMatch } from "./search";
 import {
@@ -61,6 +62,11 @@ export interface OverlayEvents {
    * no text layer for now. Called once for the document. The page itself is drawn as usual.
    */
   onTextLimit?(): void;
+  /**
+   * The text of a page uses these scripts (see `scriptsIn`). Called each time a page is read,
+   * with the scripts of that page; the receiver decides what it means.
+   */
+  onScripts?(scripts: TextScript[]): void;
 }
 
 /** Limits on the text a document keeps in the window. */
@@ -282,6 +288,10 @@ export class PageOverlays {
   private async fetchText(page: number): Promise<PageText | null> {
     if (!this.api.getPageText) return null;
     const wire = await this.api.getPageText(this.doc, page);
+    if (!this.destroyed && this.events.onScripts) {
+      const scripts = scriptsIn(wire.text);
+      if (scripts.size > 0) this.events.onScripts([...scripts]);
+    }
     return parsePageText(wire.text, wire.rects);
   }
 

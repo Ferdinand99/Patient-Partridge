@@ -233,6 +233,16 @@ impl State {
     }
 
     fn page(&mut self, doc: u32, page: u32, count: u32, size: PageSize) {
+        // Which fonts the engine had to refuse: at most the seven scripts, each once, in order.
+        match self.ask(RequestBody::FontReport) {
+            ResponseBody::FontReport { missed } => {
+                assert!(
+                    missed.windows(2).all(|w| w[0].code() < w[1].code()),
+                    "{missed:?}"
+                );
+            }
+            other => panic!("a font report was answered with {other:?}"),
+        }
         // The text of the page when it could be read, and two pieces of it to search for.
         let mut text: Option<Vec<char>> = None;
         let mut from_text: Vec<String> = Vec::new();

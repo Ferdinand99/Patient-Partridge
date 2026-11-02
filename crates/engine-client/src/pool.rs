@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 use partridge_protocol::{ErrorCode, PageSize};
 
 use crate::{
-    Bitmap, ClientError, EngineClient, EngineConfig, EngineInfo, OutlineItem, PageLink, PageText,
-    TextMatch,
+    Bitmap, ClientError, EngineClient, EngineConfig, EngineInfo, FontScript, OutlineItem, PageLink,
+    PageText, TextMatch,
 };
 
 struct Entry {
@@ -148,6 +148,12 @@ impl EnginePool {
     pub fn outline(&self, handle: u64) -> Result<Vec<OutlineItem>, ClientError> {
         let (client, doc) = self.entry(handle)?;
         client.outline(doc)
+    }
+
+    /// The scripts the engine of a document had no font for when PDFium asked.
+    pub fn font_report(&self, handle: u64) -> Result<Vec<FontScript>, ClientError> {
+        let (client, doc) = self.entry(handle)?;
+        client.font_report(doc)
     }
 
     pub fn page_text(&self, handle: u64, page: u32) -> Result<PageText, ClientError> {

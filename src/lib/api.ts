@@ -116,6 +116,15 @@ export const api = {
     return invoke<{ text: string; rects: number[] }>("get_page_text", { doc, page });
   },
 
+  /**
+   * The scripts for which the engine of a document was asked for a font and had none to give
+   * ("japanese", "korean", "chinese-simplified", ...): text in them that the PDF does not carry a
+   * font for is drawn as blanks.
+   */
+  missedFonts(doc: number): Promise<string[]> {
+    return invoke<string[]>("missed_fonts", { doc });
+  },
+
   /** The links of a page that lead to a web address or to a page of the document. */
   getPageLinks(doc: number, page: number): Promise<PageLinkInfo[]> {
     return invoke<PageLinkInfo[]>("get_page_links", { doc, page });
