@@ -696,6 +696,9 @@ fn raw_echo_only(args: &[String], say: &mut dyn FnMut(String)) {
         .first()
         .and_then(|a| a.parse().ok())
         .expect("rawecho needs an IPv4 address");
+    // Winsock is started by the first use of the standard library's sockets (a locked-in program
+    // did that before the lock-in).
+    let _ = std::net::UdpSocket::bind("127.0.0.1:0");
     for i in 0..5 {
         let result = raw_socket(Some(std::net::SocketAddr::from((target, 0))));
         let (denied, detail) = match result {
