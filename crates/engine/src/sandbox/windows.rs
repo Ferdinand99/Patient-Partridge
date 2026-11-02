@@ -12,8 +12,17 @@
 //! the process is in a job, and the mitigation policies are on. It tries to open a file, which must
 //! fail. And it tries the network: a TCP connection and a UDP datagram to the loopback address. The
 //! AppContainer without capabilities makes the system answer both with "access denied" (what the
-//! restricted token alone never did). Anything else, including success, means the network is not
-//! blocked, and the engine does not run: a release engine reports the sandbox as unavailable.
+//! restricted token alone never did).
+//!
+//! What happens when the network attempts do not get that answer depends on what the attempt
+//! shows. The block is made by the filtering platform of Windows, fed by the firewall. A computer
+//! can be in a state where the answer differs (a firewall product that has taken over, a rule that
+//! lets this package out) while the process is an AppContainer token all the same. The engine then
+//! still runs, because everything it controls is in force, but it does not say that the network is
+//! blocked: the greeting names `network-not-proved` instead of `no-network` and carries what the
+//! system answered, and the app tells the user. The fail-closed condition is the AppContainer
+//! token and the other layers, which the engine checks itself; a token that is not an AppContainer
+//! token, or a layer that is missing, still ends the engine.
 
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
@@ -40,9 +49,9 @@ use windows_sys::Win32::System::Threading::{
 
 const SE_GROUP_INTEGRITY: u32 = 0x0000_0020;
 
-/// The integrity level of a process is the last sub-authority of the SID in its token. Medium is
-/// 0x2000.
-const MEDIUM_INTEGRITY: u32 = 0x2000;
+/// The integrity level of a process is the last sub-authority of the SID in its token. The
+/// untrusted level, the lowest, is 0.
+const UNTRUSTED_INTEGRITY: u32 = 0;
 
 /// The pseudo handle for the token of the process itself (`GetCurrentProcessToken` in C). The
 /// engine cannot open its own token the usual way: with the restricted token it has now, the
@@ -95,8 +104,8 @@ fn check_layers() -> Result<Vec<&'static str>, String> {
         }
         layers.push("restricted-token");
 
-        if integrity_level()? >= MEDIUM_INTEGRITY {
-            return Err("the integrity level of the engine is not below medium".to_string());
+        if integrity_level()? != UNTRUSTED_INTEGRITY {
+            return Err("the integrity level of the engine is not the untrusted one".to_string());
         }
         layers.push("low-integrity");
 
@@ -251,6 +260,30 @@ fn network_is_blocked() -> Result<(), String> {
     }
 }
 
+/// What the system answered when the network was not proved blocked (set once by [`lock_down`]).
+static NETWORK_NOTE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Why the network block was not proved on this computer, if it was not: what the system answered
+/// to the attempts, on one line. `None` when the block was proved.
+pub fn network_note() -> Option<String> {
+    NETWORK_NOTE.get().map(|note| {
+        note.chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .take(300)
+            .collect()
+    })
+}
+
+/// The network check, or in a debug build with the test switch an answer that is not the one of a
+/// blocked network, to try what happens then.
+fn network_proof() -> Result<(), String> {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("PARTRIDGE_TEST_NETWORK_UNPROVED").is_some() {
+        return Err("a TCP connection failed, but not with the answer of a blocked network (access denied): forced by a test".to_string());
+    }
+    network_is_blocked()
+}
+
 /// Ends the start-up identity and checks that the restrictions are in force.
 pub fn lock_down() -> Result<Vec<&'static str>, String> {
     start_winsock();
@@ -261,10 +294,16 @@ pub fn lock_down() -> Result<Vec<&'static str>, String> {
     }
     let mut layers = check_layers()?;
     verify()?;
-    // The network is the reason for the AppContainer: it is only reported when the system has just
-    // refused real attempts, and an engine that cannot show that does not run.
-    network_is_blocked()?;
-    layers.push("no-network");
+    // The network is the reason for the AppContainer: it is only reported as blocked when the
+    // system has just refused real attempts. Without that answer the engine goes on (it is in an
+    // AppContainer, which was checked above) and says that the block was not proved.
+    match network_proof() {
+        Ok(()) => layers.push("no-network"),
+        Err(why) => {
+            let _ = NETWORK_NOTE.set(why);
+            layers.push("network-not-proved");
+        }
+    }
     // The desktop is an extra layer: the engines run on the user's desktop where the system would
     // not make one.
     if on_own_desktop() {
@@ -282,4 +321,28 @@ fn verify() -> Result<(), String> {
         return Err("a file could still be opened".to_string());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failed(code: i32) -> std::io::Result<()> {
+        Err(std::io::Error::from_raw_os_error(code))
+    }
+
+    #[test]
+    fn only_access_denied_counts_as_a_blocked_network() {
+        assert!(refused_by_policy("an attempt", failed(WSAEACCES)).is_ok());
+        // Refused by the other end, timed out, no route, a name that does not resolve: the network
+        // was not what said no.
+        for code in [10061, 10060, 10051, 10065, 11001] {
+            assert!(
+                refused_by_policy("an attempt", failed(code)).is_err(),
+                "{code}"
+            );
+        }
+        // And an attempt that worked.
+        assert!(refused_by_policy("an attempt", Ok(())).is_err());
+    }
 }

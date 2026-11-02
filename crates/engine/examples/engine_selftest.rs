@@ -7,11 +7,11 @@
 //! the app runs the engine (same start-up, same inherited document, same restrictions).
 //!
 //! Usage (the engine's options first, then these):
-//! `engine_selftest [--pdfium-dir D] [--document N] [--memory-limit B] probe FILE DIR EXE PID PORT TITLE`
+//! `engine_selftest [--pdfium-dir D] [--document N] [--memory-limit B] probe FILE DIR EXE PID PORT TITLE [NAME=VALUE ...]`
 //! `engine_selftest [...] memory MIB HOLD_SECONDS [app-only]`
 //! `engine_selftest [...] document`
 //! `engine_selftest [...] descriptors`
-//! `engine_selftest control FILE DIR EXE PID PORT TITLE` runs the probes of `probe` in a program
+//! `engine_selftest control FILE DIR EXE PID PORT TITLE [NAME=VALUE ...]` runs the probes of `probe` in a program
 //! that is not locked in, to show that each attempt is one that works without the sandbox.
 
 // Like the engine, a program without a console on Windows (it is started with a restricted token).
@@ -151,12 +151,21 @@ fn verdict(name: &str, denied: bool, detail: String) -> String {
 
 fn probe(args: &[String], say: &mut dyn FnMut(String)) {
     let [file, dir, exe, pid, port, title, extra @ ..] = args else {
-        panic!("probe needs FILE DIR EXE PID PORT TITLE [HOST_ADDRESS DNS_NAME]");
+        panic!("probe needs FILE DIR EXE PID PORT TITLE [NAME=VALUE ...]");
     };
-    // A listener on an address of this computer that is not the loopback one ("-" when there is
-    // none), and a name for the lookup ("-" for none).
-    let host_address = extra.first().map(String::as_str).filter(|a| *a != "-");
-    let dns_name = extra.get(1).map(String::as_str).filter(|a| *a != "-");
+    // Optional targets, each as NAME=VALUE (Windows): `host` is a listener on an address of this
+    // computer that is not the loopback one, `dns` a name for the lookup, `v6port` a TCP port on
+    // `[::1]`, `remote` an address on another computer that accepts TCP connections (`ADDRESS:PORT`),
+    // `pipe` a named pipe with a NULL access list. Without a value the attempt is left out.
+    let option = |name: &str| -> Option<String> {
+        extra
+            .iter()
+            .find_map(|e| e.strip_prefix(name).and_then(|v| v.strip_prefix('=')))
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let host_address = option("host");
+    let dns_name = option("dns");
     let mut report = |name: &str, result: std::io::Result<()>| {
         let (denied, detail) = match result {
             Ok(()) => (false, String::new()),
@@ -203,9 +212,11 @@ fn probe(args: &[String], say: &mut dyn FnMut(String)) {
         "bind_udp_socket",
         std::net::UdpSocket::bind("127.0.0.1:0").map(|_| ()),
     );
-    // A datagram to the UDP socket the test listens on, from a socket of our own.
+    // A datagram to the UDP socket the test listens on. The socket is bound first, so where the
+    // system refuses the bind this line shows the bind and no datagram is sent; the attempts
+    // below (`windows_network_probes`) send from a socket that was never bound.
     report(
-        "udp_send",
+        "udp_bind_then_send",
         std::net::UdpSocket::bind("0.0.0.0:0")
             .and_then(|s| s.send_to(b"hello", address).map(|_| ())),
     );
@@ -232,6 +243,9 @@ fn probe(args: &[String], say: &mut dyn FnMut(String)) {
             }),
         );
     }
+
+    #[cfg(windows)]
+    windows_network_probes(&option, port, &mut report);
 
     // Processes.
     report(
@@ -495,13 +509,215 @@ fn windows_probes(title: &str, say: &mut dyn FnMut(String)) {
 
     // The network below Winsock: the device that every socket is made from.
     say(afd_endpoint());
-    // A path on another computer: the kernel connects to it without any socket of ours.
-    let unc = std::fs::File::open(r"\\127.0.0.1\C$\Windows\win.ini");
-    say(verdict(
-        "open_network_path",
-        unc.is_err(),
-        unc.err().map(|e| e.to_string()).unwrap_or_default(),
-    ));
+}
+
+/// More ways to reach the network, tried from the locked-in program and from the control. Each
+/// returns `Ok` when it worked.
+///
+/// - Datagrams from sockets that were never bound (`sendto` binds them by itself, so these reach
+///   the point that the bind-first attempt never reaches): to the loopback address, to an address on
+///   another computer (the TEST-NET-1 address, which the stack sends to the gateway) and to `[::1]`.
+/// - A TCP connection to `[::1]`, and to an address on another computer.
+/// - A raw socket, and an ICMP echo through the ICMP service of the system.
+/// - A path on another computer: the kernel connects to it without any socket of ours.
+/// - A named pipe whose access list is NULL, which any program of the user could talk to: a local
+///   proxy would be one.
+#[cfg(windows)]
+fn windows_network_probes(
+    option: &dyn Fn(&str) -> Option<String>,
+    port: &str,
+    report: &mut dyn FnMut(&str, std::io::Result<()>),
+) {
+    use std::net::{Ipv6Addr, SocketAddr, TcpStream};
+    use std::time::{Duration, Instant};
+
+    let timeout = Duration::from_secs(3);
+    let port: u16 = port.parse().expect("PORT");
+    report(
+        "udp_sendto_unbound_loopback",
+        sendto_unbound(SocketAddr::from(([127, 0, 0, 1], port))),
+    );
+    report(
+        "udp_sendto_unbound_remote",
+        sendto_unbound(SocketAddr::from(([192, 0, 2, 1], 9))),
+    );
+    if let Some(v6) = option("v6port").and_then(|p| p.parse::<u16>().ok()) {
+        let target = SocketAddr::from((Ipv6Addr::LOCALHOST, v6));
+        report(
+            "connect_v6_loopback",
+            TcpStream::connect_timeout(&target, timeout).map(|_| ()),
+        );
+        report("udp_sendto_unbound_v6", sendto_unbound(target));
+    }
+    if let Some(remote) = option("remote") {
+        let target: SocketAddr = remote.parse().expect("remote");
+        report(
+            "connect_remote",
+            TcpStream::connect_timeout(&target, timeout).map(|_| ()),
+        );
+        report("icmp_echo_remote", icmp_echo(target.ip()));
+    }
+    report("raw_socket", raw_socket());
+    report(
+        "icmp_echo_loopback",
+        icmp_echo(std::net::IpAddr::from([127, 0, 0, 1])),
+    );
+
+    // The server message block client of the kernel, to an address of this computer that is not
+    // the loopback one (the loopback one is reached without the network card).
+    let share = match option("host").and_then(|h| h.parse::<SocketAddr>().ok()) {
+        Some(host) => format!(r"\\{}\C$\Windows\win.ini", host.ip()),
+        None => r"\\127.0.0.1\C$\Windows\win.ini".to_string(),
+    };
+    report("open_network_path", std::fs::File::open(share).map(|_| ()));
+    // And to a computer that does not exist. A refusal that comes at once says that no connection
+    // was tried: trying one takes seconds. The control does not do this (`smb_remote` is only
+    // given to the locked-in program).
+    if option("smb_remote").is_some() {
+        let start = Instant::now();
+        let result = std::fs::File::open(r"\\192.0.2.1\x\y");
+        let took = start.elapsed().as_millis();
+        report(
+            "open_network_path_remote",
+            result
+                .map(|_| ())
+                .map_err(|e| std::io::Error::other(format!("{e}; after {took} ms"))),
+        );
+    }
+
+    if let Some(pipe) = option("pipe") {
+        report(
+            "open_local_pipe",
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(pipe)
+                .map(|_| ()),
+        );
+    }
+}
+
+/// Sends one datagram from a socket that was never bound: the system binds it with the send. An
+/// error says which call failed, so that a refusal of `sendto` is not taken for a refusal of
+/// `socket`.
+#[cfg(windows)]
+fn sendto_unbound(target: std::net::SocketAddr) -> std::io::Result<()> {
+    use windows_sys::Win32::Networking::WinSock::{
+        closesocket, sendto, socket, WSAGetLastError, INVALID_SOCKET, SOCKADDR,
+    };
+    // The socket address by hand: family (little endian), port (big endian), address.
+    let mut address = Vec::new();
+    match target {
+        std::net::SocketAddr::V4(v4) => {
+            address.extend_from_slice(&2u16.to_le_bytes());
+            address.extend_from_slice(&v4.port().to_be_bytes());
+            address.extend_from_slice(&v4.ip().octets());
+            address.extend_from_slice(&[0u8; 8]);
+        }
+        std::net::SocketAddr::V6(v6) => {
+            address.extend_from_slice(&23u16.to_le_bytes());
+            address.extend_from_slice(&v6.port().to_be_bytes());
+            address.extend_from_slice(&0u32.to_le_bytes());
+            address.extend_from_slice(&v6.ip().octets());
+            address.extend_from_slice(&0u32.to_le_bytes());
+        }
+    }
+    let family = if target.is_ipv4() { 2 } else { 23 };
+    // SAFETY: documented Winsock calls; Winsock is started (the program made a socket before the
+    // lock-in) and the buffers live through the calls.
+    unsafe {
+        let s = socket(family, 2, 17);
+        if s == INVALID_SOCKET {
+            let e = std::io::Error::from_raw_os_error(WSAGetLastError());
+            return Err(std::io::Error::other(format!("socket: {e}")));
+        }
+        let sent = sendto(
+            s,
+            b"hello-unbound".as_ptr(),
+            13,
+            0,
+            address.as_ptr().cast::<SOCKADDR>(),
+            address.len() as i32,
+        );
+        let code = WSAGetLastError();
+        closesocket(s);
+        if sent < 0 {
+            let e = std::io::Error::from_raw_os_error(code);
+            return Err(std::io::Error::other(format!("sendto: {e}")));
+        }
+    }
+    Ok(())
+}
+
+/// A raw ICMP socket. (An account without administrator rights cannot make one anywhere.)
+#[cfg(windows)]
+fn raw_socket() -> std::io::Result<()> {
+    use windows_sys::Win32::Networking::WinSock::{
+        closesocket, socket, WSAGetLastError, INVALID_SOCKET,
+    };
+    // SAFETY: documented Winsock calls.
+    unsafe {
+        let s = socket(2, 3, 1);
+        if s == INVALID_SOCKET {
+            let e = std::io::Error::from_raw_os_error(WSAGetLastError());
+            return Err(std::io::Error::other(format!("socket: {e}")));
+        }
+        closesocket(s);
+    }
+    Ok(())
+}
+
+/// One ICMP echo through the ICMP service of the system (`IcmpSendEcho`), which is not a socket of
+/// the program. `Ok` when a reply came.
+#[cfg(windows)]
+fn icmp_echo(target: std::net::IpAddr) -> std::io::Result<()> {
+    use std::ffi::c_void;
+    #[link(name = "iphlpapi")]
+    extern "system" {
+        fn IcmpCreateFile() -> *mut c_void;
+        fn IcmpSendEcho(
+            handle: *mut c_void,
+            destination: u32,
+            data: *const c_void,
+            data_size: u16,
+            options: *const c_void,
+            reply: *mut c_void,
+            reply_size: u32,
+            timeout_ms: u32,
+        ) -> u32;
+        fn IcmpCloseHandle(handle: *mut c_void) -> i32;
+    }
+    let std::net::IpAddr::V4(v4) = target else {
+        return Err(std::io::Error::other("only IPv4"));
+    };
+    // SAFETY: documented calls; the reply buffer is larger than one reply and the data.
+    unsafe {
+        let handle = IcmpCreateFile();
+        if handle.is_null() || handle as isize == -1 {
+            return Err(std::io::Error::other(format!(
+                "IcmpCreateFile: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let mut reply = [0u8; 256];
+        let data = [b'x'; 8];
+        let replies = IcmpSendEcho(
+            handle,
+            u32::from_ne_bytes(v4.octets()),
+            data.as_ptr().cast(),
+            data.len() as u16,
+            std::ptr::null(),
+            reply.as_mut_ptr().cast(),
+            reply.len() as u32,
+            1500,
+        );
+        let error = std::io::Error::last_os_error();
+        IcmpCloseHandle(handle);
+        if replies == 0 {
+            return Err(std::io::Error::other(format!("IcmpSendEcho: {error}")));
+        }
+    }
+    Ok(())
 }
 
 /// Opens `\Device\Afd\Endpoint` with `NtCreateFile`, which is what creating a socket does first.

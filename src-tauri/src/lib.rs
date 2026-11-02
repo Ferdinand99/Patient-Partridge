@@ -325,6 +325,9 @@ struct OpenedInfo {
     name: String,
     /// Where this file was left the last time, if it was.
     position: Option<Position>,
+    /// Windows: an engine has run on this computer without being able to prove that the network is
+    /// blocked for it. The window tells the user once. Always false elsewhere.
+    network_not_proved: bool,
 }
 
 /// Runs a blocking engine call off the thread that handles the window.
@@ -376,6 +379,7 @@ async fn open_pdf(
         pages: pages.iter().map(|p| [p.width, p.height]).collect(),
         name,
         position,
+        network_not_proved: engine.0.network_not_proved(),
     })
 }
 

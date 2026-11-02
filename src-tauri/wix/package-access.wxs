@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The PDF engine runs in an AppContainer, which can read only what is open to its own package or to
+  "all application packages" (S-1-15-2-1). The program files in Program Files already are. In any
+  other folder (the install page of the installer lets the user choose one, and deployment tools set
+  INSTALLDIR) they are not, and the user who runs the program usually cannot change that: the files
+  belong to the administrators. So the installer, which runs with administrator rights, adds the
+  entry: read and execute for "all application packages" on the install folder, inherited by what
+  is in it. A failure is not an error of the installation: a folder on a file system without access
+  lists needs no entry.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <DirectoryRef Id="INSTALLDIR">
+      <Component Id="PackageAccessMarker" Guid="*">
+        <RegistryValue Root="HKLM" Key="Software\Patient Partridge Installer" Name="PackageAccess" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <ComponentGroup Id="PackageAccessGroup">
+      <ComponentRef Id="PackageAccessMarker" />
+    </ComponentGroup>
+
+    <!-- The command line goes to the deferred action through the property of the same name. -->
+    <CustomAction Id="PackageAccessCommand" Property="PackageAccess" Value="&quot;[SystemFolder]icacls.exe&quot; &quot;[INSTALLDIR]\.&quot; /grant *S-1-15-2-1:(OI)(CI)(RX)" />
+    <CustomAction Id="PackageAccess" BinaryKey="WixCA" DllEntry="CAQuietExec" Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="PackageAccessCommand" Before="PackageAccess">NOT (REMOVE="ALL")</Custom>
+      <Custom Action="PackageAccess" After="InstallFiles">NOT (REMOVE="ALL")</Custom>
+    </InstallExecuteSequence>
+  </Fragment>
+</Wix>

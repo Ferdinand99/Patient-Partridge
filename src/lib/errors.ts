@@ -89,7 +89,7 @@ export function describeError(error: AppErrorLike, fileName?: string): Described
     case "sandbox_unavailable":
       return {
         title: "The file was not opened",
-        detail: `Patient Partridge could not lock its PDF reader into the protective sandbox of this system, so it did not open ${fileName ? file : "this file"}. No part of the file was read.${error.message ? ` (${error.message})` : ""}`,
+        detail: `Patient Partridge could not lock its PDF reader into the protective sandbox of this system, so it did not open ${fileName ? file : "this file"}. No part of the file was read. Close Patient Partridge and start it again. If this keeps happening, reinstall it, and make sure no security program is changing how it starts.${error.message ? ` (${error.message})` : ""}`,
         action: "none",
       };
     case "save_read_only":

@@ -3,8 +3,12 @@
 //! thread has the identity that may open files), so every library the engine imports must be one
 //! the system maps without opening a file. That holds when the C runtime is linked statically
 //! (`.cargo/config.toml`); with the dynamic runtime about nine starts in ten ended with "library
-//! not found". These tests start the real engine many times, and many at once, so a start that
-//! fails at random fails here too.
+//! not found". These tests start the real engine many times, and many at once.
+//!
+//! The client starts the engine again when a start ends with "library not found" (see
+//! `EngineClient::start`), which would hide exactly the failure these tests look for. So they count
+//! the starts that had to be tried again and require that there are none: every start works the
+//! first time. The count is printed.
 
 #![cfg(windows)]
 
@@ -18,25 +22,37 @@ fn config() -> EngineConfig {
     config
 }
 
+/// Starts one engine with a client of its own and returns how many times the start was tried again.
+fn start_once(label: &str) -> u64 {
+    let client = EngineClient::new(config());
+    let info = client
+        .info()
+        .unwrap_or_else(|e| panic!("{label} failed: {e:?}"));
+    for layer in [
+        "restricted-token",
+        "low-integrity",
+        "job",
+        "mitigations",
+        "appcontainer",
+        "own-desktop",
+    ] {
+        assert!(info.sandbox.contains(layer), "{label}: {info:?}");
+    }
+    // The block is proved or the greeting says it is not; one of the two, never neither.
+    assert!(
+        info.sandbox.contains("no-network") || info.sandbox.contains("network-not-proved"),
+        "{label}: {info:?}"
+    );
+    client.start_retries()
+}
+
 #[test]
 fn the_engine_starts_every_time_with_all_its_layers() {
-    for run in 0..100 {
-        // A new client every time: a new engine process every time.
-        let info = EngineClient::new(config())
-            .info()
-            .unwrap_or_else(|e| panic!("start {run} failed: {e:?}"));
-        for layer in [
-            "restricted-token",
-            "low-integrity",
-            "job",
-            "mitigations",
-            "appcontainer",
-            "no-network",
-            "own-desktop",
-        ] {
-            assert!(info.sandbox.contains(layer), "start {run}: {info:?}");
-        }
-    }
+    let retries: u64 = (0..100)
+        .map(|run| start_once(&format!("start {run}")))
+        .sum();
+    println!("starts: 100, started again after a first failure: {retries}");
+    assert_eq!(retries, 0, "{retries} of 100 starts failed the first time");
 }
 
 #[test]
@@ -44,16 +60,13 @@ fn engines_that_start_together_all_start() {
     let handles: Vec<_> = (0..8)
         .map(|n| {
             std::thread::spawn(move || {
-                for run in 0..10 {
-                    let info = EngineClient::new(config())
-                        .info()
-                        .unwrap_or_else(|e| panic!("thread {n} start {run} failed: {e:?}"));
-                    assert!(info.sandbox.contains("appcontainer"), "{info:?}");
-                }
+                (0..10)
+                    .map(|run| start_once(&format!("thread {n} start {run}")))
+                    .sum::<u64>()
             })
         })
         .collect();
-    for handle in handles {
-        handle.join().unwrap();
-    }
+    let retries: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+    println!("starts: 80, started again after a first failure: {retries}");
+    assert_eq!(retries, 0, "{retries} of 80 starts failed the first time");
 }

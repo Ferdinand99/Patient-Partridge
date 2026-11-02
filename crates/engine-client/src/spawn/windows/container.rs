@@ -26,7 +26,10 @@
 //! the few files the engine loads (its own program, the PDFium library, the `VERSION` file, the
 //! fonts folder). The user owns these files, so no administrator is needed. Where the entry cannot
 //! be added (a per-machine install in `Program Files`, which already allows "all application
-//! packages" to read) nothing is changed. The entry is kept: it names a package that exists only
+//! packages" to read) nothing is changed. The installers add the entry on the install folder too
+//! (`src-tauri/wix/package-access.wxs`, `src-tauri/windows/installer-hooks.nsh`), because a
+//! per-machine install outside `Program Files` belongs to the administrators and the user who runs
+//! the program cannot add it. The entry is kept: it names a package that exists only
 //! as a number, and the next start finds it in place. After the lock-in the engine still cannot
 //! open these files, because the restricted token has the null SID as its only restricting SID.
 
@@ -48,9 +51,9 @@ use windows_sys::Win32::Security::{
     AclSizeInformation, EqualSid, FreeSid, GetAce, GetAclInformation, GetLengthSid,
     ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
 };
-use windows_sys::Win32::Storage::FileSystem::{
-    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-};
+#[cfg(debug_assertions)]
+use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE;
+use windows_sys::Win32::Storage::FileSystem::{FILE_GENERIC_EXECUTE, FILE_GENERIC_READ};
 
 use super::{wide, Owned};
 
@@ -219,8 +222,13 @@ fn add_entry(
     let _descriptor = Local(descriptor);
 
     let who = trustee(sid);
+    // A NULL DACL is open to everybody, the package included. (Building a new ACL from one entry
+    // would lock everybody else out.)
+    if dacl.is_null() {
+        return Ok(());
+    }
     // SAFETY: the ACL is the one just read; the SID is live.
-    if !dacl.is_null() && unsafe { allows(dacl, sid, rights) } {
+    if unsafe { allows(dacl, sid, rights) } {
         return Ok(());
     }
     let entry = EXPLICIT_ACCESS_W {

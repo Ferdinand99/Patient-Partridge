@@ -47,6 +47,8 @@ mod platform {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Applied {
     layers: Vec<&'static str>,
+    /// Windows: what the system answered when the network block was not proved, if it was not.
+    note: Option<String>,
 }
 
 impl Applied {
@@ -57,7 +59,10 @@ impl Applied {
 
     /// The layers as one text, such as `seccomp+landlock`. This is what the engine tells the app.
     pub fn describe(&self) -> String {
-        self.layers.join("+")
+        match &self.note {
+            Some(note) => format!("{} ({note})", self.layers.join("+")),
+            None => self.layers.join("+"),
+        }
     }
 }
 
@@ -99,5 +104,31 @@ pub fn lock_down() -> Result<Applied, String> {
     if layers.is_empty() {
         return Err("no sandbox layer is in force".to_string());
     }
-    Ok(Applied { layers })
+    #[cfg(windows)]
+    let note = windows::network_note();
+    #[cfg(not(windows))]
+    let note = None;
+    Ok(Applied { layers, note })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_greeting_names_the_layers_and_what_the_system_answered_to_the_network() {
+        let proved = Applied {
+            layers: vec!["restricted-token", "no-network"],
+            note: None,
+        };
+        assert_eq!(proved.describe(), "restricted-token+no-network");
+        let not_proved = Applied {
+            layers: vec!["restricted-token", "network-not-proved"],
+            note: Some("a TCP connection failed".to_string()),
+        };
+        assert_eq!(
+            not_proved.describe(),
+            "restricted-token+network-not-proved (a TCP connection failed)"
+        );
+    }
 }

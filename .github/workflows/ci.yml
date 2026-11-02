@@ -34,6 +34,12 @@ jobs:
           - name: windows
             os: windows-latest
             lint: false
+          # Windows Server 2022 (build 20348) is closer to Windows 10 and 11 than the newest
+          # image: the token calls and the list of known libraries that the sandbox depends on can
+          # differ between versions.
+          - name: windows-2022
+            os: windows-2022
+            lint: false
           - name: macos
             os: macos-latest
             lint: false
@@ -377,10 +383,14 @@ jobs:
   # its path), and runs the sandbox tests of the engine as that user. Steps and limits are in
   # scripts/windows-standard-user and docs/windows-standard-user.md.
   windows-standard-user:
-    name: Windows, as a standard user
+    name: Windows, as a standard user (${{ matrix.os }})
     needs: build
-    runs-on: windows-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-2022]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -388,7 +398,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          key: standard-user
+          key: standard-user-${{ matrix.os }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 22
@@ -415,6 +425,9 @@ jobs:
           $setup = Get-ChildItem installers -Filter '*-setup.exe' | Select-Object -First 1
           if (-not $setup) { throw 'The Build job made no NSIS installer.' }
           Copy-Item $setup.FullName C:\pp\in\
+          $msi = Get-ChildItem installers -Filter '*.msi' | Select-Object -First 1
+          if (-not $msi) { throw 'The Build job made no MSI.' }
+          Copy-Item $msi.FullName C:\pp\in\
           $library = Get-ChildItem vendor/pdfium -Recurse -Filter pdfium.dll | Select-Object -First 1
           Copy-Item "$($library.DirectoryName)\*" C:\pp\pdfium\ -Recurse
           Get-ChildItem C:\pp\in, C:\pp\pdfium | Format-Table Name, Length
@@ -423,6 +436,15 @@ jobs:
       - name: Build the engine tests
         shell: pwsh
         run: ./scripts/windows-standard-user/build-tests.ps1
+
+      # What a deployment tool or an administrator does: install in a folder outside Program Files,
+      # as an administrator. The files then belong to the administrators, and the standard user who
+      # runs the program cannot change who may read them. The installers add the entry for the
+      # engine's package themselves; the third copy has none (a control: the engine must fail there,
+      # which is what every installation outside Program Files did before the installers did this).
+      - name: Install outside the profile, as an administrator
+        shell: pwsh
+        run: ./scripts/windows-standard-user/install-as-admin.ps1
 
       - name: Run the checks as the standard user
         shell: powershell
@@ -445,7 +467,7 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
-          name: standard-user-logs
+          name: standard-user-logs-${{ matrix.os }}
           path: C:\pp\out\*
           if-no-files-found: ignore
           retention-days: 7
@@ -462,21 +484,22 @@ jobs:
   # the engine does: it must open the document in all of them, and it must say truthfully whether it
   # could prove the block (docs/windows-sandbox.md).
   windows-firewall:
-    name: Windows, firewall state (${{ matrix.state }})
-    runs-on: windows-latest
+    name: Windows, firewall state (${{ matrix.state }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
         include:
-          - state: default
-            expect: record
-          - state: profiles-off
-            expect: record
-          - state: firewall-service-stopped
-            expect: record
-          - state: filtering-engine-stopped
-            expect: record
+          - { os: windows-latest, state: default, expect: record }
+          - { os: windows-latest, state: profiles-off, expect: record }
+          - { os: windows-latest, state: outbound-allowed, expect: record }
+          - { os: windows-latest, state: package-allowed, expect: record }
+          - { os: windows-latest, state: loopback-exempt, expect: record }
+          - { os: windows-latest, state: firewall-service-stopped, expect: record }
+          - { os: windows-latest, state: filtering-engine-stopped, expect: record }
+          - { os: windows-2022, state: default, expect: record }
+          - { os: windows-2022, state: profiles-off, expect: record }
     defaults:
       run:
         shell: pwsh
@@ -487,7 +510,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          key: firewall
+          key: firewall-${{ matrix.os }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 22
@@ -498,30 +521,7 @@ jobs:
           cargo build -p partridge-engine --examples --locked
           cargo test -p partridge-engine --locked --no-run --test sandbox --test windows_start --test windows_network_states --test sandbox_refusal
       - name: Put the runner in the state
-        env:
-          STATE: ${{ matrix.state }}
-        run: |
-          New-Item -ItemType Directory -Force logs | Out-Null
-          $log = 'logs/state.txt'
-          function Say($text) { $text | Tee-Object -FilePath $log -Append }
-          Say '--- before'
-          Say (Get-NetFirewallProfile | Format-Table Name, Enabled | Out-String)
-          Say (Get-Service MpsSvc, BFE | Format-Table Name, Status, StartType | Out-String)
-          Say (Get-CimInstance -Namespace root/SecurityCenter2 -ClassName FirewallProduct -ErrorAction SilentlyContinue | Format-List displayName, productState | Out-String)
-          switch ($env:STATE) {
-            'profiles-off' {
-              Set-NetFirewallProfile -Profile Domain, Public, Private -Enabled False
-            }
-            'firewall-service-stopped' {
-              try { Stop-Service MpsSvc -Force -ErrorAction Stop; Say 'MpsSvc stopped' } catch { Say "MpsSvc could not be stopped: $_" }
-            }
-            'filtering-engine-stopped' {
-              try { Stop-Service BFE -Force -ErrorAction Stop; Say 'BFE stopped' } catch { Say "BFE could not be stopped: $_" }
-            }
-          }
-          Say '--- after'
-          Say (Get-NetFirewallProfile -ErrorAction SilentlyContinue | Format-Table Name, Enabled | Out-String)
-          Say (Get-Service MpsSvc, BFE | Format-Table Name, Status, StartType | Out-String)
+        run: ./scripts/windows-firewall-state.ps1 ${{ matrix.state }}
       - name: What the engine does in this state
         continue-on-error: true
         env:
@@ -543,7 +543,7 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
-          name: firewall-${{ matrix.state }}
+          name: firewall-${{ matrix.os }}-${{ matrix.state }}
           path: logs/*
           if-no-files-found: ignore
           retention-days: 7

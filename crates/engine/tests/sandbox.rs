@@ -196,6 +196,51 @@ fn host_listener() -> Option<(TcpListener, SocketAddr)> {
     found
 }
 
+/// A TCP listener and a UDP socket on the same port of `[::1]` (Windows). `None` where the computer
+/// has no IPv6 loopback address, except on the CI runners, which have one.
+fn v6_listeners() -> Option<(TcpListener, UdpSocket, u16)> {
+    if !cfg!(windows) {
+        return None;
+    }
+    for _ in 0..100 {
+        let Ok(udp) = UdpSocket::bind("[::1]:0") else {
+            break;
+        };
+        let port = udp.local_addr().unwrap().port();
+        if let Ok(tcp) = TcpListener::bind(("::1", port)) {
+            tcp.set_nonblocking(true).unwrap();
+            return Some((tcp, udp, port));
+        }
+    }
+    assert!(
+        std::env::var_os("GITHUB_ACTIONS").is_none(),
+        "the runner has no IPv6 loopback address"
+    );
+    println!("this computer has no IPv6 loopback address: the IPv6 checks are left out");
+    None
+}
+
+/// An address on another computer that accepts TCP connections: the first IPv4 address of the name
+/// (port 443). Nothing is sent to it except the connection. `None` without a network, except on the
+/// CI runners, which have one.
+fn remote_target(name: Option<&str>) -> Option<String> {
+    let found = name.and_then(|name| {
+        (name, 443)
+            .to_socket_addrs()
+            .ok()?
+            .find(SocketAddr::is_ipv4)
+            .map(|a| a.to_string())
+    });
+    if found.is_none() {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "the runner has no IPv4 address of another computer to try"
+        );
+        println!("no other computer to try: the check of a remote address is left out");
+    }
+    found
+}
+
 /// A name that only the network can resolve. Without network the lookup is left out, except on
 /// the CI runners, which have one.
 fn dns_name() -> Option<String> {
@@ -212,6 +257,73 @@ fn dns_name() -> Option<String> {
     );
     println!("{name} does not resolve here: the name lookup check is left out");
     None
+}
+
+/// Named pipes whose access list is NULL (open to every program), made by the test. A local proxy
+/// would be one. There are two instances: the control takes one and the locked-in program tries the
+/// other. (Windows only.)
+#[cfg(windows)]
+mod pipes {
+    use std::ffi::c_void;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::{
+        InitializeSecurityDescriptor, SetSecurityDescriptorDacl, SECURITY_ATTRIBUTES,
+    };
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateNamedPipeW(
+            name: *const u16,
+            open_mode: u32,
+            pipe_mode: u32,
+            max_instances: u32,
+            out_buffer: u32,
+            in_buffer: u32,
+            timeout: u32,
+            attributes: *const SECURITY_ATTRIBUTES,
+        ) -> *mut c_void;
+    }
+
+    pub struct Pipes {
+        pub name: String,
+        handles: Vec<*mut c_void>,
+    }
+
+    pub fn start() -> Pipes {
+        let name = format!(r"\\.\pipe\partridge-proxy-{}", std::process::id());
+        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: documented calls; the descriptor outlives the calls that use it.
+        unsafe {
+            let mut descriptor = [0u64; 8];
+            let psd = descriptor.as_mut_ptr().cast::<c_void>();
+            assert!(InitializeSecurityDescriptor(psd, 1) != 0);
+            // A DACL that is present and NULL: everybody may do everything.
+            assert!(SetSecurityDescriptorDacl(psd, 1, std::ptr::null(), 0) != 0);
+            let attributes = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: psd,
+                bInheritHandle: 0,
+            };
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    // PIPE_ACCESS_DUPLEX, a byte pipe that waits, four instances at most.
+                    let h = CreateNamedPipeW(wide.as_ptr(), 3, 0, 4, 4096, 4096, 0, &attributes);
+                    assert!(h as isize != -1 && !h.is_null(), "no named pipe");
+                    h
+                })
+                .collect();
+            Pipes { name, handles }
+        }
+    }
+
+    impl Drop for Pipes {
+        fn drop(&mut self) {
+            for h in &self.handles {
+                // SAFETY: the handles were made by `start`.
+                unsafe { CloseHandle(*h) };
+            }
+        }
+    }
 }
 
 /// A window and some text on the clipboard of the user's session, made by the test, for the
@@ -324,6 +436,11 @@ fn a_locked_in_engine_cannot_open_files_use_the_network_or_start_programs() {
     // network can resolve.
     let host = host_listener();
     let dns = dns_name();
+    // Windows: the same on IPv6, an address on another computer, and a pipe that is open to all.
+    let v6 = v6_listeners();
+    let remote = remote_target(dns.as_deref());
+    #[cfg(windows)]
+    let pipe = pipes::start();
 
     // A secret in the environment of the app, which the engine must not get.
     std::env::set_var("PARTRIDGE_PLANTED_SECRET", "hunter2");
@@ -332,8 +449,9 @@ fn a_locked_in_engine_cannot_open_files_use_the_network_or_start_programs() {
     #[cfg(windows)]
     let mut session = session::start(&title);
 
-    let probe_args = |file: String, dir: &std::path::Path| -> Vec<String> {
-        vec![
+    // `slow` adds the attempt that takes seconds when the network is open (the control skips it).
+    let probe_args = |file: String, dir: &std::path::Path, slow: bool| -> Vec<String> {
+        let mut args = vec![
             "probe".to_string(),
             file,
             dir.to_string_lossy().into_owned(),
@@ -344,15 +462,30 @@ fn a_locked_in_engine_cannot_open_files_use_the_network_or_start_programs() {
             std::process::id().to_string(),
             port.to_string(),
             title.clone(),
-            host.as_ref()
-                .map(|(_, address)| address.to_string())
-                .unwrap_or_else(|| "-".to_string()),
-            dns.clone().unwrap_or_else(|| "-".to_string()),
-        ]
+        ];
+        if let Some((_, address)) = &host {
+            args.push(format!("host={address}"));
+        }
+        if let Some(name) = &dns {
+            args.push(format!("dns={name}"));
+        }
+        if let Some((_, _, v6port)) = &v6 {
+            args.push(format!("v6port={v6port}"));
+        }
+        if let Some(address) = &remote {
+            args.push(format!("remote={address}"));
+        }
+        #[cfg(windows)]
+        args.push(format!("pipe={}", pipe.name));
+        if slow {
+            args.push("smb_remote=1".to_string());
+        }
+        args
     };
 
     // The control: the same attempts without the sandbox.
-    let control = run_control(&probe_args(control_document.path_str(), &control_folder)[1..]);
+    let control =
+        run_control(&probe_args(control_document.path_str(), &control_folder, false)[1..]);
     println!("control: {control:#?}");
     // The control reached every listener: a listener that the control cannot reach would make the
     // checks below pass for nothing.
@@ -364,10 +497,36 @@ fn a_locked_in_engine_cannot_open_files_use_the_network_or_start_programs() {
     udp_listener
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    let (length, _) = udp_listener
-        .recv_from(&mut datagram)
-        .expect("the control's datagram did not arrive");
-    assert_eq!(&datagram[..length], b"hello");
+    // Windows: two datagrams, one from a socket that was bound and one from a socket that was
+    // never bound (the system binds that one with the send). Elsewhere one.
+    let mut arrived = Vec::new();
+    for _ in 0..if cfg!(windows) { 2 } else { 1 } {
+        let (length, _) = udp_listener
+            .recv_from(&mut datagram)
+            .expect("the control's datagram did not arrive");
+        arrived.push(datagram[..length].to_vec());
+    }
+    arrived.sort();
+    if cfg!(windows) {
+        assert_eq!(arrived, [b"hello".to_vec(), b"hello-unbound".to_vec()]);
+    } else {
+        assert_eq!(arrived, [b"hello".to_vec()]);
+    }
+    if let Some((v6_tcp, v6_udp, _)) = &v6 {
+        assert!(
+            accepts_within(v6_tcp, Duration::from_secs(5)),
+            "the control did not connect to the IPv6 listener"
+        );
+        v6_udp
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let (length, _) = v6_udp
+            .recv_from(&mut datagram)
+            .expect("the control's IPv6 datagram did not arrive");
+        assert_eq!(&datagram[..length], b"hello-unbound");
+        v6_udp.set_nonblocking(true).unwrap();
+        while v6_tcp.accept().is_ok() {}
+    }
     // Nothing else is expected from here on.
     udp_listener.set_nonblocking(true).unwrap();
     while listener.accept().is_ok() {}
@@ -392,7 +551,11 @@ fn a_locked_in_engine_cannot_open_files_use_the_network_or_start_programs() {
 
     let handle = std::fs::File::open(document.path()).unwrap();
     let before = std::fs::read(document.path()).unwrap();
-    let run = run_selftest(&handle, None, &probe_args(document.path_str(), &folder));
+    let run = run_selftest(
+        &handle,
+        None,
+        &probe_args(document.path_str(), &folder, true),
+    );
     let lines = &run.lines;
     println!("{lines:#?}");
 
@@ -436,12 +599,30 @@ fn a_locked_in_engine_cannot_open_files_use_the_network_or_start_programs() {
         assert!(layers.contains("appcontainer"), "{lines:#?}");
         assert!(layers.contains("no-network"), "{lines:#?}");
     }
-    let mut network_attempts = vec!["connect_socket", "udp_send"];
+    // `udp_bind_then_send` binds first, so where the bind is refused no datagram is sent: it shows
+    // the bind. The `udp_sendto_unbound_*` attempts send from a socket that was never bound; their
+    // refusal must come from `sendto` itself (a refusal of `socket` would mean no send was tried).
+    let mut network_attempts = vec!["connect_socket"];
+    if cfg!(windows) {
+        network_attempts.extend([
+            "udp_bind_then_send",
+            "udp_sendto_unbound_loopback",
+            "udp_sendto_unbound_remote",
+        ]);
+    } else {
+        network_attempts.push("udp_bind_then_send");
+    }
     if host.is_some() {
         network_attempts.push("connect_host_address");
     }
     if dns.is_some() {
         network_attempts.push("dns_lookup");
+    }
+    if v6.is_some() {
+        network_attempts.extend(["connect_v6_loopback", "udp_sendto_unbound_v6"]);
+    }
+    if remote.is_some() {
+        network_attempts.push("connect_remote");
     }
     for attempt in network_attempts {
         let l = line(lines, attempt);
@@ -457,6 +638,44 @@ fn a_locked_in_engine_cannot_open_files_use_the_network_or_start_programs() {
         if cfg!(windows) && attempt != "dns_lookup" {
             assert!(l.contains("os error 10013"), "{l}");
         }
+        if attempt.starts_with("udp_sendto_unbound") {
+            assert!(l.contains("sendto:"), "no datagram was sent: {l}");
+        }
+    }
+    // Windows: a raw socket and an ICMP echo. An account without administrator rights cannot make
+    // a raw socket in the control either, and a computer that does not answer an echo gives no
+    // reply to the control: then the line is printed and the attempt proves nothing about the
+    // engine, which the log shows.
+    #[cfg(windows)]
+    for attempt in ["raw_socket", "icmp_echo_loopback"] {
+        let l = line(lines, attempt);
+        let c = line(&control, attempt);
+        println!("network: {l} (control: {c})");
+        assert!(l.starts_with(&format!("{attempt}: denied")), "{l}");
+        if attempt == "icmp_echo_loopback" && c.contains("ALLOWED") {
+            assert!(!l.contains("ALLOWED"), "{l}");
+        }
+    }
+    #[cfg(windows)]
+    if remote.is_some() {
+        let l = line(lines, "icmp_echo_remote");
+        println!(
+            "network: {l} (control: {})",
+            line(&control, "icmp_echo_remote")
+        );
+        assert!(l.starts_with("icmp_echo_remote: denied"), "{l}");
+    }
+    #[cfg(windows)]
+    {
+        let l = line(lines, "open_local_pipe");
+        let c = line(&control, "open_local_pipe");
+        println!("network: {l} (control: {c})");
+        assert!(l.starts_with("open_local_pipe: denied"), "{l}");
+        assert!(l.contains("os error 5)"), "{l}");
+        assert!(
+            c.starts_with("open_local_pipe: ALLOWED"),
+            "the control cannot open the pipe either: {c}"
+        );
     }
     // Binding a socket is not reaching the network: the systems differ on whether it is refused.
     let bind = line(&control, "bind_udp_socket");
@@ -552,7 +771,20 @@ fn a_locked_in_engine_cannot_open_files_use_the_network_or_start_programs() {
         );
         let l = line(lines, "open_network_path");
         assert!(l.starts_with("open_network_path: denied"), "{l}");
+        assert!(l.contains("os error 5)"), "{l}");
         println!("control: {}", line(&control, "open_network_path"));
+        // A path on a computer that does not exist: the refusal comes at once, so no connection
+        // was tried (trying one takes seconds).
+        let l = line(lines, "open_network_path_remote");
+        println!("network: {l}");
+        assert!(l.starts_with("open_network_path_remote: denied"), "{l}");
+        assert!(l.contains("os error 5)"), "{l}");
+        let took: u64 = l
+            .rsplit("after ")
+            .next()
+            .and_then(|t| t.trim_end_matches(" ms)").parse().ok())
+            .unwrap_or_else(|| panic!("no time in {l}"));
+        assert!(took < 1500, "the refusal took {took} ms: {l}");
         if session.has_window() {
             assert!(line(lines, "find_window_of_the_user").contains("denied"));
             assert!(
@@ -601,6 +833,16 @@ fn a_locked_in_engine_cannot_open_files_use_the_network_or_start_programs() {
         assert!(
             host_listener.accept().is_err(),
             "something connected to the address of this computer"
+        );
+    }
+    if let Some((v6_tcp, v6_udp, _)) = &v6 {
+        assert!(
+            v6_tcp.accept().is_err(),
+            "something connected to the IPv6 listener"
+        );
+        assert!(
+            v6_udp.recv_from(&mut datagram).is_err(),
+            "a datagram arrived on IPv6 from the engine"
         );
     }
     let _ = std::fs::remove_dir_all(&folder);

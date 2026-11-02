@@ -23,7 +23,8 @@
 //!   and the document, and nothing else of the app's handles.
 //!
 //! A process with that token cannot load its own DLLs, so the first thread of the engine starts out
-//! impersonating the app's own (full) token. The engine loads PDFium with that, then calls
+//! impersonating a copy of the app's own token (the user's rights) that is an AppContainer token of
+//! the same package. The engine loads PDFium with that, then calls
 //! `RevertToSelf` (see `partridge-engine`), after which the thread has the restricted token like the
 //! rest of the process. The engine reads nothing of the document before that.
 //!

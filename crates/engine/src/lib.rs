@@ -648,7 +648,9 @@ type Loaded = (&'static Pdfium, Arc<AtomicU8>);
 #[cfg(windows)]
 fn resolve_folder(dir: &Path) -> std::io::Result<PathBuf> {
     let full = std::path::absolute(dir)?;
-    if full.is_dir() {
+    // `metadata` says why when the folder cannot be reached (access denied, for one), where
+    // `is_dir` would only say no.
+    if std::fs::metadata(&full)?.is_dir() {
         Ok(full)
     } else {
         Err(std::io::Error::new(
