@@ -1,11 +1,12 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Permissions for the main window: events (file drops and paths), the window title and the open dialog",
+  "description": "Permissions for the main window: events (file drops and paths), the name of the app, the window title and the open dialog",
   "windows": ["main"],
   "permissions": [
     "core:event:allow-listen",
     "core:event:allow-unlisten",
+    "core:app:allow-name",
     "core:window:allow-set-title",
     "dialog:allow-open"
   ]

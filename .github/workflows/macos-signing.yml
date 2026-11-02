@@ -4,10 +4,20 @@
 # and the disk image, and starts the signed app from the disk image to open a PDF. Run it
 # from the Actions tab after changing certificates or keys. It also runs when the files that make
 # the signed build change, so a change is tested before it is merged.
+#
+# With the "beta" input on, the same build is made as "Patient Partridge Beta" (see docs/signing.md):
+# another identifier, so it installs next to the stable app and keeps its own settings, no update
+# files and no update server, no file association, and a "BETA" ribbon on the icon. The disk image
+# in the artifact is the delivery; nothing is published, no release and no tag.
 name: macOS signing check
 
 on:
   workflow_dispatch:
+    inputs:
+      beta:
+        description: Make a beta build that installs next to the stable app (see docs/signing.md)
+        type: boolean
+        default: false
   push:
     paths:
       - .github/workflows/macos-signing.yml
@@ -18,6 +28,7 @@ on:
       - scripts/smoke.mjs
       - scripts/prepare-bundle.mjs
       - scripts/bundle-config.mjs
+      - scripts/beta-build.mjs
       - src-tauri/tauri.conf.json
 
 permissions:
@@ -33,6 +44,10 @@ jobs:
     defaults:
       run:
         shell: bash
+    env:
+      # "1" for a beta build, empty otherwise (a push never makes one). Not a secret.
+      BETA: ${{ inputs.beta && '1' || '' }} # TEMPORARY-BETA-TEST
+      APP_NAME: ${{ inputs.beta && 'Patient Partridge Beta' || 'Patient Partridge' }}
     # No secret is set for the job. Each is set on the one step that reads it; the steps that run
     # third-party code (npm, the build scripts of the Rust dependencies, Vite) have none.
     steps:
@@ -77,6 +92,12 @@ jobs:
           PARTRIDGE_UNIVERSAL: "1"
         run: node scripts/prepare-bundle.mjs
 
+      # Beta only: the icon with its ribbon and the beta settings, merged over the config that the
+      # compile and the signing step below already use. No secret.
+      - name: Make the beta settings and icons
+        if: env.BETA == '1'
+        run: node scripts/beta-build.mjs prepare
+
       # Compiles the app and runs the frontend build. No secret.
       - name: Compile
         run: npx tauri build --no-bundle --target universal-apple-darwin --config src-tauri/tauri.bundle.generated.conf.json -- --locked
@@ -96,9 +117,54 @@ jobs:
 
       - name: Check the result
         run: |
-          APP="target/universal-apple-darwin/release/bundle/macos/Patient Partridge.app"
+          APP="target/universal-apple-darwin/release/bundle/macos/$APP_NAME.app"
           DMG=$(find target/universal-apple-darwin/release/bundle/dmg -name '*.dmg' | head -1)
           scripts/macos-verify.sh "$APP" "$DMG"
+
+      # Beta only: the build cannot be taken for the stable app, and cannot update itself.
+      - name: Check the beta build
+        if: env.BETA == '1'
+        run: |
+          APP="target/universal-apple-darwin/release/bundle/macos/$APP_NAME.app"
+          PLIST="$APP/Contents/Info.plist"
+          fail() { echo "::error title=Beta build::$*"; exit 1; }
+          plist() { /usr/libexec/PlistBuddy -c "Print :$1" "$PLIST"; }
+          BIN=$(plist CFBundleExecutable)
+          echo "identifier:  $(plist CFBundleIdentifier)"
+          echo "name:        $(plist CFBundleName)"
+          echo "version:     $(plist CFBundleShortVersionString)"
+          echo "executable:  $BIN"
+          [ "$(plist CFBundleIdentifier)" = com.ferdinand99.patientpartridge.beta ] || fail "the identifier is not the beta one"
+          [ "$(plist CFBundleName)" = "Patient Partridge Beta" ] || fail "the app is not named Patient Partridge Beta"
+          case "$(plist CFBundleShortVersionString)" in *-beta.*) ;; *) fail "the version has no beta mark" ;; esac
+          [ -f "$APP/Contents/MacOS/$BIN" ] || fail "the executable $BIN is not in the app"
+          if plist CFBundleDocumentTypes > /dev/null 2>&1; then fail "the app takes file types (CFBundleDocumentTypes)"; fi
+          DMG=$(find target/universal-apple-darwin/release/bundle/dmg -name '*.dmg' | head -1)
+          case "$(basename "$DMG")" in "Patient Partridge Beta_"*) ;; *) fail "the disk image is not named Patient Partridge Beta_...: $DMG" ;; esac
+          if find target/universal-apple-darwin/release/bundle \( -name '*.tar.gz' -o -name '*.sig' \) | grep -q .; then fail "an update file was made"; fi
+          # The configuration is part of the program. The public key must be found in it (so that this
+          # search can see the configuration at all) and the address of the update file must not.
+          grep -aq 'dW50cnVzdGVk' "$APP/Contents/MacOS/$BIN" || fail "the search cannot see the configuration in the program"
+          if grep -aq 'releases/latest/download/latest.json' "$APP/Contents/MacOS/$BIN"; then fail "the program still has the address of the update file"; fi
+          # What the icon of the finished app looks like, from the .icns inside it.
+          mkdir -p beta-preview
+          sips -s format png -Z 512 "$APP/Contents/Resources/icon.icns" --out beta-preview/app-icon-512.png
+          sips -s format png -Z 64 "$APP/Contents/Resources/icon.icns" --out beta-preview/app-icon-64.png
+          {
+            echo "### Beta build"
+            echo
+            echo "- Product: $(plist CFBundleName), identifier $(plist CFBundleIdentifier), version $(plist CFBundleShortVersionString), program $BIN"
+            echo "- No update file, no update address in the program, no file types taken."
+            echo "- The icon of the finished app (512 px and 64 px) is in the artifact patient-partridge-beta-icon."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: env.BETA == '1'
+        with:
+          name: patient-partridge-beta-icon
+          path: beta-preview/*.png
+          if-no-files-found: error
+          retention-days: 3
 
       # A signed, notarised app is started and opens a PDF, the way a user's copy does: out of the
       # disk image, with the "downloaded" mark on it. The hardened runtime, library validation and the
@@ -112,12 +178,15 @@ jobs:
           mkdir -p "$mount" "$RUNNER_TEMP/copy"
           # The disk image has a licence agreement, which `hdiutil` asks to accept ("attach canceled" otherwise).
           echo Y | hdiutil attach -nobrowse -readonly -noverify -mountpoint "$mount" "$DMG" > /dev/null
-          cp -R "$mount/Patient Partridge.app" "$RUNNER_TEMP/copy/"
+          cp -R "$mount/$APP_NAME.app" "$RUNNER_TEMP/copy/"
           hdiutil detach "$mount" > /dev/null
-          APP="$RUNNER_TEMP/copy/Patient Partridge.app"
+          APP="$RUNNER_TEMP/copy/$APP_NAME.app"
+          # The name of the program, from the app itself: the beta is started under its own name too.
+          BIN=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP/Contents/Info.plist")
+          echo "program: $BIN"
           xattr -w com.apple.quarantine "0081;00000000;Safari;" "$APP"
           spctl --assess --type execute --verbose=4 "$APP"
-          node scripts/smoke.mjs --bin "$APP/Contents/MacOS/patient-partridge" --pdf "$RUNNER_TEMP/launch.pdf" --runs 2 | tee launch.txt
+          node scripts/smoke.mjs --bin "$APP/Contents/MacOS/$BIN" --pdf "$RUNNER_TEMP/launch.pdf" --runs 2 | tee launch.txt
           {
             echo "### The signed app opened a PDF"
             echo
@@ -130,13 +199,14 @@ jobs:
       - name: What happened to the signed app
         if: failure()
         run: |
-          APP="$RUNNER_TEMP/copy/Patient Partridge.app"
+          APP="$RUNNER_TEMP/copy/$APP_NAME.app"
+          BIN=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP/Contents/Info.plist" 2>/dev/null || echo patient-partridge)
           ls -la "$APP/Contents/MacOS" "$APP/Contents/Resources" | head -30
           xattr -l "$APP" | head -5
           for mode in with-mark without-mark; do
             [ "$mode" = without-mark ] && xattr -d com.apple.quarantine "$APP" 2>/dev/null
             echo "=== start ($mode)"
-            "$APP/Contents/MacOS/patient-partridge" "$RUNNER_TEMP/launch.pdf" > app.out 2>&1 &
+            "$APP/Contents/MacOS/$BIN" "$RUNNER_TEMP/launch.pdf" > app.out 2>&1 &
             pid=$!
             sleep 25
             kill "$pid" 2>/dev/null
@@ -149,7 +219,7 @@ jobs:
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: patient-partridge-macos-signed
+          name: ${{ env.BETA == '1' && 'patient-partridge-macos-beta-signed' || 'patient-partridge-macos-signed' }}
           path: target/universal-apple-darwin/release/bundle/dmg/*.dmg
           if-no-files-found: error
           retention-days: 3
