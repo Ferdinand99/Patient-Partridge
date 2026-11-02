@@ -1,3 +1,4 @@
+import { getName } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -56,6 +57,11 @@ const app = new App(document, {
   },
 });
 app.init();
+// The title carries the product name of the build ("Patient Partridge Beta" in a beta build). It is
+// asked for without waiting, so a failure only leaves the plain name.
+void getName()
+  .then((name) => app.setAppName(name))
+  .catch(() => undefined);
 
 // Updates: the app process checks, downloads and installs; the window only asks and shows.
 new Updater(document, {
