@@ -34,7 +34,8 @@ fi
 
 # Attachments are never opened and links are only reported, never followed: the engine must have
 # no code that reads an attachment, launches a file, or follows a remote or embedded destination.
-if grep -rnE 'attachments\(|\.attachment|FPDFAttachment|FPDFDoc_(Get|Add|Delete)Attachment|as_launch_action|as_remote_destination_action|as_embedded_destination_action|PdfActionLaunch|PdfAttachment|Command::new' crates/engine/src; then
+# (`attachment_points` is the box list of a highlight, not an attachment of the file.)
+if grep -rnE 'attachments\(|\.attachment([^_[:alnum:]]|$)|FPDFAttachment|FPDFDoc_(Get|Add|Delete)Attachment|as_launch_action|as_remote_destination_action|as_embedded_destination_action|PdfActionLaunch|PdfAttachment|Command::new' crates/engine/src; then
   echo "The engine source touches attachments, launches something, or follows links." >&2
   fail=1
 fi
