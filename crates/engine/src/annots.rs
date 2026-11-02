@@ -1688,7 +1688,7 @@ pub fn line_boxes(chars: &[TextChar]) -> Vec<[f32; 4]> {
 }
 
 /// The boxes as quadrilaterals in page space (top left, top right, bottom left, bottom right of
-/// the box in page space, as Acrobat writes them) and the box around all of them as
+/// the box in page space, the order other PDF tools write) and the box around all of them as
 /// `[left, bottom, right, top]`.
 fn quads_for(page: &PdfPage, mapper: &Mapper, boxes: &[[f32; 4]]) -> (Vec<[f32; 8]>, [f32; 4]) {
     let mut quads = Vec::new();
