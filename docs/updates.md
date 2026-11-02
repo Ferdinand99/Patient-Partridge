@@ -64,7 +64,7 @@ The changes made to an open document live in its engine, so stopping the engines
 
 A save that is running is waited for, not cut off: it holds a permit of the gate, and the install closes the gate, then waits (up to 10 seconds) for every permit before it stops any engine. If a save or an open is still running after that, nothing is stopped and nothing is installed, and the window says so (the update then has to be downloaded again). The dialog of Save a copy does not hold a permit while it is open.
 
-This is tested with the window code (`src/app/updater.test.ts`), with the app-side checks (`an_update_is_not_installed_while_a_document_has_unsaved_changes`, `a_save_that_is_running_is_waited_for_before_any_engine_is_stopped`) and, for the close request, with the mock runtime of Tauri running the app's guard on a real window event. There is no editing feature yet that makes a document dirty, so it has not been tried in the running app.
+This is tested with the window code (`src/app/updater.test.ts`), with the app-side checks (`an_update_is_not_installed_while_a_document_has_unsaved_changes`, `a_save_that_is_running_is_waited_for_before_any_engine_is_stopped`) and, for the close request, with the mock runtime of Tauri running the app's guard on a real window event. The window that asks has been tried with the mock runtime only, not in a running app on a real system.
 
 ### Stopping the engines, and the open files
 
