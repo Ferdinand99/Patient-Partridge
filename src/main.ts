@@ -6,6 +6,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import "./styles/tokens.css";
 import "./styles/components.css";
 import "./styles/app.css";
+import "./styles/forms.css";
 import { App } from "./app/app";
 import { Updater } from "./app/updater";
 import { api } from "./lib/api";

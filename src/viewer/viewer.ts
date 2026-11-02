@@ -23,6 +23,7 @@ import {
   visibleRange,
   type Range,
 } from "./layout";
+import { FormLayer, type FormEdit, type FormsApi } from "./forms";
 import { AnnotationLayer, type AnnotLayerEvents } from "./annotlayer";
 import { PageOverlays, type CopyResult, type OverlayApi, type OverlayLimits, type PageLinkInfo } from "./overlays";
 import { RenderScheduler, type RenderJob } from "./scheduler";
@@ -74,6 +75,17 @@ export interface ViewerOptions {
   start?: ViewPosition | null;
   /** Limits on the text kept for the document. For tests; the defaults are meant for the app. */
   limits?: Partial<OverlayLimits>;
+  /**
+   * Lets the reader fill in the form of the document, if it has one. `record` is given every change,
+   * for undo and redo and for the mark that the document has changes that are not saved.
+   */
+  forms?: {
+    api: FormsApi;
+    record(edit: FormEdit): void;
+    pending?(pending: boolean): void;
+    /** The picture of a page is out of date after a change of a field (the side panel draws it again). */
+    redrawn?(page: number): void;
+  };
 }
 
 export interface DocumentInfo {
@@ -107,6 +119,7 @@ export class DocumentView {
   private readonly mounted = new Map<number, Mounted>();
   private readonly scheduler: RenderScheduler;
   private readonly overlays: PageOverlays;
+  private readonly forms: FormLayer | null;
   private readonly annots: AnnotationLayer;
   /** How many times the picture of a page was asked to be drawn afresh (see `invalidatePage`). */
   private readonly versions = new Map<number, number>();
@@ -169,6 +182,17 @@ export class DocumentView {
       options.limits,
     );
 
+    this.forms = options.forms
+      ? new FormLayer(info.doc, info.pages, options.forms.api, this.element, {
+          onEdit: (edit) => options.forms?.record(edit),
+          onRedraw: (page) => {
+            this.invalidatePage(page);
+            options.forms?.redrawn?.(page);
+          },
+          onPending: (pending) => options.forms?.pending?.(pending),
+        })
+      : null;
+    this.forms?.start();
     const listAnnotations = api.listAnnotations?.bind(api);
     this.annots = new AnnotationLayer(
       info.pages,
@@ -291,6 +315,7 @@ export class DocumentView {
     cancelAnimationFrame(this.frame);
     this.resizeObserver?.disconnect();
     window.removeEventListener("resize", this.onWindowResize);
+    this.forms?.destroy();
     for (const index of [...this.mounted.keys()]) this.unmount(index);
     this.overlays.destroy();
     this.annots.destroy();
@@ -651,11 +676,16 @@ export class DocumentView {
     const canvas = document.createElement("canvas");
     canvas.className = "viewer-canvas";
     el.append(canvas);
-    this.sizer.append(el);
+    // In page order, so that the Tab key walks the fields of the pages in reading order.
+    const after = [...this.mounted.keys()].filter((i) => i > index).sort((a, b) => a - b)[0];
+    const next = after === undefined ? null : (this.mounted.get(after)?.el ?? null);
+    if (next) this.sizer.insertBefore(el, next);
+    else this.sizer.append(el);
     const m: Mounted = { el, canvas, wantKey: "", drawnKey: null, failedKey: null };
     this.mounted.set(index, m);
     this.placePage(index, m);
     this.overlays.mount(index, el);
+    this.forms?.mount(index, el);
     this.annots.mount(index, el);
     return m;
   }
@@ -666,10 +696,24 @@ export class DocumentView {
     // Shrinking the canvas frees its bitmap right away instead of when the garbage collector runs.
     m.canvas.width = 0;
     m.canvas.height = 0;
+    this.forms?.unmount(index);
     this.overlays.unmount(index);
     this.annots.unmount(index);
     m.el.remove();
     this.mounted.delete(index);
+  }
+
+  /**
+   * Sends what was typed in a field of the form that was not left, and waits until every change of
+   * the form is made. Call it before anything that looks at the document.
+   */
+  flushForms(): Promise<void> {
+    return this.forms?.flush() ?? Promise.resolve();
+  }
+
+  /** True while a field of the form holds text that is not in the document yet. */
+  get hasPendingFormInput(): boolean {
+    return this.forms?.hasPendingInput ?? false;
   }
 
   private async renderJob(job: RenderJob): Promise<void> {
@@ -695,6 +739,7 @@ export class DocumentView {
     }
     // Text and links come after the picture, so they never delay the page the reader waits for.
     this.overlays.pageDrawn(job.page);
+    this.forms?.pageDrawn(job.page);
     this.annots.pageDrawn(job.page);
     this.events.onPageDrawn?.(job.page);
     if (!this.painted) {

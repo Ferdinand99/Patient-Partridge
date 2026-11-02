@@ -1018,3 +1018,77 @@ describe("markup that is done on some pages only", () => {
     expect(unknown.detail).toContain("Part of the change may have been made");
   });
 });
+
+describe("annotations and changes of a form in one history", () => {
+  /** A change of a form, as the form layer records it: it only has to leave a trace. */
+  const formEdit = (calls: string[], label: string) => ({
+    label,
+    undo: () => void calls.push(`undo ${label}`),
+    redo: () => void calls.push(`redo ${label}`),
+  });
+
+  it("takes both kinds back and makes them again in the order they were made", async () => {
+    const t = setup();
+    t.history.push(formEdit(t.calls, "Fill in Name"));
+    t.annotator.onStroke(0, [[1, 1]]);
+    await t.annotator.idle();
+    t.history.push(formEdit(t.calls, "Tick Agree"));
+    t.annotator.onStroke(1, [[2, 2]]);
+    await t.annotator.idle();
+    expect(t.calls).toEqual(["addInk 0 3 1", "addInk 1 3 1"]);
+    expect(t.history.undoLabel).toBe("Drawing");
+    expect(t.history.dirty).toBe(true);
+
+    // Undo, one step at a time: the drawing on page 1, the check box, the drawing on page 0, the
+    // form field.
+    t.calls.length = 0;
+    for (let i = 0; i < 4; i++) await t.history.undo();
+    expect(t.calls).toEqual(["remove 1 101", "undo Tick Agree", "remove 0 100", "undo Fill in Name"]);
+    expect(t.history.dirty).toBe(false);
+    expect(t.history.undoLabel).toBeNull();
+
+    // Redo goes the other way over the same four, and the page of an annotation is drawn again.
+    t.calls.length = 0;
+    t.log.length = 0;
+    for (let i = 0; i < 4; i++) await t.history.redo();
+    expect(t.calls).toEqual(["redo Fill in Name", "restore 0 100", "redo Tick Agree", "restore 1 101"]);
+    expect(t.log.filter((l) => l.startsWith("invalidate:"))).toEqual(["invalidate:0", "invalidate:1"]);
+    expect(t.history.dirty).toBe(true);
+    expect(t.history.undoLabel).toBe("Drawing");
+  });
+
+  it("counts a change of a form after a save as a change, and Undo of it as back at the save", async () => {
+    const t = setup();
+    t.annotator.onStroke(0, [[1, 1]]);
+    await t.annotator.idle();
+    t.history.markSaved(t.history.revision);
+    expect(t.history.dirty).toBe(false);
+    t.history.push(formEdit(t.calls, "Fill in Name"));
+    expect(t.history.dirty).toBe(true);
+    await t.history.undo();
+    expect(t.history.dirty).toBe(false);
+    // The drawing made before the save can still be taken back; then the document differs from
+    // the saved file.
+    await t.history.undo();
+    expect(t.history.dirty).toBe(true);
+    await t.history.redo();
+    expect(t.history.dirty).toBe(false);
+  });
+
+  it("holds an annotation back during a save and lets a form change through, then both are in the history", async () => {
+    const t = setup();
+    const release = t.annotator.hold();
+    t.annotator.onStroke(0, [[1, 1]]);
+    t.history.push(formEdit(t.calls, "Fill in Name"));
+    await Promise.resolve();
+    expect(t.calls).toEqual([]);
+    expect(t.history.undoLabel).toBe("Fill in Name");
+    release();
+    await t.annotator.flush();
+    expect(t.calls).toEqual(["addInk 0 3 1"]);
+    expect(t.history.undoLabel).toBe("Drawing");
+    await t.history.undo();
+    await t.history.undo();
+    expect(t.calls.slice(1)).toEqual(["remove 0 100", "undo Fill in Name"]);
+  });
+});

@@ -41,6 +41,11 @@ pub fn demo_content(number: usize, width: u32, height: u32) -> String {
     s
 }
 
+mod forms;
+pub use forms::*;
+mod forms_actions;
+pub use forms_actions::*;
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -80,6 +85,18 @@ fn build(
     trailer_extra: &str,
     extra_objects: Vec<Vec<u8>>,
 ) -> Vec<u8> {
+    assemble(
+        &build_objects(pages, catalog_extra, extra_objects),
+        trailer_extra,
+    )
+}
+
+/// The objects of [`build`], numbered from 1 (`objects[i]` is object `i + 1`).
+fn build_objects(
+    pages: &[PageSpec],
+    catalog_extra: &str,
+    extra_objects: Vec<Vec<u8>>,
+) -> Vec<Vec<u8>> {
     // 1 catalog, 2 page tree, 3 font, then per page: the page and (optionally) its content.
     let mut objects: Vec<Vec<u8>> = Vec::new();
     let mut kids = String::new();
@@ -116,7 +133,77 @@ fn build(
     objects.push(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec());
     objects.extend(body_objects);
     objects.extend(extra_objects);
-    assemble(&objects, trailer_extra)
+    objects
+}
+
+/// As [`assemble`], but the objects that are numbered `first_packed` or higher and are not streams
+/// are kept in an object stream, and the cross-reference is a stream, as in a file that a recent
+/// writer made. Nothing is compressed.
+fn assemble_packed(objects: &[Vec<u8>], first_packed: usize) -> Vec<u8> {
+    let packable = |number: usize| {
+        number >= first_packed && !objects[number - 1].windows(6).any(|w| w == b"stream")
+    };
+    let packed: Vec<usize> = (1..=objects.len()).filter(|n| packable(*n)).collect();
+    let store = objects.len() + 1;
+    let xref = objects.len() + 2;
+    let mut out = b"%PDF-1.5\n%\xE2\xE3\xCF\xD3\n".to_vec();
+    let mut offsets = vec![0usize; xref + 1];
+    for (i, body) in objects.iter().enumerate() {
+        if packable(i + 1) {
+            continue;
+        }
+        offsets[i + 1] = out.len();
+        out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let mut head = String::new();
+    let mut data = Vec::new();
+    for number in &packed {
+        let _ = write!(head, "{number} {} ", data.len());
+        data.extend_from_slice(&objects[number - 1]);
+        data.push(b'\n');
+    }
+    let mut stream = head.clone().into_bytes();
+    stream.extend_from_slice(&data);
+    offsets[store] = out.len();
+    out.extend_from_slice(
+        format!(
+            "{store} 0 obj\n<< /Type /ObjStm /N {} /First {} /Length {} >>\nstream\n",
+            packed.len(),
+            head.len(),
+            stream.len()
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(&stream);
+    out.extend_from_slice(b"\nendstream\nendobj\n");
+    offsets[xref] = out.len();
+    let mut rows = vec![0, 0, 0, 0, 0, 0xff, 0xff];
+    for (number, offset) in offsets.iter().enumerate().skip(1) {
+        if let Some(at) = packed.iter().position(|n| *n == number) {
+            rows.push(2);
+            rows.extend_from_slice(&(store as u32).to_be_bytes());
+            rows.extend_from_slice(&(at as u16).to_be_bytes());
+        } else {
+            rows.push(1);
+            rows.extend_from_slice(&(*offset as u32).to_be_bytes());
+            rows.extend_from_slice(&0u16.to_be_bytes());
+        }
+    }
+    out.extend_from_slice(
+        format!(
+            "{xref} 0 obj\n<< /Type /XRef /Size {} /W [1 4 2] /Root 1 0 R /Length {} >>\nstream\n",
+            xref + 1,
+            rows.len()
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(&rows);
+    out.extend_from_slice(
+        format!("\nendstream\nendobj\nstartxref\n{}\n%%EOF\n", offsets[xref]).as_bytes(),
+    );
+    out
 }
 
 /// A valid document of `pages` Letter-size pages with text and a bar on each.
@@ -425,7 +512,7 @@ pub fn hostile_annots_pdf() -> Vec<u8> {
 pub const FOREIGN_LONG_END: &str = "LONGCOMMENTEND";
 
 /// The comment of the first highlight of `foreign_annots_pdf`: about 6 KiB, with lines ended by
-/// CR as Acrobat writes them.
+/// CR as many desktop readers write them.
 pub fn foreign_long_comment() -> String {
     let mut text = String::new();
     let mut n = 0;
@@ -451,7 +538,7 @@ fn deflate(data: &[u8]) -> Vec<u8> {
     encoder.finish().expect("compressing in memory")
 }
 
-/// A one page document with annotations written the way Acrobat writes them, for the tests of
+/// A one page document with annotations written the way many desktop readers write them, for the tests of
 /// what the reader must not lose or leave behind (objects 6 to 19 are the annotations):
 /// - 6: a highlight with a long comment (CR line ends), rich text, name, dates, opacity, a layer,
 ///   a subject, an author and a popup (7); 8 is a reply to it.

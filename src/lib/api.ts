@@ -2,6 +2,7 @@
 
 import { Channel, invoke } from "@tauri-apps/api/core";
 import type { PageSizePt } from "../viewer/layout";
+import type { FormFieldInfo, FormInfo, FormValueIn } from "../viewer/forms";
 import type { PageLinkInfo } from "../viewer/overlays";
 import type { Annotation, AnnotKind, Rgba, StampName } from "./annotations";
 
@@ -239,6 +240,30 @@ export const api = {
   /** The links of a page that lead to a web address or to a page of the document. */
   getPageLinks(doc: number, page: number): Promise<PageLinkInfo[]> {
     return invoke<PageLinkInfo[]>("get_page_links", { doc, page });
+  },
+
+  /** What kind of form a document has, and whether it has scripts or actions that are never run. */
+  formInfo(doc: number): Promise<FormInfo> {
+    return invoke<FormInfo>("form_info", { doc });
+  },
+
+  /** The fields of a page that can be filled in. Names, tooltips and values are text from the PDF. */
+  getFormFields(doc: number, page: number): Promise<FormFieldInfo[]> {
+    return invoke<FormFieldInfo[]>("get_form_fields", { doc, page });
+  },
+
+  /**
+   * Sets one field and returns the fields of the page as they are then. `index` and `name` say
+   * which field; the app refuses the request when the widget at that place is not that field.
+   */
+  setFormField(
+    doc: number,
+    page: number,
+    index: number,
+    name: string,
+    value: FormValueIn,
+  ): Promise<FormFieldInfo[]> {
+    return invoke<FormFieldInfo[]>("set_form_field", { doc, page, index, name, value });
   },
 
   /** Finds a text on one page. Each match is `[start, length]` in characters of the page text. */

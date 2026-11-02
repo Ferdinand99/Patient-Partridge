@@ -15,8 +15,10 @@ use partridge_fuzz::{
     over_cap_request_case, over_cap_response_case, OVER_CAP_REQUESTS, OVER_CAP_RESPONSES,
 };
 use partridge_protocol::{
-    ability, AnnotInfo, AnnotKind, ErrorCode, FontScript, LinkTarget, OutlineItem, PageLink,
-    PageSize, Request, RequestBody, Response, ResponseBody, StampKind, TextMatch, MAX_FRAME_LEN, MAX_LINKS_PER_PAGE, MAX_MATCHES_PER_PAGE,
+    ability, field_flag, AnnotInfo, AnnotKind, ErrorCode, FontScript, FormField, FormFieldKind,
+    FormKind, FormOption, FormValue, LinkTarget, OutlineItem, PageLink, PageSize, Request,
+    RequestBody, Response, ResponseBody, StampKind, TextMatch, MAX_FRAME_LEN, MAX_LINKS_PER_PAGE,
+    MAX_MATCHES_PER_PAGE,
     MAX_OUTLINE_DEPTH, MAX_OUTLINE_ITEMS, MAX_OUTLINE_TITLE, MAX_QUERY_LEN, MAX_SAVE_BYTES,
     MAX_SAVE_CHUNK, MAX_URI_LEN, PROTOCOL_VERSION,
 };
@@ -173,6 +175,51 @@ fn requests() -> Vec<(&'static str, Request)> {
         (
             "restore_annot",
             b(22, RequestBody::RestoreAnnot { doc: 1, page: 0, id: 3 }),
+        ),
+        ("form_info", b(23, RequestBody::FormInfo { doc: 1 })),
+        (
+            "list_form_fields",
+            b(24, RequestBody::ListFormFields { doc: 1, page: 0 }),
+        ),
+        (
+            "set_form_text",
+            b(
+                25,
+                RequestBody::SetFormField {
+                    doc: 1,
+                    page: 0,
+                    index: 2,
+                    name: "fullname".into(),
+                    value: FormValue::Text("Ada
+Lovelace".into()),
+                },
+            ),
+        ),
+        (
+            "set_form_checked",
+            b(
+                26,
+                RequestBody::SetFormField {
+                    doc: 1,
+                    page: 0,
+                    index: 3,
+                    name: "agree".into(),
+                    value: FormValue::Checked(true),
+                },
+            ),
+        ),
+        (
+            "set_form_choice",
+            b(
+                27,
+                RequestBody::SetFormField {
+                    doc: 1,
+                    page: 0,
+                    index: 12,
+                    name: "toppings".into(),
+                    value: FormValue::Choice(vec![0, 2]),
+                },
+            ),
         ),
     ]
 }
@@ -383,6 +430,62 @@ fn responses() -> Vec<(&'static str, Response)> {
             ),
         ),
         (
+            "form_info",
+            b(
+                21,
+                ResponseBody::FormInfo {
+                    kind: FormKind::Acro,
+                    has_actions: true,
+                },
+            ),
+        ),
+        (
+            "form_fields",
+            b(
+                22,
+                ResponseBody::FormFields {
+                    fields: vec![
+                        FormField {
+                            index: 0,
+                            kind: FormFieldKind::Text,
+                            flags: field_flag::REQUIRED | field_flag::MULTILINE,
+                            turns: 1,
+                            rect: [150.0, 68.0, 400.0, 92.0],
+                            font_size: 12.0,
+                            name: "person.first".into(),
+                            tooltip: "First name".into(),
+                            value: "Ada
+Lovelace".into(),
+                            max_len: 40,
+                            options: vec![],
+                        },
+                        FormField {
+                            index: 1,
+                            kind: FormFieldKind::Combo,
+                            flags: field_flag::EDITABLE,
+                            turns: 0,
+                            rect: [150.0, 108.0, 350.0, 130.0],
+                            font_size: 0.0,
+                            name: "country".into(),
+                            tooltip: String::new(),
+                            value: "Norway".into(),
+                            max_len: 0,
+                            options: vec![
+                                FormOption {
+                                    selected: true,
+                                    label: "Norway".into(),
+                                },
+                                FormOption {
+                                    selected: false,
+                                    label: "Sweden".into(),
+                                },
+                            ],
+                        },
+                    ],
+                },
+            ),
+        ),
+        (
             "error_save_too_large",
             b(
                 14,
@@ -566,7 +669,7 @@ fn main() {
     );
 
     // Round trips: one input per kind of message.
-    for kind in 0..22u8 {
+    for kind in 0..25u8 {
         write(
             &dir,
             "protocol_roundtrip_request",
@@ -574,7 +677,7 @@ fn main() {
             &generator_input(kind, kind as u32),
         );
     }
-    for kind in 0..19u8 {
+    for kind in 0..21u8 {
         write(
             &dir,
             "protocol_roundtrip_response",
@@ -743,6 +846,27 @@ fn main() {
         ("links_over_the_cap", kit::many_links_pdf(501)),
         ("encrypted", kit::encrypted_pdf("secret", 1)),
         ("truncated", kit::truncated_pdf()),
+        // Forms: every kind of field, a turned page, XFA, scripts and actions, a signature, fields
+        // that sit under a parent, and a page with many fields.
+        ("form", kit::forms_pdf()),
+        ("form_rotated", kit::forms_rotated_pdf(90)),
+        ("form_scripts", kit::forms_script_pdf()),
+        ("form_xfa", kit::xfa_pdf()),
+        ("form_xfa_full", kit::xfa_full_pdf()),
+        ("form_signed", kit::forms_signed_pdf()),
+        ("form_nested", kit::forms_nested_pdf()),
+        ("form_many", kit::forms_many_pdf(40)),
+        ("form_actions", kit::forms_actions_pdf()),
+        ("form_harmless_actions", kit::forms_harmless_actions_pdf()),
+        ("form_multipage", kit::forms_multipage_pdf(false)),
+        ("form_multipage_no_page", kit::forms_multipage_pdf(true)),
+        ("form_loop", kit::forms_loop_pdf()),
+        ("form_parent_event", kit::forms_parent_event_pdf()),
+        (
+            "form_kids_actions",
+            kit::forms_kids_actions_pdf(Some("/K << /S /ResetForm >>"), kit::KidsParent::Absent),
+        ),
+        ("form_awkward_values", kit::forms_awkward_values_pdf()),
         ("corrupt", kit::corrupt_pdf()),
     ];
     for (name, bytes) in pdfs {

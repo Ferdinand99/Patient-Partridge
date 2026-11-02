@@ -141,6 +141,12 @@ impl SourceGuard {
         self.failures
     }
 
+    /// True when a read of PDFium's failed, or a block that was read twice differed: what PDFium
+    /// made of the file may lack a part of it. (PDFium leaves out what it cannot read and goes on.)
+    pub fn damaged(&self) -> bool {
+        self.failures > 0 || self.changed
+    }
+
     fn fail<T>(&mut self, e: io::Error) -> io::Result<T> {
         self.failures = self.failures.saturating_add(1);
         Err(e)

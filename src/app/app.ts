@@ -17,6 +17,7 @@ import {
   saveTheme,
   type StorageLike,
 } from "../lib/theme";
+import type { FormEdit, FormFieldInfo, FormInfo, FormValueIn, FormsApi } from "../viewer/forms";
 import { actionForKey } from "../viewer/keys";
 import type { CopyResult, PageLinkInfo } from "../viewer/overlays";
 import { DocumentView, type ViewPosition, type ViewerOptions } from "../viewer/viewer";
@@ -51,6 +52,16 @@ export interface AppDeps {
     getPageText(doc: number, page: number): Promise<{ text: string; rects: number[] }>;
     getPageLinks(doc: number, page: number): Promise<PageLinkInfo[]>;
     searchPage(doc: number, page: number, query: string): Promise<[number, number][]>;
+    /** The form of a document, if the app can fill in forms (the three go together). */
+    formInfo?(doc: number): Promise<FormInfo>;
+    getFormFields?(doc: number, page: number): Promise<FormFieldInfo[]>;
+    setFormField?(
+      doc: number,
+      page: number,
+      index: number,
+      name: string,
+      value: FormValueIn,
+    ): Promise<FormFieldInfo[]>;
     openLink(doc: number, url: string): Promise<void>;
     /** The scripts the engine of a document had no font for when PDFium asked. */
     missedFonts?(doc: number): Promise<string[]>;
@@ -344,15 +355,22 @@ export class App {
 
   /**
    * True when a document has changes that are not saved: the history says so, or a change is still
-   * being made, or text typed in the box of a note has not been saved yet.
+   * being made, or text typed in the box of a note has not been saved yet, or text typed in a field
+   * of a form has not been sent yet (it will be, before anything looks at the document, but the tab
+   * counts as changed from the first key).
    */
   private isDirty(tab: Tab): boolean {
-    return tab.history.dirty || (tab.annotator?.unsaved ?? false);
+    return tab.history.dirty || (tab.annotator?.unsaved ?? false) || tab.view.hasPendingFormInput;
   }
 
   /** How many documents have changes that are not saved. */
   get unsavedCount(): number {
     return this.tabs.filter((t) => this.isDirty(t)).length;
+  }
+
+  /** Sends what was typed in the forms of every tab, and waits for the changes to be made. */
+  private async flushForms(tabs: Tab[] = this.tabs): Promise<void> {
+    await Promise.all(tabs.map((t) => t.view.flushForms().catch(() => undefined)));
   }
 
   /**
@@ -741,7 +759,7 @@ export class App {
           onLoadFailed: (page, error) => tab.annotator?.onLoadFailed(page, error),
         },
       },
-      { start: opened.position ?? null, limits: this.deps.viewLimits },
+      { start: opened.position ?? null, limits: this.deps.viewLimits, forms: this.formsFor(tab) },
     );
     tab.annotator = this.makeAnnotator(tab);
     tab.history.onChange(() => this.historyChanged(tab));
@@ -772,6 +790,42 @@ export class App {
         detail: `"${opened.name}" opened, but it does not contain any pages to show.`,
         buttons: [{ id: "ok", label: "OK", primary: true }],
       });
+    }
+  }
+
+  /**
+   * What the view of a tab needs to let the reader fill in a form: the three commands, and a place to
+   * record each change, so that it can be taken back and the document counts as changed.
+   */
+  private formsFor(tab: Tab): ViewerOptions["forms"] {
+    const api = this.deps.api;
+    if (!api.formInfo || !api.getFormFields || !api.setFormField) return undefined;
+    const forms: FormsApi = {
+      formInfo: (doc) => (api.formInfo as NonNullable<typeof api.formInfo>)(doc),
+      getFormFields: (doc, page) => (api.getFormFields as NonNullable<typeof api.getFormFields>)(doc, page),
+      setFormField: (doc, page, index, name, value) =>
+        (api.setFormField as NonNullable<typeof api.setFormField>)(doc, page, index, name, value),
+    };
+    return {
+      api: forms,
+      record: (edit) => this.recordFormEdit(tab, edit),
+      pending: () => this.historyChanged(tab),
+      redrawn: (page) => this.sidebar.pageChanged(tab.doc, page),
+    };
+  }
+
+  /**
+   * Puts a change of a form in the history of its tab. While an undo or a redo is still running the
+   * history refuses it, so the change waits for the end of that (a moment) and is not lost.
+   */
+  private recordFormEdit(tab: Tab, edit: FormEdit): void {
+    try {
+      tab.history.push(edit);
+    } catch {
+      // The change is made, so it is recorded however long the undo or redo takes.
+      if (this.tabs.includes(tab)) {
+        setTimeout(() => this.recordFormEdit(tab, edit), 20);
+      }
     }
   }
 
@@ -843,6 +897,9 @@ export class App {
   async requestClose(id: number): Promise<boolean> {
     const tab = this.tabs.find((t) => t.id === id);
     if (!tab) return true;
+    // What was typed and not left yet is part of the document before the question is asked.
+    if (tab.view.hasPendingFormInput) await this.flushForms([tab]);
+    if (!this.tabs.includes(tab)) return true;
     if (!this.isDirty(tab)) {
       this.closeTab(id);
       return true;
@@ -1109,7 +1166,9 @@ export class App {
   /** Saves the document that is shown, if it has changes. Resolves with true when nothing is left unsaved. */
   async saveActive(): Promise<boolean> {
     const tab = this.active;
-    if (!tab || !this.isDirty(tab)) return true;
+    if (!tab) return true;
+    if (tab.view.hasPendingFormInput) await this.flushForms([tab]);
+    if (!this.tabs.includes(tab) || !this.isDirty(tab)) return true;
     return this.saveTab(tab, false);
   }
 
@@ -1117,11 +1176,13 @@ export class App {
   async saveActiveAs(): Promise<boolean> {
     const tab = this.active;
     if (!tab || tab.view.pageCount === 0) return false;
+    if (tab.view.hasPendingFormInput) await this.flushForms([tab]);
     return this.saveTab(tab, true);
   }
 
   /** Saves every document that has changes. Resolves with true when all were saved. */
   async saveAllChanges(halt?: AbortSignal): Promise<boolean> {
+    if (this.tabs.some((t) => t.view.hasPendingFormInput)) await this.flushForms();
     for (const tab of this.tabs.filter((t) => this.isDirty(t))) {
       // The user stopped waiting: what is running finishes, but no other document is begun.
       if (halt?.aborted) return false;
@@ -1310,6 +1371,7 @@ export class App {
     this.quitting = true;
     this.quitReveal = () => this.focusTopNotice();
     try {
+      if (this.tabs.some((t) => t.view.hasPendingFormInput)) await this.flushForms();
       const dirty = this.tabs.filter((t) => this.isDirty(t));
       if (dirty.length === 0) {
         await this.deps.api.quitApp();
@@ -1363,7 +1425,12 @@ export class App {
   private async stepHistory(direction: "undo" | "redo"): Promise<void> {
     const tab = this.active;
     if (!tab || tab.saving) return;
-    const run = () => (direction === "undo" ? tab.history.undo() : tab.history.redo());
+    const run = async (): Promise<void> => {
+      // A form change that is on its way is part of the history first: Undo takes back that one,
+      // not the one before it.
+      await tab.view.flushForms().catch(() => undefined);
+      await (direction === "undo" ? tab.history.undo() : tab.history.redo());
+    };
     try {
       // After the changes asked for before it, and before the ones asked for later.
       await (tab.annotator ? tab.annotator.sequenced(run) : run());
@@ -1699,8 +1766,9 @@ export class App {
       e.preventDefault();
       void this.saveActiveAs();
     } else if (action.type === "undo" || action.type === "redo") {
-      // In a text box, undo and redo belong to the box.
-      if (typing) return;
+      // In a text box, undo and redo belong to the box. A drop-down list has no undo of its own,
+      // and the focus stays in it after a choice.
+      if (typing && !(target instanceof HTMLSelectElement)) return;
       e.preventDefault();
       void (action.type === "undo" ? this.undoActive() : this.redoActive());
     } else if (action.type === "tool") {
@@ -1746,6 +1814,8 @@ export class App {
     const tab = this.active;
     if (!tab || this.printing || tab.view.pageCount === 0) return;
     this.printing = true;
+    // The pages are drawn from the document, so what was typed must be in it.
+    if (tab.view.hasPendingFormInput) await this.flushForms([tab]);
     try {
       const choice = await showPrintDialog(this.noticeLayer, {
         name: tab.name,

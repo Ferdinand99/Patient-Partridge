@@ -708,7 +708,7 @@ export class PageOverlays {
     if (p.button !== 0 || this.destroyed) return;
     const target = p.target;
     if (this.suspended) return;
-    if (target instanceof Element && target.closest(".page-link, .annot")) return;
+    if (target instanceof Element && target.closest(".page-link, .annot, .form-field, .form-bar")) return;
     const last = this.lastPress;
     const count =
       last &&

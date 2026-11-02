@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use partridge_protocol::{
-    ErrorCode, FontScript, PageSize, Request, RequestBody, Response, ResponseBody,
+    ErrorCode, FontScript, FormKind, PageSize, Request, RequestBody, Response, ResponseBody,
     MAX_RENDER_PIXELS, MAX_RENDER_SIDE, MAX_SAVE_CHUNK, PROTOCOL_VERSION,
 };
 use pdfium_render::prelude::*;
@@ -26,6 +26,8 @@ pub mod annots;
 #[cfg(unix)]
 pub mod fds;
 pub mod fonts;
+pub mod form_actions;
+pub mod forms;
 pub mod limits;
 pub mod sandbox;
 pub mod save;
@@ -139,6 +141,9 @@ fn fail<T>(code: ErrorCode, message: impl Into<String>) -> Result<T, Failure> {
 pub struct Engine {
     pdfium: Result<&'static Pdfium, String>,
     pdfium_version: String,
+    /// The form environment of a document, made when the first form request for it comes. It is
+    /// listed before `docs` because it must be closed before the document it belongs to.
+    forms: HashMap<u32, forms::FormEnv>,
     docs: HashMap<u32, PdfDocument<'static>>,
     /// The serialised form of a document between `SaveBegin` and `SaveEnd`.
     saves: HashMap<u32, Vec<u8>>,
@@ -195,6 +200,7 @@ impl Engine {
             missed_fonts: missed,
             pdfium,
             pdfium_version: version,
+            forms: HashMap::new(),
             docs: HashMap::new(),
             saves: HashMap::new(),
             annots: HashMap::new(),
@@ -302,6 +308,7 @@ impl Engine {
             } => self.render(doc, page, width, height),
             RequestBody::Close { doc } => {
                 // Closing an unknown id is not an error: the end state is the same.
+                self.forms.remove(&doc);
                 self.docs.remove(&doc);
                 self.saves.remove(&doc);
                 self.annots.remove(&doc);
@@ -396,6 +403,47 @@ impl Engine {
                     data: bytes[start..end].to_vec(),
                 })
             }
+            RequestBody::FormInfo { doc } => {
+                let document = self.document(doc)?;
+                let info = forms::info(pdfium, document, self.source.as_deref(), progress)?;
+                // The environment is made here and not at the first listing, because making it
+                // writes the whole document out to look for actions, and this is a request that
+                // may take long and report its progress. Listing and setting use it afterwards.
+                // If it cannot be made, the first listing says why.
+                if matches!(
+                    info,
+                    ResponseBody::FormInfo {
+                        kind: FormKind::Acro,
+                        ..
+                    }
+                ) && !self.forms.contains_key(&doc)
+                {
+                    let document = self.document(doc)?;
+                    if let Ok(env) =
+                        forms::FormEnv::create(pdfium, document, self.source.as_deref(), progress)
+                    {
+                        self.forms.insert(doc, env);
+                    }
+                }
+                Ok(info)
+            }
+            RequestBody::ListFormFields { doc, page } => self.with_form(pdfium, doc, |env| {
+                Ok(ResponseBody::FormFields {
+                    fields: env.list(page)?,
+                })
+            }),
+            RequestBody::SetFormField {
+                doc,
+                page,
+                index,
+                name,
+                value,
+            } => self.with_form(pdfium, doc, |env| {
+                env.set(page, index, &name, &value)?;
+                Ok(ResponseBody::FormFields {
+                    fields: env.list(page)?,
+                })
+            }),
             RequestBody::SaveEnd { doc } => {
                 self.saves.remove(&doc);
                 Ok(ResponseBody::SaveEnded)
@@ -488,6 +536,35 @@ impl Engine {
         edit: impl FnOnce(&mut PdfDocument<'static>) -> T,
     ) -> Option<T> {
         self.docs.get_mut(&doc).map(edit)
+    }
+
+    /// Test builds only: `None` while the form environment of a document has not been made, and
+    /// otherwise how many times it searched the pages for the other widgets of a field.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn form_scans_for_tests(&self, doc: u32) -> Option<u32> {
+        self.forms.get(&doc).map(forms::FormEnv::scans_for_tests)
+    }
+
+    /// Runs `f` on the form environment of a document, making the environment first if it is not
+    /// there yet.
+    fn with_form<T>(
+        &mut self,
+        pdfium: &'static Pdfium,
+        doc: u32,
+        f: impl FnOnce(&forms::FormEnv) -> Result<T, Failure>,
+    ) -> Result<T, Failure> {
+        if !self.forms.contains_key(&doc) {
+            let document = self.document(doc)?;
+            let env =
+                forms::FormEnv::create(pdfium, document, self.source.as_deref(), &mut |_| {})?;
+            self.forms.insert(doc, env);
+        }
+        let env = self
+            .forms
+            .get(&doc)
+            .ok_or((ErrorCode::UnknownDocument, "no such document".to_string()))?;
+        f(env)
     }
 
     /// The document and what the engine keeps of its annotations. A save looks at the file the

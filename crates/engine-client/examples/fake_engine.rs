@@ -407,6 +407,10 @@ fn main() {
                     digest: 7,
                 },
             ),
+            // The form requests have a stand-in of their own (examples/fake_forms_engine.rs).
+            RequestBody::FormInfo { .. }
+            | RequestBody::ListFormFields { .. }
+            | RequestBody::SetFormField { .. } => return,
         }
     }
 }

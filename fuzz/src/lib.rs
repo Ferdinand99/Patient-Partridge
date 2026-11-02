@@ -13,14 +13,15 @@ use std::io::{self, Read};
 
 use arbitrary::{Result, Unstructured};
 use partridge_protocol::{
-    ability, AnnotInfo, AnnotKind, ErrorCode, FontScript, LinkTarget, OutlineItem, PageLink,
-    PageSize, Request, RequestBody, Response, ResponseBody, StampKind, TextMatch,
-    MAX_ANNOTS_PER_PAGE, MAX_ANNOT_AUTHOR, MAX_ANNOT_TEXT, MAX_COORDINATE, MAX_INK_POINTS,
+    ability, field_flag, AnnotInfo, AnnotKind, ErrorCode, FontScript, FormField, FormFieldKind,
+    FormKind, FormOption, FormValue, LinkTarget, OutlineItem, PageLink, PageSize, Request,
+    RequestBody, Response, ResponseBody, StampKind, TextMatch, MAX_ANNOTS_PER_PAGE,
+    MAX_ANNOT_AUTHOR, MAX_ANNOT_TEXT, MAX_COORDINATE, MAX_FORM_FIELDS_PER_PAGE, MAX_FORM_NAME,
+    MAX_FORM_OPTIONS, MAX_FORM_OPTION_LABEL, MAX_FORM_TOOLTIP, MAX_FORM_VALUE, MAX_INK_POINTS,
     MAX_INK_STROKES, MAX_INK_WIDTH, MAX_LINKS_PER_PAGE, MAX_MARKUP_CHARS, MAX_MATCHES_PER_PAGE,
     MAX_OUTLINE_DEPTH, MAX_OUTLINE_ITEMS, MAX_OUTLINE_TITLE, MAX_QUERY_LEN, MAX_SAVE_BYTES,
     MAX_SAVE_CHUNK, MAX_STRING_LEN, MAX_URI_LEN, MIN_INK_WIDTH,
 };
-
 /// True about one time in `n`, and never when the input has run out: `Unstructured` answers
 /// `true` to every `ratio` once its bytes are used up, which would make the biggest case the
 /// usual one.
@@ -129,7 +130,7 @@ fn arb_strokes(u: &mut Unstructured) -> Result<Vec<Vec<[f32; 2]>>> {
 /// A request that the encoder writes without cutting anything.
 pub fn arb_request(u: &mut Unstructured) -> Result<Request> {
     let id: u32 = u.arbitrary()?;
-    let body = match u.int_in_range(0..=21u8)? {
+    let body = match u.int_in_range(0..=24u8)? {
         0 => RequestBody::Hello {
             protocol_version: u.arbitrary()?,
         },
@@ -262,7 +263,21 @@ pub fn arb_request(u: &mut Unstructured) -> Result<Request> {
             page: u.arbitrary()?,
             id: u.arbitrary()?,
         },
-        _ => RequestBody::FontReport,
+        21 => RequestBody::FontReport,
+        22 => RequestBody::FormInfo {
+            doc: u.arbitrary()?,
+        },
+        23 => RequestBody::ListFormFields {
+            doc: u.arbitrary()?,
+            page: u.arbitrary()?,
+        },
+        _ => RequestBody::SetFormField {
+            doc: u.arbitrary()?,
+            page: u.arbitrary()?,
+            index: u.arbitrary()?,
+            name: string_up_to(u, MAX_FORM_NAME)?,
+            value: arb_form_value(u)?,
+        },
     };
     Ok(Request { id, body })
 }
@@ -307,7 +322,7 @@ fn arb_annot(u: &mut Unstructured) -> Result<(AnnotInfo, AnnotInfo)> {
 
 pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
     let id: u32 = u.arbitrary()?;
-    let (sent, expected) = match u.int_in_range(0..=18u8)? {
+    let (sent, expected) = match u.int_in_range(0..=20u8)? {
         0 => {
             let b = ResponseBody::Hello {
                 protocol_version: u.arbitrary()?,
@@ -435,7 +450,9 @@ pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
             (b.clone(), b)
         }
         8 => {
-            let code = ErrorCode::from_u8(u.int_in_range(1..=19u8)?).expect("1 to 19 are codes");
+            let n = u.int_in_range(1..=22u8)?;
+            // The codes are 1 to 20, then 24 and 25.
+            let code = ErrorCode::from_u8(if n > 20 { n + 3 } else { n }).expect("a known code");
             let b = ResponseBody::Error {
                 code,
                 message: string_up_to(u, MAX_STRING_LEN)?,
@@ -510,7 +527,7 @@ pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
             (ResponseBody::Annot { item: s }, ResponseBody::Annot { item: e })
         }
         17 => (ResponseBody::AnnotRemoved, ResponseBody::AnnotRemoved),
-        _ => {
+        18 => {
             // Any scripts, in the order of the list, as the engine reports them.
             let mut missed = Vec::new();
             for script in FontScript::ALL {
@@ -520,6 +537,34 @@ pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
             }
             let b = ResponseBody::FontReport { missed };
             (b.clone(), b)
+        }
+        19 => {
+            let b = ResponseBody::FormInfo {
+                kind: match u.int_in_range(0..=2u8)? {
+                    0 => FormKind::None,
+                    1 => FormKind::Acro,
+                    _ => FormKind::Xfa,
+                },
+                has_actions: u.arbitrary()?,
+            };
+            (b.clone(), b)
+        }
+        _ => {
+            // The fields of a page. A long list gets short strings, so that the whole answer is
+            // under the limit the encoder keeps to (it leaves out what does not fit).
+            let count = count_up_to(u, MAX_FORM_FIELDS_PER_PAGE)?;
+            let heavy = count <= 8;
+            let mut sent = Vec::new();
+            let mut expected = Vec::new();
+            for index in 0..count {
+                let (s, e) = arb_form_field(u, index as u32, heavy)?;
+                sent.push(s);
+                expected.push(e);
+            }
+            (
+                ResponseBody::FormFields { fields: sent },
+                ResponseBody::FormFields { fields: expected },
+            )
         }
     };
     Ok(GeneratedResponse {
@@ -569,4 +614,83 @@ impl Read for ChunkReader<'_> {
         self.data = &self.data[n..];
         Ok(n)
     }
+}
+
+/// What a request sets a field to: a text at most as long as the cap, a switch, or choices.
+fn arb_form_value(u: &mut Unstructured) -> Result<FormValue> {
+    Ok(match u.int_in_range(0..=2u8)? {
+        0 => FormValue::Text(string_up_to(u, MAX_FORM_VALUE)?),
+        1 => FormValue::Checked(u.arbitrary()?),
+        _ => {
+            let count = count_up_to(u, MAX_FORM_OPTIONS)?;
+            let mut picked = Vec::with_capacity(count);
+            for _ in 0..count {
+                picked.push(u.arbitrary()?);
+            }
+            FormValue::Choice(picked)
+        }
+    })
+}
+
+/// A string for a field of a long list: short, so that the answer fits.
+fn form_string(u: &mut Unstructured, max: usize, heavy: bool) -> Result<String> {
+    if heavy {
+        string_up_to(u, max)
+    } else {
+        let count = u.int_in_range(0..=12usize)?;
+        let mut s = String::new();
+        for _ in 0..count {
+            let c: char = u.arbitrary()?;
+            if s.len() + c.len_utf8() > max {
+                break;
+            }
+            s.push(c);
+        }
+        Ok(s)
+    }
+}
+
+/// A field, as the engine sends it, and as the decoder gives it back (a box that is not a number
+/// is zeros, a size of text that is not a size is zero).
+fn arb_form_field(u: &mut Unstructured, index: u32, heavy: bool) -> Result<(FormField, FormField)> {
+    let kind = match u.int_in_range(0..=4u8)? {
+        0 => FormFieldKind::Text,
+        1 => FormFieldKind::Checkbox,
+        2 => FormFieldKind::Radio,
+        3 => FormFieldKind::Combo,
+        _ => FormFieldKind::List,
+    };
+    let flags = u.arbitrary::<u16>()? & field_flag::ALL;
+    let options = if heavy {
+        let count = count_up_to(u, MAX_FORM_OPTIONS)?;
+        let mut options = Vec::with_capacity(count);
+        for _ in 0..count {
+            options.push(FormOption {
+                selected: u.arbitrary()?,
+                label: string_up_to(u, MAX_FORM_OPTION_LABEL)?,
+            });
+        }
+        options
+    } else {
+        Vec::new()
+    };
+    let rect = any_rect(u)?;
+    let font_size: f32 = if chance(u, 8)? { f32::NAN } else { finite(u)?.abs() };
+    let field = FormField {
+        index,
+        kind,
+        flags,
+        turns: u.int_in_range(0..=3u8)?,
+        rect,
+        font_size,
+        name: form_string(u, MAX_FORM_NAME, heavy)?,
+        tooltip: form_string(u, MAX_FORM_TOOLTIP, heavy)?,
+        value: form_string(u, MAX_FORM_VALUE, heavy)?,
+        max_len: u.arbitrary()?,
+        options,
+    };
+    let mut expected = field.clone();
+    expected.rect = sanitized(rect);
+    expected.font_size = if font_size.is_finite() { font_size } else { 0.0 };
+    Ok((field, expected))
 }

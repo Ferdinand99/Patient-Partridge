@@ -9,9 +9,11 @@
 
 use arbitrary::{Result, Unstructured};
 use partridge_protocol::{
-    ability, FontScript, LinkTarget, Request, RequestBody, Response, ResponseBody,
-    MAX_ANNOTS_PER_PAGE, MAX_ANNOT_AUTHOR, MAX_ANNOT_TEXT, MAX_COORDINATE,
-    MAX_INK_POINTS, MAX_INK_STROKES, MAX_INK_WIDTH, MAX_LINKS_PER_PAGE, MAX_MARKUP_CHARS,
+    ability, FontScript, FormValue, LinkTarget, Request, RequestBody, Response, ResponseBody,
+    MAX_ANNOTS_PER_PAGE, MAX_ANNOT_AUTHOR, MAX_ANNOT_TEXT, MAX_COORDINATE, MAX_FORM_ANSWER_BYTES,
+    MAX_FORM_FIELDS_PER_PAGE, MAX_FORM_NAME, MAX_FORM_OPTIONS, MAX_FORM_OPTION_LABEL,
+    MAX_FORM_TOOLTIP, MAX_FORM_VALUE, MAX_INK_POINTS, MAX_INK_STROKES, MAX_INK_WIDTH,
+    MAX_LINKS_PER_PAGE, MAX_MARKUP_CHARS,
     MAX_MATCHES_PER_PAGE, MAX_OUTLINE_DEPTH, MAX_OUTLINE_ITEMS, MAX_OUTLINE_TITLE, MAX_PAGE_CHARS,
     MAX_PAGE_TEXT_BYTES, MAX_QUERY_LEN, MAX_RENDER_PIXELS, MAX_RENDER_SIDE, MAX_SAVE_BYTES,
     MAX_SAVE_CHUNK, MAX_STRING_LEN, MAX_URI_LEN, MIN_INK_WIDTH,
@@ -38,6 +40,18 @@ pub fn check_request_caps(request: &Request) {
         }
         RequestBody::SaveChunk { len, .. } => {
             assert!(*len as usize <= MAX_SAVE_CHUNK, "piece of {len} bytes");
+        }
+        RequestBody::SetFormField { name, value, .. } => {
+            assert!(name.len() <= MAX_FORM_NAME, "field name of {} bytes", name.len());
+            match value {
+                FormValue::Text(text) => {
+                    assert!(text.len() <= MAX_FORM_VALUE, "value of {} bytes", text.len())
+                }
+                FormValue::Choice(picked) => {
+                    assert!(picked.len() <= MAX_FORM_OPTIONS, "{} choices", picked.len())
+                }
+                FormValue::Checked(_) => {}
+            }
         }
         RequestBody::AddMarkup { start, end, .. } => {
             assert!(end > start, "an empty range of text");
@@ -169,6 +183,23 @@ pub fn check_response_caps(response: &Response) {
                 matches.len()
             );
         }
+        ResponseBody::FormInfo { .. } => {}
+        ResponseBody::FormFields { fields } => {
+            assert!(
+                fields.len() <= MAX_FORM_FIELDS_PER_PAGE,
+                "{} fields",
+                fields.len()
+            );
+            for field in fields {
+                assert!(field.name.len() <= MAX_FORM_NAME);
+                assert!(field.tooltip.len() <= MAX_FORM_TOOLTIP);
+                assert!(field.value.len() <= MAX_FORM_VALUE);
+                assert!(field.options.len() <= MAX_FORM_OPTIONS);
+                for option in &field.options {
+                    assert!(option.label.len() <= MAX_FORM_OPTION_LABEL);
+                }
+            }
+        }
         ResponseBody::FontReport { missed } => {
             assert!(missed.len() <= FontScript::ALL.len(), "{} scripts", missed.len());
         }
@@ -217,8 +248,39 @@ fn header(tag: u8, id: u32) -> Vec<u8> {
     out
 }
 
+/// One form field with a name and a value of the given sizes and the given number of choices (each
+/// with a label of `label` bytes), the way the engine writes it.
+fn raw_form_field(name: usize, value: usize, options: usize, label: usize) -> Vec<u8> {
+    let mut p = Vec::new();
+    push_u32(&mut p, 0);
+    p.push(1);
+    p.extend_from_slice(&0u16.to_le_bytes());
+    p.push(0);
+    push_rect(&mut p);
+    p.extend_from_slice(&0.0f32.to_le_bytes());
+    push_str(&mut p, name);
+    push_str(&mut p, 0);
+    push_str(&mut p, value);
+    push_u32(&mut p, 0);
+    push_u32(&mut p, options as u32);
+    for _ in 0..options {
+        p.push(0);
+        push_str(&mut p, label);
+    }
+    p
+}
+
+/// An answer with the fields of a page: one field.
+fn form_answer(id: u32, name: usize, value: usize, options: usize, label: usize) -> Vec<u8> {
+    let mut p = header(171, id);
+    push_u32(&mut p, 1);
+    p.extend_from_slice(&raw_form_field(name, value, options, label));
+    assert!(p.len() <= MAX_FORM_ANSWER_BYTES);
+    p
+}
+
 /// How many cases `over_cap_request_case` has.
-pub const OVER_CAP_REQUESTS: usize = 12;
+pub const OVER_CAP_REQUESTS: usize = 14;
 
 /// A request that is valid except that one string is one byte over its cap. Returns a name and
 /// the payload; the decoder must return an error.
@@ -345,7 +407,7 @@ pub fn over_cap_request_case(case: usize, id: u32) -> (&'static str, Vec<u8>) {
             push_f32(&mut p, 1.0);
             ("drawing with a line too thick", p)
         }
-        _ => {
+        11 => {
             // A change with text one byte over the cap.
             let mut p = header(20, id);
             push_u32(&mut p, 1);
@@ -357,11 +419,32 @@ pub fn over_cap_request_case(case: usize, id: u32) -> (&'static str, Vec<u8>) {
             push_f32(&mut p, 0.0);
             ("annotation text one byte too long", p)
         }
+        12 => {
+            // A field named with one byte more than a name may have.
+            let mut p = header(42, id);
+            for v in [1u32, 0, 0] {
+                push_u32(&mut p, v);
+            }
+            push_str(&mut p, MAX_FORM_NAME + 1);
+            p.extend_from_slice(&[2, 1]);
+            ("form field name over the cap", p)
+        }
+        _ => {
+            // A text for a field that is one byte longer than a value may be.
+            let mut p = header(42, id);
+            for v in [1u32, 0, 0] {
+                push_u32(&mut p, v);
+            }
+            push_str(&mut p, 1);
+            p.push(1);
+            push_str(&mut p, MAX_FORM_VALUE + 1);
+            ("form field value over the cap", p)
+        }
     }
 }
 
 /// How many cases `over_cap_response_case` has.
-pub const OVER_CAP_RESPONSES: usize = 26;
+pub const OVER_CAP_RESPONSES: usize = 31;
 
 /// The two cases that are 1.7 MB.
 const PAGE_TEXT_OVER: usize = 6;
@@ -582,6 +665,18 @@ pub fn over_cap_response_case(case: usize, id: u32) -> (&'static str, Vec<u8>, b
             let mut p = header(145, id);
             push_annot(&mut p, MAX_ANNOT_TEXT, MAX_ANNOT_AUTHOR);
             ("annotation with the longest text and author", p, true)
+        }
+        26 => ("form field name over the cap", form_answer(id, MAX_FORM_NAME + 1, 1, 0, 0), false),
+        27 => ("form field value over the cap", form_answer(id, 1, MAX_FORM_VALUE + 1, 0, 0), false),
+        28 => ("form field with one choice too many", form_answer(id, 1, 1, MAX_FORM_OPTIONS + 1, 0), false),
+        29 => ("form field at every cap", form_answer(id, MAX_FORM_NAME, MAX_FORM_VALUE, MAX_FORM_OPTIONS, 4), true),
+        30 => {
+            let mut p = header(171, id);
+            push_u32(&mut p, MAX_FORM_FIELDS_PER_PAGE as u32 + 1);
+            for _ in 0..=MAX_FORM_FIELDS_PER_PAGE {
+                p.extend_from_slice(&raw_form_field(1, 1, 0, 0));
+            }
+            ("page with one form field too many", p, false)
         }
         _ => unreachable!("the case number is taken modulo the number of cases"),
     }

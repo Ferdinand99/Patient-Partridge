@@ -2,7 +2,7 @@ import js from "@eslint/js";
 import tseslint from "typescript-eslint";
 
 export default tseslint.config(
-  { ignores: ["dist", "node_modules", "src-tauri", "target", "vendor", "e2e/artifacts", "e2e/fake-tauri.js", "e2e/serve.mjs"] },
+  { ignores: ["dist", "node_modules", "src-tauri", "target", "vendor", "e2e/artifacts", "e2e/fake-tauri.js", "e2e/fake-forms.js", "e2e/serve.mjs"] },
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {

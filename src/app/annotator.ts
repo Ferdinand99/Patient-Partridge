@@ -72,7 +72,12 @@ export interface AnnotatorHost {
 }
 
 /** Answers of the engine that say it changed nothing. */
-export const CLEAN_REFUSALS = new Set(["annotation_refused", "no_such_annotation", "annotations_not_allowed"]);
+export const CLEAN_REFUSALS = new Set([
+  "annotation_refused",
+  "no_such_annotation",
+  "annotations_not_allowed",
+  "form_field_refused",
+]);
 
 /** What the person is told when a change of an annotation failed. */
 export function annotationNotice(error: AppErrorLike, fileName?: string): { title: string; detail: string } {

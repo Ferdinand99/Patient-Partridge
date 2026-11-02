@@ -20,9 +20,11 @@ mod annots;
 pub use annots::*;
 #[cfg(test)]
 mod annots_tests;
+mod forms;
+pub use forms::*;
 
 /// Version of this protocol. Both sides check it in the `Hello` exchange.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Largest frame (payload) either side accepts: 128 MiB, enough for the biggest allowed bitmap.
 pub const MAX_FRAME_LEN: usize = 128 * 1024 * 1024;
@@ -90,6 +92,9 @@ const TAG_REQ_SAVE_BEGIN: u8 = 11;
 const TAG_REQ_SAVE_CHUNK: u8 = 12;
 const TAG_REQ_SAVE_END: u8 = 13;
 const TAG_REQ_FINGERPRINT: u8 = 14;
+const TAG_REQ_FORM_INFO: u8 = 40;
+const TAG_REQ_LIST_FORM_FIELDS: u8 = 41;
+const TAG_REQ_SET_FORM_FIELD: u8 = 42;
 const TAG_REQ_LIST_ANNOTS: u8 = 15;
 const TAG_REQ_ADD_MARKUP: u8 = 16;
 const TAG_REQ_ADD_NOTE: u8 = 17;
@@ -114,6 +119,8 @@ const TAG_RES_SAVE_DATA: u8 = 140;
 const TAG_RES_SAVE_ENDED: u8 = 141;
 const TAG_RES_PROGRESS: u8 = 142;
 const TAG_RES_FINGERPRINT: u8 = 143;
+const TAG_RES_FORM_INFO: u8 = 170;
+const TAG_RES_FORM_FIELDS: u8 = 171;
 const TAG_RES_ANNOTS: u8 = 144;
 const TAG_RES_ANNOT: u8 = 145;
 const TAG_RES_ANNOT_REMOVED: u8 = 146;
@@ -212,6 +219,11 @@ pub enum ErrorCode {
     /// Reading the file the document comes from failed at least once, so the document may be
     /// missing parts. Nothing is serialised.
     SourceUnreadable = 17,
+    /// The document has no form the reader can fill in (it has none, or it is an XFA form).
+    FormUnsupported = 24,
+    /// The field is not there any more, is not the one named, is read only, or cannot be set to
+    /// what was asked.
+    FormFieldRefused = 25,
     /// The annotation does not exist (any more), or the page changed under the window.
     NoSuchAnnotation = 18,
     /// The annotation exists but does not allow this change (for example, a drawing has no colour
@@ -241,6 +253,8 @@ impl ErrorCode {
             15 => ErrorCode::SaveTooLarge,
             16 => ErrorCode::SourceChanged,
             17 => ErrorCode::SourceUnreadable,
+            24 => ErrorCode::FormUnsupported,
+            25 => ErrorCode::FormFieldRefused,
             18 => ErrorCode::NoSuchAnnotation,
             19 => ErrorCode::AnnotationRefused,
             20 => ErrorCode::AnnotationsNotAllowed,
@@ -268,6 +282,8 @@ impl ErrorCode {
             ErrorCode::SaveTooLarge => "save_too_large",
             ErrorCode::SourceChanged => "source_changed",
             ErrorCode::SourceUnreadable => "source_unreadable",
+            ErrorCode::FormUnsupported => "form_unsupported",
+            ErrorCode::FormFieldRefused => "form_field_refused",
             ErrorCode::NoSuchAnnotation => "no_such_annotation",
             ErrorCode::AnnotationRefused => "annotation_refused",
             ErrorCode::AnnotationsNotAllowed => "annotations_not_allowed",
@@ -323,6 +339,20 @@ pub enum RequestBody {
     /// the number of objects and annotations. The app asks it of the engine that holds the
     /// document and of the engine that reads the saved file, and the two must agree.
     Fingerprint { doc: u32 },
+    /// What kind of form the document has, and whether it has actions that the reader does not run
+    /// (scripts, and actions on fields).
+    FormInfo { doc: u32 },
+    /// The fields of one page that the reader fills in, with their values.
+    ListFormFields { doc: u32, page: u32 },
+    /// Sets one field. `index` and `name` say which: the place of the widget on its page, and the full
+    /// name the window saw there. The answer is the fields of the page as they are now.
+    SetFormField {
+        doc: u32,
+        page: u32,
+        index: u32,
+        name: String,
+        value: FormValue,
+    },
     /// The scripts for which PDFium asked the engine for a font and got none (no system font for
     /// the script, a font that did not pass the check, or the budget of font data used up).
     /// Text in those scripts that the PDF does not carry a font for is drawn as blanks.
@@ -495,6 +525,16 @@ pub enum ResponseBody {
         failed: u32,
         digest: u64,
     },
+    /// Answer to `FormInfo`. `has_actions` is true when the document has scripts or actions on its
+    /// fields, which the reader never runs: fields that add up or format values are not updated.
+    FormInfo {
+        kind: FormKind,
+        has_actions: bool,
+    },
+    /// Answer to `ListFormFields` and `SetFormField`, at most [`MAX_FORM_FIELDS_PER_PAGE`] fields.
+    FormFields {
+        fields: Vec<FormField>,
+    },
     /// Answer to `SaveBegin`: the size of the serialised document, at most [`MAX_SAVE_BYTES`].
     SaveReady {
         size: u32,
@@ -663,6 +703,32 @@ impl Request {
                 put_u32(&mut out, self.id);
                 put_u32(&mut out, *doc);
             }
+            RequestBody::FormInfo { doc } => {
+                out.push(TAG_REQ_FORM_INFO);
+                put_u32(&mut out, self.id);
+                put_u32(&mut out, *doc);
+            }
+            RequestBody::ListFormFields { doc, page } => {
+                out.push(TAG_REQ_LIST_FORM_FIELDS);
+                put_u32(&mut out, self.id);
+                put_u32(&mut out, *doc);
+                put_u32(&mut out, *page);
+            }
+            RequestBody::SetFormField {
+                doc,
+                page,
+                index,
+                name,
+                value,
+            } => {
+                out.push(TAG_REQ_SET_FORM_FIELD);
+                put_u32(&mut out, self.id);
+                put_u32(&mut out, *doc);
+                put_u32(&mut out, *page);
+                put_u32(&mut out, *index);
+                put_str_max(&mut out, name, MAX_FORM_NAME);
+                put_form_value(&mut out, value);
+            }
             RequestBody::FontReport => {
                 out.push(TAG_REQ_FONT_REPORT);
                 put_u32(&mut out, self.id);
@@ -816,6 +882,18 @@ impl Request {
             }
             TAG_REQ_SAVE_END => RequestBody::SaveEnd { doc: r.u32()? },
             TAG_REQ_FINGERPRINT => RequestBody::Fingerprint { doc: r.u32()? },
+            TAG_REQ_FORM_INFO => RequestBody::FormInfo { doc: r.u32()? },
+            TAG_REQ_LIST_FORM_FIELDS => RequestBody::ListFormFields {
+                doc: r.u32()?,
+                page: r.u32()?,
+            },
+            TAG_REQ_SET_FORM_FIELD => RequestBody::SetFormField {
+                doc: r.u32()?,
+                page: r.u32()?,
+                index: r.u32()?,
+                name: r.string_max(MAX_FORM_NAME)?,
+                value: read_form_value(&mut r)?,
+            },
             TAG_REQ_FONT_REPORT => RequestBody::FontReport,
             TAG_REQ_LIST_ANNOTS => RequestBody::ListAnnots {
                 doc: r.u32()?,
@@ -1060,6 +1138,17 @@ impl Response {
                 out.push(TAG_RES_SAVE_ENDED);
                 put_u32(&mut out, self.id);
             }
+            ResponseBody::FormInfo { kind, has_actions } => {
+                out.push(TAG_RES_FORM_INFO);
+                put_u32(&mut out, self.id);
+                out.push(*kind as u8);
+                out.push(u8::from(*has_actions));
+            }
+            ResponseBody::FormFields { fields } => {
+                out.push(TAG_RES_FORM_FIELDS);
+                put_u32(&mut out, self.id);
+                put_fields(&mut out, fields);
+            }
             ResponseBody::FontReport { missed } => {
                 out.push(TAG_RES_FONT_REPORT);
                 put_u32(&mut out, self.id);
@@ -1302,6 +1391,17 @@ impl Response {
                 });
             }
             TAG_RES_SAVE_ENDED => ResponseBody::SaveEnded,
+            TAG_RES_FORM_INFO => ResponseBody::FormInfo {
+                kind: FormKind::from_u8(r.u8()?)?,
+                has_actions: match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    other => return Err(ProtocolError::UnknownValue(other)),
+                },
+            },
+            TAG_RES_FORM_FIELDS => ResponseBody::FormFields {
+                fields: read_fields(&mut r)?,
+            },
             TAG_RES_FONT_REPORT => {
                 let count = r.u8()? as usize;
                 if count > FontScript::ALL.len() {
