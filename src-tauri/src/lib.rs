@@ -13,6 +13,7 @@ mod links;
 mod locate;
 mod positions;
 mod session;
+mod signatures;
 mod unsaved;
 mod updates;
 
@@ -907,6 +908,7 @@ pub fn run() {
             get_outline,
             get_page_text,
             get_page_links,
+            signatures::get_signatures,
             missed_fonts,
             open_link,
             print_webview,

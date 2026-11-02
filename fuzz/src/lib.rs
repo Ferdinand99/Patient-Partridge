@@ -6,8 +6,10 @@
 //! that go past a limit on purpose are in `caps`.
 
 mod caps;
+mod signatures;
 
 pub use caps::*;
+pub use signatures::*;
 
 use std::io::{self, Read};
 
@@ -16,7 +18,7 @@ use partridge_protocol::{
     ErrorCode, FontScript, LinkTarget, OutlineItem, PageLink, PageSize, Request, RequestBody,
     Response, ResponseBody, TextMatch, MAX_LINKS_PER_PAGE, MAX_MATCHES_PER_PAGE, MAX_OUTLINE_DEPTH,
     MAX_OUTLINE_ITEMS, MAX_OUTLINE_TITLE, MAX_QUERY_LEN, MAX_SAVE_BYTES, MAX_SAVE_CHUNK,
-    MAX_STRING_LEN, MAX_URI_LEN,
+    MAX_SIGNATURES, MAX_STRING_LEN, MAX_UNIX_TIME, MAX_URI_LEN,
 };
 
 /// True about one time in `n`, and never when the input has run out: `Unstructured` answers
@@ -78,7 +80,7 @@ pub fn sanitized(rect: [f32; 4]) -> [f32; 4] {
 /// A request that the encoder writes without cutting anything.
 pub fn arb_request(u: &mut Unstructured) -> Result<Request> {
     let id: u32 = u.arbitrary()?;
-    let body = match u.int_in_range(0..=13u8)? {
+    let body = match u.int_in_range(0..=14u8)? {
         0 => RequestBody::Hello {
             protocol_version: u.arbitrary()?,
         },
@@ -136,6 +138,14 @@ pub fn arb_request(u: &mut Unstructured) -> Result<Request> {
         12 => RequestBody::Fingerprint {
             doc: u.arbitrary()?,
         },
+        13 => RequestBody::Signatures {
+            doc: u.arbitrary()?,
+            now: if chance(u, 8)? {
+                MAX_UNIX_TIME
+            } else {
+                u.int_in_range(0..=MAX_UNIX_TIME)?
+            },
+        },
         _ => RequestBody::FontReport,
     };
     Ok(Request { id, body })
@@ -161,7 +171,7 @@ pub struct GeneratedResponse {
 
 pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
     let id: u32 = u.arbitrary()?;
-    let (sent, expected) = match u.int_in_range(0..=15u8)? {
+    let (sent, expected) = match u.int_in_range(0..=16u8)? {
         0 => {
             let b = ResponseBody::Hello {
                 protocol_version: u.arbitrary()?,
@@ -342,6 +352,13 @@ pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
                 pages: u.arbitrary()?,
                 failed: u.arbitrary()?,
                 digest: u.arbitrary()?,
+            };
+            (b.clone(), b)
+        }
+        15 => {
+            let count = count_up_to(u, MAX_SIGNATURES)?;
+            let b = ResponseBody::Signatures {
+                report: arb_signature_report(u, count)?,
             };
             (b.clone(), b)
         }

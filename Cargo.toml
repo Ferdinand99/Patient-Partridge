@@ -20,3 +20,11 @@ codegen-units = 1
 opt-level = "s"
 panic = "abort"
 strip = true
+
+# Big number arithmetic makes the RSA keys of the signature tests; it is slow without
+# optimisation, and these tests run in the dev profile.
+[profile.dev.package.num-bigint]
+opt-level = 3
+
+[profile.dev.package.ring]
+opt-level = 3

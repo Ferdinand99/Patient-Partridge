@@ -130,6 +130,11 @@ impl SourceGuard {
         })
     }
 
+    /// The size of the file when the guard started to watch it.
+    pub fn file_len(&self) -> u64 {
+        self.len
+    }
+
     /// True when the time of change moved while parts of the file were unread: the bytes that were
     /// read are as they were, but the rest of the file cannot be said to be.
     pub fn touched(&self) -> bool {
@@ -283,6 +288,70 @@ impl SourceGuard {
             tail = window[window.len() - keep..].to_vec();
             if (block.len() as u64) < BLOCK {
                 return Ok(false);
+            }
+            index += 1;
+            if index.is_multiple_of(REPORT_BLOCKS) {
+                progress(index as u32);
+            }
+        }
+    }
+}
+
+impl SourceGuard {
+    /// Reads exactly `buf.len()` bytes at `pos`, for the engine's own checks of the file (the
+    /// signatures). Every block read is noted like any other. An error when the file ends first.
+    pub fn read_exact_at(&mut self, pos: u64, buf: &mut [u8]) -> io::Result<()> {
+        let mut done = 0;
+        while done < buf.len() {
+            let at = pos
+                .checked_add(done as u64)
+                .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
+            self.load(at / BLOCK, false)?;
+            let (_, block) = self.cache.as_ref().expect("just loaded");
+            let from = (at % BLOCK) as usize;
+            if from >= block.len() {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            let n = (block.len() - from).min(buf.len() - done);
+            buf[done..done + n].copy_from_slice(&block[from..from + n]);
+            done += n;
+        }
+        Ok(())
+    }
+
+    /// How many times `needle` is in the file (matches do not overlap). Reads the whole file.
+    /// `progress` is told how many blocks are read, about every MiB.
+    pub fn count_occurrences(
+        &mut self,
+        needle: &[u8],
+        progress: &mut dyn FnMut(u32),
+    ) -> io::Result<u32> {
+        if needle.is_empty() {
+            return Ok(0);
+        }
+        let mut tail: Vec<u8> = Vec::new();
+        let mut index = 0u64;
+        let mut count = 0u32;
+        loop {
+            self.load(index, false)?;
+            let (_, block) = self.cache.as_ref().expect("just loaded");
+            if block.is_empty() {
+                return Ok(count);
+            }
+            let mut window = std::mem::take(&mut tail);
+            window.extend_from_slice(block);
+            // The tail holds fewer bytes than the needle, so no match lies wholly inside it and
+            // none is counted twice.
+            let mut at = 0;
+            while let Some(found) = window[at..].windows(needle.len()).position(|w| w == needle) {
+                count = count.saturating_add(1);
+                at += found + needle.len();
+            }
+            let keep = (needle.len() - 1).min(window.len());
+            // Bytes of a match already counted do not start another one.
+            tail = window[(window.len() - keep).max(at)..].to_vec();
+            if (block.len() as u64) < BLOCK {
+                return Ok(count);
             }
             index += 1;
             if index.is_multiple_of(REPORT_BLOCKS) {

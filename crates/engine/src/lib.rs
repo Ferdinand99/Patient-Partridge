@@ -28,6 +28,8 @@ pub mod fonts;
 pub mod limits;
 pub mod sandbox;
 pub mod save;
+pub mod sigcheck;
+pub mod signatures;
 pub mod source;
 pub mod startup;
 pub mod stdio;
@@ -152,6 +154,8 @@ pub struct Engine {
     refusal: Option<Failure>,
     /// The scripts for which PDFium asked for a font and the engine had none to give.
     missed_fonts: Arc<AtomicU8>,
+    /// The certificates a signer may lead to for a signature to be called trusted (see `sigcheck`).
+    trust: sigcheck::TrustList,
 }
 
 impl Engine {
@@ -183,6 +187,7 @@ impl Engine {
         let (pdfium, missed) = match loaded {
             Ok((pdfium, missed)) => {
                 warm_up(pdfium);
+                sigcheck::warm_up();
                 (Ok(pdfium), missed)
             }
             Err(message) => (Err(message), Arc::new(AtomicU8::new(0))),
@@ -198,6 +203,7 @@ impl Engine {
             source: None,
             sandbox: String::new(),
             refusal: None,
+            trust: sigcheck::TrustList::shipped(),
         }
     }
 
@@ -211,6 +217,13 @@ impl Engine {
     #[doc(hidden)]
     pub fn set_document_source(&mut self, source: Box<dyn SourceFile>) {
         self.document = Some(source);
+    }
+
+    /// Test builds only: replaces the trust list, so that a test can have a signer it trusts.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn set_trust_list_for_tests(&mut self, list: sigcheck::TrustList) {
+        self.trust = list;
     }
 
     /// Records which sandbox layers are in force (for the greeting).
@@ -355,6 +368,17 @@ impl Engine {
                 let print = save::fingerprint(document, progress);
                 self.check_source(progress)?;
                 Ok(print)
+            }
+            RequestBody::Signatures { doc, now } => {
+                let document = self.document(doc)?;
+                self.check_source(progress)?;
+                let Some(source) = self.source.clone() else {
+                    return fail(ErrorCode::Internal, "the document has no file behind it");
+                };
+                let report =
+                    signatures::report(pdfium, document, &source, &self.trust, now, progress)?;
+                self.check_source(progress)?;
+                Ok(ResponseBody::Signatures { report })
             }
             RequestBody::SaveBegin { doc } => {
                 // A buffer from an earlier save is gone before the next one is made.

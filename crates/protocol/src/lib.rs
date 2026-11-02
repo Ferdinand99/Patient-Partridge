@@ -16,8 +16,13 @@
 use std::fmt;
 use std::io::{self, Read, Write};
 
+mod signatures;
+pub use signatures::*;
+#[cfg(test)]
+mod signatures_tests;
+
 /// Version of this protocol. Both sides check it in the `Hello` exchange.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Largest frame (payload) either side accepts: 128 MiB, enough for the biggest allowed bitmap.
 pub const MAX_FRAME_LEN: usize = 128 * 1024 * 1024;
@@ -85,6 +90,7 @@ const TAG_REQ_SAVE_BEGIN: u8 = 11;
 const TAG_REQ_SAVE_CHUNK: u8 = 12;
 const TAG_REQ_SAVE_END: u8 = 13;
 const TAG_REQ_FINGERPRINT: u8 = 14;
+const TAG_REQ_SIGNATURES: u8 = 60;
 
 const TAG_RES_HELLO: u8 = 129;
 const TAG_RES_OPENED: u8 = 130;
@@ -101,6 +107,7 @@ const TAG_RES_SAVE_DATA: u8 = 140;
 const TAG_RES_SAVE_ENDED: u8 = 141;
 const TAG_RES_PROGRESS: u8 = 142;
 const TAG_RES_FINGERPRINT: u8 = 143;
+const TAG_RES_SIGNATURES: u8 = 190;
 const TAG_RES_ERROR: u8 = 255;
 
 /// What went wrong while reading or decoding a frame.
@@ -294,6 +301,11 @@ pub enum RequestBody {
     /// the number of objects and annotations. The app asks it of the engine that holds the
     /// document and of the engine that reads the saved file, and the two must agree.
     Fingerprint { doc: u32 },
+    /// Describe and check the digital signatures of the file the document was opened from.
+    /// `now` is the time of the check in seconds since 1970 (the engine does not read the clock):
+    /// the validity of certificates is judged against it. The check reads the whole file, so it
+    /// reports progress like `DocInfo`. `now` is at most [`MAX_UNIX_TIME`].
+    Signatures { doc: u32, now: i64 },
     /// The scripts for which PDFium asked the engine for a font and got none (no system font for
     /// the script, a font that did not pass the check, or the budget of font data used up).
     /// Text in those scripts that the PDF does not carry a font for is drawn as blanks.
@@ -408,6 +420,10 @@ pub enum ResponseBody {
         pages: u32,
         failed: u32,
         digest: u64,
+    },
+    /// Answer to `Signatures`.
+    Signatures {
+        report: SignatureReport,
     },
     /// Answer to `SaveBegin`: the size of the serialised document, at most [`MAX_SAVE_BYTES`].
     SaveReady {
@@ -567,6 +583,13 @@ impl Request {
                 put_u32(&mut out, self.id);
                 put_u32(&mut out, *doc);
             }
+            RequestBody::Signatures { doc, now } => {
+                out.push(TAG_REQ_SIGNATURES);
+                put_u32(&mut out, self.id);
+                put_u32(&mut out, *doc);
+                put_u32(&mut out, *now as u32);
+                put_u32(&mut out, (*now >> 32) as u32);
+            }
             RequestBody::FontReport => {
                 out.push(TAG_REQ_FONT_REPORT);
                 put_u32(&mut out, self.id);
@@ -620,6 +643,14 @@ impl Request {
             }
             TAG_REQ_SAVE_END => RequestBody::SaveEnd { doc: r.u32()? },
             TAG_REQ_FINGERPRINT => RequestBody::Fingerprint { doc: r.u32()? },
+            TAG_REQ_SIGNATURES => {
+                let doc = r.u32()?;
+                let now = i64::from(r.u32()?) | (i64::from(r.u32()?) << 32);
+                if !(0..=MAX_UNIX_TIME).contains(&now) {
+                    return Err(ProtocolError::InvalidLength);
+                }
+                RequestBody::Signatures { doc, now }
+            }
             TAG_REQ_FONT_REPORT => RequestBody::FontReport,
             other => return Err(ProtocolError::UnknownTag(other)),
         };
@@ -748,6 +779,11 @@ impl Response {
                 put_u32(&mut out, *signatures);
                 out.push(u8::from(*maybe_signed));
                 out.push(u8::from(*touched));
+            }
+            ResponseBody::Signatures { report } => {
+                out.push(TAG_RES_SIGNATURES);
+                put_u32(&mut out, self.id);
+                report.encode(&mut out);
             }
             ResponseBody::Progress { done } => {
                 out.push(TAG_RES_PROGRESS);
@@ -1007,6 +1043,9 @@ impl Response {
                     },
                 });
             }
+            TAG_RES_SIGNATURES => ResponseBody::Signatures {
+                report: SignatureReport::decode(&mut r)?,
+            },
             TAG_RES_SAVE_ENDED => ResponseBody::SaveEnded,
             TAG_RES_FONT_REPORT => {
                 let count = r.u8()? as usize;

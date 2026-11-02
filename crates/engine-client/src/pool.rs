@@ -306,6 +306,12 @@ impl EnginePool {
         client.font_report(doc)
     }
 
+    /// The digital signatures of the document, checked at the time `now` (seconds since 1970).
+    pub fn signatures(&self, handle: u64, now: i64) -> Result<crate::SignatureReport, ClientError> {
+        let (client, doc) = self.entry(handle)?;
+        client.signatures(doc, now)
+    }
+
     pub fn page_text(&self, handle: u64, page: u32) -> Result<PageText, ClientError> {
         let (client, doc) = self.entry(handle)?;
         client.page_text(doc, page)

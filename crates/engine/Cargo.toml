@@ -21,6 +21,15 @@ partridge-protocol = { path = "../protocol" }
 # No default features: no `image` crate and no thread-safe wrapper (the engine is single threaded).
 pdfium-render = { version = "=0.9.5", default-features = false, features = ["pdfium_8125"] }
 
+# Digital signatures (see src/sigcheck.rs): the structures are read with RustCrypto's crates and the
+# signature arithmetic is ring's. None of them has network code.
+cms = "=0.2.3"
+x509-cert = "=0.2.5"
+der = { version = "=0.7.10", features = ["alloc", "oid"] }
+const-oid = "=0.9.6"
+spki = "=0.7.3"
+ring = { version = "=0.17.14", default-features = false, features = ["alloc"] }
+
 # System calls for the sandbox and the resource limits (pinned like everything else).
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.191"

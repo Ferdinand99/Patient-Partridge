@@ -49,6 +49,17 @@ if echo "$app_crates" | grep -qx 'partridge-engine'; then
   fail=1
 fi
 
+# Signatures are read and checked in the engine, in the sandbox. The crates that parse the signature
+# data (CMS) and the certificates must not be in the app process: it never parses hostile data of
+# this kind. (The crypto library `ring` is not on this list: the app links it through its update
+# check, and it parses nothing from a PDF.)
+for crate in cms x509-cert; do
+  if echo "$app_crates" | grep -qx "$crate"; then
+    echo "The app process links $crate. Signature data must be parsed in the engine only." >&2
+    fail=1
+  fi
+done
+
 if [ "$fail" -ne 0 ]; then
   exit 1
 fi

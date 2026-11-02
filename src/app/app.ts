@@ -3,6 +3,7 @@
 // storage) comes in through `AppDeps`, so tests can run the whole flow with fakes.
 
 import type { OpenedDocument, OutlineEntry, SavedFile, SavedPosition } from "../lib/api";
+import type { SignaturesInfo } from "../lib/signatures";
 import { describeError, fileNameOf, isEngineLost, toAppError, type AppErrorLike } from "../lib/errors";
 import { classifyUri, visibleAddress } from "../lib/linkPolicy";
 import { parsePageInput } from "../lib/pageInput";
@@ -31,6 +32,7 @@ import {
   type PrintDeps,
 } from "./print";
 import { showNotice } from "./notice";
+import { SignaturePanel } from "./signatures";
 import { Sidebar, type SidebarDocument } from "./sidebar";
 import { TabStrip } from "./tabs";
 
@@ -47,6 +49,8 @@ export interface AppDeps {
     getOutline(doc: number): Promise<OutlineEntry[]>;
     getPageText(doc: number, page: number): Promise<{ text: string; rects: number[] }>;
     getPageLinks(doc: number, page: number): Promise<PageLinkInfo[]>;
+    /** The digital signatures of a document, checked by its engine. */
+    getSignatures?(doc: number): Promise<SignaturesInfo>;
     searchPage(doc: number, page: number, query: string): Promise<[number, number][]>;
     openLink(doc: number, url: string): Promise<void>;
     /** The scripts the engine of a document had no font for when PDFium asked. */
@@ -83,6 +87,8 @@ export interface AppDeps {
    * SESSION_OPEN_LIMIT_MS.
    */
   sessionOpenLimitMs?: number;
+  /** How long after a document is shown its signatures are asked for, in milliseconds. Default: 1200. */
+  signaturesDelayMs?: number;
   /** Limits on the text kept for each document. For tests; the defaults are meant for the app. */
   viewLimits?: ViewerOptions["limits"];
 }
@@ -210,6 +216,7 @@ export class App {
   private readonly menu: MenuController;
   private readonly sidebar: Sidebar;
   private readonly find: FindBar;
+  private readonly signatures: SignaturePanel;
   private readonly selectionProxy: HTMLElement;
   private readonly copyStatus: HTMLElement;
   /** The line of each running copy (copies of different tabs can run together) shows in one place. */
@@ -256,6 +263,7 @@ export class App {
       storage: deps.storage ?? null,
       thumbs: deps.thumbSettleMs === undefined ? undefined : { settleMs: deps.thumbSettleMs },
     });
+    this.signatures = new SignaturePanel(root, { api: deps.api, delayMs: deps.signaturesDelayMs });
   }
 
   init(): void {
@@ -903,6 +911,7 @@ export class App {
     this.find.forget(tab.view);
     tab.view.destroy();
     this.sidebar.forget(tab.doc);
+    this.signatures.forget(tab.doc);
     void this.deps.api.close(tab.doc).catch(() => undefined);
     if (this.activeId === id) {
       this.activeId = null;
@@ -1337,6 +1346,7 @@ export class App {
     this.empty.hidden = this.tabs.length > 0;
     this.setControlsEnabled(active !== null);
     this.sidebar.setDocument(active?.sidebarDoc ?? null);
+    this.signatures.setDocument(active?.doc ?? null);
     this.find.setTarget(active ? { doc: active.doc, view: active.view } : null);
     this.selectionProxy.textContent = "";
     if (!active) {

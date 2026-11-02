@@ -59,6 +59,9 @@ jobs:
           - target: protocol_roundtrip_response
             dict: protocol
             args: "-max_len=4096 -timeout=10 -malloc_limit_mb=8"
+          - target: signature_check
+            dict: protocol
+            args: "-max_len=2048 -timeout=10 -malloc_limit_mb=64"
           - target: engine_open_render
             dict: pdf
             # No more than the engine itself may use (3 GiB on Linux) in one allocation or in all.

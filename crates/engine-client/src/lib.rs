@@ -32,13 +32,16 @@ use std::time::{Duration, Instant};
 
 use partridge_protocol::{
     read_frame_limited, write_request, ErrorCode, PageSize, Request, RequestBody, Response,
-    ResponseBody, MAX_QUERY_LEN, MAX_SAVE_BYTES, MAX_SAVE_CHUNK, MAX_STRING_LEN, PROTOCOL_VERSION,
-    SAVE_DATA_HEADER_LEN,
+    ResponseBody, MAX_QUERY_LEN, MAX_SAVE_BYTES, MAX_SAVE_CHUNK, MAX_SIGNATURE_REPORT,
+    MAX_STRING_LEN, PROTOCOL_VERSION, SAVE_DATA_HEADER_LEN,
 };
 
 pub use spawn::{spawn_engine, EngineProcess, SandboxPolicy, SpawnRequest, SpawnedEngine};
 
-pub use partridge_protocol::{FontScript, LinkTarget, OutlineItem, PageLink, TextMatch};
+pub use partridge_protocol::{
+    CertificateTime, FontScript, LinkTarget, OutlineItem, PageLink, SignatureInfo, SignatureReason,
+    SignatureReport, SignatureState, TextMatch,
+};
 
 mod pool;
 pub use pool::EnginePool;
@@ -57,6 +60,10 @@ const RENDERED_HEADER: usize = 17;
 /// How many times a long request (`DocInfo`, `Fingerprint`, `SaveBegin`) may have to read the
 /// whole document: the check of the file before and after, and the serialising itself.
 const SAVE_PASSES: u64 = 4;
+/// How many times the engine may have to read the whole document to check its signatures: the
+/// check of the file before and after, the scan for signature marks, and one pass for each of the
+/// 64 signatures it describes (the engine hashes at most 2 GiB in all).
+const SIGNATURE_PASSES: u64 = 70;
 
 /// What the error of an engine that was stopped for taking too long starts with. The app turns it
 /// into its own error code, so that the window can say what happened.
@@ -505,6 +512,26 @@ impl EngineClient {
         )
     }
 
+    /// The digital signatures of the file the document was opened from, described and checked by
+    /// the engine at the time `now` (seconds since 1970; certificates are judged against it).
+    ///
+    /// The engine is treated as hostile here too: an answer that cannot be right is not passed on
+    /// and stops the engine. In particular no signature may be called trusted when there is no
+    /// trust list, none may be called trusted without naming the certificate it leads to, and the
+    /// signatures must come in the order of their numbers.
+    pub fn signatures(&self, doc: u64, now: i64) -> Result<SignatureReport, ClientError> {
+        let now = now.clamp(0, partridge_protocol::MAX_UNIX_TIME);
+        self.call(
+            doc,
+            "signatures",
+            |doc| RequestBody::Signatures { doc, now },
+            |body| match body {
+                ResponseBody::Signatures { report } if report_is_sound(&report) => Ok(report),
+                other => Err(other),
+            },
+        )
+    }
+
     /// Has the engine serialise the document, and hands every piece to `sink` as it arrives; the
     /// pieces together are the file. Returns how many bytes there were.
     ///
@@ -620,6 +647,7 @@ impl EngineClient {
             RequestBody::Outline { .. } => MAX_OUTLINE_ANSWER,
             RequestBody::PageText { .. } => MAX_TEXT_ANSWER,
             RequestBody::PageLinks { .. } => MAX_LINKS_ANSWER,
+            RequestBody::Signatures { .. } => MAX_SIGNATURE_REPORT.max(IDLE_LIMIT),
             RequestBody::SaveChunk { len, .. } => {
                 (SAVE_DATA_HEADER_LEN + (*len as usize).min(MAX_SAVE_CHUNK)).max(IDLE_LIMIT)
             }
@@ -648,6 +676,7 @@ impl EngineClient {
         let patience = match body {
             RequestBody::DocInfo { .. }
             | RequestBody::Fingerprint { .. }
+            | RequestBody::Signatures { .. }
             | RequestBody::SaveBegin { .. } => self.config.save_stall,
             _ => self.config.timeout,
         };
@@ -664,6 +693,11 @@ impl EngineClient {
         body: RequestBody,
         patience: Duration,
     ) -> Result<ResponseBody, String> {
+        let passes = if matches!(body, RequestBody::Signatures { .. }) {
+            SIGNATURE_PASSES
+        } else {
+            SAVE_PASSES
+        };
         write_request(&mut running.stdin, &Request { id, body }).map_err(|e| {
             format!(
                 "the request could not be sent ({e}); {}",
@@ -678,7 +712,7 @@ impl EngineClient {
         // The signs of life renew the patience, but not the overall time.
         let started = Instant::now();
         let overall = if may_report {
-            self.overall_limit(running.document_len)
+            self.overall_limit(running.document_len, passes)
         } else {
             Duration::MAX
         };
@@ -719,9 +753,9 @@ impl EngineClient {
     }
 
     /// The longest a long request may take altogether, for a document of `len` bytes.
-    fn overall_limit(&self, len: u64) -> Duration {
+    fn overall_limit(&self, len: u64, passes: u64) -> Duration {
         let slowest = self.config.save_slowest.max(1);
-        let reading = Duration::from_secs(len.saturating_mul(SAVE_PASSES) / slowest);
+        let reading = Duration::from_secs(len.saturating_mul(passes) / slowest);
         self.config.save_floor.saturating_add(reading)
     }
 
@@ -964,6 +998,25 @@ fn open_document(path: &str) -> Result<File, ClientError> {
         return Err(refuse("the path is not a file".into()));
     }
     Ok(file)
+}
+
+/// Whether a report of signatures can be what an honest engine sends. The decoder has already
+/// checked the sizes, the text and that every reason goes with its state.
+fn report_is_sound(report: &SignatureReport) -> bool {
+    use partridge_protocol::MAX_SIGNATURES;
+    if report.items.len() != (report.total as usize).min(MAX_SIGNATURES) {
+        return false;
+    }
+    report.items.iter().enumerate().all(|(place, item)| {
+        let trusted = item.state == SignatureState::Trusted;
+        item.index as usize == place
+            // A signature is trusted only through a certificate on a list that exists, and that
+            // certificate is named, and the signer's own certificate is valid.
+            && trusted == item.trust_anchor.is_some()
+            && (!trusted || (report.trust_anchors > 0 && item.certificate_time == CertificateTime::Valid))
+            // "No trust list" is a statement about an empty list, and only about it.
+            && ((item.reason == SignatureReason::NoTrustList) == (report.trust_anchors == 0 && item.state == SignatureState::UnknownSigner))
+    })
 }
 
 fn stale_document() -> ClientError {

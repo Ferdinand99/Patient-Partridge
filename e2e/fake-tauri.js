@@ -56,6 +56,12 @@
       ["Third page", "The end of the book"],
     ],
     "/docs/second.pdf": [["Other document"], ["Its second page"]],
+    // Signed documents for e2e/signatures.spec.ts: the stand-in engine answers get_signatures with SIGNATURES below.
+    "/docs/signed-intact.pdf": [["Pay 100 to Alice"]],
+    "/docs/signed-changed.pdf": [["Pay 900 to Mallory"]],
+    "/docs/signed-forged.pdf": [["SIGNED AND VERIFIED by Trusted Bank AS"]],
+    "/docs/signed-hidden.pdf": [["A document with a hidden signature"]],
+    "/docs/signed-fails.pdf": [["The check of the signatures fails"]],
     "/docs/no-ending": [["A file whose name does not end in .pdf"]],
     "/docs/rtl.pdf": [[]],
     "/docs/slivers.pdf": Array.from({ length: 5000 }, () => []),
@@ -122,6 +128,38 @@
     });
     return { text: chars.join(""), rects: boxes };
   }
+
+  // What get_signatures answers for the signed documents (the shape of src-tauri/src/signatures.rs).
+  function signature(over) {
+    return {
+      index: 0, state: "unknown_signer", reason: "no_trust_list", certificateTime: "valid",
+      subFilter: "adbe.pkcs7.detached", byteRange: [0, 100, 300, 50], fileLen: 350, docMdp: 0, certificates: 1,
+      signer: "Test Signer", organisation: "Test Organisation", issuer: "Test CA", serial: "12345678",
+      fingerprint: "ab".repeat(32), validFrom: "2025-01-01 00:00 UTC", validTo: "2035-01-01 00:00 UTC",
+      key: "ECDSA P-256", digest: "SHA-256", claimedTime: "2026-06-15 12:00:00 +02:00",
+      statedReason: "I approve this document", statedLocation: "Oslo", trustAnchor: null,
+      ...over,
+    };
+  }
+  const SIGNATURES = {
+    "/docs/signed-intact.pdf": { total: 1, unlisted: 0, trustAnchors: 0, items: [signature({})] },
+    "/docs/signed-changed.pdf": {
+      total: 1, unlisted: 0, trustAnchors: 0,
+      items: [signature({ state: "changed", reason: "data_after_signature" })],
+    },
+    "/docs/signed-forged.pdf": {
+      total: 1, unlisted: 0, trustAnchors: 0,
+      items: [
+        signature({
+          state: "broken", reason: "signature_invalid",
+          signer: "<img src=x onerror=alert(1)> Trusted Bank AS",
+          statedReason: "<b>VERIFIED</b> by Acrobat",
+          statedLocation: "javascript:alert(1)",
+        }),
+      ],
+    },
+    "/docs/signed-hidden.pdf": { total: 0, unlisted: 1, trustAnchors: 0, items: [] },
+  };
 
   const docs = new Map();
   let nextDoc = 1;
@@ -237,6 +275,11 @@
         return pageData(docs.get(args.doc)?.path, args.page);
       case "missed_fonts":
         return state.fonts.slice();
+      case "get_signatures": {
+        const path = docs.get(args.doc)?.path;
+        if (path === "/docs/signed-fails.pdf") throw { code: "engine_stopped", message: "the engine stopped" };
+        return SIGNATURES[path] ?? { total: 0, unlisted: 0, trustAnchors: 0, items: [] };
+      }
       case "get_page_links":
         if (docs.get(args.doc)?.path === "/docs/crafted.pdf") return CRAFTED_LINKS.slice();
         return LINKS[docs.get(args.doc)?.path]?.[args.page] ?? [];

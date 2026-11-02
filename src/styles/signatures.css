@@ -1,0 +1,241 @@
+/* The signature badge in the toolbar and the signature panel.
+   The badge is calm: a small pill with a mark and a few words. Only a trusted signature is green and
+   has a tick; a signature that is intact but whose signer is not verified is neutral. */
+
+.sig-badge {
+  min-height: 26px;
+  border: 0;
+  font-family: inherit;
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+  max-width: 22rem;
+}
+
+.sig-badge[hidden] {
+  display: none;
+}
+
+.sig-badge > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sig-badge .icon,
+.sig-state .icon {
+  flex: none;
+  width: 14px;
+  height: 14px;
+}
+
+.sig-badge:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
+.sig-badge[aria-expanded="true"] {
+  box-shadow: inset 0 0 0 1px var(--line-strong);
+}
+
+.sig-badge.sig-trusted {
+  background: var(--ok-fill);
+  color: var(--ok-text);
+}
+
+.sig-badge.sig-unknown_signer,
+.sig-badge.sig-unsupported,
+.sig-badge.sig-error {
+  background: var(--fill);
+  color: var(--muted);
+}
+
+.sig-badge.sig-changed,
+.sig-badge.sig-marks {
+  background: var(--warn-fill);
+  color: var(--warn-text);
+}
+
+.sig-badge.sig-broken {
+  background: var(--bad-fill);
+  color: var(--bad-text);
+}
+
+/* The panel: a column at the right of the page. */
+.sig-panel {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  width: min(25rem, 42vw);
+  min-height: 0;
+  border-inline-start: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--text);
+}
+
+.sig-panel[hidden] {
+  display: none;
+}
+
+.sig-head {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--sp-2) var(--sp-3) var(--sp-2) var(--sp-4);
+  border-bottom: 1px solid var(--line);
+}
+
+.sig-title {
+  margin: 0;
+  font-size: 0.9375rem;
+  font-weight: 650;
+}
+
+.sig-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: var(--sp-3) var(--sp-4) var(--sp-6);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  font-size: 0.8125rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.sig-lead,
+.sig-note,
+.sig-alert,
+.sig-meaning,
+.sig-why {
+  margin: 0 0 var(--sp-2);
+}
+
+.sig-lead,
+.sig-note,
+.sig-why {
+  color: var(--muted);
+}
+
+.sig-alert {
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--r-sm);
+  background: var(--warn-fill);
+  color: var(--warn-text);
+}
+
+.sig-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  margin: var(--sp-3) 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sig-item {
+  padding: var(--sp-3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--card);
+  color: var(--text);
+}
+
+.sig-state {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: fit-content;
+  max-width: 100%;
+  margin-bottom: var(--sp-2);
+  padding: 2px 10px 2px 8px;
+  border-radius: var(--r-full);
+  font-size: 0.8125rem;
+}
+
+.sig-item.sig-trusted .sig-state {
+  background: var(--ok-fill);
+  color: var(--ok-text);
+}
+
+.sig-item.sig-unknown_signer .sig-state,
+.sig-item.sig-unsupported .sig-state {
+  background: var(--fill);
+  color: var(--muted);
+}
+
+.sig-item.sig-changed .sig-state {
+  background: var(--warn-fill);
+  color: var(--warn-text);
+}
+
+.sig-item.sig-broken .sig-state {
+  background: var(--bad-fill);
+  color: var(--bad-text);
+}
+
+.sig-sub {
+  margin: var(--sp-3) 0 var(--sp-1);
+  font-size: 0.75rem;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  color: var(--muted);
+}
+
+.sig-facts {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 2px var(--sp-3);
+  margin: 0;
+}
+
+.sig-facts dt {
+  color: var(--muted);
+}
+
+.sig-facts dd {
+  margin: 0;
+}
+
+.sig-mono {
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  word-break: break-all;
+}
+
+.sig-tech {
+  margin-top: var(--sp-3);
+}
+
+.sig-tech summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+
+.sig-tech .sig-facts {
+  margin-top: var(--sp-2);
+}
+
+.sig-limits ul {
+  margin: 0 0 var(--sp-2);
+  padding-inline-start: 1.1rem;
+  color: var(--muted);
+}
+
+@media (max-width: 720px) {
+  .sig-panel {
+    position: absolute;
+    inset-block: 0;
+    inset-inline-end: 0;
+    z-index: var(--z-popover);
+    width: min(25rem, 92vw);
+    box-shadow: var(--shadow-pop);
+  }
+}
+
+@media print {
+  .sig-badge,
+  .sig-panel {
+    display: none;
+  }
+}
