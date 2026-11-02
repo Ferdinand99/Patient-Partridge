@@ -15,13 +15,26 @@
 //! is taken as sound: the answer is then "could not be checked", which is a different thing from
 //! "damaged" and is worded as such.
 //!
+//! The reader is bounded. An object is read once, however many times a list of kids names it, and
+//! only what the walk needs of it is kept, so the memory it takes follows the size of the document
+//! and not the number of places in the list; the bytes it reads are counted, and a walk that reads
+//! more than a few times the size of the document is given up as "could not be checked". The
+//! caller is told after each step, so that a long walk is not taken for a hung engine.
+//!
 //! The same walk shows what a page inherits from the nodes above it (`/Resources`, `/MediaBox`,
 //! `/CropBox`, `/Rotate`). PDFium's move of pages puts a page under another node and keeps none of
 //! what the old node gave it, so a document whose nodes below the root hold such entries needs the
-//! entries written onto its pages before pages are moved (see [`hoisted`]).
+//! entries written onto its pages before pages are moved (see [`hoisted`]). A key counts as held
+//! only when it leads to a value: a key whose value is `null`, or a reference to an object that is
+//! not there, is the same as no key at all, which is what the format says and what PDFium does for
+//! a reference.
 
-use std::collections::HashSet;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::rc::Rc;
+
+use partridge_protocol::MAX_SAVE_BYTES;
 
 /// PDFium's own limit on the depth of a page tree.
 const MAX_LEVELS: usize = 1024;
@@ -35,6 +48,15 @@ const MAX_KEYS: usize = 65_536;
 const MAX_HOPS: usize = 16;
 /// The part at the end of the file where `startxref` is looked for.
 const TAIL: usize = 2048;
+/// A walk may read this many times the size of the document, and a little more, before it is given
+/// up. An object is read once, so a well formed document takes about twice its size.
+const WORK_TIMES: usize = 8;
+const WORK_EXTRA: usize = 1 << 20;
+/// A value written in place that is longer than this is written once, as an object of its own,
+/// when it is put on pages, and the pages refer to it. A shorter one is copied onto each page.
+const INLINE_MAX: usize = 128;
+/// How much more than the size of the document the part that [`hoisted`] adds may come to.
+const ADDED_EXTRA: usize = 4 << 20;
 
 /// Why a page tree is not one a change can be trusted with.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,8 +65,9 @@ pub enum TreeError {
     /// of kids holds something that is not a page or a node, a node says it has another number of
     /// pages than it lists, and so on.
     Damaged(&'static str),
-    /// The tree could not be read: a part of it was written in a way this reader does not follow.
-    /// This says nothing about the document.
+    /// The tree could not be read: a part of it was written in a way this reader does not follow,
+    /// or reading it takes more work than the size of the document explains. This says nothing
+    /// about the document.
     Unreadable(&'static str),
 }
 
@@ -60,10 +83,10 @@ impl TreeError {
     pub fn words(&self) -> String {
         match self {
             TreeError::Damaged(why) => format!(
-                "the list of pages of this document does not follow the format ({why}), so its pages cannot be changed"
+                "the list of pages of this document does not follow the format ({why}), so this change cannot be made to it safely"
             ),
             TreeError::Unreadable(why) => format!(
-                "the list of pages of this document could not be checked ({why}), so its pages cannot be changed. This says nothing about the document itself"
+                "the list of pages of this document could not be checked ({why}), so this change cannot be made to it. This says nothing about the document itself"
             ),
         }
     }
@@ -254,13 +277,23 @@ fn decode_name(raw: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The entries of the dictionary at `value`: the decoded key and the place of its value. A key that
-/// stands twice counts with its last value, as PDFium keeps it.
-fn dictionary(b: &[u8], value: &Range<usize>) -> Option<Vec<(Vec<u8>, Range<usize>)>> {
+/// One entry of a dictionary.
+struct Entry {
+    /// The key as the format reads it (`#41` is `A`).
+    key: Vec<u8>,
+    /// Where the slash of the key is.
+    at: usize,
+    /// Where the value is.
+    value: Range<usize>,
+}
+
+/// The entries of the dictionary at `value`. A key that stands twice counts with its last value,
+/// as PDFium keeps it.
+fn dictionary(b: &[u8], value: &Range<usize>) -> Option<Vec<Entry>> {
     if !b.get(value.clone())?.starts_with(b"<<") {
         return None;
     }
-    let mut entries: Vec<(Vec<u8>, Range<usize>)> = Vec::new();
+    let mut entries: Vec<Entry> = Vec::new();
     let mut p = value.start + 2;
     loop {
         p = skip_white(b, p);
@@ -278,18 +311,22 @@ fn dictionary(b: &[u8], value: &Range<usize>) -> Option<Vec<(Vec<u8>, Range<usiz
         if entries.len() >= MAX_KEYS {
             return None;
         }
-        entries.push((key, start..end));
+        entries.push(Entry {
+            key,
+            at: p,
+            value: start..end,
+        });
         p = end;
     }
     (p <= value.end).then_some(entries)
 }
 
-fn entry<'a>(entries: &'a [(Vec<u8>, Range<usize>)], key: &[u8]) -> Option<&'a Range<usize>> {
+fn entry<'a>(entries: &'a [Entry], key: &[u8]) -> Option<&'a Range<usize>> {
     entries
         .iter()
         .rev()
-        .find(|(k, _)| k.as_slice() == key)
-        .map(|(_, v)| v)
+        .find(|e| e.key.as_slice() == key)
+        .map(|e| &e.value)
 }
 
 /// The object number of the reference that `value` is, if it is one and nothing else.
@@ -301,22 +338,30 @@ fn reference_number(b: &[u8], value: &Range<usize>) -> Option<u32> {
     u32::try_from(uint(&b[value.start..end])?).ok()
 }
 
-/// The items of the array at `value`.
-fn array_items(b: &[u8], value: &Range<usize>) -> Option<Vec<Range<usize>>> {
+/// The list of kids at `value`: the places of its items. `most` is the number of items that are
+/// taken, and a list with more is refused as too big before it is kept.
+fn kids_of(b: &[u8], value: &Range<usize>, most: usize) -> Found<Vec<Range<usize>>> {
+    let not_a_list = TreeError::Damaged("the kids of a node are not a list");
     if b.get(value.start) != Some(&b'[') {
-        return None;
+        return Err(not_a_list);
     }
     let mut items = Vec::new();
     let mut p = value.start + 1;
     loop {
         p = skip_white(b, p);
-        match b.get(p)? {
-            b']' => return (p < value.end).then_some(items),
-            _ => {
-                let end = skip_value(b, p)?;
+        match b.get(p) {
+            Some(b']') if p < value.end => return Ok(items),
+            Some(_) => {
+                let Some(end) = skip_value(b, p) else {
+                    return Err(not_a_list);
+                };
+                if items.len() >= most {
+                    return Err(TreeError::Unreadable("the list of pages is too big"));
+                }
                 items.push(p..end);
                 p = end;
             }
+            None => return Err(not_a_list),
         }
     }
 }
@@ -338,9 +383,14 @@ pub const INHERITED: [&str; 4] = ["Resources", "MediaBox", "CropBox", "Rotate"];
 struct Table<'a> {
     bytes: &'a [u8],
     sections: Vec<Section>,
-    trailer: Vec<(Vec<u8>, Range<usize>)>,
+    trailer: Vec<Entry>,
     /// Where the table starts, as the file says.
     start: usize,
+    /// The objects read so far: each is read once, however often it is asked for.
+    read: RefCell<HashMap<u32, Option<Object>>>,
+    /// The bytes the walk has read, and the most it may read.
+    scanned: Cell<usize>,
+    limit: usize,
 }
 
 struct Section {
@@ -351,7 +401,7 @@ struct Section {
 }
 
 impl<'a> Table<'a> {
-    fn read(bytes: &'a [u8]) -> Found<Table<'a>> {
+    fn read(bytes: &'a [u8], limit: usize) -> Found<Table<'a>> {
         let unreadable = |why| Err(TreeError::Unreadable(why));
         let tail = bytes.len().saturating_sub(TAIL);
         let Some(word) = bytes[tail..]
@@ -414,7 +464,22 @@ impl<'a> Table<'a> {
             sections,
             trailer,
             start,
+            read: RefCell::new(HashMap::new()),
+            scanned: Cell::new(0),
+            limit,
         })
+    }
+
+    /// Counts `n` bytes read, and gives up when the walk has read more than it may.
+    fn charge(&self, n: usize) -> Found<()> {
+        let total = self.scanned.get().saturating_add(n);
+        self.scanned.set(total);
+        if total > self.limit {
+            return Err(TreeError::Unreadable(
+                "reading the list of pages takes more work than the size of the document explains",
+            ));
+        }
+        Ok(())
     }
 
     /// The place and generation of object `number`; `None` when the table has no such object (or
@@ -456,8 +521,21 @@ impl<'a> Table<'a> {
     }
 
     /// The value of object `number`: the place of what stands between `obj` and `endobj`. `None`
-    /// for an object that is not there.
+    /// for an object that is not there. An object is read the first time it is asked for, and the
+    /// bytes it takes are counted then.
     fn object(&self, number: u32) -> Found<Option<Object>> {
+        if let Some(known) = self.read.borrow().get(&number) {
+            return Ok(known.clone());
+        }
+        let found = self.read_object(number)?;
+        if let Some(o) = &found {
+            self.charge(o.value.len().saturating_add(32))?;
+        }
+        self.read.borrow_mut().insert(number, found.clone());
+        Ok(found)
+    }
+
+    fn read_object(&self, number: u32) -> Found<Option<Object>> {
         let Some((offset, generation)) = self.place(number)? else {
             return Ok(None);
         };
@@ -512,19 +590,77 @@ impl<'a> Table<'a> {
                 .then(|| decode_name(&self.bytes[v.start + 1..v.end]))
         }))
     }
+
+    /// What the key `key` of a dictionary leads to, the way PDFium reads it: the entry that stands
+    /// for the key when it leads to a value, and else the places of every entry of that name, which
+    /// lead to nothing (a reference to an object that is not there, or `null`), which is the same
+    /// as no entry.
+    fn lead(&self, entries: &[Entry], key: &[u8]) -> Found<Given> {
+        let Some(last) = entries.iter().rev().find(|e| e.key.as_slice() == key) else {
+            return Ok(Given::default());
+        };
+        let leads = match self.resolve(&last.value)? {
+            Some(v) => !is_null(&self.bytes[v]),
+            None => false,
+        };
+        if leads {
+            return Ok(Given {
+                value: Some(last.value.clone()),
+                dead: Vec::new(),
+            });
+        }
+        Ok(Given {
+            value: None,
+            dead: entries
+                .iter()
+                .filter(|e| e.key.as_slice() == key)
+                .map(|e| e.at..e.value.end)
+                .collect(),
+        })
+    }
 }
 
+/// What a key of a dictionary leads to.
+#[derive(Default)]
+struct Given {
+    /// The entry, when it leads to a value.
+    value: Option<Range<usize>>,
+    /// The places (from the slash of the key to the end of the value) of the entries of that name
+    /// when they lead to nothing.
+    dead: Vec<Range<usize>>,
+}
+
+/// True for the value `null`.
+fn is_null(value: &[u8]) -> bool {
+    value == b"null"
+}
+
+#[derive(Clone)]
 struct Object {
     value: Range<usize>,
     generation: u32,
 }
 
-/// One node or page as read.
-struct Node {
+/// What the walk needs of a page or a node once its dictionary is read. The dictionary itself is
+/// not kept, so a page that has many keys takes no more room than one that has few.
+struct Info {
     number: u32,
-    entries: Vec<(Vec<u8>, Range<usize>)>,
-    value: Range<usize>,
     generation: u32,
+    /// The place of the dictionary in the bytes.
+    value: Range<usize>,
+    kind: Option<Vec<u8>>,
+    kids: Option<Range<usize>>,
+    count: Option<Range<usize>>,
+    /// The object number of the node the page or node names as its parent.
+    parent: Option<u32>,
+    /// What each of [`INHERITED`] leads to here.
+    given: [Given; 4],
+}
+
+impl Info {
+    fn holds_a_value(&self) -> bool {
+        self.given.iter().any(|g| g.value.is_some())
+    }
 }
 
 /// Where the value to write onto a page comes from.
@@ -547,6 +683,10 @@ pub struct Hoist {
     pub dictionary: Range<usize>,
     /// The keys and their values.
     pub values: Vec<(&'static str, Source)>,
+    /// The entries of the page that stand for these keys and lead to nothing (`null`, a reference
+    /// to an object that is not there): they are left out of the page when it is written again, so
+    /// that the key stands once.
+    pub dead: Vec<Range<usize>>,
 }
 
 /// What a walk of the tree found.
@@ -568,29 +708,84 @@ pub struct Tree {
 }
 
 struct Frame {
-    node: Node,
+    info: Rc<Info>,
     kids: Vec<Range<usize>>,
     next: usize,
     claimed: Option<i64>,
     leaves: usize,
 }
 
-fn node_of(table: &Table<'_>, number: u32) -> Found<Node> {
+/// The page or node that object `number` is, read once.
+fn info_of(table: &Table<'_>, number: u32) -> Found<Info> {
     let Some(object) = table.object(number)? else {
         return Err(TreeError::Damaged(
             "a place in a list of kids holds something that is not there",
         ));
     };
+    table.charge(object.value.len())?;
     let Some(entries) = dictionary(table.bytes, &object.value) else {
         return Err(TreeError::Damaged(
             "a place in a list of kids holds something that is not a page or a node",
         ));
     };
-    Ok(Node {
+    let kind = match entry(&entries, b"Type") {
+        Some(v) => table.name_of(v)?,
+        None => None,
+    };
+    let mut given: [Given; 4] = Default::default();
+    for (slot, key) in given.iter_mut().zip(INHERITED) {
+        *slot = table.lead(&entries, key.as_bytes())?;
+    }
+    Ok(Info {
         number,
-        entries,
-        value: object.value,
         generation: object.generation,
+        value: object.value,
+        kind,
+        kids: entry(&entries, b"Kids").cloned(),
+        count: entry(&entries, b"Count").cloned(),
+        parent: entry(&entries, b"Parent").and_then(|v| reference_number(table.bytes, v)),
+        given,
+    })
+}
+
+/// A node, ready to be walked: its kids are listed and its count is read.
+fn open(table: &Table<'_>, info: Rc<Info>) -> Found<Frame> {
+    let b = table.bytes;
+    if info.kind.as_deref().is_some_and(|k| k != b"Pages") {
+        return Err(TreeError::Damaged(
+            "a node of the list of pages says it is not a node",
+        ));
+    }
+    let Some(kids_value) = &info.kids else {
+        return Err(TreeError::Damaged(
+            "a node of the list of pages has no list of kids",
+        ));
+    };
+    let Some(kids_value) = table.resolve(kids_value)? else {
+        return Err(TreeError::Damaged(
+            "the list of kids of a node is not there",
+        ));
+    };
+    table.charge(kids_value.len())?;
+    let kids = kids_of(b, &kids_value, MAX_NODES)?;
+    let claimed = match &info.count {
+        Some(v) => match table.resolve(v)? {
+            Some(v) => number(b, &v),
+            None => None,
+        },
+        None => None,
+    };
+    if claimed.is_none() {
+        return Err(TreeError::Damaged(
+            "a node of the list of pages does not give the number of its pages",
+        ));
+    }
+    Ok(Frame {
+        info,
+        kids,
+        next: 0,
+        claimed,
+        leaves: 0,
     })
 }
 
@@ -598,7 +793,28 @@ fn node_of(table: &Table<'_>, number: u32) -> Found<Node> {
 /// the document has; the tree must list as many. `parents` also asks that every page and node
 /// names the node that lists it as its parent, which is what the inheritance of a page follows.
 pub fn read(bytes: &[u8], pages: usize, parents: bool) -> Found<Tree> {
-    let table = Table::read(bytes)?;
+    read_with(bytes, pages, parents, &mut || {})
+}
+
+/// As [`read`]; `tick` is called after each place in a list of kids, so that the caller can tell
+/// that the walk is going on.
+pub fn read_with(bytes: &[u8], pages: usize, parents: bool, tick: &mut dyn FnMut()) -> Found<Tree> {
+    let limit = bytes
+        .len()
+        .saturating_mul(WORK_TIMES)
+        .saturating_add(WORK_EXTRA);
+    read_within(bytes, pages, parents, limit, tick)
+}
+
+/// As [`read_with`], with the most bytes that the walk may read given.
+pub fn read_within(
+    bytes: &[u8],
+    pages: usize,
+    parents: bool,
+    limit: usize,
+    tick: &mut dyn FnMut(),
+) -> Found<Tree> {
+    let table = Table::read(bytes, limit)?;
     let Some(root_entry) = entry(&table.trailer, b"Root") else {
         return Err(TreeError::Unreadable("the file names no catalog"));
     };
@@ -629,68 +845,32 @@ pub fn read(bytes: &[u8], pages: usize, parents: bool) -> Found<Tree> {
         id: entry(&table.trailer, b"ID").cloned(),
     };
     let mut visited: HashSet<u32> = HashSet::new();
+    // The pages and nodes read, by object number: a page that a list names again is the page that
+    // was read, not read again.
+    let mut known: HashMap<u32, Rc<Info>> = HashMap::new();
     let mut seen_nodes = 0usize;
     let mut stack: Vec<Frame> = Vec::new();
-    // For each key, whether a node below the root holds it.
+    // For each key, whether a node below the root holds it (with a value).
     let mut inner_holds = [false; 4];
+    // Whether any node, the root too, holds one, and whether a place in a list names a parent
+    // other than the node that lists it. A page follows its parent for what it inherits, so the
+    // two together make a tree that a move cannot be trusted with.
+    let mut any_holds = false;
+    let mut strays = false;
     // The pages to look at again once everything is known: the node chain is only on the stack now.
     struct Leaf {
-        node: Node,
+        info: Rc<Info>,
         inherited: [Option<Range<usize>>; 4],
     }
     let mut leaves: Vec<Leaf> = Vec::new();
 
-    let open = |table: &Table<'_>, node: Node| -> Found<Frame> {
-        let b = table.bytes;
-        let kind = match entry(&node.entries, b"Type") {
-            Some(v) => table.name_of(v)?,
-            None => None,
-        };
-        if kind.as_deref().is_some_and(|k| k != b"Pages") {
-            return Err(TreeError::Damaged(
-                "a node of the list of pages says it is not a node",
-            ));
-        }
-        let Some(kids_value) = entry(&node.entries, b"Kids") else {
-            return Err(TreeError::Damaged(
-                "a node of the list of pages has no list of kids",
-            ));
-        };
-        let Some(kids_value) = table.resolve(kids_value)? else {
-            return Err(TreeError::Damaged(
-                "the list of kids of a node is not there",
-            ));
-        };
-        let Some(kids) = array_items(b, &kids_value) else {
-            return Err(TreeError::Damaged("the kids of a node are not a list"));
-        };
-        let claimed = match entry(&node.entries, b"Count") {
-            Some(v) => match table.resolve(v)? {
-                Some(v) => number(b, &v),
-                None => None,
-            },
-            None => None,
-        };
-        if claimed.is_none() {
-            return Err(TreeError::Damaged(
-                "a node of the list of pages does not give the number of its pages",
-            ));
-        }
-        Ok(Frame {
-            node,
-            kids,
-            next: 0,
-            claimed,
-            leaves: 0,
-        })
-    };
-
     visited.insert(root_number);
-    let root_node = node_of(&table, root_number)?;
-    if entry(&root_node.entries, b"Kids").is_none() {
+    let root_info = Rc::new(info_of(&table, root_number)?);
+    if root_info.kids.is_none() {
         return Err(TreeError::Damaged("the list of pages has no list of kids"));
     }
-    stack.push(open(&table, root_node)?);
+    any_holds |= root_info.holds_a_value();
+    stack.push(open(&table, root_info)?);
     seen_nodes += 1;
 
     while let Some(top) = stack.len().checked_sub(1) {
@@ -715,7 +895,8 @@ pub fn read(bytes: &[u8], pages: usize, parents: bool) -> Found<Tree> {
         if seen_nodes > MAX_NODES {
             return Err(TreeError::Unreadable("the list of pages is too big"));
         }
-        let container = stack[top].node.number;
+        tick();
+        let container = stack[top].info.number;
         let Some(number) = reference_number(bytes, &kid) else {
             return Err(if bytes.get(kid.start..kid.start + 2) == Some(b"<<") {
                 TreeError::Unreadable("a page is written in the list of its parent")
@@ -723,19 +904,18 @@ pub fn read(bytes: &[u8], pages: usize, parents: bool) -> Found<Tree> {
                 TreeError::Damaged("a list of kids holds something that is not a reference")
             });
         };
-        let node = node_of(&table, number)?;
-        if parents {
-            let named = match entry(&node.entries, b"Parent") {
-                Some(v) => reference_number(bytes, v),
-                None => None,
-            };
-            if named != Some(container) {
-                return Err(TreeError::Damaged(
-                    "a page or a node does not name the node that lists it as its parent",
-                ));
+        let (info, fresh) = match known.get(&number) {
+            Some(info) => (info.clone(), false),
+            None => {
+                let info = Rc::new(info_of(&table, number)?);
+                known.insert(number, info.clone());
+                (info, true)
             }
+        };
+        if info.parent != Some(container) {
+            strays = true;
         }
-        if entry(&node.entries, b"Kids").is_some() {
+        if info.kids.is_some() {
             if !visited.insert(number) {
                 return Err(TreeError::Damaged(
                     "a node of the list of pages is listed twice or leads back to itself",
@@ -744,19 +924,14 @@ pub fn read(bytes: &[u8], pages: usize, parents: bool) -> Found<Tree> {
             if stack.len() >= MAX_LEVELS {
                 return Err(TreeError::Unreadable("the list of pages is too deep"));
             }
-            for (i, key) in INHERITED.iter().enumerate() {
-                if entry(&node.entries, key.as_bytes()).is_some() {
-                    inner_holds[i] = true;
-                }
+            for (held, given) in inner_holds.iter_mut().zip(&info.given) {
+                *held |= given.value.is_some();
             }
-            let frame = open(&table, node)?;
+            any_holds |= info.holds_a_value();
+            let frame = open(&table, info)?;
             stack.push(frame);
         } else {
-            let kind = match entry(&node.entries, b"Type") {
-                Some(v) => table.name_of(v)?,
-                None => None,
-            };
-            if kind.as_deref().is_some_and(|k| k != b"Page") {
+            if info.kind.as_deref().is_some_and(|k| k != b"Page") {
                 return Err(TreeError::Damaged(
                     "a page of the list of pages says it is not a page",
                 ));
@@ -766,24 +941,33 @@ pub fn read(bytes: &[u8], pages: usize, parents: bool) -> Found<Tree> {
                     "the list names more pages than the document has",
                 ));
             }
-            let mut inherited: [Option<Range<usize>>; 4] = [None, None, None, None];
-            for (i, key) in INHERITED.iter().enumerate() {
-                if entry(&node.entries, key.as_bytes()).is_some() {
-                    continue;
-                }
-                inherited[i] = stack
-                    .iter()
-                    .rev()
-                    .find_map(|f| entry(&f.node.entries, key.as_bytes()).cloned());
-            }
             tree.pages.push(number);
             stack[top].leaves += 1;
-            leaves.push(Leaf { node, inherited });
+            if fresh {
+                // What the page inherits is what the nearest node above it that holds the key
+                // leads to.
+                let mut inherited: [Option<Range<usize>>; 4] = [None, None, None, None];
+                for (i, slot) in inherited.iter_mut().enumerate() {
+                    if info.given[i].value.is_some() {
+                        continue;
+                    }
+                    *slot = stack
+                        .iter()
+                        .rev()
+                        .find_map(|f| f.info.given[i].value.clone());
+                }
+                leaves.push(Leaf { info, inherited });
+            }
         }
     }
     if tree.pages.len() != pages {
         return Err(TreeError::Damaged(
             "the document has another number of pages than the list names",
+        ));
+    }
+    if parents && strays && any_holds {
+        return Err(TreeError::Damaged(
+            "a page or a node does not name the node that lists it as its parent, and what a page inherits follows its parent",
         ));
     }
 
@@ -792,18 +976,19 @@ pub fn read(bytes: &[u8], pages: usize, parents: bool) -> Found<Tree> {
             tree.kept_by_inner_nodes.push(key);
         }
     }
-    let mut written: HashSet<u32> = HashSet::new();
     for leaf in leaves {
         let mut values = Vec::new();
+        let mut dead = Vec::new();
         // The size the page has, its own or the one it inherits: the crop box is this when nothing
         // gives the page one.
-        let media = entry(&leaf.node.entries, b"MediaBox")
-            .cloned()
+        let media = leaf.info.given[1]
+            .value
+            .clone()
             .or_else(|| leaf.inherited[1].clone());
         for (i, key) in INHERITED.iter().enumerate() {
             // Only what some node below the root holds can change for a page that moves; and a page
             // keeps what it has of its own.
-            if !inner_holds[i] || entry(&leaf.node.entries, key.as_bytes()).is_some() {
+            if !inner_holds[i] || leaf.info.given[i].value.is_some() {
                 continue;
             }
             let source = match (&leaf.inherited[i], i) {
@@ -817,15 +1002,17 @@ pub fn read(bytes: &[u8], pages: usize, parents: bool) -> Found<Tree> {
                 (None, _) => Source::Text("0"),
             };
             values.push((*key, source));
+            dead.extend(leaf.info.given[i].dead.iter().cloned());
         }
-        if values.is_empty() || !written.insert(leaf.node.number) {
+        if values.is_empty() {
             continue;
         }
         tree.hoists.push(Hoist {
-            page: leaf.node.number,
-            generation: leaf.node.generation,
-            dictionary: leaf.node.value,
+            page: leaf.info.number,
+            generation: leaf.info.generation,
+            dictionary: leaf.info.value.clone(),
             values,
+            dead,
         });
     }
     Ok(tree)
@@ -836,7 +1023,28 @@ pub fn read(bytes: &[u8], pages: usize, parents: bool) -> Found<Tree> {
 /// get entries are written once more with the entries added, followed by a table of those objects
 /// and a trailer that points back to the table before. Nothing else is touched. A page that has an
 /// entry of its own keeps it.
+///
+/// A value that is written in place and is long is written once, as an object of its own, and the
+/// pages refer to it, so that the part added does not grow with the number of pages.
 pub fn hoisted(bytes: &[u8], tree: &Tree) -> Found<Vec<u8>> {
+    hoisted_with(bytes, tree, &mut || {})
+}
+
+/// As [`hoisted`]; `tick` is called after each page, so that the caller can tell that the work is
+/// going on.
+pub fn hoisted_with(bytes: &[u8], tree: &Tree, tick: &mut dyn FnMut()) -> Found<Vec<u8>> {
+    hoisted_within(bytes, tree, bytes.len().saturating_add(ADDED_EXTRA), tick)
+}
+
+/// As [`hoisted`], with the most bytes that the added part may come to given, and `tick` called
+/// after each page. The part is refused when it would pass the limit, or when the document with it
+/// would pass [`MAX_SAVE_BYTES`], or when there is no room in memory to write it.
+pub fn hoisted_within(
+    bytes: &[u8],
+    tree: &Tree,
+    most_added: usize,
+    tick: &mut dyn FnMut(),
+) -> Found<Vec<u8>> {
     if tree.hoists.is_empty() {
         return Ok(bytes.to_vec());
     }
@@ -844,82 +1052,164 @@ pub fn hoisted(bytes: &[u8], tree: &Tree) -> Found<Vec<u8>> {
     let (Some(size), Some(root)) = (&tree.size, &tree.root) else {
         return cannot("the trailer of the file is not complete");
     };
+    let Some(old_size) = number(bytes, size).and_then(|n| u32::try_from(n).ok()) else {
+        return cannot("the size of the table of objects is not a number");
+    };
     if tree.encrypted {
         // Strings are encrypted with a key of the object they stand in; copied to another object
-        // they would not read. Names and numbers are not.
-        let has_string = tree.hoists.iter().any(|h| {
-            h.values.iter().any(|(_, v)| {
-                let Source::Bytes(v) = v else {
-                    return false;
+        // they would not read. Names and numbers are not. Each value is looked at once.
+        let mut looked: HashMap<(usize, usize), bool> = HashMap::new();
+        for hoist in &tree.hoists {
+            for (_, value) in &hoist.values {
+                let Source::Bytes(v) = value else {
+                    continue;
                 };
-                let mut p = v.start;
-                while p < v.end {
-                    match bytes[p] {
-                        b'(' => return true,
-                        b'<' if bytes.get(p + 1) != Some(&b'<') => return true,
-                        b'<' | b'>' => p += 1,
-                        _ => {}
-                    }
-                    p += 1;
+                let has_string = *looked
+                    .entry((v.start, v.end))
+                    .or_insert_with(|| holds_a_string(&bytes[v.clone()]));
+                if has_string {
+                    return cannot("the document is encrypted and the entries hold text");
                 }
-                false
-            })
-        });
-        if has_string {
-            return cannot("the document is encrypted and the entries hold text");
+            }
         }
     }
-    let mut out = Vec::with_capacity(bytes.len() + tree.hoists.len() * 256);
-    out.extend_from_slice(bytes);
-    if !out.ends_with(b"\n") {
-        out.push(b'\n');
-    }
+    let room = most_added.min(MAX_SAVE_BYTES.saturating_sub(bytes.len()));
+    let base = bytes.len() + usize::from(!bytes.ends_with(b"\n"));
+    let mut added: Vec<u8> = Vec::new();
+    let put = |added: &mut Vec<u8>, data: &[u8]| -> Found<()> {
+        if added.len().saturating_add(data.len()) > room {
+            return Err(TreeError::Unreadable(
+                "the entries that the pages inherit would make the document too much bigger",
+            ));
+        }
+        added.try_reserve(data.len()).map_err(|_| {
+            TreeError::Unreadable("there is not enough memory to write the entries onto the pages")
+        })?;
+        added.extend_from_slice(data);
+        Ok(())
+    };
     let mut hoists: Vec<&Hoist> = tree.hoists.iter().collect();
     hoists.sort_by_key(|h| h.page);
     let mut places: Vec<(u32, u32, usize)> = Vec::with_capacity(hoists.len());
+    // The long values written once: their place in the bytes, and the number of their object.
+    let mut shared: HashMap<(usize, usize), u32> = HashMap::new();
+    let mut objects: Vec<(u32, Range<usize>)> = Vec::new();
+    let mut next = old_size;
     for h in hoists {
+        tick();
         let dictionary = &bytes[h.dictionary.clone()];
-        let Some(body) = dictionary.strip_suffix(b">>") else {
+        if !dictionary.ends_with(b">>") {
             return cannot("a page does not end the way a dictionary does");
-        };
+        }
         // Between the dictionary and the end of the object there may be only white space.
         let after = skip_white(bytes, h.dictionary.end);
         if !bytes[after..].starts_with(b"endobj") {
             return cannot("a page is followed by more than a dictionary");
         }
-        places.push((h.page, h.generation, out.len()));
-        out.extend_from_slice(format!("{} {} obj\n", h.page, h.generation).as_bytes());
-        out.extend_from_slice(body);
+        places.push((h.page, h.generation, base + added.len()));
+        put(
+            &mut added,
+            format!("{} {} obj\n", h.page, h.generation).as_bytes(),
+        )?;
+        // The page as it was, less the entries that lead to nothing.
+        let end = h.dictionary.end - 2;
+        let mut cuts: Vec<&Range<usize>> = h.dead.iter().collect();
+        cuts.sort_by_key(|c| c.start);
+        let mut at = h.dictionary.start;
+        for cut in cuts {
+            if cut.start < at || cut.end > end {
+                return cannot("an entry of a page is not where it was read");
+            }
+            put(&mut added, &bytes[at..cut.start])?;
+            at = cut.end;
+        }
+        put(&mut added, &bytes[at..end])?;
         for (key, value) in &h.values {
-            out.extend_from_slice(b"\n/");
-            out.extend_from_slice(key.as_bytes());
-            out.push(b' ');
+            put(&mut added, b"\n/")?;
+            put(&mut added, key.as_bytes())?;
+            put(&mut added, b" ")?;
             match value {
-                Source::Bytes(range) => out.extend_from_slice(&bytes[range.clone()]),
-                Source::Text(text) => out.extend_from_slice(text.as_bytes()),
+                Source::Bytes(range) => {
+                    let text = &bytes[range.clone()];
+                    if text.len() <= INLINE_MAX || reference_number(bytes, range).is_some() {
+                        put(&mut added, text)?;
+                    } else {
+                        let number = match shared.get(&(range.start, range.end)) {
+                            Some(&n) => n,
+                            None => {
+                                let n = next;
+                                let Some(after) = next.checked_add(1) else {
+                                    return cannot("too many objects");
+                                };
+                                next = after;
+                                shared.insert((range.start, range.end), n);
+                                objects.push((n, range.clone()));
+                                n
+                            }
+                        };
+                        put(&mut added, format!("{number} 0 R").as_bytes())?;
+                    }
+                }
+                Source::Text(text) => put(&mut added, text.as_bytes())?,
             }
         }
-        out.extend_from_slice(b"\n>>\nendobj\n");
+        put(&mut added, b"\n>>\nendobj\n")?;
     }
-    let table_at = out.len();
-    out.extend_from_slice(b"xref\n");
+    for (number, range) in &objects {
+        places.push((*number, 0, base + added.len()));
+        put(&mut added, format!("{number} 0 obj\n").as_bytes())?;
+        put(&mut added, &bytes[range.clone()])?;
+        put(&mut added, b"\nendobj\n")?;
+    }
+    let table_at = base + added.len();
+    put(&mut added, b"xref\n")?;
     for (number, generation, at) in &places {
-        out.extend_from_slice(format!("{number} 1\n{at:010} {generation:05} n \n").as_bytes());
+        put(
+            &mut added,
+            format!("{number} 1\n{at:010} {generation:05} n \n").as_bytes(),
+        )?;
     }
-    out.extend_from_slice(b"trailer\n<< /Size ");
-    out.extend_from_slice(&bytes[size.clone()]);
-    out.extend_from_slice(b" /Root ");
-    out.extend_from_slice(&bytes[root.clone()]);
+    put(
+        &mut added,
+        format!("trailer\n<< /Size {next} /Root ").as_bytes(),
+    )?;
+    put(&mut added, &bytes[root.clone()])?;
     for (key, value) in [(&b" /Info "[..], &tree.info), (&b" /ID "[..], &tree.id)] {
         if let Some(value) = value {
-            out.extend_from_slice(key);
-            out.extend_from_slice(&bytes[value.clone()]);
+            put(&mut added, key)?;
+            put(&mut added, &bytes[value.clone()])?;
         }
     }
-    out.extend_from_slice(
+    put(
+        &mut added,
         format!(" /Prev {} >>\nstartxref\n{table_at}\n%%EOF\n", tree.start).as_bytes(),
-    );
+    )?;
+    let mut out: Vec<u8> = Vec::new();
+    out.try_reserve_exact(base + added.len()).map_err(|_| {
+        TreeError::Unreadable("there is not enough memory to write the entries onto the pages")
+    })?;
+    out.extend_from_slice(bytes);
+    if base > bytes.len() {
+        out.push(b'\n');
+    }
+    out.extend_from_slice(&added);
     Ok(out)
+}
+
+/// True when the value written in `value` has a string in it, in round brackets or in angle
+/// brackets (a dictionary opens with two angle brackets and is not one).
+fn holds_a_string(value: &[u8]) -> bool {
+    let mut p = 0;
+    while p < value.len() {
+        match value[p] {
+            b'(' => return true,
+            b'<' if value.get(p + 1) != Some(&b'<') => return true,
+            b'<' | b'>' => p += 1,
+            _ => {}
+        }
+        p += 1;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -1230,5 +1520,230 @@ mod tests {
         let table = added.find("xref\n4 1\n").unwrap() + 9;
         assert_eq!(&added[table + 19..table + 20], "\n");
         assert_eq!(added[table..].find("trailer").unwrap(), 20);
+    }
+
+    /// A tree of two nodes under the root, `n` pages in all, the first node holding `resources`
+    /// written in place and the second a short one. Object numbers: 1 catalog, 2 root, 3 and 4
+    /// nodes, the pages from 5.
+    fn two_nodes(n: usize, resources: &str) -> Vec<u8> {
+        let first = n / 2;
+        let kids = |range: std::ops::Range<usize>| {
+            range
+                .map(|i| format!("{} 0 R", 5 + i))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let mut objects: Vec<String> = vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            format!("<< /Type /Pages /Kids [3 0 R 4 0 R] /Count {n} /MediaBox [0 0 300 300] >>"),
+            format!(
+                "<< /Type /Pages /Parent 2 0 R /Kids [{}] /Count {first} /Resources {resources} >>",
+                kids(0..first)
+            ),
+            format!(
+                "<< /Type /Pages /Parent 2 0 R /Kids [{}] /Count {} /Resources << /Font << >> >> >>",
+                kids(first..n),
+                n - first
+            ),
+        ];
+        for i in 0..n {
+            let parent = if i < first { 3 } else { 4 };
+            objects.push(format!("<< /Type /Page /Parent {parent} 0 R >>"));
+        }
+        let refs: Vec<&str> = objects.iter().map(String::as_str).collect();
+        document(&refs, "")
+    }
+
+    #[test]
+    fn a_value_written_in_place_is_written_once_and_the_pages_refer_to_it() {
+        let fonts: String = (0..4000).map(|i| format!("/X{i:05} 3 0 R ")).collect();
+        let resources = format!("<< /Font << {fonts}>> >>");
+        let bytes = two_nodes(400, &resources);
+        let tree = read(&bytes, 400, true).unwrap();
+        // Every page gets the resources of its node, written onto it.
+        assert_eq!(tree.hoists.len(), 400);
+        let out = hoisted(&bytes, &tree).unwrap();
+        let added = out.len() - bytes.len();
+        assert!(
+            added < resources.len() + 400 * 100,
+            "the part added is {added} bytes for a value of {} bytes",
+            resources.len()
+        );
+        let text = String::from_utf8_lossy(&out[bytes.len()..]).to_string();
+        assert_eq!(
+            text.matches(&resources).count(),
+            1,
+            "the long value is written once"
+        );
+        // The trailer counts the new object, and the pages refer to it.
+        let new = 5 + 400;
+        assert!(text.contains(&format!("/Size {} ", new + 1)), "{text}");
+        assert!(text.contains(&format!("/Resources {new} 0 R")));
+    }
+
+    #[test]
+    fn a_short_value_is_copied_onto_each_page() {
+        let bytes = two_nodes(4, "<< /Font << /F1 3 0 R >> >>");
+        let tree = read(&bytes, 4, true).unwrap();
+        let out = hoisted(&bytes, &tree).unwrap();
+        let text = String::from_utf8_lossy(&out[bytes.len()..]).to_string();
+        assert!(text.contains("/Resources << /Font << /F1 3 0 R >> >>"));
+        assert!(text.contains("/Size 9 "), "{text}");
+    }
+
+    #[test]
+    fn what_is_added_to_the_document_has_a_limit() {
+        let fonts: String = (0..4000).map(|i| format!("/X{i:05} 3 0 R ")).collect();
+        let bytes = two_nodes(400, &format!("<< /Font << {fonts}>> >>"));
+        let tree = read(&bytes, 400, true).unwrap();
+        match hoisted_within(&bytes, &tree, 10_000, &mut || {}) {
+            Err(TreeError::Unreadable(why)) => assert!(why.contains("bigger"), "{why}"),
+            other => panic!("expected a refusal, got {:?}", other.map(|v| v.len())),
+        }
+        // With room for it, the same tree is written.
+        assert!(hoisted_within(&bytes, &tree, 1 << 20, &mut || {}).is_ok());
+    }
+
+    #[test]
+    fn a_page_that_is_listed_many_times_is_read_once() {
+        // A page with a long string, named 2000 times. Read as often as it is named it would take
+        // 2000 times its size; the walk is allowed a few times the size of the page.
+        let page = format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Pad ({}) >>",
+            "x".repeat(100_000)
+        );
+        let kids = vec!["3 0 R"; 2000].join(" ");
+        let bytes = document(
+            &[
+                "<< /Type /Catalog /Pages 2 0 R >>",
+                &format!("<< /Type /Pages /Kids [{kids}] /Count 2000 >>"),
+                &page,
+            ],
+            "",
+        );
+        let mut ticks = 0;
+        let tree = read_within(&bytes, 2000, true, 5 * page.len(), &mut || ticks += 1).unwrap();
+        assert_eq!(tree.pages.len(), 2000);
+        assert_eq!(ticks, 2000);
+    }
+
+    #[test]
+    fn a_walk_that_reads_more_than_the_size_of_the_document_explains_is_given_up() {
+        let bytes = flat("3 0 R 4 0 R 5 0 R", 3);
+        let got = read_within(&bytes, 3, true, 10, &mut || {});
+        assert!(
+            matches!(got, Err(TreeError::Unreadable(why)) if why.contains("work")),
+            "{got:?}"
+        );
+        assert!(read_within(&bytes, 3, true, bytes.len() * WORK_TIMES, &mut || {}).is_ok());
+    }
+
+    #[test]
+    fn a_list_of_kids_with_more_places_than_a_walk_takes_is_refused_before_it_is_kept() {
+        let b = b"[1 0 R 2 0 R 3 0 R]";
+        assert_eq!(kids_of(b, &(0..b.len()), 3).unwrap().len(), 3);
+        assert!(matches!(
+            kids_of(b, &(0..b.len()), 2),
+            Err(TreeError::Unreadable(_))
+        ));
+    }
+
+    /// Two nodes that give different resources, and two pages that have `own` besides.
+    fn blind(own: &str) -> Vec<u8> {
+        let page = |parent: u32| format!("<< /Type /Page /Parent {parent} 0 R {own} >>");
+        document(
+            &[
+                "<< /Type /Catalog /Pages 2 0 R >>",
+                "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 300 300] >>",
+                "<< /Type /Pages /Parent 2 0 R /Kids [5 0 R] /Count 1 /Resources << /Font << /F1 7 0 R >> >> >>",
+                "<< /Type /Pages /Parent 2 0 R /Kids [6 0 R] /Count 1 /Resources << /Font << /F2 7 0 R >> >> >>",
+                &page(3),
+                &page(4),
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            ],
+            "",
+        )
+    }
+
+    #[test]
+    fn a_key_that_leads_to_nothing_is_the_same_as_no_key() {
+        let control = read(&blind(""), 2, true).unwrap();
+        for own in ["/Resources 900 0 R", "/Resources null"] {
+            let bytes = blind(own);
+            let tree = read(&bytes, 2, true).unwrap();
+            assert_eq!(tree.pages, control.pages, "{own}");
+            assert_eq!(
+                tree.hoists.len(),
+                control.hoists.len(),
+                "{own}: a page whose key leads to nothing gets what its node gives"
+            );
+            for hoist in &tree.hoists {
+                assert!(hoist.values.iter().any(|(k, _)| *k == "Resources"), "{own}");
+                assert_eq!(hoist.dead.len(), 1, "{own}: the entry is left out");
+            }
+            // The pages are written once more with the key once, and with the value of the node.
+            let out = hoisted(&bytes, &tree).unwrap();
+            let added = String::from_utf8_lossy(&out[bytes.len()..]).to_string();
+            assert_eq!(added.matches("/Resources").count(), 2, "{own}: {added}");
+            assert!(
+                !added.contains("900 0 R") && !added.contains("null"),
+                "{own}: {added}"
+            );
+            assert!(
+                added.contains("/F1 7 0 R") && added.contains("/F2 7 0 R"),
+                "{own}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_that_leads_to_a_value_is_the_pages_own() {
+        let bytes = document(
+            &[
+                "<< /Type /Catalog /Pages 2 0 R >>",
+                "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 300 300] >>",
+                "<< /Type /Pages /Parent 2 0 R /Kids [4 0 R] /Count 1 /Resources << >> >>",
+                "<< /Type /Page /Parent 3 0 R /Resources 5 0 R >>",
+                "<< /Font << >> >>",
+            ],
+            "",
+        );
+        let tree = read(&bytes, 1, true).unwrap();
+        assert!(tree
+            .hoists
+            .iter()
+            .all(|h| h.values.iter().all(|(k, _)| *k != "Resources")));
+    }
+
+    #[test]
+    fn a_wrong_parent_matters_only_where_a_node_holds_an_entry_its_pages_inherit() {
+        // A flat tree with nothing on any node: pages that name no parent, or another one, move.
+        for page in [
+            "<< /Type /Page /MediaBox [0 0 100 100] >>",
+            "<< /Type /Page /Parent 1 0 R /MediaBox [0 0 100 100] >>",
+        ] {
+            let bytes = document(
+                &[
+                    "<< /Type /Catalog /Pages 2 0 R >>",
+                    "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+                    page,
+                    page,
+                ],
+                "",
+            );
+            assert!(read(&bytes, 2, true).is_ok(), "{page}");
+        }
+        // The same with an entry at the root: the page follows its parent for it.
+        let bytes = document(
+            &[
+                "<< /Type /Catalog /Pages 2 0 R >>",
+                "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 300 300] >>",
+                "<< /Type /Page /Parent 1 0 R >>",
+            ],
+            "",
+        );
+        assert!(matches!(read(&bytes, 1, true), Err(TreeError::Damaged(_))));
+        // And that does not apply to the tools that do not move pages.
+        assert!(read(&bytes, 1, false).is_ok());
     }
 }

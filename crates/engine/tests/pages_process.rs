@@ -665,6 +665,24 @@ fn the_files_for_other_tools_are_written() {
     );
     // The pool holds six documents at most.
     pool.close(h);
+    // Pages whose resources lead to nothing (a reference to an object that is not there, `null`):
+    // they have what their node gives, before and after a move.
+    for (name, own) in [
+        ("dangling", "/Resources 900 0 R"),
+        ("nullkey", "/Resources null"),
+    ] {
+        let (path, h) = open(&kit::dangling_resources_pdf(own));
+        fs::copy(&path, out.join(format!("{name}-original.pdf"))).unwrap();
+        pool.pages_reorder(h, &[3, 2, 1, 0]).unwrap();
+        pool.save(h, SaveOptions::default()).unwrap();
+        keep(
+            &format!("{name}-moved.pdf"),
+            &path,
+            4,
+            &format!("draws={name}-original.pdf:3,2,1,0"),
+        );
+        pool.close(h);
+    }
 
     // Two pages copied out in the other order.
     let (path, h) = open(&kit::marked_pdf(5));
@@ -1057,4 +1075,46 @@ fn a_change_that_takes_many_times_the_stall_limit_is_not_ended_while_it_reports_
     );
     // The document is there, with one page, and the next tool works.
     assert_eq!(pool.pages_rotate(handle, &[0], 1).unwrap().pages.len(), 1);
+}
+
+// ---- documents that a limit has to meet ------------------------------------------------------------
+
+#[test]
+fn a_value_of_a_megabyte_on_a_node_of_a_thousand_pages_is_moved_by_the_engine_in_its_sandbox() {
+    // A file of a little over a megabyte. The value was copied onto every page: a gigabyte, and the
+    // engine was stopped by the limit on its memory, losing the turn that was not saved.
+    let dir = Dir::new("shared");
+    let bytes = kit::shared_values_pdf(1000, 1 << 20);
+    assert!(bytes.len() < 1_300_000);
+    let path = dir.write("shared.pdf", &bytes);
+    let pool = pool();
+    let (h, sizes) = pool.open(&text(&path), None).unwrap();
+    assert_eq!(sizes.len(), 1000);
+    pool.pages_rotate(h, &[0], 1).unwrap();
+    let order: Vec<u32> = (1..1000).chain([0]).collect();
+    let moved = pool.pages_reorder(h, &order).unwrap();
+    assert_eq!(moved.pages.len(), 1000);
+    // The document saves in a size of its own.
+    pool.save(h, SaveOptions::default()).unwrap();
+    let saved = fs::metadata(&path).unwrap().len();
+    assert!(saved < bytes.len() as u64 * 3, "{saved} bytes");
+}
+
+#[test]
+fn a_page_listed_thousands_of_times_is_changed_by_the_engine_in_its_sandbox() {
+    // A page of 65,000 keys named 2,000 times, in a file of 660 kilobytes, ended the engine at a
+    // delete after a turn: the reader kept every listing in full.
+    let dir = Dir::new("listed");
+    let bytes = kit::listed_many_times_pdf(65_000, 2_000, 0);
+    assert!(bytes.len() < 700_000);
+    let path = dir.write("listed.pdf", &bytes);
+    let pool = pool();
+    let (h, sizes) = pool.open(&text(&path), None).unwrap();
+    assert_eq!(sizes.len(), 2000);
+    pool.pages_rotate(h, &[0], 1).unwrap();
+    let deleted = pool.pages_delete(h, &[1]).unwrap();
+    assert_eq!(deleted.pages.len(), 1999);
+    let order: Vec<u32> = (1..1999).chain([0]).collect();
+    assert_eq!(pool.pages_reorder(h, &order).unwrap().pages.len(), 1999);
+    pool.save(h, SaveOptions::default()).unwrap();
 }

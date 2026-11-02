@@ -3325,3 +3325,252 @@ fn a_copy_that_reads_back_as_other_pages_of_the_same_number_is_not_put_in_place_
     ));
     assert_eq!(sizes, pages);
 }
+
+// ---- limits of the reader and of what is written onto pages, and keys that lead to nothing ----------
+
+/// A move of one page from the front to the back.
+fn first_to_last(doc: u32, n: u32) -> PagesRequest {
+    PagesRequest::Reorder {
+        doc,
+        order: (1..n).chain([0]).collect(),
+    }
+}
+
+fn picture(engine: &mut Engine, doc: u32, page: u32) -> Vec<u8> {
+    match ask(
+        engine,
+        RequestBody::Render {
+            doc,
+            page,
+            width: 300,
+            height: 200,
+        },
+    ) {
+        ResponseBody::Rendered { rgba, .. } => rgba,
+        other => panic!("page {page}: {other:?}"),
+    }
+}
+
+#[test]
+fn pages_whose_resources_are_a_reference_to_nothing_are_drawn_after_a_move_as_they_were() {
+    // The key leads to nothing, so the page has what its node gives, and a page moved under another
+    // node must still have it. A graphics state and a colour space are not in the print of a page,
+    // so this is shown by the pixels only.
+    assert_moves_keep_every_picture(
+        "a reference to nothing",
+        &kit::dangling_resources_pdf("/Resources 900 0 R"),
+    );
+    assert_moves_keep_every_picture("no key", &kit::dangling_resources_pdf(""));
+}
+
+#[test]
+fn pages_whose_resources_are_null_are_drawn_after_a_move_as_pages_with_no_key() {
+    // The format says that a key with the value `null` is the same as no key. A page with it is
+    // drawn with what its node gives, before and after a move, whatever the library does with it.
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let (control, _c) = open_doc(e, &kit::dangling_resources_pdf(""));
+    let wanted = pictures(e, control);
+    let (doc, _f) = open_doc(e, &kit::dangling_resources_pdf("/Resources null"));
+    let order = vec![3, 2, 1, 0];
+    changed(page_op(
+        e,
+        PagesRequest::Reorder {
+            doc,
+            order: order.clone(),
+        },
+    ));
+    let now = pictures(e, doc);
+    for (place, picture) in now.iter().enumerate() {
+        assert!(
+            *picture == wanted[order[place] as usize],
+            "place {place} is not drawn as a page with no key is"
+        );
+    }
+    // The key stands once on each page, with a value.
+    let saved = save_all(e, doc);
+    assert!(
+        !contains(&saved, "/Resources null"),
+        "the saved file still has a null for the resources"
+    );
+}
+
+#[test]
+fn a_value_written_in_place_on_a_node_is_not_copied_onto_every_page() {
+    let original = kit::shared_values_pdf(1000, 64 * 1024);
+    assert!(original.len() < 200_000);
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let (doc, _f) = open_doc(e, &original);
+    let seen_before: Vec<Vec<u8>> = [0, 499, 500, 999]
+        .iter()
+        .map(|&p| picture(e, doc, p))
+        .collect();
+    let (_, snapshot, _) = changed(page_op(e, first_to_last(doc, 1000)));
+    let saved = save_all(e, doc);
+    assert!(
+        saved.len() < original.len() * 3,
+        "a file of {} bytes became one of {} bytes",
+        original.len(),
+        saved.len()
+    );
+    // Page 0 went to the end; the others moved up by one.
+    assert!(picture(e, doc, 998) == seen_before[3]);
+    assert!(picture(e, doc, 999) == seen_before[0]);
+    // The step can be taken back.
+    changed(page_op(e, PagesRequest::Restore { doc, snapshot }));
+    assert!(picture(e, doc, 0) == seen_before[0]);
+}
+
+#[test]
+fn a_value_of_a_megabyte_on_a_node_with_a_thousand_pages_can_be_moved() {
+    // The file is a little over a megabyte; copied onto every page it was a gigabyte.
+    let original = kit::shared_values_pdf(1000, 1 << 20);
+    assert!(original.len() < 1_300_000);
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let (doc, _f) = open_doc(e, &original);
+    changed(page_op(
+        e,
+        PagesRequest::Rotate {
+            doc,
+            pages: vec![0],
+            turns: 1,
+        },
+    ));
+    changed(page_op(e, first_to_last(doc, 1000)));
+    let saved = save_all(e, doc);
+    assert!(saved.len() < original.len() * 3, "{}", saved.len());
+    let reopened = open(e, &saved, None).unwrap();
+    assert_eq!(page_count(e, reopened), 1000);
+}
+
+#[test]
+fn a_move_that_would_add_too_much_to_the_document_is_refused_and_leaves_it_as_it_was() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let (doc, _f) = open_doc(e, &kit::shared_values_pdf(20, 64 * 1024));
+    e.set_page_tools_for_tests(doc, PageTools::default().limiting_revision(2000));
+    let before = pictures(e, doc);
+    let (code, message) = page_error(e, first_to_last(doc, 20));
+    assert_eq!(code, ErrorCode::PageChangeFailed);
+    assert!(message.contains("bigger"), "{message}");
+    assert!(message.contains("left as they are"), "{message}");
+    assert!(before == pictures(e, doc), "the document is as it was");
+    // The engine is alive and the document can be changed in other ways.
+    changed(page_op(
+        e,
+        PagesRequest::Rotate {
+            doc,
+            pages: vec![0],
+            turns: 1,
+        },
+    ));
+}
+
+#[test]
+fn a_page_listed_thousands_of_times_is_changed_without_reading_it_as_often() {
+    // A page with 65,000 keys named 2,000 times, in a file of 660 kilobytes. Read as often as it is
+    // named it took gigabytes.
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let bytes = kit::listed_many_times_pdf(65_000, 2_000, 0);
+    assert!(bytes.len() < 700_000);
+    let (doc, _f) = open_doc(e, &bytes);
+    assert_eq!(page_count(e, doc), 2000);
+    let started = Instant::now();
+    changed(page_op(
+        e,
+        PagesRequest::Rotate {
+            doc,
+            pages: vec![0],
+            turns: 1,
+        },
+    ));
+    changed(page_op(
+        e,
+        PagesRequest::Delete {
+            doc,
+            pages: vec![5],
+        },
+    ));
+    changed(page_op(e, first_to_last(doc, 1999)));
+    eprintln!("two thousand listings: {:?}", started.elapsed());
+    assert!(save_all(e, doc).starts_with(b"%PDF-"));
+}
+
+#[test]
+fn a_page_with_a_big_string_listed_thousands_of_times_does_not_take_minutes() {
+    // 8 MiB in the page, named 9,000 times. Each listing was read in full (0.02 s a time here, 0.18 s
+    // with the 64 MiB of the file that was reported), and nothing was said meanwhile.
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let bytes = kit::listed_many_times_pdf(1, 9_000, 8 << 20);
+    let (doc, _f) = open_doc(e, &bytes);
+    let started = Instant::now();
+    let mut seen = Vec::new();
+    let response = e.handle_with_progress(
+        Request {
+            id: 9,
+            body: RequestBody::Pages(PagesRequest::Delete {
+                doc,
+                pages: vec![3],
+            }),
+        },
+        &mut |done| seen.push(done),
+    );
+    let elapsed = started.elapsed();
+    eprintln!(
+        "nine thousand listings: {elapsed:?}, {} reports",
+        seen.len()
+    );
+    assert!(matches!(
+        response.body,
+        ResponseBody::Pages(PagesResponse::Changed { .. })
+    ));
+    assert!(
+        elapsed < Duration::from_secs(60),
+        "the delete took {elapsed:?}"
+    );
+}
+
+#[test]
+fn a_page_that_is_added_keeps_its_own_size_and_turn_under_a_node_that_turns_and_crops() {
+    // Every page under the root is turned a quarter turn and cropped to 150 by 150 points. A page
+    // that comes from another file with neither of its own must not take them.
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let (doc, _f) = open_doc(e, &kit::turned_root_pdf());
+    let (before, _, _) = changed(page_op(
+        e,
+        PagesRequest::Rotate {
+            doc,
+            pages: vec![0],
+            turns: 2,
+        },
+    ));
+    assert_eq!((before[0].width, before[0].height), (150.0, 150.0));
+    let (sizes, snapshot, _) = insert_document(e, doc, &kit::simple_pdf(2), 1, 4096).unwrap();
+    assert_eq!(sizes.len(), 4);
+    for (i, size) in sizes.iter().enumerate().skip(1).take(2) {
+        assert_eq!(
+            (size.width, size.height),
+            (612.0, 792.0),
+            "the added page {i} is not the size it had"
+        );
+    }
+    // The pages that were there are as they were.
+    assert_eq!((sizes[0].width, sizes[0].height), (150.0, 150.0));
+    assert_eq!((sizes[3].width, sizes[3].height), (150.0, 150.0));
+    // And what is written, read again, has the same sizes.
+    let saved = save_all(e, doc);
+    let file = TempFile::new("added.pdf", &saved);
+    e.set_document(File::open(file.path()).unwrap());
+    let ResponseBody::Opened { pages, .. } = ask(e, RequestBody::Open { password: None }) else {
+        panic!("the saved document does not open");
+    };
+    assert_eq!(pages, sizes);
+    // Taking the insert back gives the document it was.
+    let (back, _, _) = changed(page_op(e, PagesRequest::Restore { doc, snapshot }));
+    assert_eq!(back.len(), 2);
+}

@@ -876,3 +876,137 @@ pub fn heavy_pages_pdf(pages: usize, segments: usize) -> Vec<u8> {
     }
     assemble(&objects, "")
 }
+
+// ---- page trees that are large or odd in a way that a limit has to meet ---------------------------------
+
+const BLIND_FONT: &str = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>";
+
+/// Four pages (A to D) in two nodes. The first node gives a graphics state that makes the pages
+/// faint and a colour space that makes the bar red; the second gives an opaque graphics state and a
+/// colour space that makes the bar blue. Each page draws a bar through the graphics state and the
+/// colour space, and its letter. `own` is written on every page besides (nothing, a `/Resources`
+/// that is a reference to nothing, or `null`). The root holds `/MediaBox`, and the nodes hold
+/// `/Resources`, so a page that is moved takes what its new node gives
+/// unless the entries are written onto it first, and a graphics state or a colour space is not in
+/// the page print.
+///
+/// Object numbers: 2 root, 3 the font, 4 and 5 the nodes, 6 to 9 the pages.
+pub fn dangling_resources_pdf(own: &str) -> Vec<u8> {
+    let node = |parent: u32, kids: &str, resources: &str| {
+        format!("<< /Type /Pages /Parent {parent} 0 R /Kids [{kids}] /Count 2 /Resources {resources} >>")
+            .into_bytes()
+    };
+    let faint = "<< /Font << /F1 3 0 R >> /ExtGState << /G0 << /ca 0.2 >> >> /ColorSpace << /C0 [/Separation /Spot /DeviceRGB << /FunctionType 2 /Domain [0 1] /N 1 /C0 [1 1 1] /C1 [1 0 0] >>] >> >>";
+    let solid = "<< /Font << /F1 3 0 R >> /ExtGState << /G0 << /ca 1 >> >> /ColorSpace << /C0 [/Separation /Spot2 /DeviceRGB << /FunctionType 2 /Domain [0 1] /N 1 /C0 [1 1 1] /C1 [0 0 1] >>] >> >>";
+    let mut objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [4 0 R 5 0 R] /Count 4 /MediaBox [0 0 300 300] >>".to_vec(),
+        BLIND_FONT.as_bytes().to_vec(),
+        node(2, "6 0 R 7 0 R", faint),
+        node(2, "8 0 R 9 0 R", solid),
+    ];
+    for i in 0..4usize {
+        let parent = if i < 2 { 4 } else { 5 };
+        objects.push(
+            format!(
+                "<< /Type /Page /Parent {parent} 0 R {own} /Contents {} 0 R >>",
+                10 + i
+            )
+            .into_bytes(),
+        );
+    }
+    for i in 0..4u8 {
+        objects.push(stream_object(
+            "",
+            &format!(
+                "/G0 gs /C0 cs 1 scn {} 20 200 200 re f 0 g BT /F1 24 Tf 40 150 Td (PAGE-{}) Tj ET",
+                20 + 15 * u32::from(i),
+                (b'A' + i) as char
+            ),
+        ));
+    }
+    assemble(&objects, "")
+}
+
+/// `pages` pages in two nodes. The first node gives its pages `/Resources` that are written in
+/// place and take about `bytes` bytes (a long list of fonts); the second gives a short one. All
+/// pages draw the same text, from one content stream.
+///
+/// Object numbers: 2 root, 3 the font, 4 and 5 the nodes, 6 the content, 7 on the pages.
+pub fn shared_values_pdf(pages: usize, bytes: usize) -> Vec<u8> {
+    let mut fonts = String::new();
+    let mut i = 0;
+    while fonts.len() < bytes {
+        let _ = write!(fonts, "/X{i:06} 3 0 R ");
+        i += 1;
+    }
+    let first = pages / 2;
+    let kids = |range: std::ops::Range<usize>| {
+        range
+            .map(|i| format!("{} 0 R", 7 + i))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let mut objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        format!("<< /Type /Pages /Kids [4 0 R 5 0 R] /Count {pages} /MediaBox [0 0 300 300] >>")
+            .into_bytes(),
+        BLIND_FONT.as_bytes().to_vec(),
+        format!(
+            "<< /Type /Pages /Parent 2 0 R /Kids [{}] /Count {first} /Resources << /Font << /F1 3 0 R {fonts}>> >> >>",
+            kids(0..first)
+        )
+        .into_bytes(),
+        format!(
+            "<< /Type /Pages /Parent 2 0 R /Kids [{}] /Count {} /Resources << /Font << /F1 3 0 R >> >> >>",
+            kids(first..pages),
+            pages - first
+        )
+        .into_bytes(),
+        stream_object("", "BT /F1 24 Tf 40 150 Td (SAME) Tj ET"),
+    ];
+    for i in 0..pages {
+        let parent = if i < first { 4 } else { 5 };
+        objects
+            .push(format!("<< /Type /Page /Parent {parent} 0 R /Contents 6 0 R >>").into_bytes());
+    }
+    assemble(&objects, "")
+}
+
+/// One page with `keys` keys of no meaning (and a string of `pad` bytes), named `times` times by
+/// the page tree, under a root that holds nothing the page inherits. The file stays small and the
+/// pages are many.
+pub fn listed_many_times_pdf(keys: usize, times: usize, pad: usize) -> Vec<u8> {
+    let mut page = String::from("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300]");
+    for i in 0..keys {
+        let _ = write!(page, " /K{i:05} 1");
+    }
+    if pad > 0 {
+        let _ = write!(page, " /Pad ({})", "x".repeat(pad));
+    }
+    page.push_str(" >>");
+    let kids = vec!["3 0 R"; times].join(" ");
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        format!("<< /Type /Pages /Kids [{kids}] /Count {times} >>").into_bytes(),
+        page.into_bytes(),
+    ];
+    assemble(&objects, "")
+}
+
+/// Two pages of 300 by 300 points under a root that turns every page a quarter turn and shows only
+/// the 150 by 150 points at the bottom left. Nothing is on the pages themselves.
+pub fn turned_root_pdf() -> Vec<u8> {
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [4 0 R 5 0 R] /Count 2 /Rotate 90 /CropBox [0 0 150 150] /MediaBox [0 0 300 300] >>".to_vec(),
+        BLIND_FONT.as_bytes().to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 3 0 R >> >> /Contents 6 0 R >>"
+            .to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 3 0 R >> >> /Contents 7 0 R >>"
+            .to_vec(),
+        stream_object("", "BT /F1 24 Tf 40 100 Td (PAGE-A) Tj ET"),
+        stream_object("", "BT /F1 24 Tf 40 100 Td (PAGE-B) Tj ET"),
+    ];
+    assemble(&objects, "")
+}

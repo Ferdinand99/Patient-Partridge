@@ -90,6 +90,9 @@ pub struct PageTools {
     /// Test builds only: how many pages more than there are the checks after a change see.
     #[cfg(debug_assertions)]
     miscount: isize,
+    /// Test builds only: the most bytes that the entries written onto pages may add.
+    #[cfg(debug_assertions)]
+    revision_limit: Option<usize>,
     /// Test builds only: the pages seem to be one place off when a move is checked.
     #[cfg(debug_assertions)]
     scramble: bool,
@@ -121,6 +124,8 @@ impl Default for PageTools {
             miscount: 0,
             #[cfg(debug_assertions)]
             scramble: false,
+            #[cfg(debug_assertions)]
+            revision_limit: None,
         }
     }
 }
@@ -188,6 +193,26 @@ impl PageTools {
     pub fn scrambling(mut self) -> PageTools {
         self.scramble = true;
         self
+    }
+
+    /// Lets the entries that are written onto pages before a move add at most `bytes` to the
+    /// document (for tests: no document a test can make comes near the real limit).
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn limiting_revision(mut self, bytes: usize) -> PageTools {
+        self.revision_limit = Some(bytes);
+        self
+    }
+
+    fn revision_limit(&self) -> Option<usize> {
+        #[cfg(debug_assertions)]
+        {
+            self.revision_limit
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            None
+        }
     }
 
     fn scrambled(&self) -> bool {
@@ -627,9 +652,18 @@ fn page_is_sound(document: &PdfDocument<'_>, index: PdfPageIndex) -> bool {
 /// Reads the page tree out of a copy of the document as PDFium writes it, and refuses a change to
 /// the list of pages when the tree is not one the change can be trusted with (see
 /// [`crate::pagetree`]). A tree that cannot be read is refused too, in words that do not blame the
-/// document. `parents` also asks that every page names the node that lists it, which a move needs.
-fn read_tree(bytes: &[u8], count: usize, parents: bool) -> Result<pagetree::Tree, Failure> {
-    pagetree::read(bytes, count, parents).map_err(|e| (ErrorCode::PageChangeFailed, e.words()))
+/// document. `parents` also asks that every page names the node that lists it, when a node holds
+/// an entry that its pages inherit, which a move needs. The tree is read in steps, and `progress`
+/// is told now and then.
+fn read_tree(
+    bytes: &[u8],
+    count: usize,
+    parents: bool,
+    progress: &mut dyn FnMut(u32),
+) -> Result<pagetree::Tree, Failure> {
+    let mut pace = Pace::new();
+    pagetree::read_with(bytes, count, parents, &mut || pace.step(progress))
+        .map_err(|e| (ErrorCode::PageChangeFailed, e.words()))
 }
 
 /// Tells the app now and then that a change is going on, so that a change that takes long (pages
@@ -809,7 +843,7 @@ fn take_checked_snapshot(
             "the document is too big for its pages to be changed",
         );
     };
-    read_tree(&bytes, count, false)?;
+    read_tree(&bytes, count, false, progress)?;
     let limit = tools(engine, doc).max_undo_bytes;
     Ok(if bytes.len() <= limit {
         tools(engine, doc).keep(bytes, count, Some(sizes_digest(&sizes)))
@@ -1170,7 +1204,7 @@ fn reorder(
     // PDFium's move stops the process on a list of pages that names something that is not there,
     // and puts a page under another node without what the old node gave it. The tree is read
     // from the document as PDFium writes it, and such a document is not moved as it is.
-    let tree = read_tree(&bytes, count, true)?;
+    let tree = read_tree(&bytes, count, true, progress)?;
     let stable = stable_places(order);
     let fail_at = tools(engine, doc).fail_at();
     let miscount = tools(engine, doc).miscount();
@@ -1181,8 +1215,15 @@ fn reorder(
     let digest = sizes_digest(&sizes);
     let before = page_prints(engine.document(doc)?, progress)?;
     if !tree.hoists.is_empty() {
+        let revision_limit = tools(engine, doc).revision_limit();
         write_inherited_entries(
-            engine, pdfium, doc, &bytes, &tree, &before, &password, progress,
+            engine,
+            pdfium,
+            doc,
+            (&bytes, &tree, revision_limit),
+            &before,
+            &password,
+            progress,
         )?;
     }
     let result = (|| {
@@ -1286,13 +1327,11 @@ fn reorder(
 /// written out gets a part added at its end (see [`pagetree::hoisted`]), is read in again, and
 /// replaces the open document only when every page looks the way it did. Otherwise the document is
 /// left as it is.
-#[allow(clippy::too_many_arguments)]
 fn write_inherited_entries(
     engine: &mut Engine,
     pdfium: &'static Pdfium,
     doc: u32,
-    bytes: &[u8],
-    tree: &pagetree::Tree,
+    (bytes, tree, revision_limit): (&[u8], &pagetree::Tree, Option<usize>),
     before: &[PagePrint],
     password: &Option<Secret>,
     progress: &mut dyn FnMut(u32),
@@ -1305,7 +1344,13 @@ fn write_inherited_entries(
             ),
         )
     };
-    let written = pagetree::hoisted(bytes, tree).map_err(|e| refused(&e.reason()))?;
+    let mut pace = Pace::new();
+    let mut tick = || pace.step(progress);
+    let written = match revision_limit {
+        Some(most) => pagetree::hoisted_within(bytes, tree, most, &mut tick),
+        None => pagetree::hoisted_with(bytes, tree, &mut tick),
+    }
+    .map_err(|e| refused(&e.reason()))?;
     let loaded = load_copy(pdfium, written, password_str(password), before.len(), None)
         .map_err(|_| refused("the document did not read back"))?;
     if page_prints(&loaded, progress)? != before {
@@ -1574,6 +1619,52 @@ fn insert_blank(
     changed(engine, doc, token, 1)
 }
 
+/// Page `from` of `source` has just been copied into `document` as page `to`. The copy has the
+/// turn and the boxes that the page had in its own file, except those it took from nodes above it
+/// there when the page has none of its own: if the node it landed in gives it another turn or
+/// another part to show, it is written onto the page, so that the page looks as it did.
+fn fix_inherited_view(
+    document: &mut PdfDocument<'_>,
+    source: &PdfDocument<'_>,
+    from: usize,
+    to: usize,
+) -> Result<(), Failure> {
+    let was = source
+        .pages()
+        .get(from as PdfPageIndex)
+        .map_err(|_| failed("a page of the other document could not be read"))?;
+    let mut page = document
+        .pages()
+        .get(to as PdfPageIndex)
+        .map_err(|_| failed("an added page could not be read"))?;
+    let turns = was.rotation().map(turns_of).unwrap_or(0);
+    if page.rotation().map(turns_of).unwrap_or(0) != turns {
+        page.set_rotation(rotation_of(turns));
+    }
+    let shown = |p: &PdfPage<'_>| {
+        p.boundaries()
+            .bounding()
+            .ok()
+            .map(|b| bits(rect_of(&b.bounds)))
+    };
+    let wanted = was.boundaries().bounding().ok().map(|b| rect_of(&b.bounds));
+    let Some(wanted) = wanted.filter(usable) else {
+        return Ok(());
+    };
+    if shown(&page) != Some(bits(wanted)) {
+        page.boundaries_mut()
+            .set_crop(pdf_rect(&wanted))
+            .map_err(|_| failed("PDFium could not set the box of an added page"))?;
+        if shown(&page) != Some(bits(wanted)) {
+            // The size of the page that it takes from the node is smaller than what is to be shown.
+            page.boundaries_mut()
+                .set_media(pdf_rect(&wanted))
+                .map_err(|_| failed("PDFium could not set the box of an added page"))?;
+        }
+    }
+    Ok(())
+}
+
 fn restore(
     engine: &mut Engine,
     pdfium: &'static Pdfium,
@@ -1730,7 +1821,7 @@ fn import_end(
         );
     };
     // PDFium adds pages to the list as it finds it: a list that cannot be trusted is refused first.
-    read_tree(&bytes, count, false)?;
+    read_tree(&bytes, count, false, progress)?;
     let password = password_of(engine, doc);
     let miscount = tools(engine, doc).miscount();
     let digest = sizes_digest(&page_sizes(engine.document(doc)?));
@@ -1748,6 +1839,13 @@ fn import_end(
             return Err(failed(
                 "the document has the wrong number of pages after the insert",
             ));
+        }
+        // A page that has no turn or no crop box of its own takes the ones of the node it lands
+        // in. Each page that came is given the turn and the shown part it had in its own file.
+        let mut pace = Pace::new();
+        for k in 0..added {
+            fix_inherited_view(document, &source, k, at as usize + k)?;
+            pace.step(progress);
         }
         // The copied pages still point into `source` for some things that PDFium does not carry
         // over (a pop-up note's `/Parent`). Written out and read in again, with `source` still

@@ -890,6 +890,13 @@ fn main() {
         ("far_object_number", kit::far_object_number_pdf()),
         ("inherited_tree", kit::inherited_tree_pdf()),
         ("root_inherited", kit::root_inherited_pdf()),
+        (
+            "dangling_resources",
+            kit::dangling_resources_pdf("/Resources 900 0 R"),
+        ),
+        ("null_resources", kit::dangling_resources_pdf("/Resources null")),
+        ("turned_root", kit::turned_root_pdf()),
+        ("listed_many_times", kit::listed_many_times_pdf(200, 300, 0)),
         ("indirect_kids", kit::indirect_kids_pdf()),
         ("words_in_node", kit::words_in_node_pdf(true)),
         ("object_streams", kit::object_streams_pdf()),
