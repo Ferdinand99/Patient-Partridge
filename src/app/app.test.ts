@@ -2962,6 +2962,24 @@ describe("App: the verdict on a signature belongs to the bytes it was made from"
     expect((m.api as unknown as { getSignatures: ReturnType<typeof vi.fn> }).getSignatures).toHaveBeenCalledTimes(1);
   });
 
+  it("drops the verdict when a read of the file failed after the check, and says the file may be unchanged", async () => {
+    const m = make({ signatures: signed });
+    // A page lost a part of what was signed to a read that failed: the file was not changed, and
+    // the page would have been shown under the badge of an intact signature.
+    m.api.render.mockRejectedValue({ code: "source_unreadable", message: "a part could not be read" });
+    await m.app.openPath("/docs/signed.pdf");
+    await flush();
+    expect(badge().textContent).toBe(STALE);
+    expect(badge().textContent).not.toContain("intact");
+    badge().click();
+    const text = q("#signature-panel").textContent ?? "";
+    expect(text).toContain("could not be read");
+    expect(text).toContain("missing content");
+    expect(text).not.toContain("has been changed");
+    expect(text).not.toContain("Signature intact");
+    expect(q("#signature-panel").querySelector("button.btn:not(.btn-icon)")).toBeNull();
+  });
+
   it("drops the verdict of a tab whose file was replaced by a save in another tab", async () => {
     const m = await openSigned("/docs/one.pdf");
     await m.app.openPath("/docs/two.pdf");

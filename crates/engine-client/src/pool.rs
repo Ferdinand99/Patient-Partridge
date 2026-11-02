@@ -289,16 +289,28 @@ impl EnginePool {
     /// that was saved itself, it is not asked about its signatures any more. Their handles are
     /// returned so that the window can say so.
     fn mark_replaced(&self, handle: u64, path: &Path) -> Vec<u64> {
-        let st = state(&self.state);
+        // Comparing two paths asks the file system (it resolves both), and a share that hangs would
+        // hold up every call that needs the lock of the pool for as long as that takes. So the lock
+        // is held only to take a list of the other documents, and the file system is asked after it
+        // is let go. The lock of a document is not held across the question either.
+        let others: Vec<(u64, Arc<Mutex<Source>>)> = {
+            let st = state(&self.state);
+            st.docs
+                .iter()
+                .filter(|(other, _)| **other != handle)
+                .map(|(other, entry)| (*other, entry.source.clone()))
+                .collect()
+        };
         let mut replaced = Vec::new();
-        for (other, entry) in st.docs.iter() {
-            if *other == handle {
-                continue;
-            }
-            let mut source = entry.source.lock().unwrap_or_else(|e| e.into_inner());
-            if same_file(&source.original, path) {
-                source.saved = true;
-                replaced.push(*other);
+        for (other, source) in others {
+            let original = source
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .original
+                .clone();
+            if same_file(&original, path) {
+                source.lock().unwrap_or_else(|e| e.into_inner()).saved = true;
+                replaced.push(other);
             }
         }
         replaced.sort_unstable();

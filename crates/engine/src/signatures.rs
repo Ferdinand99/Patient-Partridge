@@ -52,13 +52,66 @@ pub const HASH_BUDGET: u64 = 2 * 1024 * 1024 * 1024;
 
 /// The longest the check of the signatures of one document may take, in all: the scan of the file,
 /// the signatures, and the look at the file afterwards that ties the report to it. The engine of a
-/// document answers one request at a time, so drawing a page waits while this runs. What is not
-/// done when the time is up is reported as not checked, or (for the scan of the file and the look
-/// afterwards) as a check that could not be made; it is never reported as good. Two things are
-/// not cut short by the clock: a single read of the file that does not return, and (when the
-/// engine runs without the thread of `sigcheck::start_parser`) the decoding of a signature that
-/// passed the limits on its shape.
+/// document answers one request at a time, so drawing a page waits while this runs.
+///
+/// A fifth of it (see [`last_look_reserve`]) is kept for the look at the file afterwards, so the
+/// scan of the file and the signatures have the rest. A signature that is not finished when its
+/// time is up is reported as not checked, and the signatures that were finished keep their
+/// result. When the scan of the file does not finish, or the first look at the file, there is
+/// nothing to report and the request ends as a check that could not be made. When the look
+/// afterwards does not finish, a signature that held is reported as not checked too, since there
+/// was no time left to see that the file was still the one that was read; what was found wrong
+/// stays. Nothing is ever reported as good because time ran out. Two things are not cut short by
+/// the clock: a single read of the file that does not return, and (when the engine runs without
+/// the thread of `sigcheck::start_parser`) the decoding of a signature that passed the limits on
+/// its shape.
 pub const CHECK_TIME: Duration = Duration::from_secs(10);
+
+/// Test builds only: another time limit for the check, in milliseconds (0: the real one).
+#[cfg(debug_assertions)]
+static CHECK_TIME_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Test builds only: shortens the time limit of the check, so that a test can run out of time
+/// without waiting for the real one.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_check_time_for_tests(millis: u64) {
+    CHECK_TIME_MS.store(millis, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The time limit of the check: [`CHECK_TIME`].
+pub fn check_time() -> Duration {
+    #[cfg(debug_assertions)]
+    {
+        let millis = CHECK_TIME_MS.load(std::sync::atomic::Ordering::Relaxed);
+        if millis > 0 {
+            return Duration::from_millis(millis);
+        }
+    }
+    CHECK_TIME
+}
+
+/// How much of `total` is kept back for the look at the file after the signatures.
+pub fn last_look_reserve(total: Duration) -> Duration {
+    total / 5
+}
+
+/// What a report may still say when the file could not be looked at again in time: a signature
+/// that held is "not checked" (too large, or out of time), and the name of the trust list entry
+/// goes with it. Everything else was found wrong or not checkable by the bytes that were read,
+/// and stands.
+pub fn leave_unconfirmed(report: &mut SignatureReport) {
+    for item in &mut report.items {
+        if matches!(
+            item.state,
+            SignatureState::Trusted | SignatureState::UnknownSigner
+        ) {
+            item.state = SignatureState::Unsupported;
+            item.reason = SignatureReason::TooLarge;
+            item.trust_anchor = None;
+        }
+    }
+}
 
 /// Most numbers of a byte range read from PDFium.
 const MAX_RAW_RANGE: usize = 64;
@@ -809,9 +862,9 @@ fn read_failure(error: &io::Error) -> Failure {
 }
 
 /// Describes and checks the signatures of `document`, which was opened from the file behind
-/// `source`. `now` is the time of the check in seconds since 1970. `deadline` is when the whole
-/// check must be done (see [`CHECK_TIME`]); the caller sets it and uses the same one for what it
-/// does after the report.
+/// `source`. `now` is the time of the check in seconds since 1970. `deadline` is when the scan and
+/// the signatures must be done (see [`CHECK_TIME`]); the caller keeps some time back after it for
+/// the look at the file that ties the report to it.
 pub fn report(
     pdfium: &Pdfium,
     document: &PdfDocument<'_>,

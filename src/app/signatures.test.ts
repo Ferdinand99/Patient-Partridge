@@ -513,6 +513,89 @@ describe("a verdict is only for the bytes it was made from", () => {
     expect(getSignatures).not.toHaveBeenCalled();
     expect(badge().hidden).toBe(true);
   });
+
+  it("keeps the badge off for a refusal that says nothing about whether the document is signed", async () => {
+    // The pool refuses to answer for a document that was saved: the document may be one without
+    // signatures, and a badge would speak of signatures that are not there.
+    const reject: ((e: unknown) => void)[] = [];
+    const getSignatures = vi.fn(() => new Promise<SignaturesInfo>((_, no) => reject.push(no)));
+    const panel = new SignaturePanel(document, { api: { getSignatures }, delayMs: 0 });
+    panel.setDocument(1);
+    panel.invalidate(1);
+    reject[0]({ code: "source_changed", message: "the document was saved" });
+    await flush();
+    expect(badge().hidden).toBe(true);
+  });
+
+  const CHECKED = "The signatures were checked on the file as it was opened";
+
+  it("does not say that a check happened after a check that failed", async () => {
+    const { panel } = make(new Error("gone"));
+    panel.setDocument(1);
+    await flush();
+    panel.invalidate(1);
+    panel.invalidate(1, "file_changed");
+    badge().click();
+    const text = panelEl().textContent ?? "";
+    expect(text).not.toContain(CHECKED);
+    expect(text).toContain("were not checked");
+    expect(text).toContain("the file on the disk has been changed");
+    expect(text).toContain("Do not rely");
+  });
+
+  it("does not say that a check happened when the answer that was on its way fails", async () => {
+    const reject: ((e: unknown) => void)[] = [];
+    const getSignatures = vi.fn(() => new Promise<SignaturesInfo>((_, no) => reject.push(no)));
+    const panel = new SignaturePanel(document, { api: { getSignatures }, delayMs: 0 });
+    panel.setDocument(2);
+    panel.invalidate(2);
+    reject[0](new Error("the engine could not say"));
+    await flush();
+    expect(badge().hidden).toBe(false);
+    badge().click();
+    const text = panelEl().textContent ?? "";
+    expect(text).not.toContain(CHECKED);
+    expect(text).toContain("were not checked");
+  });
+
+  it("does say that a check happened when one finished", async () => {
+    const { panel } = make(report([item("unknown_signer")]));
+    panel.setDocument(3);
+    await flush();
+    panel.invalidate(3);
+    badge().click();
+    expect(panelEl().textContent).toContain(CHECKED);
+  });
+
+  it("lets a reason about the file replace one about the tab, and not the reverse", async () => {
+    const { panel } = make(report([item("unknown_signer")]));
+    panel.setDocument(1);
+    await flush();
+    badge().click();
+    panel.invalidate(1);
+    expect(panelEl().textContent).toContain("saved or changed since");
+    // The page said the file changed; the panel says so too.
+    panel.invalidate(1, "file_changed");
+    expect(panelEl().textContent).toContain("The file on the disk has been changed");
+    panel.invalidate(1);
+    expect(panelEl().textContent).toContain("The file on the disk has been changed");
+  });
+
+  it("says that a part of the file could not be read, and that the file may be unchanged", async () => {
+    const { panel } = make(report([item("unknown_signer")]));
+    panel.setDocument(1);
+    await flush();
+    badge().click();
+    panel.invalidate(1, "read_failed");
+    const text = panelEl().textContent ?? "";
+    expect(badge().textContent).toBe(STALE);
+    expect(text).not.toContain("Signature intact");
+    expect(text).toContain("could not be read");
+    expect(text).toContain("missing content");
+    expect(text).toContain("Do not rely");
+    expect(text).not.toContain("has been changed");
+    expect(panelEl().querySelector("button.btn:not(.btn-icon)")).toBeNull();
+  });
 });
 
 describe("what the panel says about the name of a signer", () => {

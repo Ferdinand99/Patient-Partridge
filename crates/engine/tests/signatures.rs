@@ -16,6 +16,8 @@ use partridge_protocol::{
 use partridge_testkit as kit;
 use partridge_testkit::signed::*;
 
+mod common;
+
 struct Shared(Engine);
 unsafe impl Send for Shared {}
 
@@ -545,5 +547,190 @@ fn a_shadow_attack_that_shows_hidden_content_after_signing_is_a_change() {
     let report = report_of(engine, doc, NOW);
     none_intact(&report);
     expect(&report.items[0], S::Changed, R::DataAfterSignature);
+    ask(engine, RequestBody::Close { doc });
+}
+
+// ---- a read that fails, and a draw that fails, after the verdict ---------------------------------
+
+/// A content stream with `text` in it, as an object body.
+fn stream_object(text: &str) -> Vec<u8> {
+    format!("<< /Length {} >>\nstream\n{text}\nendstream", text.len()).into_bytes()
+}
+
+/// A signed page of two content streams, far apart in the file: the text, and a stamp over it that
+/// the signer saw and signed.
+fn stamped_page() -> SignedFile {
+    let options = SignOptions::default();
+    let mut objects: Vec<(u32, Vec<u8>)> = Vec::new();
+    for (n, body) in base_objects(&options) {
+        match n {
+            4 => objects.push((
+                4,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents [6 0 R 9 0 R] /Resources << /Font << /F1 3 0 R >> >> /Annots [5 0 R] >>".to_vec(),
+            )),
+            7 => {
+                // Enough in between that the stamp is in another block of the file than the text.
+                objects.push((8, stream_object(&"% filler\n".repeat(8000))));
+                objects.push((9, stream_object("BT /F1 24 Tf 72 600 Td (VOID DO NOT PAY) Tj ET")));
+                objects.push((7, body));
+            }
+            _ => objects.push((n, body)),
+        }
+    }
+    sign_placeholder(write_file(&objects), &p256("Test Signer"), &options)
+}
+
+/// Opens `bytes` from a file the test controls.
+fn open_controlled(engine: &mut Engine, bytes: &[u8]) -> (u32, common::Controls) {
+    let (file, controls) = common::ControlledFile::new(bytes);
+    engine.set_document_source(Box::new(file));
+    match ask(engine, RequestBody::Open { password: None }) {
+        ResponseBody::Opened { doc, .. } => (doc, controls),
+        other => panic!("{other:?}"),
+    }
+}
+
+fn error_code(body: &ResponseBody) -> Option<ErrorCode> {
+    match body {
+        ResponseBody::Error { code, .. } => Some(*code),
+        _ => None,
+    }
+}
+
+fn render(engine: &mut Engine, doc: u32, page: u32) -> ResponseBody {
+    ask(
+        engine,
+        RequestBody::Render {
+            doc,
+            page,
+            width: 300,
+            height: 390,
+        },
+    )
+}
+
+#[test]
+fn a_stamp_does_not_vanish_from_a_page_under_an_intact_signature() {
+    let file = stamped_page();
+    let stamp_at = file.bytes.windows(4).position(|w| w == b"VOID").unwrap() as u64;
+    let stamp_block = stamp_at / partridge_engine::source::BLOCK;
+    let text_block = file.bytes.windows(4).position(|w| w == b"Pay ").unwrap() as u64
+        / partridge_engine::source::BLOCK;
+    assert_ne!(stamp_block, text_block, "the stamp has a block of its own");
+
+    let mut shared = engine();
+    let engine = &mut shared.0;
+
+    // As signed, the page shows the stamp and the signature is intact.
+    let (doc, _controls) = open_controlled(engine, &file.bytes);
+    expect(
+        &report_of(engine, doc, NOW).items[0],
+        S::UnknownSigner,
+        R::NoTrustList,
+    );
+    let signed_text = page_text(engine, doc);
+    assert!(signed_text.contains("VOID DO NOT PAY"), "{signed_text}");
+    ask(engine, RequestBody::Close { doc });
+
+    // Before any verdict there is nothing to protect: a page that lost a part to a failed read is
+    // drawn as it always was.
+    let (doc, controls) = open_controlled(engine, &file.bytes);
+    controls.fail_reads_of_block(stamp_block);
+    let text = page_text(engine, doc);
+    assert!(
+        text.contains("Pay 100 to Alice") && !text.contains("VOID"),
+        "{text}"
+    );
+    ask(engine, RequestBody::Close { doc });
+
+    // After the verdict, the read of the block with the stamp fails. The text and the drawing of the
+    // page are refused: a page without the stamp must not stand under the "intact" badge.
+    let (doc, controls) = open_controlled(engine, &file.bytes);
+    expect(
+        &report_of(engine, doc, NOW).items[0],
+        S::UnknownSigner,
+        R::NoTrustList,
+    );
+    controls.fail_reads_of_block(stamp_block);
+    let refused = |engine: &mut Engine, doc: u32| {
+        [
+            ask(engine, RequestBody::PageText { doc, page: 0 }),
+            render(engine, doc, 0),
+            ask(engine, RequestBody::PageLinks { doc, page: 0 }),
+            ask(
+                engine,
+                RequestBody::Search {
+                    doc,
+                    page: 0,
+                    query: "Alice".into(),
+                },
+            ),
+            ask(engine, RequestBody::Outline { doc }),
+        ]
+        .iter()
+        .map(error_code)
+        .collect::<Vec<_>>()
+    };
+    let all_refused = vec![Some(ErrorCode::SourceUnreadable); 5];
+    assert_eq!(refused(engine, doc), all_refused);
+    // And it stays so when the share is back: what was parsed may hold the hole.
+    controls.reads_work_again();
+    assert_eq!(refused(engine, doc), all_refused);
+    // A new question is refused too, as before.
+    assert_eq!(
+        error_code(&ask(engine, RequestBody::Signatures { doc, now: NOW })),
+        Some(ErrorCode::SourceUnreadable)
+    );
+    ask(engine, RequestBody::Close { doc });
+}
+
+#[test]
+fn a_draw_that_fails_after_the_file_changed_tells_the_window_the_file_changed() {
+    // A document of two pages whose second page cannot be loaded: a draw of it fails as `Corrupt`.
+    let options = SignOptions::default();
+    let objects: Vec<(u32, Vec<u8>)> = base_objects(&options)
+        .into_iter()
+        .map(|(n, body)| match n {
+            2 => (
+                2,
+                b"<< /Type /Pages /Kids [4 0 R 99 0 R] /Count 2 >>".to_vec(),
+            ),
+            _ => (n, body),
+        })
+        .collect();
+    let file = sign_placeholder(write_file(&objects), &p256("Test Signer"), &options);
+
+    let mut shared = engine();
+    let engine = &mut shared.0;
+    let (doc, controls) = open_controlled(engine, &file.bytes);
+    expect(
+        &report_of(engine, doc, NOW).items[0],
+        S::UnknownSigner,
+        R::NoTrustList,
+    );
+    // The page that works draws, and the one that does not fails the way it always did.
+    assert!(matches!(
+        render(engine, doc, 0),
+        ResponseBody::Rendered { .. }
+    ));
+    let plain = |engine: &mut Engine| {
+        [
+            error_code(&render(engine, doc, 1)),
+            error_code(&ask(engine, RequestBody::PageText { doc, page: 1 })),
+            error_code(&ask(engine, RequestBody::PageLinks { doc, page: 1 })),
+        ]
+    };
+    for code in plain(engine) {
+        assert!(
+            matches!(code, Some(ErrorCode::Corrupt | ErrorCode::RenderFailed)),
+            "{code:?}"
+        );
+    }
+    // The file grows after the verdict: the same failures are now what they are, a file that is not
+    // the one that was checked.
+    controls.data.lock().unwrap().push(b'\n');
+    for code in plain(engine) {
+        assert_eq!(code, Some(ErrorCode::SourceChanged));
+    }
     ask(engine, RequestBody::Close { doc });
 }

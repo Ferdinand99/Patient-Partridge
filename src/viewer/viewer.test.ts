@@ -291,6 +291,21 @@ describe("DocumentView", () => {
     expect(events.onFatal).not.toHaveBeenCalled();
   });
 
+  it("says that a part of the file could not be read when the engine refuses to draw for that, and goes on", async () => {
+    const { view, events } = open(3, (_d, page, w, h) =>
+      page === 0
+        ? Promise.reject({ code: "source_unreadable", message: "a part could not be read" })
+        : Promise.resolve(new ArrayBuffer(w * h * 4)),
+    );
+    await flush();
+    const first = view.element.querySelector<HTMLElement>('[data-page="0"]');
+    expect(first?.classList.contains("viewer-page-failed")).toBe(true);
+    expect(first?.dataset.error).toContain("could not be read");
+    expect(first?.dataset.error).toContain("could be missing content");
+    expect(first?.dataset.error).toContain("open the file again");
+    expect(events.onFatal).not.toHaveBeenCalled();
+  });
+
   it("rejects a bitmap of the wrong size instead of drawing garbage", async () => {
     const { view } = open(1, () => Promise.resolve(new ArrayBuffer(16)));
     await flush();

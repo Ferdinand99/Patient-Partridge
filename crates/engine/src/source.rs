@@ -157,6 +157,22 @@ impl SourceGuard {
         self.changed
     }
 
+    /// What is known to be wrong with the file without looking at it again: other bytes than the
+    /// first time or another size ([`Problem::Changed`], see [`SourceGuard::has_changed`]), or a
+    /// read for PDFium that failed ([`Problem::Unreadable`]). A failed read stays on record for
+    /// good: PDFium leaves out what it cannot read and goes on, and it may keep the hole in
+    /// memory, so a later read that works does not make what it parsed whole again. Reads
+    /// nothing.
+    pub fn known_problem(&mut self) -> Option<Problem> {
+        if self.has_changed() {
+            Some(Problem::Changed)
+        } else if self.failures > 0 {
+            Some(Problem::Unreadable)
+        } else {
+            None
+        }
+    }
+
     /// How many reads failed so far.
     pub fn failures(&self) -> u32 {
         self.failures
@@ -588,6 +604,37 @@ mod tests {
 
     fn later(secs: u64) -> Option<SystemTime> {
         Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+    }
+
+    #[test]
+    fn a_failed_read_is_a_known_problem_without_a_new_look_and_stays_one() {
+        let rig = rig(100_000);
+        let mut reader = GuardedReader::new(rig.guard.clone());
+        let mut buf = [0u8; 10];
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(lock(&rig.guard).known_problem(), None);
+        rig.broken.store(true, Ordering::SeqCst);
+        reader.seek(SeekFrom::Start(60_000)).unwrap();
+        assert!(reader.read(&mut buf).is_err());
+        assert_eq!(lock(&rig.guard).known_problem(), Some(Problem::Unreadable));
+        // The share comes back: what PDFium parsed may have a hole, so the problem stays.
+        rig.broken.store(false, Ordering::SeqCst);
+        reader.seek(SeekFrom::Start(60_000)).unwrap();
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(lock(&rig.guard).known_problem(), Some(Problem::Unreadable));
+        // Other bytes are the stronger fact, and come first.
+        rig.data.lock().unwrap().push(1);
+        assert_eq!(lock(&rig.guard).known_problem(), Some(Problem::Changed));
+    }
+
+    #[test]
+    fn a_read_of_the_guards_own_that_failed_is_not_a_known_problem() {
+        let rig = rig(100_000);
+        rig.broken.store(true, Ordering::SeqCst);
+        assert!(lock(&rig.guard)
+            .contains_any(&[b"/ByteRange"], &mut |_| {})
+            .is_err());
+        assert_eq!(lock(&rig.guard).known_problem(), None);
     }
 
     #[test]

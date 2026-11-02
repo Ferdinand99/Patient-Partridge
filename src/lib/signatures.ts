@@ -141,15 +141,38 @@ export const NOT_CHECKED: readonly string[] = [
 /** The badge for a tab whose document is no longer the file the signatures were checked on. */
 export const STALE_LABEL = "Not checked for this version";
 
-/** Why a tab no longer holds the file the signatures were checked on. */
-export type StaleReason = "changed" | "file_changed";
+/**
+ * Why a tab no longer holds the file the signatures were checked on: it was saved or changed in
+ * memory (`changed`), the file on the disk now has other bytes (`file_changed`), or a part of the
+ * file could not be read after the check, so that a page may be missing content that was signed
+ * (`read_failed`).
+ */
+export type StaleReason = "changed" | "file_changed" | "read_failed";
 
-/** What the panel says about such a tab, by why it is one. */
+/**
+ * How much is known about a stale tab: a reason that is about the file itself (what is on the disk
+ * and what could be read) says more than one that is about the tab.
+ */
+export const STALE_RANK: Record<StaleReason, number> = { changed: 0, read_failed: 1, file_changed: 2 };
+
+/** What the panel says about such a tab, by why it is one, when the signatures were checked on the file as it was opened. */
 export const STALE_TEXT: Record<StaleReason, string> = {
   changed:
     "The signatures were checked on the file as it was opened. This tab now shows a version that was saved or changed since, and that version has not been checked. Earlier results do not apply to it. Do not rely on them for this version. To check the file, close this tab and open the file again.",
   file_changed:
     "The signatures were checked on the file as it was opened. The file on the disk has been changed since, so that result does not apply to the file as it is now. Do not rely on it. To check the file, close this tab and open the file again.",
+  read_failed:
+    "The signatures were checked on the file as it was opened. Since then a part of the file could not be read, so a page may be missing content that was part of what was signed. The file may not have been changed. That result does not apply to what this tab shows. Do not rely on it. To check the file, close this tab and open the file again.",
+};
+
+/** The same, when no check of the signatures finished: nothing was checked, so nothing is said about a check. */
+export const STALE_TEXT_UNCHECKED: Record<StaleReason, string> = {
+  changed:
+    "The signatures of this document were not checked. This tab now shows a version that was saved or changed since it was opened, and no signature in it has been checked. Do not rely on any signature in it. To check the file, close this tab and open the file again.",
+  file_changed:
+    "The signatures of this document were not checked, and the file on the disk has been changed since it was opened. Do not rely on any signature in it. To check the file, close this tab and open the file again.",
+  read_failed:
+    "The signatures of this document were not checked, and a part of the file could not be read after it was opened, so a page may be missing content. The file may not have been changed. Do not rely on any signature in it. To check the file, close this tab and open the file again.",
 };
 
 /** What the badge shows for a document. */

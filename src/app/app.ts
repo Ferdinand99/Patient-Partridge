@@ -3,7 +3,7 @@
 // storage) comes in through `AppDeps`, so tests can run the whole flow with fakes.
 
 import type { OpenedDocument, OutlineEntry, SavedFile, SavedPosition } from "../lib/api";
-import type { SignaturesInfo } from "../lib/signatures";
+import type { SignaturesInfo, StaleReason } from "../lib/signatures";
 import { describeError, fileNameOf, isEngineLost, toAppError, type AppErrorLike } from "../lib/errors";
 import { classifyUri, visibleAddress } from "../lib/linkPolicy";
 import { parsePageInput } from "../lib/pageInput";
@@ -185,13 +185,16 @@ function byId<T extends HTMLElement>(root: Document, id: string): T {
 /**
  * The commands of the app process, with every read from the file behind a document watched. When
  * the engine refuses one because the file now has other bytes than the ones it was checked on
- * (`source_changed`), `told` hears which document it was, and the error goes on to the caller as it
- * would have without this.
+ * (`source_changed`), or because a read of the file failed after the check, so that a page may have
+ * lost content (`source_unreadable`), `told` hears which document it was and why, and the error
+ * goes on to the caller as it would have without this.
  */
-function watchReads(api: AppDeps["api"], told: (doc: number) => void): AppDeps["api"] {
+function watchReads(api: AppDeps["api"], told: (doc: number, why: StaleReason) => void): AppDeps["api"] {
   const watch = <T>(call: Promise<T>, doc: number): Promise<T> =>
     call.catch((error: unknown) => {
-      if (toAppError(error).code === "source_changed") told(doc);
+      const code = toAppError(error).code;
+      if (code === "source_changed") told(doc, "file_changed");
+      else if (code === "source_unreadable") told(doc, "read_failed");
       throw error;
     });
   const watched = {
@@ -268,7 +271,7 @@ export class App {
     this.zoomIn = byId(root, "zoom-in");
     this.zoomOut = byId(root, "zoom-out");
     this.positionDelay = deps.positionDelayMs ?? DEFAULT_POSITION_DELAY_MS;
-    this.api = watchReads(deps.api, (doc) => this.sourceChanged(doc));
+    this.api = watchReads(deps.api, (doc, why) => this.sourceChanged(doc, why));
     this.tabStrip = new TabStrip(byId(root, "tabs"), {
       select: (id) => this.activate(id),
       close: (id) => void this.requestClose(id),
@@ -967,11 +970,11 @@ export class App {
 
   /**
    * The engine of a document found that the file it reads from has other bytes than the ones the
-   * signatures were checked on, and refused to draw or read from it. What was found is dropped at
-   * once, whatever the tab shows.
+   * signatures were checked on, or that a read of it failed, and refused to draw or read from it.
+   * What was found is dropped at once, whatever the tab shows.
    */
-  private sourceChanged(doc: number): void {
-    if (this.tabs.some((t) => t.doc === doc)) this.signatures.invalidate(doc, "file_changed");
+  private sourceChanged(doc: number, why: StaleReason): void {
+    if (this.tabs.some((t) => t.doc === doc)) this.signatures.invalidate(doc, why);
   }
 
   // ---- changes that are not saved ---------------------------------------------

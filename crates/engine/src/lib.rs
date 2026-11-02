@@ -268,9 +268,20 @@ impl Engine {
             last = done.max(last.saturating_add(1));
             progress(last);
         };
+        let reads_a_page = matches!(
+            request.body,
+            RequestBody::Render { .. }
+                | RequestBody::Outline { .. }
+                | RequestBody::PageText { .. }
+                | RequestBody::PageLinks { .. }
+                | RequestBody::Search { .. }
+        );
         let body = match self.dispatch(request.body, &mut rising) {
             Ok(body) => body,
-            Err((code, message)) => ResponseBody::Error { code, message },
+            Err(failure) => {
+                let (code, message) = self.refusal_for_failed_read(reads_a_page, failure);
+                ResponseBody::Error { code, message }
+            }
         };
         Response {
             id: request.id,
@@ -379,22 +390,34 @@ impl Engine {
                 let document = self.document(doc)?;
                 // One time limit for all of it: the look at the file before, the check of each
                 // signature, and the look at the file after, which is what makes the report
-                // about this file and no other.
-                let deadline = Instant::now() + signatures::CHECK_TIME;
+                // about this file and no other. The signatures stop a little before the end, so
+                // that the last look has time left and a signature that was finished is not lost
+                // because a slow one came after it.
+                let total = signatures::check_time();
+                let deadline = Instant::now() + total;
+                let work_deadline = deadline - signatures::last_look_reserve(total);
                 self.check_source_until(Some(deadline), progress)?;
                 let Some(source) = self.source.clone() else {
                     return fail(ErrorCode::Internal, "the document has no file behind it");
                 };
-                let report = signatures::report(
+                let mut report = signatures::report(
                     pdfium,
                     document,
                     &source,
                     &self.trust,
                     now,
-                    deadline,
+                    work_deadline,
                     progress,
                 )?;
-                self.check_source_until(Some(deadline), progress)?;
+                let last_look = source::lock(&source).verify_until(Some(deadline), progress);
+                match last_look {
+                    Ok(()) => {}
+                    // The file may have changed while the signatures were checked, and there was
+                    // no time left to see. What was found as wrong stays; what was found to hold
+                    // is not shown as holding.
+                    Err(source::Problem::TimedOut) => signatures::leave_unconfirmed(&mut report),
+                    Err(problem) => return Err(save::source_failure(problem)),
+                }
                 if report.total > 0 || report.unlisted > 0 || !report.items.is_empty() {
                     self.verdict_given = true;
                 }
@@ -477,16 +500,34 @@ impl Engine {
     /// PDFium all the same) must not be shown as part of the same document: the answer is
     /// `SourceChanged`, and the window drops the verdict. Before any report there is no verdict to
     /// protect, and a document is drawn as it always was.
+    ///
+    /// The same goes for a read that failed: PDFium leaves out the part it could not read and goes
+    /// on, so a page can lose content that was signed (a stamp, say) and still be drawn. That is
+    /// `SourceUnreadable`, and it stays, because what PDFium parsed may keep the hole.
     fn refuse_if_changed(&self) -> Result<(), Failure> {
         if !self.verdict_given {
             return Ok(());
         }
-        match &self.source {
-            Some(source) if source::lock(source).has_changed() => {
-                Err(save::source_failure(source::Problem::Changed))
-            }
-            _ => Ok(()),
+        match self
+            .source
+            .as_ref()
+            .and_then(|source| source::lock(source).known_problem())
+        {
+            Some(problem) => Err(save::source_failure(problem)),
+            None => Ok(()),
         }
+    }
+
+    /// The answer to a read of a page that failed. When the file is not what it was (or a read of
+    /// it failed), the failure may be that, and the window has to hear it, so that it drops the
+    /// verdict, and not a plain "could not be drawn" that leaves the badge up.
+    fn refusal_for_failed_read(&self, reads_a_page: bool, failure: Failure) -> Failure {
+        if reads_a_page && matches!(failure.0, ErrorCode::Corrupt | ErrorCode::RenderFailed) {
+            if let Err(refusal) = self.refuse_if_changed() {
+                return refusal;
+            }
+        }
+        failure
     }
 
     fn document(&self, doc: u32) -> Result<&PdfDocument<'static>, Failure> {
@@ -541,6 +582,8 @@ impl Engine {
             .load_pdf_from_reader(GuardedReader::new(guard.clone()), password)
             .map_err(|e| map_open_error(e, password.is_some()))?;
         self.source = Some(guard);
+        // A report about an earlier file says nothing about this one.
+        self.verdict_given = false;
         // One unreadable page must not refuse the whole document: it gets a placeholder size.
         let page_list = doc.pages();
         let pages = (0..page_list.len())

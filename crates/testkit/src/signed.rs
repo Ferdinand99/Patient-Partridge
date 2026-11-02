@@ -1065,7 +1065,7 @@ fn page_content(text: &str) -> Vec<u8> {
 
 /// The objects of the unsigned base: 1 catalog, 2 page tree, 3 font, 4 page, 5 signature field,
 /// 6 page content, 7 signature dictionary.
-fn base_objects(options: &SignOptions) -> Vec<(u32, Vec<u8>)> {
+pub fn base_objects(options: &SignOptions) -> Vec<(u32, Vec<u8>)> {
     let mut objects = vec![
         (
             1,

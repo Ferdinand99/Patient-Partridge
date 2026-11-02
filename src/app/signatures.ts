@@ -19,10 +19,13 @@
 // file it reads from has other bytes than the ones that were checked: the window is told, and the
 // result is dropped at once.
 
+import { toAppError } from "../lib/errors";
 import {
   NOT_CHECKED,
   STALE_LABEL,
+  STALE_RANK,
   STALE_TEXT,
+  STALE_TEXT_UNCHECKED,
   STATE_LABEL,
   STATE_MEANING,
   type StaleReason,
@@ -52,9 +55,11 @@ type Entry =
   /**
    * The tab no longer holds the bytes that were (or were being) checked. `shown` says whether the
    * badge is there to say so: it is for a document that had signatures, and `null` while the answer
-   * that tells is still on its way (it is used for that and for nothing else).
+   * that tells is still on its way (it is used for that and for nothing else). `checked` says
+   * whether a check of the signatures finished on the file as it was opened: the panel speaks of a
+   * check only then.
    */
-  | { kind: "stale"; shown: boolean | null; why: StaleReason };
+  | { kind: "stale"; shown: boolean | null; why: StaleReason; checked: boolean };
 
 const SVG = "http://www.w3.org/2000/svg";
 
@@ -217,8 +222,15 @@ export class SignaturePanel {
     this.timers.delete(doc);
     const entry = this.entries.get(doc);
     let shown: boolean | null;
+    let checked = false;
     switch (entry?.kind) {
       case "stale":
+        // Already stale. A reason that is about the file says more than one about the tab: the
+        // panel then says what the page says.
+        if (STALE_RANK[why] > STALE_RANK[entry.why]) {
+          this.entries.set(doc, { ...entry, why });
+          if (this.current === doc) this.render();
+        }
         return;
       case "loading":
         // The answer on its way (or, if the wait before asking is not over, the one that will be
@@ -227,15 +239,17 @@ export class SignaturePanel {
         break;
       case "ready":
         shown = entry.summary !== null;
+        checked = true;
         break;
       case "error":
+        // The check did not finish, and the badge said so.
         shown = true;
         break;
       default:
         // Never asked, and now it will not be: nothing is known about this version.
         shown = false;
     }
-    this.entries.set(doc, { kind: "stale", shown, why });
+    this.entries.set(doc, { kind: "stale", shown, why, checked });
     if (this.current === doc) this.render();
     // Whether the document is signed at all is still not known: ask now, and let the answer decide
     // only whether the badge is there. Without this a signed document would end with no badge.
@@ -297,7 +311,8 @@ export class SignaturePanel {
         // The document may be gone by now, or its tab may hold other bytes than the ones checked.
         const now = this.entries.get(doc);
         if (now?.kind === "stale" && now.shown === null) {
-          this.entries.set(doc, { kind: "stale", shown: summarise(info) !== null, why: now.why });
+          // A check finished on the file as it was opened.
+          this.entries.set(doc, { kind: "stale", shown: summarise(info) !== null, why: now.why, checked: true });
           if (this.current === doc) this.render();
           return;
         }
@@ -305,12 +320,16 @@ export class SignaturePanel {
         this.entries.set(doc, { kind: "ready", info, summary: summarise(info) });
         if (this.current === doc) this.render();
       },
-      () => {
+      (error: unknown) => {
         const now = this.entries.get(doc);
         if (now?.kind === "stale" && now.shown === null) {
-          // The engine could not say whether the document is signed. A document that was changed
-          // may well be one that was, so the badge says that this version was not checked.
-          this.entries.set(doc, { kind: "stale", shown: true, why: now.why });
+          // No answer. When it is a refusal because the file or the tab is not what was opened
+          // (`source_changed`), nothing at all is known about whether the document is signed, and
+          // the badge stays off: it would speak of signatures that may not be there. When the
+          // engine could not say, a document that was changed may well be one that was signed, so
+          // the badge says that this version was not checked.
+          const refused = toAppError(error).code === "source_changed";
+          this.entries.set(doc, { kind: "stale", shown: !refused, why: now.why, checked: false });
           if (this.current === doc) this.render();
           return;
         }
@@ -376,7 +395,7 @@ export class SignaturePanel {
     if (entry.kind === "stale") {
       this.body.append(
         el(doc, "p", "sig-lead", "Only this panel reports on a signature. A picture of a signature on a page is only a picture."),
-        el(doc, "p", "sig-alert", STALE_TEXT[entry.why]),
+        el(doc, "p", "sig-alert", (entry.checked ? STALE_TEXT : STALE_TEXT_UNCHECKED)[entry.why]),
       );
       return;
     }
