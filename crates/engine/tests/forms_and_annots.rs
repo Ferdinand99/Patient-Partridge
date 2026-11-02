@@ -228,3 +228,81 @@ fn an_annotation_made_after_the_form_was_listed_does_not_change_what_the_form_li
         other => panic!("{other:?}"),
     }
 }
+
+/// The fingerprint that the app compares before it accepts a saved file: pages, pages that could
+/// not be read, and a digest of what was read.
+fn print(e: &mut partridge_engine::Engine, doc: u32) -> (u32, u32, u64) {
+    match ask(e, RequestBody::Fingerprint { doc }) {
+        ResponseBody::Fingerprint {
+            pages,
+            failed,
+            digest,
+        } => (pages, failed, digest),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn the_saved_file_of_a_filled_and_annotated_document_has_the_fingerprint_of_the_session() {
+    // What `verify_written` does with a saved file: the document in the session is looked at before
+    // the save, the file is opened afresh, and the two must agree, whatever mix of form changes and
+    // annotations the session holds.
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let doc = open(e, &kit::forms_pdf(), None).unwrap();
+    assert!(matches!(
+        ask(e, RequestBody::FormInfo { doc }),
+        ResponseBody::FormInfo { .. }
+    ));
+    let before = fields(e, doc);
+    let _ = set(
+        e,
+        doc,
+        &named(&before, "fullname"),
+        FormValue::Text("Ada".into()),
+    );
+    let _ = annot(ask(
+        e,
+        RequestBody::AddNote {
+            doc,
+            page: 0,
+            x: 500.0,
+            y: 700.0,
+            color: YELLOW,
+            text: "A note".into(),
+        },
+    ));
+    let _ = annot(ask(
+        e,
+        RequestBody::AddStamp {
+            doc,
+            page: 0,
+            x: 400.0,
+            y: 100.0,
+            stamp: StampKind::Draft,
+        },
+    ));
+    let _ = annot(ask(
+        e,
+        RequestBody::AddInk {
+            doc,
+            page: 0,
+            color: [0, 0, 255, 255],
+            width: 4.0,
+            strokes: vec![vec![[100.0, 600.0], [150.0, 620.0], [200.0, 600.0]]],
+        },
+    ));
+    let now = fields(e, doc);
+    let _ = set(e, doc, &named(&now, "agree"), FormValue::Checked(true));
+
+    let session = print(e, doc);
+    assert_eq!(session.1, 0, "a page of the session could not be read");
+    let saved = save_all(e, doc);
+    let second = open(e, &saved, None).unwrap();
+    let file = print(e, second);
+    assert_eq!(file, session, "the saved file is not the session");
+
+    // A different session gives a different digest, so the comparison is not empty.
+    let other = open(e, &kit::forms_pdf(), None).unwrap();
+    assert_ne!(print(e, other).2, session.2);
+}

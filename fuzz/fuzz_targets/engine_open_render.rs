@@ -32,10 +32,12 @@
 //!   the pieces asked for one after the other add up to a file that starts like a PDF. A piece past
 //!   the end, or longer than a piece may be, is refused. The saved file opens again (with the
 //!   password, for the encrypted seed) with the same number of pages and the same kind of
-//!   protection, and every page looked at that both it and a fresh open of the original can read
-//!   has the same size and the same text. (Not the whole fingerprint: the fields and annotations
-//!   added before the save change the objects and annotations the fingerprint counts.) A document
-//!   that PDFium cannot write fails only with `SaveFailed`.
+//!   protection. Its fingerprint is the one of the session just before the save, where both can be
+//!   read in full. Every page looked at that the saved file, a fresh open of the original and the
+//!   session can all read, and on which the last two agree, has the same size and the same text in
+//!   the saved file. (The original's fingerprint is not used: the fields and annotations added
+//!   before the save change the objects and annotations it counts.) A document that PDFium cannot
+//!   write fails only with `SaveFailed`.
 //! - Forms: `FormInfo` answers, and for a form the reader fills in, the fields of each page are
 //!   listed (within the caps, with a place on the page) and the first three are set to a value of
 //!   their kind. A change is answered with the list or refused with `FormFieldRefused`; a form
@@ -44,8 +46,8 @@
 //! - Annotations: the list is inside the caps with ids that differ; a highlight, a note, a drawing
 //!   and a stamp can be added (or are refused with an error that means "not this one"), one is
 //!   changed, all are removed and put back with the ids they had, and an id that was never given
-//!   out is refused. All of it happens before the save, so the saved file is the document with
-//!   its annotations and must read back the same.
+//!   out is refused. All of it happens before the save, so the saved file holds them and is looked
+//!   at in the same way as the session.
 //! - Every answer can be encoded and decoded by the app, and the encoder cuts nothing.
 //! - A page that exists fails only with `Corrupt` or `RenderFailed`; a page past the end gives
 //!   `PageOutOfRange`.
@@ -448,12 +450,18 @@ impl State {
             } => (pages, security),
             other => panic!("unexpected answer to DocInfo: {other:?}"),
         };
-        match self.ask(RequestBody::Fingerprint { doc }) {
-            ResponseBody::Fingerprint { pages: seen, .. } => {
+        // What the app looks at before a save and compares with the saved file afterwards.
+        let session_print = match self.ask(RequestBody::Fingerprint { doc }) {
+            ResponseBody::Fingerprint {
+                pages: seen,
+                failed,
+                digest,
+            } => {
                 assert_eq!(seen, count, "the fingerprint names another number of pages");
+                (failed, digest)
             }
             other => panic!("unexpected answer to Fingerprint: {other:?}"),
-        }
+        };
         assert_eq!(pages, count, "DocInfo names another number of pages");
         let size = match self.ask(RequestBody::SaveBegin { doc }) {
             ResponseBody::SaveReady { size } => size as usize,
@@ -544,6 +552,21 @@ impl State {
                         security: now, ..
                     } => assert_eq!(now, security, "the saved file is protected differently"),
                     other => panic!("unexpected answer to DocInfo: {other:?}"),
+                }
+                // Like for like: the session as it was just before the save, against the saved
+                // file. Where both can be read in full the two must agree, which is what the app
+                // checks before it accepts the file (`crates/engine-client/src/save.rs`). Both
+                // hold the form changes and the annotations of this run.
+                if session_print.0 == 0 {
+                    if let ResponseBody::Fingerprint {
+                        failed: 0, digest, ..
+                    } = self.ask(RequestBody::Fingerprint { doc: again })
+                    {
+                        assert_eq!(
+                            digest, session_print.1,
+                            "the saved file does not have the pages of the session"
+                        );
+                    }
                 }
                 // A page the saved file shows must read as it does in the original: the same size
                 // and the same text. Only that, because the fields and the annotations this target
@@ -720,7 +743,7 @@ impl State {
     }
 
     /// What kind of form the document has now. It can change while the pages are drawn: PDFium adds
-    /// an empty `/AcroForm` to a document when it makes the picture of a text box that has none.
+    /// an `/AcroForm` with no `/Fields` to a document when it makes the picture of a text box that has none.
     fn form_kind(&mut self, doc: u32) -> FormKind {
         match self.ask(RequestBody::FormInfo { doc }) {
             ResponseBody::FormInfo { kind, .. } => kind,
