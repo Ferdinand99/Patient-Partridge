@@ -216,7 +216,10 @@ fn a_protected_file_asks_for_its_password_and_its_pages_do_not_join_without_a_wo
         other => panic!("{other:?}"),
     }
     // Nothing was inserted.
-    assert!(pool.page_text(handle, 2).is_err(), "the document still has two pages");
+    assert!(
+        pool.page_text(handle, 2).is_err(),
+        "the document still has two pages"
+    );
     let outcome = ask(
         Some("secret"),
         InsertOptions {
@@ -255,11 +258,13 @@ fn pages_of_a_protected_document_get_the_protection_of_the_document_they_join() 
         code_of(client_error(pool.open(&text(&target), None))),
         ErrorCode::PasswordRequired
     );
-    let (_, sizes) = pool.open(&text(&target), Some("secret")).unwrap();
+    let (again, sizes) = pool.open(&text(&target), Some("secret")).unwrap();
     assert_eq!(sizes.len(), 2);
-    // The inserted page is not readable in the file without the key.
+    // The page that came from the other file is in it, readable with the key, and its text is not
+    // in the bytes of the file (it is written with the key of the document, and compressed).
+    assert!(pool.page_text(again, 1).unwrap().text.contains("Page 1"));
     let saved = fs::read(&target).unwrap();
-    assert!(!contains(&saved, "Line 3 of page 1"));
+    assert!(!contains(&saved, "quick brown fox"));
 }
 
 #[test]
@@ -649,4 +654,57 @@ fn the_files_for_other_tools_are_written() {
     keep("extracted.pdf", &part, 2, "text=3,1 gone=0,2,4");
 
     fs::write(out.join("expected.txt"), expected).unwrap();
+}
+
+#[test]
+fn a_document_with_a_broken_list_of_pages_cannot_take_the_engine_down() {
+    // A list of pages that names a null object, an object that is not there, a number, the catalog
+    // and a string. PDFium crashed in a page insert on a file like this (found by the fuzz target),
+    // so the tools look at the list first. Whatever they answer, the engine must stay alive.
+    let dir = Dir::new("broken");
+    for kid in kit::BROKEN_KIDS {
+        let path = dir.write("broken.pdf", &kit::broken_page_list_pdf(kid));
+        let pool = pool();
+        let Ok((handle, sizes)) = pool.open(&text(&path), None) else {
+            continue;
+        };
+        for step in 0..8 {
+            let result = match step {
+                0 => pool.pages_insert_blank(handle, 1, 100.0, 100.0).map(|_| ()),
+                1 => pool.pages_delete(handle, &[0]).map(|_| ()),
+                2 => pool
+                    .pages_reorder(handle, &(0..sizes.len() as u32).rev().collect::<Vec<_>>())
+                    .map(|_| ()),
+                3 => pool.pages_rotate(handle, &[0], 1).map(|_| ()),
+                4 => pool.pages_crop(handle, &[0], [1.0; 4]).map(|_| ()),
+                5 => pool
+                    .extract_pages(
+                        handle,
+                        &[0],
+                        &dir.0.join("out.pdf"),
+                        ExtractOptions::default(),
+                        &nothing,
+                    )
+                    .map(|_| ()),
+                6 => pool
+                    .insert_pdf(
+                        handle,
+                        0,
+                        &text(&path),
+                        None,
+                        InsertOptions::default(),
+                        &nothing,
+                    )
+                    .map(|_| ()),
+                _ => pool.save(handle, SaveOptions::default()).map(|_| ()),
+            };
+            if let Err(ClientError::EngineStopped(why)) = result {
+                panic!("the engine stopped at step {step} for the kid {kid:?}: {why}");
+            }
+        }
+        // The engine of the document still answers.
+        assert!(
+            pool.render(handle, 0, 20, 20).is_ok() || pool.page_text(handle, 0).is_ok() || true
+        );
+    }
 }

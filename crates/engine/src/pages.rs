@@ -68,6 +68,21 @@ pub struct PageTools {
     import: Option<Import>,
     max_undo_bytes: usize,
     max_undo_steps: usize,
+    /// Test builds only: the step of the next change at which PDFium is made to fail.
+    #[cfg(debug_assertions)]
+    fail_at: Option<usize>,
+}
+
+/// Test builds only: true at the step a test chose, to see what a change that fails half way
+/// leaves behind.
+#[cfg(debug_assertions)]
+fn injected(fail_at: Option<usize>, step: usize) -> bool {
+    fail_at == Some(step)
+}
+
+#[cfg(not(debug_assertions))]
+fn injected(_fail_at: Option<usize>, _step: usize) -> bool {
+    false
 }
 
 impl Default for PageTools {
@@ -78,6 +93,8 @@ impl Default for PageTools {
             import: None,
             max_undo_bytes: MAX_UNDO_BYTES,
             max_undo_steps: MAX_UNDO_STEPS,
+            #[cfg(debug_assertions)]
+            fail_at: None,
         }
     }
 }
@@ -113,6 +130,26 @@ impl PageTools {
                 Some(old) => total -= old.bytes.len(),
                 None => break,
             }
+        }
+    }
+
+    /// Makes the next change fail at its `step`-th step (for tests).
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn failing_at(mut self, step: usize) -> PageTools {
+        self.fail_at = Some(step);
+        self
+    }
+
+    /// The step a test chose for the change that is starting, once.
+    fn fail_at(&mut self) -> Option<usize> {
+        #[cfg(debug_assertions)]
+        {
+            self.fail_at.take()
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            None
         }
     }
 
@@ -346,6 +383,18 @@ pub(crate) fn handle(
 /// The document may be changed: it is open, no save or copy is holding its bytes, and it has no
 /// more pages than the tools take. Returns the number of pages.
 fn editable(engine: &Engine, doc: u32) -> Result<usize, Failure> {
+    editable_with(engine, doc, false)
+}
+
+/// As [`editable`], and for a change to the list of pages itself (a delete, a move, a page added
+/// or copied) the list must be sound: every place in it is a page that can be found. PDFium
+/// crashes when it adds a page to a list that holds something that is not a page (found by the
+/// fuzz target), so such a document is refused here, before PDFium is asked.
+fn editable_list(engine: &Engine, doc: u32) -> Result<usize, Failure> {
+    editable_with(engine, doc, true)
+}
+
+fn editable_with(engine: &Engine, doc: u32, sound: bool) -> Result<usize, Failure> {
     let document = engine.document(doc)?;
     if engine.saves.contains_key(&doc) {
         return fail(
@@ -360,7 +409,24 @@ fn editable(engine: &Engine, doc: u32) -> Result<usize, Failure> {
             format!("the page tools work on documents of up to {MAX_EDIT_PAGES} pages"),
         );
     }
+    if sound {
+        let list = document.pages();
+        if let Some(bad) = (0..list.len()).find(|i| !page_is_sound(document, *i)) {
+            return fail(
+                ErrorCode::PageChangeFailed,
+                format!(
+                    "the list of pages of this document is damaged (page {} cannot be found), so its pages cannot be added, deleted or moved",
+                    bad + 1
+                ),
+            );
+        }
+    }
     Ok(count)
+}
+
+/// A page that can be found and has a size.
+fn page_is_sound(document: &PdfDocument<'_>, index: PdfPageIndex) -> bool {
+    document.pages().page_size(index).is_ok()
 }
 
 fn password_of(engine: &Engine, doc: u32) -> Option<String> {
@@ -405,23 +471,54 @@ fn take_snapshot(
     }
 }
 
-/// Loads a copy of the document back (after a change that went wrong), and drops the changes.
-fn roll_back(engine: &mut Engine, pdfium: &'static Pdfium, doc: u32, token: u32) {
-    if token == 0 {
-        return;
-    }
+/// A change failed half way. The document is put back from the copy kept for this change, and the
+/// failure to give is the one that happened. When it cannot be put back (no copy was kept because
+/// the document is too big, or the copy does not load), what is left is neither the old document nor
+/// the new one and must never be saved: the document is closed, and the failure says so. The window
+/// takes it as a lost document, like a stopped engine; the file on the disk is untouched.
+fn recover(
+    engine: &mut Engine,
+    pdfium: &'static Pdfium,
+    doc: u32,
+    token: u32,
+    original: Failure,
+) -> Failure {
     let password = password_of(engine, doc);
-    let Some(tools) = engine.tools.get_mut(&doc) else {
-        return;
-    };
-    let Some(at) = tools.snapshots.iter().position(|s| s.token == token) else {
-        return;
-    };
     // The copy stays: the change did not happen, so it still describes the document.
-    let bytes = tools.snapshots[at].bytes.clone();
-    if let Ok(loaded) = pdfium.load_pdf_from_byte_vec(bytes, password.as_deref()) {
-        engine.docs.insert(doc, loaded);
+    let bytes = engine
+        .tools
+        .get(&doc)
+        .and_then(|t| t.snapshots.iter().find(|s| s.token == token))
+        .map(|s| s.bytes.clone());
+    match bytes {
+        Some(bytes) if token != 0 => put_back(engine, pdfium, doc, bytes, password, original),
+        _ => lose(engine, doc),
     }
+}
+
+fn put_back(
+    engine: &mut Engine,
+    pdfium: &'static Pdfium,
+    doc: u32,
+    bytes: Vec<u8>,
+    password: Option<String>,
+    original: Failure,
+) -> Failure {
+    match pdfium.load_pdf_from_byte_vec(bytes, password.as_deref()) {
+        Ok(loaded) => {
+            engine.docs.insert(doc, loaded);
+            original
+        }
+        Err(_) => lose(engine, doc),
+    }
+}
+
+fn lose(engine: &mut Engine, doc: u32) -> Failure {
+    engine.docs.remove(&doc);
+    (
+        ErrorCode::UnknownDocument,
+        "a change to the pages failed half way and the document could not be put back, so it was closed; the file on the disk is untouched".to_string(),
+    )
 }
 
 fn changed(
@@ -476,7 +573,7 @@ fn delete(
     pages: &[u32],
     progress: &mut dyn FnMut(u32),
 ) -> Result<PagesResponse, Failure> {
-    let count = editable(engine, doc)?;
+    let count = editable_list(engine, doc)?;
     let sorted = page_list(pages, count)?;
     if sorted.len() >= count {
         return fail(
@@ -485,6 +582,7 @@ fn delete(
         );
     }
     let token = take_snapshot(engine, doc, progress)?;
+    let fail_at = tools(engine, doc).fail_at();
     let mut form_fields = 0;
     let result = (|| {
         let document = engine.docs.get_mut(&doc).ok_or_else(gone)?;
@@ -492,6 +590,9 @@ fn delete(
             form_fields += clear_form_fields(document, index);
         }
         for (i, &index) in sorted.iter().rev().enumerate() {
+            if injected(fail_at, i) {
+                return Err(failed("a failure made by a test"));
+            }
             let page = document
                 .pages()
                 .get(index as PdfPageIndex)
@@ -510,8 +611,7 @@ fn delete(
         Ok(())
     })();
     if let Err(e) = result {
-        roll_back(engine, pdfium, doc, token);
-        return Err(e);
+        return Err(recover(engine, pdfium, doc, token, e));
     }
     changed_with(engine, doc, token, sorted.len(), form_fields)
 }
@@ -527,7 +627,7 @@ fn reorder(
     order: &[u32],
     progress: &mut dyn FnMut(u32),
 ) -> Result<PagesResponse, Failure> {
-    let count = editable(engine, doc)?;
+    let count = editable_list(engine, doc)?;
     if order.len() != count {
         return fail(
             ErrorCode::InvalidRequest,
@@ -558,6 +658,7 @@ fn reorder(
         );
     };
     let stable = stable_places(order);
+    let fail_at = tools(engine, doc).fail_at();
     let password = password_of(engine, doc);
     let moved = stable.iter().filter(|s| !**s).count();
     let result = (|| {
@@ -573,6 +674,9 @@ fn reorder(
             .collect();
         leaving.sort_unstable_by(|a, b| b.cmp(a));
         for (i, &index) in leaving.iter().enumerate() {
+            if injected(fail_at, i) {
+                return Err(failed("a failure made by a test"));
+            }
             let page = document
                 .pages()
                 .get(index as PdfPageIndex)
@@ -615,10 +719,7 @@ fn reorder(
     let limit = tools(engine, doc).max_undo_bytes;
     if let Err(e) = result {
         // Put the document back from the copy.
-        if let Ok(loaded) = pdfium.load_pdf_from_byte_vec(bytes, password.as_deref()) {
-            engine.docs.insert(doc, loaded);
-        }
-        return Err(e);
+        return Err(put_back(engine, pdfium, doc, bytes, password, e));
     }
     let token = if bytes.len() <= limit {
         tools(engine, doc).keep(bytes)
@@ -783,7 +884,7 @@ fn insert_blank(
     height: f32,
     progress: &mut dyn FnMut(u32),
 ) -> Result<PagesResponse, Failure> {
-    let count = editable(engine, doc)?;
+    let count = editable_list(engine, doc)?;
     if at as usize > count {
         return fail(
             ErrorCode::PageOutOfRange,
@@ -804,8 +905,16 @@ fn insert_blank(
         );
     }
     let token = take_snapshot(engine, doc, progress)?;
+    let fail_at = tools(engine, doc).fail_at();
     let result = (|| {
         let document = engine.docs.get_mut(&doc).ok_or_else(gone)?;
+        if injected(fail_at, 0) {
+            // After the page is added, as a failure in the check would be.
+            let _ = document
+                .pages_mut()
+                .create_page_at_index(PdfPagePaperSize::a4(), 0);
+            return Err(failed("a failure made by a test"));
+        }
         document
             .pages_mut()
             .create_page_at_index(
@@ -821,8 +930,7 @@ fn insert_blank(
         Ok(())
     })();
     if let Err(e) = result {
-        roll_back(engine, pdfium, doc, token);
-        return Err(e);
+        return Err(recover(engine, pdfium, doc, token, e));
     }
     changed(engine, doc, token, 1)
 }
@@ -922,7 +1030,7 @@ fn import_end(
     at: u32,
     progress: &mut dyn FnMut(u32),
 ) -> Result<PagesResponse, Failure> {
-    let count = editable(engine, doc)?;
+    let count = editable_list(engine, doc)?;
     let Some(import) = engine.tools.get_mut(&doc).and_then(|t| t.import.take()) else {
         return fail(ErrorCode::InvalidRequest, "no insert is under way");
     };
@@ -977,8 +1085,7 @@ fn import_end(
         Ok(())
     })();
     if let Err(e) = result {
-        roll_back(engine, pdfium, doc, token);
-        return Err(e);
+        return Err(recover(engine, pdfium, doc, token, e));
     }
     changed(engine, doc, token, added)
 }
@@ -990,7 +1097,7 @@ fn export_begin(
     pages: &[u32],
     progress: &mut dyn FnMut(u32),
 ) -> Result<PagesResponse, Failure> {
-    let count = editable(engine, doc)?;
+    let count = editable_list(engine, doc)?;
     if pages.is_empty() || pages.len() > MAX_EDIT_PAGES {
         return fail(
             ErrorCode::InvalidRequest,

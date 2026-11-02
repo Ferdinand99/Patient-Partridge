@@ -152,7 +152,7 @@
         send(args.progress, index++, [step * 10, total]);
       }
     } else {
-      send(args.progress, index++, [total, total]);
+      send(args.progress, index, [total, total]);
       if (pg.delay) await delay(pg.delay);
     }
     const snapshot = keep(m);

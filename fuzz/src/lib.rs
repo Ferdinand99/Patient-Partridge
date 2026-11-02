@@ -6,8 +6,10 @@
 //! that go past a limit on purpose are in `caps`.
 
 mod caps;
+mod pages;
 
 pub use caps::*;
+pub use pages::*;
 
 use std::io::{self, Read};
 
@@ -78,7 +80,7 @@ pub fn sanitized(rect: [f32; 4]) -> [f32; 4] {
 /// A request that the encoder writes without cutting anything.
 pub fn arb_request(u: &mut Unstructured) -> Result<Request> {
     let id: u32 = u.arbitrary()?;
-    let body = match u.int_in_range(0..=13u8)? {
+    let body = match u.int_in_range(0..=14u8)? {
         0 => RequestBody::Hello {
             protocol_version: u.arbitrary()?,
         },
@@ -136,7 +138,8 @@ pub fn arb_request(u: &mut Unstructured) -> Result<Request> {
         12 => RequestBody::Fingerprint {
             doc: u.arbitrary()?,
         },
-        _ => RequestBody::FontReport,
+        13 => RequestBody::FontReport,
+        _ => RequestBody::Pages(arb_pages_request(u)?),
     };
     Ok(Request { id, body })
 }
@@ -161,7 +164,7 @@ pub struct GeneratedResponse {
 
 pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
     let id: u32 = u.arbitrary()?;
-    let (sent, expected) = match u.int_in_range(0..=15u8)? {
+    let (sent, expected) = match u.int_in_range(0..=16u8)? {
         0 => {
             let b = ResponseBody::Hello {
                 protocol_version: u.arbitrary()?,
@@ -289,7 +292,13 @@ pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
             (b.clone(), b)
         }
         8 => {
-            let code = ErrorCode::from_u8(u.int_in_range(1..=17u8)?).expect("1 to 17 are codes");
+            // The codes of the reader and the save, and now and then those of the page tools.
+            let raw = if chance(u, 6)? {
+                u.int_in_range(40..=44u8)?
+            } else {
+                u.int_in_range(1..=17u8)?
+            };
+            let code = ErrorCode::from_u8(raw).expect("1 to 17 and 40 to 44 are codes");
             let b = ResponseBody::Error {
                 code,
                 message: string_up_to(u, MAX_STRING_LEN)?,
@@ -345,7 +354,7 @@ pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
             };
             (b.clone(), b)
         }
-        _ => {
+        15 => {
             // Any scripts, in the order of the list, as the engine reports them.
             let mut missed = Vec::new();
             for script in FontScript::ALL {
@@ -354,6 +363,10 @@ pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
                 }
             }
             let b = ResponseBody::FontReport { missed };
+            (b.clone(), b)
+        }
+        _ => {
+            let b = ResponseBody::Pages(arb_pages_response(u)?);
             (b.clone(), b)
         }
     };

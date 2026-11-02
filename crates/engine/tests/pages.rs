@@ -1801,3 +1801,92 @@ fn a_circular_page_tree_and_a_very_deep_one_do_not_hang_the_tools() {
         let _ = info(e, doc);
     }
 }
+
+// ---- a change that fails half way ---------------------------------------------------------------
+
+#[test]
+fn a_change_that_fails_half_way_leaves_the_document_as_it_was_when_a_copy_was_kept() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    for (name, make, step) in [
+        (
+            "delete",
+            (|doc| PagesRequest::Delete {
+                doc,
+                pages: vec![1, 2, 3],
+            }) as fn(u32) -> PagesRequest,
+            2usize,
+        ),
+        (
+            "move",
+            |doc| PagesRequest::Reorder {
+                doc,
+                order: vec![4, 3, 2, 1, 0],
+            },
+            2,
+        ),
+        (
+            "blank page",
+            |doc| PagesRequest::InsertBlank {
+                doc,
+                at: 2,
+                width: 100.0,
+                height: 100.0,
+            },
+            0,
+        ),
+    ] {
+        let (doc, _f) = open_doc(e, &kit::marked_pdf(5));
+        let start = fingerprint(e, doc);
+        e.set_page_tools_for_tests(doc, PageTools::default().failing_at(step));
+        assert_eq!(
+            page_op(e, make(doc)).unwrap_err(),
+            ErrorCode::PageChangeFailed,
+            "{name}"
+        );
+        // The pages are exactly what they were, in the file too, and the tools go on working.
+        assert_eq!(fingerprint(e, doc), start, "{name}");
+        assert_eq!(order_of(e, doc, 5), vec![0, 1, 2, 3, 4], "{name}");
+        let saved = save_all(e, doc);
+        for page in 0..5 {
+            assert_has(&saved, page);
+        }
+        changed(page_op(
+            e,
+            PagesRequest::Rotate {
+                doc,
+                pages: vec![0],
+                turns: 1,
+            },
+        ));
+    }
+}
+
+#[test]
+fn a_change_that_fails_half_way_without_a_copy_closes_the_document_instead_of_keeping_half_of_it() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let (doc, _f) = open_doc(e, &kit::marked_pdf(5));
+    // No room for a copy, so there is nothing to go back to when the change fails.
+    e.set_page_tools_for_tests(doc, PageTools::with_limits(100, 10).failing_at(1));
+    assert_eq!(
+        page_op(
+            e,
+            PagesRequest::Delete {
+                doc,
+                pages: vec![1, 2, 3]
+            }
+        )
+        .unwrap_err(),
+        ErrorCode::UnknownDocument
+    );
+    // What was left, with some of the pages gone, can neither be read nor saved.
+    for body in [
+        RequestBody::DocInfo { doc },
+        RequestBody::SaveBegin { doc },
+        RequestBody::Fingerprint { doc },
+        RequestBody::PageText { doc, page: 0 },
+    ] {
+        assert_eq!(code_of(ask(e, body)), ErrorCode::UnknownDocument);
+    }
+}

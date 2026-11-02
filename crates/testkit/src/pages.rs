@@ -358,3 +358,20 @@ pub fn odd_boxes_pdf() -> Vec<u8> {
 pub fn pdf_from_specs(specs: &[super::PageSpec]) -> Vec<u8> {
     super::build(specs, "", "", Vec::new())
 }
+
+/// A page tree with three pages whose list of kids names a thing that is not a page: `kid` is the
+/// text put in the second place of the list (a reference to an object that is not there, to a null
+/// object, to a number, to the catalog).
+pub fn broken_page_list_pdf(kid: &str) -> Vec<u8> {
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        format!("<< /Type /Pages /Kids [3 0 R {kid} 5 0 R] /Count 3 >>").into_bytes(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec(),
+        b"null".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec(),
+    ];
+    assemble(&objects, "")
+}
+
+/// The things `broken_page_list_pdf` is tried with.
+pub const BROKEN_KIDS: [&str; 5] = ["4 0 R", "99 0 R", "42", "1 0 R", "(text)"];
