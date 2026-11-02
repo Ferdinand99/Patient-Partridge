@@ -1,5 +1,7 @@
 // Keyboard shortcuts of the viewer, as pure data: a key press goes in, an action comes out.
 
+import { type Tool, toolForKey } from "../lib/annotations";
+
 export interface KeyInfo {
   key: string;
   ctrlKey: boolean;
@@ -31,7 +33,10 @@ export type Action =
   | { type: "save" }
   | { type: "save-as" }
   | { type: "undo" }
-  | { type: "redo" };
+  | { type: "redo" }
+  /** A plain letter that picks a tool of the annotation bar. */
+  | { type: "tool"; tool: Tool }
+  | { type: "toggle-annotations" };
 
 /** CSS pixels one arrow key press scrolls. */
 export const LINE_SCROLL = 48;
@@ -73,7 +78,7 @@ export function actionForKey(e: KeyInfo): Action | null {
         return { type: "find" };
       case "a":
       case "A":
-        return { type: "select-all" };
+        return { type: e.shiftKey ? "toggle-annotations" : "select-all" };
       case "p":
       case "P":
         return { type: "print" };
@@ -122,8 +127,11 @@ export function actionForKey(e: KeyInfo): Action | null {
       return { type: "go-first" };
     case "End":
       return { type: "go-last" };
-    default:
-      return null;
+    default: {
+      // A single letter picks a tool of the annotation bar (V, H, U, T, N, P, M).
+      const tool = e.shiftKey ? null : toolForKey(e.key);
+      return tool ? { type: "tool", tool } : null;
+    }
   }
 }
 

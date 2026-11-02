@@ -326,6 +326,473 @@ pub fn signed_without_field_pdf() -> Vec<u8> {
     build(&specs, "/Perms << /DocMDP 6 0 R >>", "", extras)
 }
 
+/// The text of the page of `annotated_pdf`: "Hello Partridge" as a title at (72, 740) and three
+/// lines from (72, 400) going down by 16 points.
+pub const ANNOTATED_PAGE_TEXT: &str = "Hello Partridge";
+
+/// A hex string of the UTF-16 text of a PDF text string (with the byte order mark).
+fn pdf_text(text: &str) -> String {
+    let mut out = String::from("<FEFF");
+    for unit in text.encode_utf16() {
+        let _ = write!(out, "{unit:04X}");
+    }
+    out.push('>');
+    out
+}
+
+/// A document whose first page holds annotations made by "another program", none of them with an
+/// appearance stream of its own: a yellow-red highlight over the title with a comment, a sticky
+/// note, a drawing, a stamp, a text box, and a link. The second page is plain.
+///
+/// The author names, the comments and the places are for the tests to check; the engine has to
+/// show these, let them be changed or removed, and write nothing of its own over them.
+pub fn annotated_pdf() -> Vec<u8> {
+    let page1 = "BT /F1 24 Tf 72 740 Td (Hello Partridge) Tj ET\n\
+BT /F1 12 Tf 72 400 Td 16 TL (A needle in a haystack.) Tj T* (Another NEEDLE here and quick) Tj T* (brown fox) Tj ET\n"
+        .to_string();
+    let specs = [
+        PageSpec {
+            width: 612,
+            height: 792,
+            content: Some(page1),
+            extra: "/Annots [8 0 R 9 0 R 10 0 R 11 0 R 12 0 R 13 0 R]".into(),
+        },
+        PageSpec {
+            width: 612,
+            height: 792,
+            content: Some(demo_content(2, 612, 792)),
+            extra: String::new(),
+        },
+    ];
+    let extras: Vec<Vec<u8>> = vec![
+        // 8: a highlight over the title, red
+        format!(
+            "<< /Type /Annot /Subtype /Highlight /Rect [72 735 200 765] /QuadPoints [72 765 200 765 72 735 200 735] /C [1 0 0] /Contents {} /T {} /F 4 >>",
+            pdf_text("Check this title"),
+            pdf_text("Alice")
+        )
+        .into_bytes(),
+        // 9: a sticky note
+        format!(
+            "<< /Type /Annot /Subtype /Text /Rect [300 700 320 720] /C [1 1 0] /Name /Comment /Contents {} /T {} /F 4 >>",
+            pdf_text("A note from the file \u{2713}"),
+            pdf_text("Bob")
+        )
+        .into_bytes(),
+        // 10: a drawing
+        b"<< /Type /Annot /Subtype /Ink /Rect [100 300 200 350] /InkList [[100 300 150 350 200 300]] /C [0 0 1] /BS << /W 3 >> /Contents (Ink) /F 4 >>".to_vec(),
+        // 11: a stamp
+        b"<< /Type /Annot /Subtype /Stamp /Rect [400 600 500 650] /Name /Approved /Contents (Stamp) /F 4 >>".to_vec(),
+        // 12: a text box
+        b"<< /Type /Annot /Subtype /FreeText /Rect [72 500 300 540] /Contents (A text box) /DA (/Helv 12 Tf 0 g) /F 4 >>".to_vec(),
+        // 13: a link, which the annotation list leaves out
+        b"<< /Type /Annot /Subtype /Link /Rect [72 650 172 670] /Border [0 0 0] /A << /S /URI /URI (https://example.com/page) >> >>".to_vec(),
+    ];
+    build(&specs, "", "", extras)
+}
+
+/// A document with annotations that try to make a reader misbehave: a comment and an author far
+/// longer than any limit, control characters and direction marks in the text, text that looks like
+/// markup, and a box that is a million points wide. The first page has them; the engine has to
+/// cut, clean and bound all of it, and show it only as text.
+pub fn hostile_annots_pdf() -> Vec<u8> {
+    let specs = [PageSpec {
+        width: 612,
+        height: 792,
+        content: Some(demo_content(1, 612, 792)),
+        extra: "/Annots [6 0 R 7 0 R 8 0 R]".into(),
+    }];
+    let long = "x".repeat(60_000);
+    let extras: Vec<Vec<u8>> = vec![
+        format!(
+            "<< /Type /Annot /Subtype /Text /Rect [100 100 120 120] /Contents {} /T {} /F 4 >>",
+            pdf_text(&long),
+            pdf_text(&"A".repeat(10_000))
+        )
+        .into_bytes(),
+        format!(
+            "<< /Type /Annot /Subtype /Text /Rect [200 100 220 120] /Contents {} /T {} /F 4 >>",
+            pdf_text("<img src=x onerror=alert(1)>\u{7}bell\u{202E}evil\u{200B}\r\nsecond line"),
+            pdf_text("<b>author</b>")
+        )
+        .into_bytes(),
+        b"<< /Type /Annot /Subtype /Square /Rect [-1000000 -1000000 1000000 1000000] /C [0 1 0] /Contents (huge) /F 4 >>".to_vec(),
+    ];
+    build(&specs, "", "", extras)
+}
+
+/// Markers in the text of `foreign_annots_pdf`, for the tests to look for.
+pub const FOREIGN_LONG_END: &str = "LONGCOMMENTEND";
+
+/// The comment of the first highlight of `foreign_annots_pdf`: about 6 KiB, with lines ended by
+/// CR as Acrobat writes them.
+pub fn foreign_long_comment() -> String {
+    let mut text = String::new();
+    let mut n = 0;
+    while text.len() < 6000 {
+        text.push_str(&format!("paragraph {n} of the long comment\r"));
+        n += 1;
+    }
+    text.push_str(FOREIGN_LONG_END);
+    text
+}
+
+fn binary_stream(dict: &str, body: &[u8]) -> Vec<u8> {
+    let mut out = format!("<< {dict} /Length {} >>\nstream\n", body.len()).into_bytes();
+    out.extend_from_slice(body);
+    out.extend_from_slice(b"\nendstream");
+    out
+}
+
+fn deflate(data: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(data).expect("compressing in memory");
+    encoder.finish().expect("compressing in memory")
+}
+
+/// A one page document with annotations written the way Acrobat writes them, for the tests of
+/// what the reader must not lose or leave behind (objects 6 to 19 are the annotations):
+/// - 6: a highlight with a long comment (CR line ends), rich text, name, dates, opacity, a layer,
+///   a subject, an author and a popup (7); 8 is a reply to it.
+/// - 10, 12: text boxes whose words are in their appearance stream (11 plain, 13 compressed).
+/// - 14, 15: stamps that are locked and read-only; 16: a note whose contents are locked.
+/// - 17: a highlight whose comment has a CR; 18: a highlight with a comment, rich text and a
+///   subject that must be gone from the file when it is deleted, with a popup (19) that has text.
+pub fn foreign_annots_pdf() -> Vec<u8> {
+    let specs = [PageSpec {
+        width: 612,
+        height: 792,
+        content: Some(demo_content(1, 612, 792)),
+        extra:
+            "/Annots [6 0 R 7 0 R 8 0 R 10 0 R 12 0 R 14 0 R 15 0 R 16 0 R 17 0 R 18 0 R 19 0 R]"
+                .into(),
+    }];
+    let quad = |x0: u32, y0: u32| {
+        format!(
+            "/Rect [{x0} {y0} {} {}] /QuadPoints [{x0} {} {} {} {x0} {y0} {} {y0}]",
+            x0 + 128,
+            y0 + 20,
+            y0 + 20,
+            x0 + 128,
+            y0 + 20,
+            x0 + 128
+        )
+    };
+    let font =
+        "/Resources << /Font << /Helv << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >>";
+    let plain_ap = binary_stream(
+        &format!("/Type /XObject /Subtype /Form /BBox [0 0 228 40] {font}"),
+        b"BT /Helv 12 Tf 2 20 Td (APSECRETONE) Tj ET",
+    );
+    let packed_ap = binary_stream(
+        &format!("/Type /XObject /Subtype /Form /BBox [0 0 228 40] {font} /Filter /FlateDecode"),
+        &deflate(b"BT /Helv 12 Tf 2 20 Td (APSECRETTWO) Tj ET"),
+    );
+    let extras: Vec<Vec<u8>> = vec![
+        // 6
+        format!(
+            "<< /Type /Annot /Subtype /Highlight {} /C [1 0.5 0] /CA 0.5 /Contents {} /RC {} /NM (NMMARKER) /M (D:20240102030405Z) /CreationDate (D:20230101000000Z) /OC 9 0 R /Popup 7 0 R /Subj {} /T {} /F 4 >>",
+            quad(72, 700),
+            pdf_text(&foreign_long_comment()),
+            pdf_text("<?xml version=\"1.0\"?><body xmlns=\"http://www.w3.org/1999/xhtml\"><p>RCMARKERONE</p></body>"),
+            pdf_text("SUBJMARKERONE"),
+            pdf_text("Alice"),
+        )
+        .into_bytes(),
+        // 7
+        b"<< /Type /Annot /Subtype /Popup /Rect [300 700 400 780] /Parent 6 0 R /Open true /F 28 >>"
+            .to_vec(),
+        // 8: a reply
+        format!(
+            "<< /Type /Annot /Subtype /Text /Rect [210 700 230 720] /IRT 6 0 R /RT /R /Contents {} /T {} /F 28 >>",
+            pdf_text("REPLYMARKER"),
+            pdf_text("Bob")
+        )
+        .into_bytes(),
+        // 9
+        b"<< /Type /OCG /Name (Comments) >>".to_vec(),
+        // 10
+        format!(
+            "<< /Type /Annot /Subtype /FreeText /Rect [72 500 300 540] /Contents {} /Subj {} /RC {} /DA (/Helv 12 Tf 0 g) /F 4 /AP << /N 11 0 R >> >>",
+            pdf_text("FREECONTENTSONE"),
+            pdf_text("FREESUBJONE"),
+            pdf_text("<body xmlns=\"http://www.w3.org/1999/xhtml\"><p>FREERCONE</p></body>"),
+        )
+        .into_bytes(),
+        // 11
+        plain_ap,
+        // 12
+        format!(
+            "<< /Type /Annot /Subtype /FreeText /Rect [72 440 300 480] /Contents {} /DA (/Helv 12 Tf 0 g) /F 4 /AP << /N 13 0 R >> >>",
+            pdf_text("FREECONTENTSTWO"),
+        )
+        .into_bytes(),
+        // 13
+        packed_ap,
+        // 14: locked stamp
+        b"<< /Type /Annot /Subtype /Stamp /Rect [400 600 500 650] /Name /Approved /Contents (LOCKEDSTAMP) /F 132 >>".to_vec(),
+        // 15: read-only stamp
+        b"<< /Type /Annot /Subtype /Stamp /Rect [400 540 500 590] /Name /Draft /Contents (READONLYSTAMP) /F 68 >>".to_vec(),
+        // 16: a note whose contents are locked
+        format!(
+            "<< /Type /Annot /Subtype /Text /Rect [300 300 320 320] /Contents {} /T {} /F 516 >>",
+            pdf_text("LOCKEDCONTENTS"),
+            pdf_text("Carol")
+        )
+        .into_bytes(),
+        // 17
+        format!(
+            "<< /Type /Annot /Subtype /Highlight {} /C [0 1 0] /Contents {} /T {} /F 4 >>",
+            quad(72, 650),
+            pdf_text("line one\rline two"),
+            pdf_text("Dave")
+        )
+        .into_bytes(),
+        // 18
+        format!(
+            "<< /Type /Annot /Subtype /Highlight {} /C [0 0 1] /Contents {} /RC {} /Subj {} /T {} /Popup 19 0 R /M (D:20240303040506Z) /F 4 >>",
+            quad(72, 600),
+            pdf_text("salary 90k"),
+            pdf_text("<body xmlns=\"http://www.w3.org/1999/xhtml\"><p>RCSALARY</p></body>"),
+            pdf_text("SUBJSALARY"),
+            pdf_text("Erin")
+        )
+        .into_bytes(),
+        // 19
+        format!(
+            "<< /Type /Annot /Subtype /Popup /Rect [300 600 400 680] /Parent 18 0 R /Contents {} /F 28 >>",
+            pdf_text("POPUPSECRET")
+        )
+        .into_bytes(),
+    ];
+    build(&specs, "", "", extras)
+}
+
+/// A one page document with annotations from a file whose appearance is not a plain filled path
+/// (objects 6, 9, 11 and 13 are the annotations):
+/// - 6: a red highlight (`NESTEDONE`); the red is in the form that the appearance draws.
+/// - 9: a highlight (`NESTEDTWO`) with a blue `/C` whose appearance draws nothing a colour can be
+///   read from (it holds the comment `NOCOLOURAP`).
+/// - 11: a highlight (`STROKEDHL`) whose appearance strokes a thick red line instead of filling a
+///   box, after a path that paints nothing (a green one that ends in `n`).
+/// - 13: an underline (`FILLEDUL`) whose appearance fills a thin red box instead of stroking a line.
+pub fn nested_appearance_pdf() -> Vec<u8> {
+    let specs = [PageSpec {
+        width: 612,
+        height: 792,
+        content: Some(demo_content(1, 612, 792)),
+        extra: "/Annots [6 0 R 9 0 R 11 0 R 13 0 R]".into(),
+    }];
+    let quad = "/Rect [72 700 200 720] /QuadPoints [72 720 200 720 72 700 200 700]";
+    let extras: Vec<Vec<u8>> = vec![
+        // 6
+        format!(
+            "<< /Type /Annot /Subtype /Highlight {quad} /C [1 0 0] /Contents (NESTEDONE) /F 4 /AP << /N 7 0 R >> >>"
+        )
+        .into_bytes(),
+        // 7: draws the form 8
+        binary_stream(
+            "/Type /XObject /Subtype /Form /BBox [72 700 200 720] /Resources << /XObject << /Fm0 8 0 R >> >>",
+            b"/Fm0 Do",
+        ),
+        // 8
+        binary_stream(
+            "/Type /XObject /Subtype /Form /BBox [72 700 200 720]",
+            b"1 0 0 rg 72 700 128 20 re f",
+        ),
+        // 9
+        format!(
+            "<< /Type /Annot /Subtype /Highlight {quad} /C [0 0 1] /Contents (NESTEDTWO) /F 4 /AP << /N 10 0 R >> >>"
+        )
+        .into_bytes(),
+        // 10
+        binary_stream(
+            "/Type /XObject /Subtype /Form /BBox [72 700 200 720]",
+            b"% NOCOLOURAP\nq Q",
+        ),
+        // 11
+        format!(
+            "<< /Type /Annot /Subtype /Highlight {quad} /C [1 0 0] /Contents (STROKEDHL) /F 4 /AP << /N 12 0 R >> >>"
+        )
+        .into_bytes(),
+        // 12
+        binary_stream(
+            "/Type /XObject /Subtype /Form /BBox [72 700 200 720]",
+            b"0 1 0 RG 72 690 m 200 690 l n 1 0 0 RG 18 w 72 710 m 200 710 l S",
+        ),
+        // 13
+        format!(
+            "<< /Type /Annot /Subtype /Underline {quad} /C [1 0 0] /Contents (FILLEDUL) /F 4 /AP << /N 14 0 R >> >>"
+        )
+        .into_bytes(),
+        // 14
+        binary_stream(
+            "/Type /XObject /Subtype /Form /BBox [72 700 200 720]",
+            b"1 0 0 rg 72 700 128 2 re f",
+        ),
+    ];
+    build(&specs, "", "", extras)
+}
+
+/// A one page document with a highlight whose `/Popup` names a locked stamp, not a popup
+/// (objects 6 and 7; the stamp holds `STAMPSTAYS`), and a note that a file puts partly outside
+/// its page, at `/Rect [-10 600 10 620]` (object 8, `EDGENOTE`).
+pub fn odd_links_pdf() -> Vec<u8> {
+    let specs = [PageSpec {
+        width: 612,
+        height: 792,
+        content: Some(demo_content(1, 612, 792)),
+        extra: "/Annots [6 0 R 7 0 R 8 0 R]".into(),
+    }];
+    let extras: Vec<Vec<u8>> = vec![
+        // 6
+        b"<< /Type /Annot /Subtype /Highlight /Rect [72 700 200 720] /QuadPoints [72 720 200 720 72 700 200 700] /C [1 1 0] /Contents (OWNERWORDS) /Popup 7 0 R /F 4 >>"
+            .to_vec(),
+        // 7
+        b"<< /Type /Annot /Subtype /Stamp /Rect [400 600 500 650] /Name /Approved /Contents (STAMPSTAYS) /F 132 >>"
+            .to_vec(),
+        // 8
+        b"<< /Type /Annot /Subtype /Text /Rect [-10 600 10 620] /Name /Note /Contents (EDGENOTE) /F 4 >>"
+            .to_vec(),
+    ];
+    build(&specs, "", "", extras)
+}
+
+/// A one page document with a free text box that has no appearance stream (the entry is optional):
+/// PDFium makes the appearance, with the words in it, when the page is drawn.
+pub fn free_text_without_appearance_pdf() -> Vec<u8> {
+    let specs = [PageSpec {
+        width: 612,
+        height: 792,
+        content: Some(demo_content(1, 612, 792)),
+        extra: "/Annots [6 0 R]".into(),
+    }];
+    let extras: Vec<Vec<u8>> = vec![
+        b"<< /Type /Annot /Subtype /FreeText /Rect [72 500 300 540] /Contents (BAREFREEWORDS) /DA (/Helv 12 Tf 0 g) /F 4 >>"
+            .to_vec(),
+    ];
+    build(&specs, "", "", extras)
+}
+
+/// The forms in which a text can be in a saved file: as it is, as UTF-16 and as the hex strings
+/// of both. A text is there when any form is in the file or in a stream that has been inflated.
+pub fn text_in_file(file: &[u8], text: &str) -> bool {
+    fn find(haystack: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+    }
+    let ascii = text.as_bytes().to_vec();
+    let utf16: Vec<u8> = text.encode_utf16().flat_map(|u| u.to_be_bytes()).collect();
+    let hex_of = |bytes: &[u8], upper: bool| -> Vec<u8> {
+        bytes
+            .iter()
+            .flat_map(|b| {
+                if upper {
+                    format!("{b:02X}")
+                } else {
+                    format!("{b:02x}")
+                }
+                .into_bytes()
+            })
+            .collect()
+    };
+    let needles = [
+        ascii.clone(),
+        utf16.clone(),
+        hex_of(&ascii, true),
+        hex_of(&ascii, false),
+        hex_of(&utf16, true),
+        hex_of(&utf16, false),
+    ];
+    let mut haystacks: Vec<Vec<u8>> = vec![file.to_vec()];
+    // Every stream, inflated when it can be.
+    let mut at = 0;
+    while let Some(start) = file[at..]
+        .windows(6)
+        .position(|w| w == b"stream")
+        .map(|p| p + at)
+    {
+        let mut body = start + 6;
+        if file.get(body) == Some(&b'\r') {
+            body += 1;
+        }
+        if file.get(body) == Some(&b'\n') {
+            body += 1;
+        }
+        let Some(end) = file[body..]
+            .windows(9)
+            .position(|w| w == b"endstream")
+            .map(|p| p + body)
+        else {
+            break;
+        };
+        {
+            use std::io::Read as _;
+            let mut out = Vec::new();
+            if flate2::read::ZlibDecoder::new(&file[body..end])
+                .take(64 << 20)
+                .read_to_end(&mut out)
+                .is_ok()
+                && !out.is_empty()
+            {
+                haystacks.push(out);
+            }
+        }
+        at = end + 9;
+    }
+    haystacks.iter().any(|h| needles.iter().any(|n| find(h, n)))
+}
+
+/// A one page document with `count` sticky notes in a grid, numbered in their text.
+pub fn many_annots_pdf(count: usize) -> Vec<u8> {
+    let first = 6;
+    let refs: String = (0..count).map(|i| format!("{} 0 R ", first + i)).collect();
+    let specs = [PageSpec {
+        width: 612,
+        height: 792,
+        content: Some(demo_content(1, 612, 792)),
+        extra: format!("/Annots [{refs}]"),
+    }];
+    let extras: Vec<Vec<u8>> = (0..count)
+        .map(|i| {
+            let x = 10 + (i % 25) * 22;
+            let y = 10 + (i / 25) * 22;
+            format!(
+                "<< /Type /Annot /Subtype /Text /Rect [{x} {y} {} {}] /Contents (Note {i}) /F 4 >>",
+                x + 20,
+                y + 20
+            )
+            .into_bytes()
+        })
+        .collect();
+    build(&specs, "", "", extras)
+}
+
+/// Five pages with the same text, turned in every way a page can be: not turned, a quarter turn,
+/// a half turn, three quarters, and a quarter turn with a crop box that does not start at zero.
+/// Every page says "Line 0 of page N: the quick brown fox jumps over the lazy dog." on its first
+/// line of text.
+pub fn turned_pdf() -> Vec<u8> {
+    let turns = ["/Rotate 0", "/Rotate 90", "/Rotate 180", "/Rotate 270"];
+    let mut specs: Vec<PageSpec> = turns
+        .iter()
+        .enumerate()
+        .map(|(i, extra)| PageSpec {
+            width: 612,
+            height: 792,
+            content: Some(demo_content(i + 1, 612, 792)),
+            extra: extra.to_string(),
+        })
+        .collect();
+    specs.push(PageSpec {
+        width: 612,
+        height: 792,
+        content: Some(demo_content(5, 612, 792)),
+        extra: "/Rotate 90 /CropBox [50 60 500 700]".to_string(),
+    });
+    build(&specs, "", "", Vec::new())
+}
+
 /// Letters of the right-to-left test page, in reading order: the first ten letters of the Hebrew
 /// alphabet (U+05D0 to U+05D9).
 pub const RTL_LINE: &str = "\u{5d0}\u{5d1}\u{5d2}\u{5d3}\u{5d4}\u{5d5}\u{5d6}\u{5d7}\u{5d8}\u{5d9}";
@@ -763,17 +1230,59 @@ fn rc4(key: &[u8], data: &[u8]) -> Vec<u8> {
 /// `user_password` to open. The pages are blank so nothing has to be encrypted besides the
 /// handler's own entries.
 pub fn encrypted_pdf(user_password: &str, pages: usize) -> Vec<u8> {
+    encrypted_pdf_with_permissions(user_password, pages, -4)
+}
+
+/// As `encrypted_pdf`, with the permission bits the file grants (`-4` grants everything; clear
+/// bit 6, value 32, to forbid annotating).
+pub fn encrypted_pdf_with_permissions(
+    user_password: &str,
+    pages: usize,
+    permissions: i32,
+) -> Vec<u8> {
+    encrypted_pdf_impl(user_password, None, pages, permissions)
+}
+
+/// As `encrypted_pdf_with_permissions`, with an owner password that opens the document with every
+/// permission whatever the file grants the user.
+pub fn encrypted_pdf_with_owner(
+    user_password: &str,
+    owner_password: &str,
+    pages: usize,
+    permissions: i32,
+) -> Vec<u8> {
+    encrypted_pdf_impl(user_password, Some(owner_password), pages, permissions)
+}
+
+fn encrypted_pdf_impl(
+    user_password: &str,
+    owner_password: Option<&str>,
+    pages: usize,
+    permissions: i32,
+) -> Vec<u8> {
     let mut padded = [0u8; 32];
     let pw = user_password.as_bytes();
     let n = pw.len().min(32);
     padded[..n].copy_from_slice(&pw[..n]);
     padded[n..].copy_from_slice(&PADDING[..32 - n]);
 
-    // The owner entry only matters for the owner password, which these files do not use.
-    let owner: Vec<u8> = (0u8..32)
-        .map(|i| i.wrapping_mul(7).wrapping_add(3))
-        .collect();
-    let permissions: i32 = -4;
+    // The owner entry (algorithm 3, revision 2): the padded user password, encrypted with a key
+    // made from the owner password. Without an owner password it is filler nobody can open with.
+    let owner: Vec<u8> = match owner_password {
+        Some(owner_password) => {
+            let mut padded_owner = [0u8; 32];
+            let ow = owner_password.as_bytes();
+            let m = ow.len().min(32);
+            padded_owner[..m].copy_from_slice(&ow[..m]);
+            padded_owner[m..].copy_from_slice(&PADDING[..32 - m]);
+            let mut md5 = Md5::new();
+            md5.update(padded_owner);
+            rc4(&md5.finalize()[..5], &padded)
+        }
+        None => (0u8..32)
+            .map(|i| i.wrapping_mul(7).wrapping_add(3))
+            .collect(),
+    };
     let id: [u8; 16] = *b"partridge-test-1";
 
     // Algorithm 2 for revision 2: the file key.

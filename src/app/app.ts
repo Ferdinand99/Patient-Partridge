@@ -3,6 +3,7 @@
 // storage) comes in through `AppDeps`, so tests can run the whole flow with fakes.
 
 import type { OpenedDocument, OutlineEntry, SavedFile, SavedPosition } from "../lib/api";
+import { PALETTE, PEN_WIDTHS, type Annotation, type Tool } from "../lib/annotations";
 import { describeError, fileNameOf, isEngineLost, toAppError, type AppErrorLike } from "../lib/errors";
 import { classifyUri, visibleAddress } from "../lib/linkPolicy";
 import { parsePageInput } from "../lib/pageInput";
@@ -21,6 +22,8 @@ import type { CopyResult, PageLinkInfo } from "../viewer/overlays";
 import { DocumentView, type ViewPosition, type ViewerOptions } from "../viewer/viewer";
 import { zoomLabel, type ZoomMode } from "../viewer/zoom";
 import { FindBar } from "./find";
+import { Annotator, CLEAN_REFUSALS, annotationNotice, type AnnotatorApi } from "./annotator";
+import { AnnotBar } from "./annotbar";
 import { EditHistory, type Edit } from "./history";
 import { MenuController } from "./menu";
 import {
@@ -58,7 +61,10 @@ export interface AppDeps {
     saveAs(doc: number, allowSigned: boolean): Promise<SavedFile | null>;
     quitApp(): Promise<void>;
     stayOpen(): Promise<void>;
-  };
+  } & Partial<AnnotatorApi> & {
+      /** The annotations of a page. Without it, and without the other annotation calls, the annotation bar is off. */
+      listAnnotations?(doc: number, page: number): Promise<Annotation[]>;
+    };
   /** Shows the file dialog. Resolves with the chosen paths, or an empty list when cancelled. */
   pickFiles(): Promise<string[]>;
   setWindowTitle(title: string): void;
@@ -99,6 +105,8 @@ interface Tab {
   /** Set while the document is being saved; resolves with the answer of that save. */
   saving: Promise<boolean> | null;
   view: DocumentView;
+  /** The annotations of the document, or null when the app process offers none. */
+  annotator: Annotator | null;
   /** What the side panel knows about this document. */
   sidebarDoc: SidebarDocument;
   saveTimer: ReturnType<typeof setTimeout> | undefined;
@@ -212,6 +220,13 @@ export class App {
   private readonly sidebar: Sidebar;
   private readonly find: FindBar;
   private readonly selectionProxy: HTMLElement;
+  private readonly annotbar: AnnotBar;
+  private readonly annotStatus: HTMLElement;
+  private readonly popovers: HTMLElement;
+  /** Whether the annotation bar is shown. */
+  private annotOpen = false;
+  /** Makes the same sentence be read twice in a row. */
+  private announceFlip = false;
   private readonly copyStatus: HTMLElement;
   /** The line of each running copy (copies of different tabs can run together) shows in one place. */
   private readonly copyLines = new Map<DocumentView, string>();
@@ -242,6 +257,25 @@ export class App {
     });
     this.menu = new MenuController(byId(root, "menu-button"), byId(root, "menu"));
     this.selectionProxy = byId(root, "sel-proxy");
+    this.annotStatus = byId(root, "annot-status");
+    this.popovers = byId(root, "annot-popovers");
+    this.annotbar = new AnnotBar(root, {
+      toggle: (open) => this.setAnnotating(open, true),
+      setTool: (tool) => this.active?.annotator?.setTool(tool),
+      setColor: (color) => this.active?.annotator?.setColor(color),
+      setPenWidth: (width) => this.active?.annotator?.setPenWidth(width),
+      setStamp: (stamp) => {
+        this.active?.annotator?.setStamp(stamp);
+        this.active?.view.element.focus({ preventScroll: true });
+      },
+      editText: () => {
+        const a = this.active?.annotator;
+        if (a?.selected) void a.editText(a.selected.page, a.selected.id);
+      },
+      remove: () => void this.active?.annotator?.removeSelected(),
+      undo: () => void this.undoActive(),
+      redo: () => void this.redoActive(),
+    });
     this.copyStatus = byId(root, "copy-status");
     this.printRoot = byId(root, "print-root");
     this.find = new FindBar(root, {
@@ -308,9 +342,17 @@ export class App {
     this.active?.history.push(edit);
   }
 
+  /**
+   * True when a document has changes that are not saved: the history says so, or a change is still
+   * being made, or text typed in the box of a note has not been saved yet.
+   */
+  private isDirty(tab: Tab): boolean {
+    return tab.history.dirty || (tab.annotator?.unsaved ?? false);
+  }
+
   /** How many documents have changes that are not saved. */
   get unsavedCount(): number {
-    return this.tabs.filter((t) => t.history.dirty).length;
+    return this.tabs.filter((t) => this.isDirty(t)).length;
   }
 
   /**
@@ -643,6 +685,7 @@ export class App {
       dirtyTold: false,
       saving: null,
       view: undefined as unknown as DocumentView,
+      annotator: null,
       sidebarDoc: undefined as unknown as SidebarDocument,
       saveTimer: undefined,
       forgottenAt: null,
@@ -679,16 +722,28 @@ export class App {
         onSelectionChange: (has) => {
           if (!has && this.active === tab) this.selectionProxy.textContent = "";
         },
-        onSelectionSettled: () => this.updateSelectionProxy(tab),
+        onSelectionSettled: () => {
+          tab.annotator?.selectionSettled();
+          this.updateSelectionProxy(tab);
+        },
         onTextLimit: () => void this.textLimitHit(tab),
         onScripts: () => {
           tab.sawScripts = true;
           void this.fontsMissed(tab);
         },
         onPageDrawn: () => void this.fontsMissed(tab),
+        annotations: {
+          onSelect: (page, id) => tab.annotator?.onSelect(page, id),
+          onPlace: (page, x, y, client) => tab.annotator?.onPlace(page, x, y, client),
+          onStroke: (page, points) => tab.annotator?.onStroke(page, points),
+          onMove: (page, id, dx, dy) => tab.annotator?.onMove(page, id, dx, dy),
+          onEdit: (page, id) => tab.annotator?.onEdit(page, id),
+          onLoadFailed: (page, error) => tab.annotator?.onLoadFailed(page, error),
+        },
       },
       { start: opened.position ?? null, limits: this.deps.viewLimits },
     );
+    tab.annotator = this.makeAnnotator(tab);
     tab.history.onChange(() => this.historyChanged(tab));
     tab.sidebarDoc = {
       doc: opened.doc,
@@ -788,7 +843,7 @@ export class App {
   async requestClose(id: number): Promise<boolean> {
     const tab = this.tabs.find((t) => t.id === id);
     if (!tab) return true;
-    if (!tab.history.dirty) {
+    if (!this.isDirty(tab)) {
       this.closeTab(id);
       return true;
     }
@@ -902,6 +957,7 @@ export class App {
       this.printJob.cleanup();
     }
     this.find.forget(tab.view);
+    tab.annotator?.destroy();
     tab.view.destroy();
     this.sidebar.forget(tab.doc);
     void this.deps.api.close(tab.doc).catch(() => undefined);
@@ -913,10 +969,112 @@ export class App {
     this.syncChrome();
   }
 
+  // ---- annotations -----------------------------------------------------------
+
+  /** The annotations of a document, if the app process offers the calls for them. */
+  private makeAnnotator(tab: Tab): Annotator | null {
+    const api = this.deps.api;
+    if (
+      !api.listAnnotations ||
+      !api.addMarkup ||
+      !api.addNote ||
+      !api.addInk ||
+      !api.addStamp ||
+      !api.updateAnnotation ||
+      !api.removeAnnotation ||
+      !api.restoreAnnotation
+    ) {
+      return null;
+    }
+    const annotator = new Annotator(tab.doc, tab.view, tab.history, api as AnnotatorApi, {
+      popovers: this.popovers,
+      announce: (text) => this.announce(text),
+      ask: (options) => showNotice(this.noticeLayer, options),
+      failed: (error) => void this.annotationFailed(tab, error),
+      changed: () => {
+        this.historyChanged(tab);
+        if (this.active === tab) this.syncAnnotBar();
+      },
+      pageChanged: (page) => this.sidebar.pageChanged(tab.doc, page),
+    });
+    // Reading is the way a page is shown until the bar is opened.
+    annotator.setReading(!this.annotOpen);
+    return annotator;
+  }
+
+  /** A change to an annotation failed. A lost engine ends the tab; anything else is told and forgotten. */
+  private async annotationFailed(tab: Tab, error: unknown): Promise<void> {
+    if (!this.tabs.includes(tab)) return;
+    const app = toAppError(error);
+    if (isEngineLost(app)) {
+      await this.documentLost(tab, app);
+      return;
+    }
+    const text = annotationNotice(app, tab.name);
+    await showNotice(this.noticeLayer, {
+      title: text.title,
+      detail: text.detail,
+      buttons: [{ id: "ok", label: "OK", primary: true }],
+    });
+  }
+
+  /** Says something to a screen reader, in the live region of the page. */
+  private announce(text: string): void {
+    this.announceFlip = !this.announceFlip;
+    this.annotStatus.textContent = this.announceFlip ? text : `${text}\u00a0`;
+  }
+
+  /** Shows or hides the annotation bar. Hiding it puts the pointer back to picking. */
+  private setAnnotating(open: boolean, focus = false): void {
+    this.annotOpen = open;
+    if (!open) {
+      for (const tab of this.tabs) tab.annotator?.setTool("select");
+    }
+    for (const tab of this.tabs) tab.annotator?.setReading(!open);
+    this.syncAnnotBar();
+    if (open && focus) this.annotbar.focusBar();
+  }
+
+  /** Picks a tool from the keyboard: the bar opens if it was closed. */
+  private chooseTool(tool: Tool): void {
+    const annotator = this.active?.annotator;
+    if (!annotator) return;
+    if (!this.annotOpen) this.setAnnotating(true);
+    if (tool === "stamp" && annotator.tool === "stamp") {
+      this.annotbar.openStampMenu();
+      return;
+    }
+    annotator.setTool(tool);
+    this.active?.view.element.focus({ preventScroll: true });
+  }
+
+  /** Brings the annotation bar in step with the document in front. */
+  private syncAnnotBar(): void {
+    const tab = this.active;
+    const annotator = tab?.annotator ?? null;
+    const picked = annotator?.current ?? null;
+    this.annotbar.render({
+      open: this.annotOpen,
+      enabled: annotator !== null,
+      tool: annotator?.tool ?? "select",
+      color: annotator?.color ?? PALETTE[0].rgba,
+      penWidth: annotator?.penWidth ?? PEN_WIDTHS[1].width,
+      stamp: annotator?.stamp ?? "approved",
+      note: annotator?.blockedReason ?? annotator?.pickedReason ?? null,
+      blocked: annotator?.blockedReason != null,
+      canEditText: picked?.can.editText ?? false,
+      canRemove: picked?.can.remove ?? false,
+      canUndo: tab?.history.canUndo ?? false,
+      canRedo: tab?.history.canRedo ?? false,
+      undoLabel: tab?.history.undoLabel ?? null,
+      redoLabel: tab?.history.redoLabel ?? null,
+    });
+  }
+
   /** The engine of one document stopped and took the document with it. The other tabs carry on. */
   private async documentLost(tab: Tab, error: AppErrorLike): Promise<void> {
     if (!this.tabs.includes(tab)) return;
-    const lostChanges = tab.history.dirty;
+    const lostChanges = this.isDirty(tab);
     this.closeTab(tab.id);
     const text = describeError(error, tab.name);
     const answer = await showNotice(this.noticeLayer, {
@@ -935,7 +1093,7 @@ export class App {
   /** The history of a tab changed: tell the app process if the document turned dirty or clean. */
   private historyChanged(tab: Tab): void {
     if (!this.tabs.includes(tab)) return;
-    const dirty = tab.history.dirty;
+    const dirty = this.isDirty(tab);
     if (dirty !== tab.dirtyTold) {
       tab.dirtyTold = dirty;
       // If the app process does not get to know, the next change tries again.
@@ -945,12 +1103,13 @@ export class App {
     }
     this.drawTabs();
     this.drawTitle();
+    if (this.active === tab) this.syncAnnotBar();
   }
 
   /** Saves the document that is shown, if it has changes. Resolves with true when nothing is left unsaved. */
   async saveActive(): Promise<boolean> {
     const tab = this.active;
-    if (!tab || !tab.history.dirty) return true;
+    if (!tab || !this.isDirty(tab)) return true;
     return this.saveTab(tab, false);
   }
 
@@ -963,7 +1122,7 @@ export class App {
 
   /** Saves every document that has changes. Resolves with true when all were saved. */
   async saveAllChanges(halt?: AbortSignal): Promise<boolean> {
-    for (const tab of this.tabs.filter((t) => t.history.dirty)) {
+    for (const tab of this.tabs.filter((t) => this.isDirty(t))) {
       // The user stopped waiting: what is running finishes, but no other document is begun.
       if (halt?.aborted) return false;
       if (!(await this.saveTab(tab, false))) return false;
@@ -977,11 +1136,14 @@ export class App {
    * (a save breaks a signature). A failure is told to the user. Resolves with true when saved.
    */
   private async saveTab(tab: Tab, asCopy: boolean): Promise<boolean> {
+    // What is under way is done first (an open box of a note is saved, running changes finish),
+    // so that the file holds what the window shows.
+    await tab.annotator?.flush();
     // A save that is running is waited for, and then the state is looked at again: it may have
     // saved everything, or an edit may have come after it.
     while (tab.saving) {
       await tab.saving.catch(() => false);
-      if (!asCopy && !tab.history.dirty) return true;
+      if (!asCopy && !this.isDirty(tab)) return true;
     }
     const running = this.writeTab(tab, asCopy);
     tab.saving = running;
@@ -1000,7 +1162,14 @@ export class App {
    */
   private async writeTab(tab: Tab, asCopy: boolean): Promise<boolean> {
     const began = tab.history.revision;
-    const saved = asCopy ? await this.runSaveAs(tab, false) : await this.runSave(tab);
+    // The engine is not changed while the file is written; changes made meanwhile wait.
+    const release = tab.annotator?.hold();
+    let saved: SavedFile | null;
+    try {
+      saved = asCopy ? await this.runSaveAs(tab, false) : await this.runSave(tab);
+    } finally {
+      release?.();
+    }
     if (!saved) return false;
     tab.history.markSaved(began);
     if (saved.path !== tab.path || saved.name !== tab.name) {
@@ -1008,7 +1177,7 @@ export class App {
       tab.name = saved.name;
       this.syncChrome();
     }
-    return !tab.history.dirty;
+    return !this.isDirty(tab);
   }
 
   private async runSave(tab: Tab): Promise<SavedFile | null> {
@@ -1141,7 +1310,7 @@ export class App {
     this.quitting = true;
     this.quitReveal = () => this.focusTopNotice();
     try {
-      const dirty = this.tabs.filter((t) => t.history.dirty);
+      const dirty = this.tabs.filter((t) => this.isDirty(t));
       if (dirty.length === 0) {
         await this.deps.api.quitApp();
         return;
@@ -1194,12 +1363,22 @@ export class App {
   private async stepHistory(direction: "undo" | "redo"): Promise<void> {
     const tab = this.active;
     if (!tab || tab.saving) return;
+    const run = () => (direction === "undo" ? tab.history.undo() : tab.history.redo());
     try {
-      await (direction === "undo" ? tab.history.undo() : tab.history.redo());
-    } catch {
+      // After the changes asked for before it, and before the ones asked for later.
+      await (tab.annotator ? tab.annotator.sequenced(run) : run());
+    } catch (error) {
+      // An engine that was lost ends the tab, as it does for any other change.
+      const lost = toAppError(error);
+      if (isEngineLost(lost)) {
+        await this.documentLost(tab, lost);
+        return;
+      }
       await showNotice(this.noticeLayer, {
         title: direction === "undo" ? "The change could not be taken back" : "The change could not be made again",
-        detail: "The document is as it was before. Nothing was lost.",
+        detail: CLEAN_REFUSALS.has(toAppError(error).code)
+          ? "The document is as it was before. Nothing was lost."
+          : "Part of the change may have been made. The document is marked as changed; close it without saving to go back to the file.",
         buttons: [{ id: "ok", label: "OK", primary: true }],
       });
     }
@@ -1340,6 +1519,7 @@ export class App {
     this.sidebar.setDocument(active?.sidebarDoc ?? null);
     this.find.setTarget(active ? { doc: active.doc, view: active.view } : null);
     this.selectionProxy.textContent = "";
+    this.syncAnnotBar();
     if (!active) {
       this.pageInput.value = "";
       this.pageTotal.textContent = "";
@@ -1356,7 +1536,7 @@ export class App {
   /** Draws the tab strip: one tab for each document, with a dot on those with unsaved changes. */
   private drawTabs(): void {
     this.tabStrip.render(
-      this.tabs.map((t) => ({ id: t.id, title: t.name, path: t.path, dirty: t.history.dirty })),
+      this.tabs.map((t) => ({ id: t.id, title: t.name, path: t.path, dirty: this.isDirty(t) })),
       this.activeId,
     );
   }
@@ -1378,7 +1558,7 @@ export class App {
       this.deps.setWindowTitle(this.appName);
       return;
     }
-    this.deps.setWindowTitle(`${active.history.dirty ? "\u2022 " : ""}${active.name} - ${this.appName}`);
+    this.deps.setWindowTitle(`${this.isDirty(active) ? "\u2022 " : ""}${active.name} - ${this.appName}`);
   }
 
   private setControlsEnabled(on: boolean): void {
@@ -1457,6 +1637,10 @@ export class App {
   // ---- keyboard --------------------------------------------------------------
 
   private onKeyDown(e: KeyboardEvent): void {
+    if (this.noticeLayer.childElementCount === 0 && this.annotationKey(e)) {
+      e.preventDefault();
+      return;
+    }
     if (e.key === "Escape" && this.noticeLayer.childElementCount === 0) {
       const view = this.active?.view;
       if (view?.hasSelection && !(e.target instanceof HTMLInputElement)) {
@@ -1519,12 +1703,40 @@ export class App {
       if (typing) return;
       e.preventDefault();
       void (action.type === "undo" ? this.undoActive() : this.redoActive());
+    } else if (action.type === "tool") {
+      e.preventDefault();
+      this.chooseTool(action.tool);
+    } else if (action.type === "toggle-annotations") {
+      e.preventDefault();
+      if (this.active?.annotator) this.setAnnotating(!this.annotOpen, !this.annotOpen);
     } else if (action.type === "next-tab" || action.type === "previous-tab") {
       e.preventDefault();
       this.stepTab(action.type === "next-tab" ? 1 : -1);
     } else if (this.active?.view.handleAction(action)) {
       e.preventDefault();
     }
+  }
+
+  /**
+   * Keys for the annotation that is picked (Delete, Enter, the arrows) and for the tool in use
+   * (Escape, and Enter for the note and the stamp). They belong to the annotation only when no text
+   * is being typed and no button but an annotation has the focus.
+   */
+  private annotationKey(e: KeyboardEvent): boolean {
+    const annotator = this.active?.annotator;
+    if (!annotator || e.ctrlKey || e.metaKey || e.altKey) return false;
+    // With the bar closed the keys belong to the page: the arrows scroll it, and nothing is picked.
+    if (!this.annotOpen) return false;
+    const target = e.target as HTMLElement | null;
+    const typing =
+      target instanceof HTMLInputElement ||
+      target instanceof HTMLSelectElement ||
+      target instanceof HTMLTextAreaElement;
+    if (typing) return false;
+    const onBox = target instanceof Element && target.closest(".annot") !== null;
+    if (e.key === "Escape") return annotator.handleKey(e);
+    if (target instanceof HTMLButtonElement && !onBox) return false;
+    return annotator.handleKey(e);
   }
 
   // ---- printing --------------------------------------------------------------

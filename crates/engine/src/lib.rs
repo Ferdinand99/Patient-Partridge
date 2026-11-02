@@ -22,6 +22,7 @@ use partridge_protocol::{
 use pdfium_render::prelude::*;
 use source::{GuardedReader, SourceFile, SourceGuard};
 
+pub mod annots;
 #[cfg(unix)]
 pub mod fds;
 pub mod fonts;
@@ -141,6 +142,9 @@ pub struct Engine {
     docs: HashMap<u32, PdfDocument<'static>>,
     /// The serialised form of a document between `SaveBegin` and `SaveEnd`.
     saves: HashMap<u32, Vec<u8>>,
+    /// What the engine knows of the annotations of each document (their ids, and how to put back
+    /// what it removed).
+    annots: HashMap<u32, annots::DocAnnots>,
     next_doc: u32,
     /// The one document the app handed over. `Open` takes it.
     document: Option<Box<dyn SourceFile>>,
@@ -193,6 +197,7 @@ impl Engine {
             pdfium_version: version,
             docs: HashMap::new(),
             saves: HashMap::new(),
+            annots: HashMap::new(),
             next_doc: 1,
             document: None,
             source: None,
@@ -299,6 +304,7 @@ impl Engine {
                 // Closing an unknown id is not an error: the end state is the same.
                 self.docs.remove(&doc);
                 self.saves.remove(&doc);
+                self.annots.remove(&doc);
                 Ok(ResponseBody::Closed)
             }
             RequestBody::Outline { doc } => {
@@ -394,6 +400,81 @@ impl Engine {
                 self.saves.remove(&doc);
                 Ok(ResponseBody::SaveEnded)
             }
+            RequestBody::ListAnnots { doc, page } => {
+                let (document, state) = self.annotating(doc)?;
+                Ok(ResponseBody::Annots {
+                    items: state.list(document, page)?,
+                })
+            }
+            RequestBody::AddMarkup {
+                doc,
+                page,
+                kind,
+                color,
+                start,
+                end,
+            } => {
+                let (document, state) = self.annotating(doc)?;
+                let item = state.add_markup(document, page, kind, color, start, end)?;
+                Ok(ResponseBody::Annot { item })
+            }
+            RequestBody::AddNote {
+                doc,
+                page,
+                x,
+                y,
+                color,
+                text,
+            } => {
+                let (document, state) = self.annotating(doc)?;
+                let item = state.add_note(document, page, x, y, color, &text)?;
+                Ok(ResponseBody::Annot { item })
+            }
+            RequestBody::AddInk {
+                doc,
+                page,
+                color,
+                width,
+                strokes,
+            } => {
+                let (document, state) = self.annotating(doc)?;
+                let item = state.add_ink(document, page, color, width, strokes)?;
+                Ok(ResponseBody::Annot { item })
+            }
+            RequestBody::AddStamp {
+                doc,
+                page,
+                x,
+                y,
+                stamp,
+            } => {
+                let (document, state) = self.annotating(doc)?;
+                let item = state.add_stamp(document, page, x, y, stamp)?;
+                Ok(ResponseBody::Annot { item })
+            }
+            RequestBody::UpdateAnnot {
+                doc,
+                page,
+                id,
+                text,
+                color,
+                dx,
+                dy,
+            } => {
+                let (document, state) = self.annotating(doc)?;
+                let item = state.update(document, page, id, text.as_deref(), color, dx, dy)?;
+                Ok(ResponseBody::Annot { item })
+            }
+            RequestBody::RemoveAnnot { doc, page, id } => {
+                let (document, state) = self.annotating(doc)?;
+                state.remove(document, page, id)?;
+                Ok(ResponseBody::AnnotRemoved)
+            }
+            RequestBody::RestoreAnnot { doc, page, id } => {
+                let (document, state) = self.annotating(doc)?;
+                let item = state.restore(document, page, id)?;
+                Ok(ResponseBody::Annot { item })
+            }
         }
     }
 
@@ -407,6 +488,20 @@ impl Engine {
         edit: impl FnOnce(&mut PdfDocument<'static>) -> T,
     ) -> Option<T> {
         self.docs.get_mut(&doc).map(edit)
+    }
+
+    /// The document and what the engine keeps of its annotations. A save looks at the file the
+    /// document is read from (see `check_source`), so a change made while the file was altered
+    /// by someone else is not written.
+    fn annotating(
+        &mut self,
+        doc: u32,
+    ) -> Result<(&mut PdfDocument<'static>, &mut annots::DocAnnots), Failure> {
+        let document = self
+            .docs
+            .get_mut(&doc)
+            .ok_or((ErrorCode::UnknownDocument, "no such document".to_string()))?;
+        Ok((document, self.annots.entry(doc).or_default()))
     }
 
     /// Fails when the file the document is read from changed, or a read of it failed.

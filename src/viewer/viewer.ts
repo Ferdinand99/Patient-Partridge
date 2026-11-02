@@ -7,6 +7,7 @@
 // its canvases and asks the engine for nothing, and remembers where the reader was.
 
 import type { TextScript } from "../lib/scripts";
+import type { Annotation, Tool } from "../lib/annotations";
 import { type AppErrorLike, isEngineLost, toAppError } from "../lib/errors";
 import { type Action, pageScrollDistance } from "./keys";
 import {
@@ -22,6 +23,7 @@ import {
   visibleRange,
   type Range,
 } from "./layout";
+import { AnnotationLayer, type AnnotLayerEvents } from "./annotlayer";
 import { PageOverlays, type CopyResult, type OverlayApi, type OverlayLimits, type PageLinkInfo } from "./overlays";
 import { RenderScheduler, type RenderJob } from "./scheduler";
 import type { SearchMatch } from "./search";
@@ -30,6 +32,8 @@ import { type ZoomMode, clampZoom, fitWidthZoom, stepZoom } from "./zoom";
 
 export interface ViewerApi extends OverlayApi {
   render(doc: number, page: number, width: number, height: number): Promise<ArrayBuffer>;
+  /** The annotations of a page. Without it the pages carry no annotation layer. */
+  listAnnotations?(doc: number, page: number): Promise<Annotation[]>;
 }
 
 export interface ViewerEvents {
@@ -53,6 +57,8 @@ export interface ViewerEvents {
   onScripts?(scripts: TextScript[]): void;
   /** A page has been drawn (the engine has asked for the fonts it needed for it). */
   onPageDrawn?(page: number): void;
+  /** What the annotation layer of the pages reports: a box picked, a click, a stroke, a drag. */
+  annotations?: AnnotLayerEvents;
 }
 
 /** Where the reader was: a page, how far down it, and the zoom (null means fit width). */
@@ -101,6 +107,11 @@ export class DocumentView {
   private readonly mounted = new Map<number, Mounted>();
   private readonly scheduler: RenderScheduler;
   private readonly overlays: PageOverlays;
+  private readonly annots: AnnotationLayer;
+  /** How many times the picture of a page was asked to be drawn afresh (see `invalidatePage`). */
+  private readonly versions = new Map<number, number>();
+  /** Those waiting for a page to be drawn (see `whenRedrawn`). */
+  private readonly redrawn = new Map<number, (() => void)[]>();
   private readonly resizeObserver?: ResizeObserver;
   private layout: Layout;
   private zoom = 1;
@@ -156,6 +167,19 @@ export class DocumentView {
         onScripts: (scripts) => events.onScripts?.(scripts),
       },
       options.limits,
+    );
+
+    const listAnnotations = api.listAnnotations?.bind(api);
+    this.annots = new AnnotationLayer(
+      info.pages,
+      listAnnotations ? (page) => listAnnotations(info.doc, page) : null,
+      events.annotations ?? {
+        onSelect() {},
+        onPlace() {},
+        onStroke() {},
+        onMove() {},
+        onEdit() {},
+      },
     );
 
     this.element.addEventListener("scroll", this.onScroll, { passive: true });
@@ -269,6 +293,7 @@ export class DocumentView {
     window.removeEventListener("resize", this.onWindowResize);
     for (const index of [...this.mounted.keys()]) this.unmount(index);
     this.overlays.destroy();
+    this.annots.destroy();
     this.element.remove();
   }
 
@@ -342,6 +367,92 @@ export class DocumentView {
 
   clearSelection(): void {
     this.overlays.clearSelection();
+  }
+
+  /** The size of a page in points. */
+  pageSizeOf(index: number): PageSizePt {
+    return this.info.pages[Math.min(Math.max(index, 0), Math.max(0, this.pageCount - 1))];
+  }
+
+  /** The annotations of the pages, and the tool that works on them. */
+  get annotationLayer(): AnnotationLayer {
+    return this.annots;
+  }
+
+  /**
+   * The tool of the annotation bar. The pen, the note and the stamp work on the page with the
+   * pointer, so the selection of text, which also takes the pointer, steps aside while they do.
+   */
+  setAnnotationTool(tool: Tool): void {
+    this.annots.setTool(tool);
+    this.overlays.setSuspended(tool === "pen" || tool === "note" || tool === "stamp");
+  }
+
+  /** The selected stretches of text, page by page: characters `start..end` of the page text. */
+  selectedRanges(): Promise<{ ranges: { page: number; start: number; end: number }[]; truncated: boolean }> {
+    return this.overlays.selectedRanges();
+  }
+
+  /**
+   * Draws a page afresh (after an annotation was added, changed or taken away) and asks for the
+   * list of its annotations again. A picture that was on its way when this was called is dropped.
+   */
+  invalidatePage(index: number): void {
+    if (this.destroyed || index < 0 || index >= this.pageCount) return;
+    this.versions.set(index, (this.versions.get(index) ?? 0) + 1);
+    const m = this.mounted.get(index);
+    if (m) {
+      m.drawnKey = null;
+      m.failedKey = null;
+      m.el.classList.remove("viewer-page-failed");
+    }
+    void this.annots.reload(index);
+    this.refresh();
+  }
+
+  /**
+   * Resolves after the next time the picture of a page is drawn, or after `timeoutMs` when it is not
+   * (the page scrolled away, the engine is slow). For something that must stay on screen until the
+   * page shows what it stands for.
+   */
+  whenRedrawn(index: number, timeoutMs = 1500): Promise<void> {
+    return new Promise((resolve) => {
+      if (this.destroyed || !this.mounted.has(index)) {
+        resolve();
+        return;
+      }
+      const timer = setTimeout(done, timeoutMs);
+      function done(): void {
+        clearTimeout(timer);
+        resolve();
+      }
+      const list = this.redrawn.get(index) ?? [];
+      list.push(done);
+      this.redrawn.set(index, list);
+    });
+  }
+
+  /** The page in the middle of the window, and the point of it that is in the middle. */
+  centreOfView(): { page: number; x: number; y: number } | null {
+    if (this.pageCount === 0 || !this.active) return null;
+    const view = this.element.getBoundingClientRect();
+    const cx = view.left + view.width / 2;
+    const cy = view.top + view.height / 2;
+    let best: { page: number; distance: number } | null = null;
+    for (const [index, m] of this.mounted) {
+      const r = m.el.getBoundingClientRect();
+      const distance = cy < r.top ? r.top - cy : cy > r.bottom ? cy - r.bottom : 0;
+      if (!best || distance < best.distance) best = { page: index, distance };
+    }
+    if (!best) return null;
+    const r = (this.mounted.get(best.page) as Mounted).el.getBoundingClientRect();
+    const size = this.info.pages[best.page];
+    const clamp = (v: number, side: number) => Math.min(Math.max(v, 0), side);
+    return {
+      page: best.page,
+      x: clamp(((cx - r.left) / (r.width || 1)) * size.width, size.width),
+      y: clamp(((cy - r.top) / (r.height || 1)) * size.height, size.height),
+    };
   }
 
   /** The selected text from the pages that are loaded, and the pages that are not. */
@@ -500,7 +611,7 @@ export class DocumentView {
       for (let index = range.first; index <= range.last; index++) {
         const m = this.mounted.get(index) ?? this.mount(index);
         const size = bitmapSize(this.info.pages[index], this.zoom, dpr);
-        const key = `${index}:${size.width}x${size.height}`;
+        const key = `${index}:${size.width}x${size.height}:${this.versions.get(index) ?? 0}`;
         m.wantKey = key;
         if (m.drawnKey === key || m.failedKey === key) continue;
         const pageCenter = this.layout.tops[index] + this.layout.heights[index] / 2;
@@ -545,6 +656,7 @@ export class DocumentView {
     this.mounted.set(index, m);
     this.placePage(index, m);
     this.overlays.mount(index, el);
+    this.annots.mount(index, el);
     return m;
   }
 
@@ -555,6 +667,7 @@ export class DocumentView {
     m.canvas.width = 0;
     m.canvas.height = 0;
     this.overlays.unmount(index);
+    this.annots.unmount(index);
     m.el.remove();
     this.mounted.delete(index);
   }
@@ -575,8 +688,14 @@ export class DocumentView {
     ctx.putImageData(new ImageData(new Uint8ClampedArray(buffer), job.width, job.height), 0, 0);
     m.drawnKey = job.key;
     m.el.classList.remove("viewer-page-failed");
+    const waiting = this.redrawn.get(job.page);
+    if (waiting) {
+      this.redrawn.delete(job.page);
+      for (const done of waiting) done();
+    }
     // Text and links come after the picture, so they never delay the page the reader waits for.
     this.overlays.pageDrawn(job.page);
+    this.annots.pageDrawn(job.page);
     this.events.onPageDrawn?.(job.page);
     if (!this.painted) {
       this.painted = true;

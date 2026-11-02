@@ -124,6 +124,16 @@ export class EditHistory {
     this.changed();
   }
 
+  /**
+   * Says that the document may differ from every state in the history, because a change failed
+   * or was cut off in the middle. The document counts as changed until it is saved.
+   */
+  markUnsaved(): void {
+    if (this.saved === null) return;
+    this.saved = null;
+    this.changed();
+  }
+
   /** Forgets everything, for a document that was reloaded from the file. The document is clean. */
   reset(): void {
     this.edits = [];

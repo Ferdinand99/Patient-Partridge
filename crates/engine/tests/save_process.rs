@@ -365,7 +365,7 @@ fn a_document_that_is_closed_cannot_be_saved() {
     assert_eq!(pool.source_path(handle), None);
 }
 
-// ---- findings of the review of PR 31: each of these failed on the first version --------------
+// ---- a file that changes or is replaced after it was opened: each of these failed on the first version ----
 
 /// Rewrites a file in place: the same file (same inode), new bytes.
 fn rewrite_in_place(path: &Path, bytes: &[u8]) {

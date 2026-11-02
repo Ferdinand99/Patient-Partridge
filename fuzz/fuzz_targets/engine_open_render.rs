@@ -33,6 +33,11 @@
 //!   the end, or longer than a piece may be, is refused. The saved file opens again (with the
 //!   password, for the encrypted seed) with the same number of pages and the same kind of
 //!   protection. A document that PDFium cannot write fails only with `SaveFailed`.
+//! - Annotations: the list is inside the caps with ids that differ; a highlight, a note, a drawing
+//!   and a stamp can be added (or are refused with an error that means "not this one"), one is
+//!   changed, all are removed and put back with the ids they had, and an id that was never given
+//!   out is refused. All of it happens before the save, so the saved file is the document with
+//!   its annotations and must read back the same.
 //! - Every answer can be encoded and decoded by the app, and the encoder cuts nothing.
 //! - A page that exists fails only with `Corrupt` or `RenderFailed`; a page past the end gives
 //!   `PageOutOfRange`.
@@ -44,8 +49,8 @@ use libfuzzer_sys::fuzz_target;
 use partridge_engine::Engine;
 use partridge_fuzz::check_response_caps;
 use partridge_protocol::{
-    ErrorCode, LinkTarget, PageSize, Request, RequestBody, Response, ResponseBody, MAX_SAVE_BYTES,
-    MAX_SAVE_CHUNK, PROTOCOL_VERSION,
+    AnnotKind, ErrorCode, LinkTarget, PageSize, Request, RequestBody, Response, ResponseBody,
+    StampKind, MAX_ANNOTS_PER_PAGE, MAX_SAVE_BYTES, MAX_SAVE_CHUNK, PROTOCOL_VERSION,
 };
 
 /// Longest side of the bitmaps the target draws. Small, so that an iteration is fast.
@@ -215,6 +220,8 @@ impl State {
             height: 10,
         });
 
+        self.annotate(doc, count, &pages);
+
         self.save(doc, count);
 
         match self.ask(RequestBody::Close { doc }) {
@@ -228,6 +235,179 @@ impl State {
             } => {}
             other => panic!("a closed document answered: {other:?}"),
         }
+    }
+
+    /// Annotations on the first pages: the list the file already has, then every kind added, one
+    /// changed, removed and put back. Whatever the file, the answers are annotations inside the
+    /// caps or one of the errors that mean "not this one", and the document stays usable.
+    fn annotate(&mut self, doc: u32, count: u32, sizes: &[PageSize]) {
+        for page in 0..count.min(2) {
+            let size = sizes[page as usize];
+            let listed = match self.ask(RequestBody::ListAnnots { doc, page }) {
+                ResponseBody::Annots { items } => items,
+                // A page that cannot be read has no annotations to work with.
+                ResponseBody::Error {
+                    code: ErrorCode::Corrupt,
+                    ..
+                } => continue,
+                other => panic!("unexpected answer to ListAnnots: {other:?}"),
+            };
+            check_response_caps(&Response {
+                id: 0,
+                body: ResponseBody::Annots {
+                    items: listed.clone(),
+                },
+            });
+            let mut ids: Vec<u32> = listed.iter().map(|i| i.id).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            assert_eq!(ids.len(), listed.len(), "two annotations share an id");
+            let text_len = match self.ask(RequestBody::PageText { doc, page }) {
+                ResponseBody::PageText { rects, .. } => rects.len() as u32,
+                _ => 0,
+            };
+            let mut made: Vec<(AnnotKind, u32)> = Vec::new();
+            let requests = [
+                (
+                    AnnotKind::Highlight,
+                    RequestBody::AddMarkup {
+                        doc,
+                        page,
+                        kind: AnnotKind::Highlight,
+                        color: [255, 235, 59, 255],
+                        start: 0,
+                        end: text_len.clamp(1, 40),
+                    },
+                ),
+                (
+                    AnnotKind::Note,
+                    RequestBody::AddNote {
+                        doc,
+                        page,
+                        x: size.width / 3.0,
+                        y: size.height / 3.0,
+                        color: [255, 235, 59, 255],
+                        text: "fuzz".into(),
+                    },
+                ),
+                (
+                    AnnotKind::Ink,
+                    RequestBody::AddInk {
+                        doc,
+                        page,
+                        color: [0, 0, 255, 255],
+                        width: 3.0,
+                        strokes: vec![
+                            vec![[10.0, 10.0], [size.width / 2.0, size.height / 2.0]],
+                            vec![[size.width, size.height]],
+                        ],
+                    },
+                ),
+                (
+                    AnnotKind::Stamp,
+                    RequestBody::AddStamp {
+                        doc,
+                        page,
+                        x: size.width / 2.0,
+                        y: size.height / 2.0,
+                        stamp: StampKind::Draft,
+                    },
+                ),
+            ];
+            for (kind, body) in requests {
+                match self.ask(body) {
+                    ResponseBody::Annot { item } => {
+                        assert_eq!(item.kind, kind);
+                        assert!(!ids.contains(&item.id), "a new annotation took an id in use");
+                        ids.push(item.id);
+                        check_response_caps(&Response {
+                            id: 0,
+                            body: ResponseBody::Annot { item: item.clone() },
+                        });
+                        made.push((kind, item.id));
+                    }
+                    ResponseBody::Error {
+                        code:
+                            ErrorCode::InvalidRequest
+                            | ErrorCode::AnnotationRefused
+                            | ErrorCode::AnnotationsNotAllowed
+                            | ErrorCode::Corrupt,
+                        ..
+                    } => {}
+                    other => panic!("unexpected answer to adding {kind:?}: {other:?}"),
+                }
+            }
+            // The ones made are listed, and the others did not go away.
+            let after = match self.ask(RequestBody::ListAnnots { doc, page }) {
+                ResponseBody::Annots { items } => items,
+                other => panic!("unexpected answer to ListAnnots: {other:?}"),
+            };
+            if after.len() < MAX_ANNOTS_PER_PAGE {
+                for (_, id) in &made {
+                    assert!(after.iter().any(|i| i.id == *id), "annotation {id} is not listed");
+                }
+                for item in &listed {
+                    assert!(after.iter().any(|i| i.id == item.id), "annotation {} was lost", item.id);
+                }
+            }
+            if let Some((_, id)) = made.iter().find(|(k, _)| *k == AnnotKind::Note) {
+                match self.ask(RequestBody::UpdateAnnot {
+                    doc,
+                    page,
+                    id: *id,
+                    text: Some("fuzz changed".into()),
+                    color: None,
+                    dx: 5.0,
+                    dy: 5.0,
+                }) {
+                    ResponseBody::Annot { item } => assert_eq!(item.id, *id),
+                    other => panic!("unexpected answer to a change: {other:?}"),
+                }
+            }
+            // Remove each one made, then put each back: the same ids come back.
+            for (_, id) in &made {
+                match self.ask(RequestBody::RemoveAnnot { doc, page, id: *id }) {
+                    ResponseBody::AnnotRemoved => {}
+                    other => panic!("unexpected answer to a removal: {other:?}"),
+                }
+            }
+            for (_, id) in &made {
+                match self.ask(RequestBody::RestoreAnnot { doc, page, id: *id }) {
+                    ResponseBody::Annot { item } => assert_eq!(item.id, *id),
+                    ResponseBody::Error {
+                        code: ErrorCode::AnnotationRefused,
+                        ..
+                    } => {}
+                    other => panic!("unexpected answer to a restore: {other:?}"),
+                }
+            }
+            // An id that was never given out, and a page past the end.
+            for body in [
+                RequestBody::RemoveAnnot {
+                    doc,
+                    page,
+                    id: u32::MAX,
+                },
+                RequestBody::UpdateAnnot {
+                    doc,
+                    page,
+                    id: u32::MAX,
+                    text: None,
+                    color: None,
+                    dx: 1.0,
+                    dy: 1.0,
+                },
+            ] {
+                match self.ask(body) {
+                    ResponseBody::Error {
+                        code: ErrorCode::NoSuchAnnotation,
+                        ..
+                    } => {}
+                    other => panic!("an annotation that does not exist gave {other:?}"),
+                }
+            }
+        }
+        self.expect_range_error(RequestBody::ListAnnots { doc, page: count });
     }
 
     /// The three requests of a save, and a look at the file that comes out.

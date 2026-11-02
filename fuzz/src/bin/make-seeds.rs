@@ -15,9 +15,8 @@ use partridge_fuzz::{
     over_cap_request_case, over_cap_response_case, OVER_CAP_REQUESTS, OVER_CAP_RESPONSES,
 };
 use partridge_protocol::{
-    ErrorCode, FontScript, LinkTarget, OutlineItem, PageLink, PageSize, Request, RequestBody,
-    Response,
-    ResponseBody, TextMatch, MAX_FRAME_LEN, MAX_LINKS_PER_PAGE, MAX_MATCHES_PER_PAGE,
+    ability, AnnotInfo, AnnotKind, ErrorCode, FontScript, LinkTarget, OutlineItem, PageLink,
+    PageSize, Request, RequestBody, Response, ResponseBody, StampKind, TextMatch, MAX_FRAME_LEN, MAX_LINKS_PER_PAGE, MAX_MATCHES_PER_PAGE,
     MAX_OUTLINE_DEPTH, MAX_OUTLINE_ITEMS, MAX_OUTLINE_TITLE, MAX_QUERY_LEN, MAX_SAVE_BYTES,
     MAX_SAVE_CHUNK, MAX_URI_LEN, PROTOCOL_VERSION,
 };
@@ -97,7 +96,97 @@ fn requests() -> Vec<(&'static str, Request)> {
         ),
         ("save_end", b(13, RequestBody::SaveEnd { doc: 1 })),
         ("fingerprint", b(14, RequestBody::Fingerprint { doc: 1 })),
+        ("list_annots", b(15, RequestBody::ListAnnots { doc: 1, page: 0 })),
+        (
+            "add_markup",
+            b(
+                16,
+                RequestBody::AddMarkup {
+                    doc: 1,
+                    page: 0,
+                    kind: AnnotKind::Highlight,
+                    color: [255, 235, 59, 255],
+                    start: 4,
+                    end: 19,
+                },
+            ),
+        ),
+        (
+            "add_note",
+            b(
+                17,
+                RequestBody::AddNote {
+                    doc: 1,
+                    page: 0,
+                    x: 72.0,
+                    y: 100.5,
+                    color: [255, 235, 59, 255],
+                    text: "A note \u{2713}".into(),
+                },
+            ),
+        ),
+        (
+            "add_ink",
+            b(
+                18,
+                RequestBody::AddInk {
+                    doc: 1,
+                    page: 0,
+                    color: [0, 0, 255, 255],
+                    width: 2.5,
+                    strokes: vec![vec![[10.0, 10.0], [20.0, 30.0]], vec![[5.0, 5.0]]],
+                },
+            ),
+        ),
+        (
+            "add_stamp",
+            b(
+                19,
+                RequestBody::AddStamp {
+                    doc: 1,
+                    page: 0,
+                    x: 100.0,
+                    y: 200.0,
+                    stamp: StampKind::Approved,
+                },
+            ),
+        ),
+        (
+            "update_annot",
+            b(
+                20,
+                RequestBody::UpdateAnnot {
+                    doc: 1,
+                    page: 0,
+                    id: 3,
+                    text: Some("changed".into()),
+                    color: Some([1, 2, 3, 255]),
+                    dx: 4.0,
+                    dy: -4.0,
+                },
+            ),
+        ),
+        (
+            "remove_annot",
+            b(21, RequestBody::RemoveAnnot { doc: 1, page: 0, id: 3 }),
+        ),
+        (
+            "restore_annot",
+            b(22, RequestBody::RestoreAnnot { doc: 1, page: 0, id: 3 }),
+        ),
     ]
+}
+
+fn a_note(id: u32, text: &str) -> AnnotInfo {
+    AnnotInfo {
+        id,
+        kind: AnnotKind::Note,
+        abilities: ability::EDIT_TEXT | ability::MOVE | ability::REMOVE,
+        rect: [72.0, 100.0, 92.0, 120.0],
+        color: [255, 235, 59, 255],
+        text: text.into(),
+        author: "Someone".into(),
+    }
 }
 
 fn responses() -> Vec<(&'static str, Response)> {
@@ -269,6 +358,27 @@ fn responses() -> Vec<(&'static str, Response)> {
                     pages: 12,
                     failed: 0,
                     digest: 0x0123_4567_89ab_cdef,
+                },
+            ),
+        ),
+        (
+            "annots",
+            b(
+                17,
+                ResponseBody::Annots {
+                    items: vec![a_note(1, "first"), a_note(2, "<b>second</b> \u{2713}")],
+                },
+            ),
+        ),
+        ("annot", b(18, ResponseBody::Annot { item: a_note(3, "") })),
+        ("annot_removed", b(19, ResponseBody::AnnotRemoved)),
+        (
+            "error_no_such_annotation",
+            b(
+                20,
+                ResponseBody::Error {
+                    code: ErrorCode::NoSuchAnnotation,
+                    message: "the annotation is not on the page any more".into(),
                 },
             ),
         ),
@@ -456,7 +566,7 @@ fn main() {
     );
 
     // Round trips: one input per kind of message.
-    for kind in 0..14u8 {
+    for kind in 0..22u8 {
         write(
             &dir,
             "protocol_roundtrip_request",
@@ -464,7 +574,7 @@ fn main() {
             &generator_input(kind, kind as u32),
         );
     }
-    for kind in 0..16u8 {
+    for kind in 0..19u8 {
         write(
             &dir,
             "protocol_roundtrip_response",
@@ -616,6 +726,9 @@ fn main() {
             "destinations_negative",
             hostile_destinations(&features, "-1111"),
         ),
+        ("annotated", kit::annotated_pdf()),
+        ("annotations_hostile", kit::hostile_annots_pdf()),
+        ("annotations_many", kit::many_annots_pdf(24)),
         ("simple", kit::simple_pdf(1)),
         ("two_pages", kit::simple_pdf(2)),
         ("mixed_sizes", kit::mixed_size_pdf()),

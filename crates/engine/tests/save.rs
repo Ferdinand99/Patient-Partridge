@@ -346,7 +346,7 @@ fn the_engine_speaks_the_new_protocol_version() {
     );
 }
 
-// ---- findings of the review: what the engine watches while a document is open ------------------
+// ---- what the engine watches while a document is open: a source that fails or changes -----------
 
 use partridge_engine::source::SourceFile;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
