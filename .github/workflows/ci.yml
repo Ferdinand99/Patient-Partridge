@@ -491,14 +491,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # In every state that a hosted runner allows, the block still holds and the engine proves it.
-          - { os: windows-latest, state: default, expect: proved }
-          - { os: windows-latest, state: profiles-off, expect: proved }
-          - { os: windows-latest, state: outbound-allowed, expect: proved }
-          - { os: windows-latest, state: package-allowed, expect: proved }
-          - { os: windows-latest, state: loopback-exempt, expect: proved }
-          - { os: windows-2022, state: default, expect: proved }
-          - { os: windows-2022, state: profiles-off, expect: proved }
+          # In every state that a hosted runner allows, the TCP and UDP block still holds. The runners
+          # are administrators, and a raw socket can send from the sandbox for such an account: then
+          # the engine says that the block is not proved, because of the raw socket.
+          - { os: windows-latest, state: default, expect: proved-or-raw }
+          - { os: windows-latest, state: profiles-off, expect: proved-or-raw }
+          - { os: windows-latest, state: outbound-allowed, expect: proved-or-raw }
+          - { os: windows-latest, state: package-allowed, expect: proved-or-raw }
+          - { os: windows-latest, state: loopback-exempt, expect: proved-or-raw }
+          - { os: windows-2022, state: default, expect: proved-or-raw }
+          - { os: windows-2022, state: profiles-off, expect: proved-or-raw }
           # The runner refuses to stop either service, for an administrator and for the system
           # account alike (the log of the first step says so), so these two stay as they were. They
           # are kept to show it and to try again when an image allows it.

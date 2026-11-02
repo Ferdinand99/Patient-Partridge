@@ -600,7 +600,6 @@ fn a_locked_in_engine_cannot_open_files_use_the_network_or_start_programs() {
         // The AppContainer without capabilities is the layer that does this, and the engine
         // reports it only after the system has refused attempts of its own.
         assert!(layers.contains("appcontainer"), "{lines:#?}");
-        assert!(layers.contains("no-network"), "{lines:#?}");
     }
     // `udp_bind_then_send` binds first, so where the bind is refused no datagram is sent: it shows
     // the bind. The `udp_sendto_unbound_*` attempts send from a socket that was never bound; their
@@ -671,11 +670,42 @@ fn a_locked_in_engine_cannot_open_files_use_the_network_or_start_programs() {
             line(lines, "raw_socket"),
             line(&control, "raw_socket")
         );
-        for attempt in ["raw_socket_send_loopback", "raw_socket_send_remote"] {
-            let l = line(lines, attempt);
-            let c = line(&control, attempt);
-            println!("network: {l} (control: {c})");
-            assert!(l.starts_with(&format!("{attempt}: denied")), "{l}");
+        for attempt in [
+            "raw_socket_send_loopback",
+            "raw_socket_send_remote",
+            "raw_socket_echo_loopback",
+            "raw_socket_echo_internet",
+        ] {
+            println!(
+                "network: {} (control: {})",
+                line(lines, attempt),
+                line(&control, attempt)
+            );
+        }
+        // A raw ICMP socket is a way to the network that the AppContainer does not close on every
+        // computer (it can depend on the rights of the account that runs the program: the runners
+        // are administrators). The engine tries it in its own check, so what it says about the
+        // network must agree with what the sandboxed program can do: when a packet can be sent from
+        // a raw socket, the engine says `network-not-proved`, and otherwise `no-network`.
+        let can_send = line(lines, "raw_socket_send_loopback").contains("ALLOWED");
+        assert_eq!(
+            layers.contains("network-not-proved"),
+            can_send,
+            "the engine's greeting and the raw socket disagree: {layers} / {lines:#?}"
+        );
+        assert_eq!(layers.contains("no-network"), !can_send, "{layers}");
+        if can_send {
+            println!(
+                "network: FINDING: a raw ICMP socket can send from the sandbox on this account \
+                 (the engine says so in its greeting: {layers})"
+            );
+        } else {
+            for attempt in ["raw_socket_send_loopback", "raw_socket_send_remote"] {
+                assert!(
+                    line(lines, attempt).starts_with(&format!("{attempt}: denied")),
+                    "{lines:#?}"
+                );
+            }
         }
         for attempt in ["icmp_echo_loopback", "icmp_echo_remote"] {
             let l = line(lines, attempt);

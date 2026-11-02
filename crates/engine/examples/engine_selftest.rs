@@ -564,6 +564,15 @@ fn windows_network_probes(
     }
     report("raw_socket", raw_socket(None));
     report(
+        "raw_socket_echo_loopback",
+        raw_echo(SocketAddr::from(([127, 0, 0, 1], 0))),
+    );
+    // One echo request to a public resolver; a reply means a packet went out and one came back.
+    report(
+        "raw_socket_echo_internet",
+        raw_echo(SocketAddr::from(([1, 1, 1, 1], 0))),
+    );
+    report(
         "raw_socket_send_loopback",
         raw_socket(Some(SocketAddr::from(([127, 0, 0, 1], 0)))),
     );
@@ -705,6 +714,78 @@ fn raw_socket(send_to: Option<std::net::SocketAddr>) -> std::io::Result<()> {
             }
             Some(_) => Err(std::io::Error::other("only IPv4")),
         };
+        closesocket(s);
+        result
+    }
+}
+
+/// Sends one echo request from a raw ICMP socket and waits for the reply. `Ok` when a reply came,
+/// which means the packet left the program and an answer reached it.
+#[cfg(windows)]
+fn raw_echo(target: std::net::SocketAddr) -> std::io::Result<()> {
+    use windows_sys::Win32::Networking::WinSock::{
+        closesocket, recvfrom, sendto, setsockopt, socket, WSAGetLastError, INVALID_SOCKET,
+        SOCKADDR,
+    };
+    let std::net::SocketAddr::V4(v4) = target else {
+        return Err(std::io::Error::other("only IPv4"));
+    };
+    let mut address = Vec::new();
+    address.extend_from_slice(&2u16.to_le_bytes());
+    address.extend_from_slice(&0u16.to_be_bytes());
+    address.extend_from_slice(&v4.ip().octets());
+    address.extend_from_slice(&[0u8; 8]);
+    let packet = [8u8, 0, 0xF7, 0xFD, 0, 1, 0, 1];
+    // SAFETY: documented Winsock calls; the buffers live through the calls.
+    unsafe {
+        let s = socket(2, 3, 1);
+        if s == INVALID_SOCKET {
+            let e = std::io::Error::from_raw_os_error(WSAGetLastError());
+            return Err(std::io::Error::other(format!("socket: {e}")));
+        }
+        let timeout_ms: u32 = 2000;
+        setsockopt(
+            s,
+            0xffff,
+            0x1006,
+            (&timeout_ms as *const u32).cast::<u8>(),
+            4,
+        );
+        let sent = sendto(
+            s,
+            packet.as_ptr(),
+            packet.len() as i32,
+            0,
+            address.as_ptr().cast::<SOCKADDR>(),
+            address.len() as i32,
+        );
+        if sent < 0 {
+            let e = std::io::Error::from_raw_os_error(WSAGetLastError());
+            closesocket(s);
+            return Err(std::io::Error::other(format!("sendto: {e}")));
+        }
+        // The reply is an IP header (20 bytes, no options) and then the ICMP message: type 0.
+        let mut buffer = [0u8; 128];
+        let mut result = Err(std::io::Error::other("recvfrom: no reply"));
+        for _ in 0..3 {
+            let got = recvfrom(
+                s,
+                buffer.as_mut_ptr(),
+                buffer.len() as i32,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            if got < 0 {
+                let e = std::io::Error::from_raw_os_error(WSAGetLastError());
+                result = Err(std::io::Error::other(format!("recvfrom: {e}")));
+                break;
+            }
+            if got >= 28 && buffer[20] == 0 {
+                result = Ok(());
+                break;
+            }
+        }
         closesocket(s);
         result
     }

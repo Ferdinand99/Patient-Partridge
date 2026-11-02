@@ -242,6 +242,48 @@ fn refused_by_policy<T>(what: &str, result: std::io::Result<T>) -> Result<(), St
     }
 }
 
+/// An ICMP echo request: type 8, code 0, checksum, identifier 1, sequence 1.
+const ECHO_REQUEST: [u8; 8] = [8, 0, 0xF7, 0xFD, 0, 1, 0, 1];
+
+/// A raw ICMP socket is a way to the network that the AppContainer does not close by itself: on a
+/// computer where the process may make one, a packet sent from it is not refused. This tries to
+/// send one echo request to the loopback address. Any failure (the socket cannot be made, the send
+/// is refused) means the way is closed; a send that works means it is not.
+fn raw_socket_is_blocked() -> Result<(), String> {
+    use windows_sys::Win32::Networking::WinSock::{
+        closesocket, sendto, socket, INVALID_SOCKET, SOCKADDR,
+    };
+    // The address by hand: family 2 (IPv4), port 0, 127.0.0.1.
+    let mut address = Vec::with_capacity(16);
+    address.extend_from_slice(&2u16.to_le_bytes());
+    address.extend_from_slice(&0u16.to_be_bytes());
+    address.extend_from_slice(&[127, 0, 0, 1]);
+    address.extend_from_slice(&[0u8; 8]);
+    // SAFETY: documented Winsock calls (Winsock is started, see `start_winsock`); the buffers live
+    // through the calls.
+    unsafe {
+        let s = socket(2, 3, 1);
+        if s == INVALID_SOCKET {
+            return Ok(());
+        }
+        let sent = sendto(
+            s,
+            ECHO_REQUEST.as_ptr(),
+            ECHO_REQUEST.len() as i32,
+            0,
+            address.as_ptr().cast::<SOCKADDR>(),
+            address.len() as i32,
+        );
+        closesocket(s);
+        if sent >= 0 {
+            return Err(
+                "a raw socket could send a packet: the network is not blocked for it".to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Tries to reach the network and expects the system to forbid it. The address is the loopback
 /// one: if the policy did not forbid it, nothing leaves the computer and the answer is "refused
 /// by the other end", which is not the answer of a blocked network. (A process in an AppContainer
@@ -254,10 +296,11 @@ fn network_is_blocked() -> Result<(), String> {
     )?;
     // A datagram: either the socket cannot be bound or the send is refused.
     match UdpSocket::bind("127.0.0.1:0") {
-        Err(e) if e.raw_os_error() == Some(WSAEACCES) => Ok(()),
-        Err(e) => Err(format!("a UDP socket could not be made: {e}")),
-        Ok(socket) => refused_by_policy("a UDP datagram", socket.send_to(&[0u8], address)),
+        Err(e) if e.raw_os_error() == Some(WSAEACCES) => {}
+        Err(e) => return Err(format!("a UDP socket could not be made: {e}")),
+        Ok(socket) => refused_by_policy("a UDP datagram", socket.send_to(&[0u8], address))?,
     }
+    raw_socket_is_blocked()
 }
 
 /// What the system answered when the network was not proved blocked (set once by [`lock_down`]).
