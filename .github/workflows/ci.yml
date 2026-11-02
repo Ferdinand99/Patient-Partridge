@@ -483,6 +483,51 @@ jobs:
   # filtering engine (BFE) feed. This job puts the runner in each of those states and records what
   # the engine does: it must open the document in all of them, and it must say truthfully whether it
   # could prove the block (docs/windows-sandbox.md).
+  windows-capture:
+    name: Windows, packet capture (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-2022]
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: capture-${{ matrix.os }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+      - name: Fetch PDFium
+        run: node scripts/fetch-pdfium.mjs
+      - name: Build the tests
+        run: |
+          cargo build -p partridge-engine --examples --locked
+          cargo test -p partridge-engine --locked --no-run --test sandbox
+      # pktmon is the packet monitor of Windows. It shows whether a raw echo request that a
+      # program sends leaves for the network card; the control shows that the capture sees it.
+      - name: Raw echo requests under pktmon
+        run: ./scripts/windows-packet-capture.ps1
+      - name: Stop the capture
+        if: always()
+        run: |
+          pktmon stop 2>&1 | Out-Null
+          pktmon filter remove 2>&1 | Out-Null
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: capture-${{ matrix.os }}
+          path: logs/*
+          if-no-files-found: ignore
+          retention-days: 7
+
   windows-firewall:
     name: Windows, firewall state (${{ matrix.state }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -491,21 +536,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # In every state that a hosted runner allows, the TCP and UDP block still holds. A raw
-          # socket can send from the sandbox on these server images: then the engine says that the
-          # block is not proved, because of the raw socket.
-          - { os: windows-latest, state: default, expect: proved-or-raw }
-          - { os: windows-latest, state: profiles-off, expect: proved-or-raw }
-          - { os: windows-latest, state: outbound-allowed, expect: proved-or-raw }
-          - { os: windows-latest, state: package-allowed, expect: proved-or-raw }
-          - { os: windows-latest, state: loopback-exempt, expect: proved-or-raw }
-          - { os: windows-2022, state: default, expect: proved-or-raw }
-          - { os: windows-2022, state: profiles-off, expect: proved-or-raw }
-          # The runner refuses to stop either service, for an administrator and for the system
-          # account alike (the log of the first step says so), so these two stay as they were. They
-          # are kept to show it and to try again when an image allows it.
-          - { os: windows-latest, state: firewall-service-stopped, expect: any }
-          - { os: windows-latest, state: filtering-engine-stopped, expect: any }
+          # In every state that a hosted runner allows, the engine still proves the block: TCP,
+          # UDP and raw sockets are refused. (The script fails when the runner did not reach the
+          # state, so a green leg is a state that was made.)
+          - { os: windows-latest, state: default, expect: proved }
+          - { os: windows-latest, state: profiles-off, expect: proved }
+          - { os: windows-latest, state: outbound-allowed, expect: proved }
+          - { os: windows-latest, state: package-allowed, expect: proved }
+          - { os: windows-latest, state: loopback-exempt, expect: proved }
+          - { os: windows-2022, state: default, expect: proved }
+          - { os: windows-2022, state: profiles-off, expect: proved }
+          # Not in the list, on purpose: a hosted runner refuses to stop the firewall service
+          # (MpsSvc) or the filtering engine (BFE), for an administrator and for the system account
+          # alike, so a leg for either would run in the default state. The script has both states
+          # and fails when the service is still running, for a runner that allows it.
           # A debug engine told to take the answer of the network check as one that is not "blocked":
           # the whole path after it (greeting, client, document) must work and say so.
           - { os: windows-latest, state: simulated-answer, expect: not-proved }

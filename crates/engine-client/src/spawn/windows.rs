@@ -439,7 +439,16 @@ fn make_tokens() -> io::Result<(Owned, Owned)> {
             "DuplicateTokenEx (primary)",
         )?;
         let lockdown = Owned::new(primary)?;
-        remove_bypass_traverse_checking(&lockdown)?;
+        // Debug builds only: the packet capture job keeps the privilege on purpose, to show what a
+        // raw echo does on a computer where the token has it. Release builds have no such switch.
+        #[cfg(debug_assertions)]
+        let keep_privilege = std::env::var_os("PARTRIDGE_TEST_KEEP_TRAVERSE_PRIVILEGE")
+            .is_some_and(|v| !v.is_empty());
+        #[cfg(not(debug_assertions))]
+        let keep_privilege = false;
+        if !keep_privilege {
+            remove_bypass_traverse_checking(&lockdown)?;
+        }
 
         // The integrity level stays the app's own for now. The system lets the first thread
         // impersonate a token only if its integrity level is not above that of the process, so

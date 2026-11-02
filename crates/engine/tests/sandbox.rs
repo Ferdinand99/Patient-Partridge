@@ -658,54 +658,81 @@ fn a_locked_in_engine_cannot_open_files_use_the_network_or_start_programs() {
             );
         }
     }
-    // Windows: a raw socket, an echo request sent from it, and an ICMP echo through the ICMP
-    // service. A raw socket can be made in the sandbox (the log says so); sending from it must be
-    // refused. An account without administrator rights cannot make a raw socket in the control
-    // either, and a computer that does not answer an echo gives no reply to the control: then the
-    // attempt proves nothing about the engine, and the log shows that.
+    // Windows: raw sockets, an echo request sent from one, an ICMP echo through the ICMP service,
+    // and the other ways to make a socket. A raw ICMP socket is open to every token outside a
+    // sandbox, and an AppContainer token that keeps `SeChangeNotifyPrivilege` can make one too (CI
+    // showed it, on both server images and as a standard user). The app removes the privilege from
+    // the engine's token, and then no socket can be made at all: `socket` is refused with
+    // `WSAEACCES` before any send. The control must be able to make the same socket, or the
+    // refusal would prove nothing; CI requires that, and a computer where it cannot is told so.
     #[cfg(windows)]
     {
-        println!(
-            "network: raw socket made in the sandbox: {} (control: {})",
-            line(lines, "raw_socket"),
-            line(&control, "raw_socket")
-        );
+        let in_ci = std::env::var_os("CI").is_some();
         for attempt in [
+            "raw_socket",
             "raw_socket_send_loopback",
             "raw_socket_send_remote",
             "raw_socket_echo_loopback",
             "raw_socket_echo_internet",
         ] {
-            println!(
-                "network: {} (control: {})",
-                line(lines, attempt),
-                line(&control, attempt)
+            let l = line(lines, attempt);
+            let c = line(&control, attempt);
+            println!("network: {l} (control: {c})");
+            assert!(l.starts_with(&format!("{attempt}: denied")), "{l}");
+            assert!(
+                l.contains("socket:") && l.contains("os error 10013"),
+                "{attempt} should be refused by `socket` with access denied: {l}"
             );
         }
-        // A raw ICMP socket is a way to the network that the AppContainer does not close on every
-        // computer (it can depend on the system and on the account that runs the program: the server images
-        // of CI allow it, also to a standard user). The engine tries it in its own check, so what it says about the
-        // network must agree with what the sandboxed program can do: when a packet can be sent from
-        // a raw socket, the engine says `network-not-proved`, and otherwise `no-network`.
-        let can_send = line(lines, "raw_socket_send_loopback").contains("ALLOWED");
-        assert_eq!(
-            layers.contains("network-not-proved"),
-            can_send,
-            "the engine's greeting and the raw socket disagree: {layers} / {lines:#?}"
-        );
-        assert_eq!(layers.contains("no-network"), !can_send, "{layers}");
-        if can_send {
-            println!(
-                "network: FINDING: a raw ICMP socket can send from the sandbox on this account \
-                 (the engine says so in its greeting: {layers})"
-            );
-        } else {
-            for attempt in ["raw_socket_send_loopback", "raw_socket_send_remote"] {
+        for attempt in [
+            "raw_socket",
+            "raw_socket_send_loopback",
+            "raw_socket_send_remote",
+            "raw_socket_echo_loopback",
+        ] {
+            let c = line(&control, attempt);
+            if in_ci {
                 assert!(
-                    line(lines, attempt).starts_with(&format!("{attempt}: denied")),
-                    "{lines:#?}"
+                    c.starts_with(&format!("{attempt}: ALLOWED")),
+                    "{attempt} does not work in the control, so its refusal proves nothing: {c}"
+                );
+            } else if !c.contains("ALLOWED") {
+                println!("network: the control cannot do {attempt} either on this computer: {c}");
+            }
+        }
+        // The engine tried a raw socket in its own check, so its greeting must say that the network
+        // is blocked and that the token holds no privilege.
+        assert!(layers.contains("no-privileges"), "{layers}");
+        assert!(layers.contains("no-network"), "{layers}");
+        assert!(!layers.contains("network-not-proved"), "{layers}");
+        // Other families: all start with the same device. Each is refused; where the control
+        // makes the socket, the refusal must be the access denied of the policy (and not a
+        // family that is not installed).
+        for attempt in [
+            "socket_family_raw_ipv6_icmp",
+            "socket_family_raw_ip",
+            "socket_family_unix",
+            "socket_family_hyperv",
+            "socket_family_bluetooth",
+        ] {
+            let l = line(lines, attempt);
+            let c = line(&control, attempt);
+            println!("network: {l} (control: {c})");
+            assert!(l.starts_with(&format!("{attempt}: denied")), "{l}");
+            if c.contains("ALLOWED") {
+                assert!(
+                    l.contains("os error 10013") || l.contains("os error 5)"),
+                    "{attempt} works in the control, but the sandbox was refused for another reason: {l}"
                 );
             }
+        }
+        // At least one of them must work outside the sandbox on a runner, or the loop above
+        // proves nothing about the families.
+        if in_ci {
+            assert!(
+                line(&control, "socket_family_unix").starts_with("socket_family_unix: ALLOWED"),
+                "{control:#?}"
+            );
         }
         for attempt in ["icmp_echo_loopback", "icmp_echo_remote"] {
             let l = line(lines, attempt);
@@ -818,11 +845,13 @@ fn a_locked_in_engine_cannot_open_files_use_the_network_or_start_programs() {
             "{}",
             line(lines, "desktop")
         );
-        println!(
-            "afd: {} (control: {})",
-            line(lines, "afd_endpoint"),
-            line(&control, "afd_endpoint")
-        );
+        // The device every socket is made from: with no privilege to bypass the traverse check
+        // the engine cannot open it (STATUS_ACCESS_DENIED), and the control can.
+        let (l, c) = (line(lines, "afd_endpoint"), line(&control, "afd_endpoint"));
+        println!("afd: {l} (control: {c})");
+        assert!(l.starts_with("afd_endpoint: denied"), "{l}");
+        assert!(l.contains("0xC0000022"), "{l}");
+        assert!(c.starts_with("afd_endpoint: ALLOWED"), "{c}");
         let l = line(lines, "open_network_path");
         assert!(l.starts_with("open_network_path: denied"), "{l}");
         assert!(l.contains("os error 5)"), "{l}");
@@ -1171,4 +1200,28 @@ fn an_engine_that_is_stopped_and_continued_keeps_working() {
         assert_eq!((bitmap.width, bitmap.height), (120, 156));
     }
     assert_eq!(client.spawn_count(), 1, "the engine had to be restarted");
+}
+
+/// Sends raw ICMP echo requests to `PARTRIDGE_CAPTURE_TARGET` (an address of the documentation
+/// range, which nobody answers) from the sandboxed program or, with `PARTRIDGE_CAPTURE_PHASE=control`,
+/// from a program that is not locked in. It asserts nothing: the job "Windows, packet capture"
+/// runs it under `pktmon` and counts the packets that appear on the network card. With
+/// `PARTRIDGE_TEST_KEEP_TRAVERSE_PRIVILEGE=1` (a debug switch of the client) the sandboxed program
+/// keeps the privilege the app normally removes.
+#[cfg(windows)]
+#[test]
+#[ignore = "run by the packet capture job"]
+fn raw_echo_for_the_packet_capture() {
+    let target = std::env::var("PARTRIDGE_CAPTURE_TARGET").unwrap_or_else(|_| "192.0.2.1".into());
+    let phase = std::env::var("PARTRIDGE_CAPTURE_PHASE").unwrap_or_else(|_| "sandbox".into());
+    let args = ["rawecho".to_string(), target.clone()];
+    let lines = if phase == "control" {
+        run_control(&args)
+    } else {
+        let document = kit::TempFile::new("capture.pdf", &kit::simple_pdf(1));
+        let handle = std::fs::File::open(document.path()).unwrap();
+        run_selftest(&handle, None, &args).lines
+    };
+    println!("capture phase {phase}, target {target}: {lines:#?}");
+    assert!(lines.iter().any(|l| l == "done"), "{lines:#?}");
 }

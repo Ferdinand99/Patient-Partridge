@@ -9,6 +9,8 @@
 //! Usage (the engine's options first, then these):
 //! `engine_selftest [--pdfium-dir D] [--document N] [--memory-limit B] probe FILE DIR EXE PID PORT TITLE [NAME=VALUE ...]`
 //! `engine_selftest [...] memory MIB HOLD_SECONDS [app-only]`
+//! `engine_selftest [...] rawecho ADDRESS` (Windows) sends five ICMP echo requests from a raw socket (for the packet
+//! capture job; `control rawecho ADDRESS` does the same in a program that is not locked in)
 //! `engine_selftest [...] document`
 //! `engine_selftest [...] descriptors`
 //! `engine_selftest control FILE DIR EXE PID PORT TITLE [NAME=VALUE ...]` runs the probes of `probe` in a program
@@ -52,6 +54,12 @@ fn main() {
     // The control is not locked in: the same attempts, to see that they work without a sandbox.
     if mode[0] == "control" {
         let mut say = |line: String| println!("{line}");
+        #[cfg(windows)]
+        if mode.get(1).is_some_and(|m| m == "rawecho") {
+            raw_echo_only(&mode[2..], &mut say);
+            say("done".to_string());
+            return;
+        }
         probe(&mode[1..], &mut say);
         say("done".to_string());
         return;
@@ -104,6 +112,8 @@ fn main() {
 
     match mode[0].as_str() {
         "probe" => probe(&mode[1..], &mut say),
+        #[cfg(windows)]
+        "rawecho" => raw_echo_only(&mode[1..], &mut say),
         "memory" => memory(
             mode[1].parse().expect("MiB"),
             mode[2].parse().expect("seconds"),
@@ -584,6 +594,13 @@ fn windows_network_probes(
         "icmp_echo_loopback",
         icmp_echo(std::net::IpAddr::from([127, 0, 0, 1])),
     );
+    // Other ways to make a socket: all of them start by opening the same device. Where a family is
+    // not installed the control cannot make the socket either, and the test says so.
+    report("socket_family_raw_ipv6_icmp", socket_family(23, 3, 58));
+    report("socket_family_raw_ip", socket_family(2, 3, 0));
+    report("socket_family_unix", socket_family(1, 1, 0));
+    report("socket_family_hyperv", socket_family(34, 1, 1));
+    report("socket_family_bluetooth", socket_family(32, 1, 3));
 
     // The server message block client of the kernel, to an address of this computer that is not
     // the loopback one (the loopback one is reached without the network card).
@@ -671,9 +688,46 @@ fn sendto_unbound(target: std::net::SocketAddr) -> std::io::Result<()> {
     Ok(())
 }
 
-/// A raw ICMP socket, and an echo request sent from it. `send` is where the attempt ends if the
-/// socket could be made. An account without administrator rights cannot make a raw socket anywhere.
-/// The error says which call failed.
+/// Sends five echo requests from a raw ICMP socket to the address in `args[0]`, and says what
+/// happened to each. The packet capture job watches the network card meanwhile.
+#[cfg(windows)]
+fn raw_echo_only(args: &[String], say: &mut dyn FnMut(String)) {
+    let target: std::net::Ipv4Addr = args
+        .first()
+        .and_then(|a| a.parse().ok())
+        .expect("rawecho needs an IPv4 address");
+    for i in 0..5 {
+        let result = raw_socket(Some(std::net::SocketAddr::from((target, 0))));
+        let (denied, detail) = match result {
+            Ok(()) => (false, String::new()),
+            Err(e) => (true, e.to_string()),
+        };
+        say(verdict(&format!("raw_echo_sent_{i}"), denied, detail));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+}
+
+/// Makes a socket of the given family, type and protocol and closes it again.
+#[cfg(windows)]
+fn socket_family(family: i32, kind: i32, protocol: i32) -> std::io::Result<()> {
+    use windows_sys::Win32::Networking::WinSock::{
+        closesocket, socket, WSAGetLastError, INVALID_SOCKET,
+    };
+    // SAFETY: documented Winsock calls (Winsock was started before the lock-in).
+    unsafe {
+        let s = socket(family, kind, protocol);
+        if s == INVALID_SOCKET {
+            let e = std::io::Error::from_raw_os_error(WSAGetLastError());
+            return Err(std::io::Error::other(format!("socket: {e}")));
+        }
+        closesocket(s);
+    }
+    Ok(())
+}
+
+/// A raw ICMP socket, and an echo request sent from it. `send_to` is where the attempt ends if the
+/// socket could be made. (Windows lets every account make a raw ICMP socket outside a sandbox; the
+/// control shows it.) The error says which call failed.
 #[cfg(windows)]
 fn raw_socket(send_to: Option<std::net::SocketAddr>) -> std::io::Result<()> {
     use windows_sys::Win32::Networking::WinSock::{

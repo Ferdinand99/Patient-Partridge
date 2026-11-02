@@ -26,11 +26,13 @@
 //! the few files the engine loads (its own program, the PDFium library, the `VERSION` file, the
 //! fonts folder). The user owns these files, so no administrator is needed. Where the entry cannot
 //! be added (a per-machine install in `Program Files`, which already allows "all application
-//! packages" to read) nothing is changed. The installers add the entry on the install folder too
+//! packages" to read) nothing is changed. The installers add the entry for this package on the install
+//! folder (without inheritance) and on the engine program and the PDFium library
 //! (`src-tauri/wix/package-access.wxs`, `src-tauri/windows/installer-hooks.nsh`), because a
 //! per-machine install outside `Program Files` belongs to the administrators and the user who runs
-//! the program cannot add it. The entry is kept: it names a package that exists only
-//! as a number, and the next start finds it in place. After the lock-in the engine still cannot
+//! the program cannot add it; they remove the entry on the folder when the program is uninstalled.
+//! The entry the app adds itself is kept: it names a package that exists only as a number, and the
+//! next start finds it in place. After the lock-in the engine still cannot
 //! open these files, because the restricted token has the null SID as its only restricting SID.
 
 use std::collections::HashSet;
@@ -396,4 +398,44 @@ pub(super) fn allow_files(program: &Path, args: &[std::ffi::OsString]) -> io::Re
 #[cfg(debug_assertions)]
 pub(super) fn allow_read_write(path: &Path) -> io::Result<()> {
     on_path(path, package_sid()?, FILE_GENERIC_READ | FILE_GENERIC_WRITE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+
+    /// The installers name the package by its number. It must be the one the app computes.
+    #[test]
+    fn the_installers_name_the_package_the_app_uses() {
+        let sid = package_sid().expect("the package SID");
+        let mut text: *mut u16 = null_mut();
+        // SAFETY: a valid SID and an out pointer; the string is freed with LocalFree.
+        let ok = unsafe { ConvertSidToStringSidW(sid.as_ptr() as *mut c_void, &mut text) };
+        assert_ne!(ok, 0, "ConvertSidToStringSidW");
+        let _free = Local(text.cast());
+        // SAFETY: the system returned a terminated string.
+        let name = unsafe {
+            let mut length = 0;
+            while *text.add(length) != 0 {
+                length += 1;
+            }
+            String::from_utf16_lossy(std::slice::from_raw_parts(text, length))
+        };
+        assert!(name.starts_with("S-1-15-2-"), "{name}");
+        for file in [
+            include_str!("../../../../../src-tauri/wix/package-access.wxs"),
+            include_str!("../../../../../src-tauri/windows/installer-hooks.nsh"),
+        ] {
+            assert!(
+                file.contains(&name),
+                "an installer file does not name {name}"
+            );
+            // No entry for all application packages (S-1-15-2-1) on a path.
+            assert!(
+                !file.contains("*S-1-15-2-1:"),
+                "an installer file grants all application packages"
+            );
+        }
+    }
 }

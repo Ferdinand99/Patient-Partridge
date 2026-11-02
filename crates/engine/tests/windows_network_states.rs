@@ -3,11 +3,9 @@
 //! state (the job "Windows, firewall states") and sets `PARTRIDGE_NETWORK_EXPECT`:
 //!
 //! - `record`: print what happened and assert nothing (used to find out what a state does).
-//! - `proved`: the engine must report `no-network`.
+//! - `proved`: the engine must report `no-network` (TCP, UDP and raw sockets all refused) and no
+//!   privilege in the token.
 //! - `not-proved`: the engine must report `network-not-proved` and no `no-network`.
-//! - `proved-or-raw`: `no-network`, or `network-not-proved` because a raw socket could send (an
-//!   account with administrator rights, as on the CI runners; see `docs/windows-sandbox.md`). Not
-//!   proved for any other reason (a connection that was not answered with "access denied") fails.
 //! - `any`: either, but never a refusal of the document.
 //!
 //! In every state except `record` the document must open, because the engine's fail-closed
@@ -48,12 +46,11 @@ fn the_engine_in_this_firewall_state() {
     let unproved = info.sandbox.contains("network-not-proved");
     assert!(proved != unproved, "exactly one of the two: {info:?}");
     match expect.as_str() {
-        "proved" => assert!(proved, "{info:?}"),
+        "proved" => {
+            assert!(proved, "{info:?}");
+            assert!(info.sandbox.contains("no-privileges"), "{info:?}");
+        }
         "not-proved" => assert!(unproved, "{info:?}"),
-        "proved-or-raw" => assert!(
-            proved || info.sandbox.contains("raw socket"),
-            "the block was not proved, and not because of a raw socket: {info:?}"
-        ),
         _ => {}
     }
 }

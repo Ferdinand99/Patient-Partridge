@@ -1,28 +1,30 @@
 //! Windows: the restrictions are placed on the engine by the app when it starts the engine (see the
 //! `windows` module of `partridge-engine-client`): an AppContainer token with no capabilities made
-//! from a restricted token that has only the null SID as restricting SID, the untrusted integrity
-//! level, a job object with no child processes and a memory limit, process mitigation policies, and
-//! a desktop of its own.
+//! from a restricted token that has only the null SID as restricting SID and no privilege (not even
+//! `SeChangeNotifyPrivilege`), the untrusted integrity level, a job object with no child processes
+//! and a memory limit, process mitigation policies, and a desktop of its own.
 //!
 //! A process with such a token cannot even load its own DLLs, so the engine starts with the first
 //! thread impersonating a more powerful token of the same package (the user's own rights, as a
-//! restricted token). Loading PDFium and the fonts happens in that state. This function ends it
-//! (`RevertToSelf`), so the thread falls back to the locked-down token, and then checks every
-//! layer: the token is restricted and an AppContainer token, the integrity level is below medium,
-//! the process is in a job, and the mitigation policies are on. It tries to open a file, which must
-//! fail. And it tries the network: a TCP connection and a UDP datagram to the loopback address. The
-//! AppContainer without capabilities makes the system answer both with "access denied" (what the
-//! restricted token alone never did).
+//! restricted token, with the privilege). Loading PDFium and the fonts happens in that state. This
+//! function ends it (`RevertToSelf`), so the thread falls back to the locked-down token, and then
+//! checks every layer: the token is restricted, holds no privilege and is an AppContainer token,
+//! the integrity level is the untrusted one, the process is in a job, and the mitigation policies
+//! are on. It tries to open a file, which must fail. And it tries the network: a TCP connection
+//! and a UDP datagram to the loopback address, and raw ICMP sockets. Each must fail with "access
+//! denied". The AppContainer without capabilities makes the system answer the first two that way
+//! (what the restricted token alone never did); a raw socket is refused because the token has no
+//! right to open the device that every socket is made from.
 //!
-//! What happens when the network attempts do not get that answer depends on what the attempt
-//! shows. The block is made by the filtering platform of Windows, fed by the firewall. A computer
-//! can be in a state where the answer differs (a firewall product that has taken over, a rule that
-//! lets this package out) while the process is an AppContainer token all the same. The engine then
-//! still runs, because everything it controls is in force, but it does not say that the network is
-//! blocked: the greeting names `network-not-proved` instead of `no-network` and carries what the
-//! system answered, and the app tells the user. The fail-closed condition is the AppContainer
-//! token and the other layers, which the engine checks itself; a token that is not an AppContainer
-//! token, or a layer that is missing, still ends the engine.
+//! When the network attempts do not get that answer, the engine still runs, because everything it
+//! controls is in force, but it does not say that the network is blocked: the greeting names
+//! `network-not-proved` instead of `no-network` and carries what the system answered, and the app
+//! tells the user. That is a state the engine has not been seen in on a normal computer (the
+//! hosted runners of CI, with the firewall switched off or rules for the package, still get the
+//! answers); it is there for a computer where something else changes the answer. The fail-closed
+//! condition is the AppContainer token and the other layers, which the engine checks itself; a
+//! token that is not an AppContainer token, that holds a privilege, or a layer that is missing,
+//! still ends the engine.
 
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
@@ -172,7 +174,9 @@ fn check_layers() -> Result<Vec<&'static str>, String> {
         }
         let count = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
         if count != 0 {
-            return Err(format!("the token of the engine holds {count} privilege(s)"));
+            return Err(format!(
+                "the token of the engine holds {count} privilege(s)"
+            ));
         }
         layers.push("no-privileges");
     }
@@ -264,44 +268,49 @@ fn refused_by_policy<T>(what: &str, result: std::io::Result<T>) -> Result<(), St
     }
 }
 
-/// An ICMP echo request: type 8, code 0, checksum, identifier 1, sequence 1.
-const ECHO_REQUEST: [u8; 8] = [8, 0, 0xF7, 0xFD, 0, 1, 0, 1];
+/// `ERROR_ACCESS_DENIED`: what the system answers for an IPv6 socket that policy refuses.
+const ERROR_ACCESS_DENIED: i32 = 5;
 
-/// A raw ICMP socket is a way to the network that the AppContainer does not close by itself: on a
-/// computer where the process may make one, a packet sent from it is not refused. This tries to
-/// send one echo request to the loopback address. Any failure (the socket cannot be made, the send
-/// is refused) means the way is closed; a send that works means it is not.
+/// True when the error of a failed `socket` call is the answer of a blocked network: access denied
+/// (`WSAEACCES`, or error 5 on IPv6). For IPv6 also "no such address family, socket type or
+/// protocol" (`WSAEAFNOSUPPORT`, `WSAEPROTONOSUPPORT`, `WSAESOCKTNOSUPPORT`): a computer without
+/// IPv6 has nothing there to refuse and nothing to use.
+fn socket_refused(code: i32, ipv6: bool) -> bool {
+    code == WSAEACCES
+        || code == ERROR_ACCESS_DENIED
+        || (ipv6 && matches!(code, 10047 | 10043 | 10044))
+}
+
+/// A raw ICMP socket is a way to the network that the AppContainer does not close by itself: CI
+/// showed that one can be made and used from an AppContainer token that still has
+/// `SeChangeNotifyPrivilege`, on every server image and also as a standard user. What closes it is
+/// the token having no such privilege (the app removes it): then the device every socket is made
+/// from, `\Device\Afd\Endpoint`, cannot be opened and `socket` fails with "access denied". This
+/// makes the socket and nothing else: no packet is sent. A socket that can be made means the way is
+/// open.
 fn raw_socket_is_blocked() -> Result<(), String> {
     use windows_sys::Win32::Networking::WinSock::{
-        closesocket, sendto, socket, INVALID_SOCKET, SOCKADDR,
+        closesocket, socket, WSAGetLastError, INVALID_SOCKET,
     };
-    // The address by hand: family 2 (IPv4), port 0, 127.0.0.1.
-    let mut address = Vec::with_capacity(16);
-    address.extend_from_slice(&2u16.to_le_bytes());
-    address.extend_from_slice(&0u16.to_be_bytes());
-    address.extend_from_slice(&[127, 0, 0, 1]);
-    address.extend_from_slice(&[0u8; 8]);
-    // SAFETY: documented Winsock calls (Winsock is started, see `start_winsock`); the buffers live
-    // through the calls.
-    unsafe {
-        let s = socket(2, 3, 1);
-        if s == INVALID_SOCKET {
-            return Ok(());
+    // (address family, name, protocol): ICMP over IPv4 (1) and ICMPv6 over IPv6 (58).
+    for (family, protocol, what) in [(2, 1, "raw ICMP socket"), (23, 58, "raw ICMPv6 socket")] {
+        // SAFETY: documented Winsock calls (Winsock is started, see `start_winsock`).
+        unsafe {
+            let s = socket(family, 3, protocol);
+            if s == INVALID_SOCKET {
+                let code = WSAGetLastError();
+                if socket_refused(code, family == 23) {
+                    continue;
+                }
+                return Err(format!(
+                    "a {what} could not be made, but not with the answer of a blocked network                      (access denied): error {code}"
+                ));
+            }
+            closesocket(s);
         }
-        let sent = sendto(
-            s,
-            ECHO_REQUEST.as_ptr(),
-            ECHO_REQUEST.len() as i32,
-            0,
-            address.as_ptr().cast::<SOCKADDR>(),
-            address.len() as i32,
-        );
-        closesocket(s);
-        if sent >= 0 {
-            return Err(
-                "a raw socket could send a packet: the network is not blocked for it".to_string(),
-            );
-        }
+        return Err(format!(
+            "a {what} could be made: the network is not blocked for it"
+        ));
     }
     Ok(())
 }
@@ -394,6 +403,20 @@ mod tests {
 
     fn failed(code: i32) -> std::io::Result<()> {
         Err(std::io::Error::from_raw_os_error(code))
+    }
+
+    #[test]
+    fn only_access_denied_counts_as_a_refused_socket() {
+        assert!(socket_refused(WSAEACCES, false));
+        assert!(socket_refused(ERROR_ACCESS_DENIED, true));
+        // No IPv6 on the computer is not a way out; no IPv4 raw support would be a surprise.
+        assert!(socket_refused(10047, true));
+        assert!(!socket_refused(10047, false));
+        // Anything else (no buffers, a timeout, success is not an error at all) proves nothing.
+        for code in [10055, 10060, 10022, 0] {
+            assert!(!socket_refused(code, true), "{code}");
+            assert!(!socket_refused(code, false), "{code}");
+        }
     }
 
     #[test]

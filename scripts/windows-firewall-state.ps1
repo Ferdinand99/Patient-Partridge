@@ -1,7 +1,8 @@
 # Puts a Windows runner in one state of the firewall, to see what the engine does in it (the job
 # "Windows, firewall state" in .github/workflows/ci.yml). The state is the first argument. Everything
-# that is done and what the system answered goes to logs/state.txt. A state that the runner does not
-# allow is said so in the log and is not an error: the job then proves nothing about that state.
+# that is done and what the system answered goes to logs/state.txt. After the change the script
+# checks that the state is the one asked for and fails if it is not (a hosted runner does not let a
+# job stop the firewall service or the filtering engine), so a green job is a state that was made.
 param([Parameter(Mandatory)][string]$State)
 
 $ErrorActionPreference = 'Continue'
@@ -87,3 +88,34 @@ switch ($State) {
 }
 
 Show-Firewall 'after'
+
+function Require([bool]$ok, [string]$what) {
+  if (-not $ok) { Say "NOT REACHED: $what"; throw "The state '$State' was not reached: $what" }
+  Say "reached: $what"
+}
+switch ($State) {
+  'profiles-off' {
+    $profiles = Get-NetFirewallProfile
+    Require (@($profiles | Where-Object { $_.Enabled -eq 'False' }).Count -eq 3) 'all three firewall profiles are off'
+  }
+  'outbound-allowed' {
+    $profiles = Get-NetFirewallProfile
+    Require (@($profiles | Where-Object { $_.DefaultOutboundAction -eq 'Allow' }).Count -eq 3) 'the default for outgoing traffic is allow in all three profiles'
+    Require ($null -ne (Get-NetFirewallRule -DisplayName 'allow all out' -ErrorAction SilentlyContinue)) 'the rule that allows all outgoing traffic exists'
+  }
+  'package-allowed' {
+    $sid = Get-PackageSid
+    foreach ($name in 'allow the engine package', 'allow the engine package in') {
+      $rule = Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue
+      $filter = if ($rule) { $rule | Get-NetFirewallApplicationFilter } else { $null }
+      Require ($null -ne $filter -and "$($filter.Package)" -eq $sid) "the rule '$name' exists and names the package $sid"
+    }
+  }
+  'loopback-exempt' {
+    $sid = Get-PackageSid
+    $list = (CheckNetIsolation.exe LoopbackExempt -s | Out-String)
+    Require ($list -match [regex]::Escape($sid)) "the loopback exemption list names the package $sid"
+  }
+  'firewall-service-stopped' { Require ((Get-Service MpsSvc).Status -eq 'Stopped') 'the firewall service (MpsSvc) is stopped' }
+  'filtering-engine-stopped' { Require ((Get-Service BFE).Status -eq 'Stopped') 'the filtering engine (BFE) is stopped' }
+}

@@ -9,17 +9,20 @@
 //!   processes, no `ptrace`, no executable memory), and Landlock on top where the kernel has it.
 //! - **macOS**: a Seatbelt profile that denies everything by default.
 //! - **Windows**: the app starts the engine in an AppContainer without capabilities (which blocks the
-//!   network) made from a restricted token, with a low integrity level, a job
-//!   object and process mitigation policies (see `partridge-engine-client`); the engine only gives
+//!   network) made from a restricted token that holds no privilege, with the untrusted integrity
+//!   level, a job object and process mitigation policies (see `partridge-engine-client`); the engine only gives
 //!   up the more powerful start-up identity here and checks that the restrictions are in force.
 //!
 //! The engine never opens files by path: the app opens the document and hands over an inherited,
 //! read-only handle. Nothing in the sandbox has to allow reading any file.
 //!
 //! A sandbox that did not apply is a failure. Every layer is checked after it is applied (the
-//! engine tries to open a file and to use the network, and must be refused: a socket on Linux and
-//! macOS, a TCP connection and a UDP datagram on Windows), and a release build that cannot show a working
-//! sandbox refuses to read documents.
+//! engine tries to open a file and to use the network and must be refused: a socket on Linux and
+//! macOS, a TCP connection, a UDP datagram and raw sockets on Windows), and a release build that
+//! cannot show a working sandbox refuses to read documents. The one exception is the answer of the
+//! network on Windows: when the attempts are not refused with "access denied" the engine still
+//! runs, because every layer it controls is in force, and its greeting says `network-not-proved`
+//! instead of `no-network`.
 
 #[cfg(target_os = "linux")]
 mod linux;
