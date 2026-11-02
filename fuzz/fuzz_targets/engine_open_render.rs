@@ -355,8 +355,13 @@ impl State {
                 if print.0 == 0 {
                     match self.ask(RequestBody::Fingerprint { doc: again }) {
                         ResponseBody::Fingerprint { failed, digest, .. } => {
-                            assert_eq!(failed, 0, "pages of the saved file cannot be read");
-                            assert_eq!(digest, print.1, "the saved file is another document");
+                            // A damaged file that PDFium repaired on opening can be written in a
+                            // form with a page it cannot read (a page tree it had to guess at).
+                            // The app's check of a saved file refuses exactly that, so the target
+                            // only holds a file whose pages all read to the digest.
+                            if failed == 0 {
+                                assert_eq!(digest, print.1, "the saved file is another document");
+                            }
                         }
                         other => panic!("unexpected answer to Fingerprint: {other:?}"),
                     }
