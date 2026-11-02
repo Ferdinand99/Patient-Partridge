@@ -461,8 +461,8 @@ export class DocumentView {
   }
 
   /** The selected text for a Copy, loading the pages it still lacks, and what it could not do. */
-  loadSelectedText(): Promise<CopyResult> {
-    return this.overlays.loadSelectedText();
+  loadSelectedText(onProgress?: (done: number, total: number) => void): Promise<CopyResult> {
+    return this.overlays.loadSelectedText(onProgress);
   }
 
   /** How many characters of page text the document keeps now. For tests and for diagnostics. */

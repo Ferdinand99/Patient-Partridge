@@ -284,14 +284,14 @@ export class TextStore {
     return this.refusedPages.has(page);
   }
 
-  /** True when the page could not be read the last time it was loaded. */
-  failed(page: number): boolean {
-    return this.failedPages.has(page);
-  }
-
   /** True when the page has no text and asking again now is no use: it was refused or is unreadable. */
   unavailable(page: number): boolean {
     return this.refusedPages.has(page) || this.failedPages.has(page);
+  }
+
+  /** Lets a page that could not be read try again. A refused page is left as it is. */
+  retry(page: number): void {
+    this.failedPages.delete(page);
   }
 
   /** Lets a refused or unreadable page try again, such as when it comes on screen again. */

@@ -27,6 +27,20 @@ describe("the real latest.json of Nimble Newt v0.3.0", () => {
     expect(assetOf(real.platforms["darwin-x86_64"].url, assets)?.name).toBe("Nimble.Newt_0.3.0_universal.app.tar.gz");
   });
 
+  it("asks for the entry of each Windows installer, which is the one an installed copy uses", () => {
+    expect(real.platforms["windows-x86_64-nsis"].url).not.toBe(real.platforms["windows-x86_64-msi"].url);
+    const noNsis = { ...real, platforms: { ...real.platforms } };
+    delete noNsis.platforms["windows-x86_64-nsis"];
+    expect(problemsOf(noNsis, assets, "0.3.0", hasWindowsAndMac)).toEqual(["windows-x86_64-nsis is missing from latest.json"]);
+    const swapped = {
+      ...real,
+      platforms: { ...real.platforms, "windows-x86_64-nsis": real.platforms["windows-x86_64-msi"] },
+    };
+    expect(problemsOf(swapped, assets, "0.3.0", hasWindowsAndMac).join("\n")).toContain(
+      "windows-x86_64-nsis points to Nimble.Newt_0.3.0_x64_en-US.msi, which is not an update file for it",
+    );
+  });
+
   it("asks for Linux when Linux is required, as it is for Patient Partridge", () => {
     expect(problemsOf(real, assets, "0.3.0")).toEqual(["linux-x86_64 is missing from latest.json"]);
   });

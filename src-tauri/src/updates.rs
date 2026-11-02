@@ -26,7 +26,7 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, State};
 use tauri_plugin_updater::UpdaterExt;
 
-use crate::positions::{create_private_dir, write_private_file};
+use crate::positions::{create_private_dir, read_plain_file, write_private_file};
 use crate::unsaved::Unsaved;
 use crate::{links, locate, now_seconds, CommandError, Engine};
 
@@ -145,6 +145,25 @@ pub fn detect() -> InstallMethod {
         appimage,
         appdir,
     })
+}
+
+/// True on macOS when the app was started through a symbolic link. Tauri refuses the path of the
+/// running program then (a link can be pointed somewhere else), so the update plugin ends in an I/O
+/// error and a restart after an update would quit without starting the app again. The app itself
+/// works. Tauri's check is kept on because it is what stops a restart from starting whatever a
+/// link has been pointed at; the window tells the person that updates are not possible here.
+pub fn runs_through_symlink() -> bool {
+    through_symlink(
+        cfg!(target_os = "macos"),
+        tauri::utils::platform::current_exe().is_err(),
+        std::env::current_exe().is_ok(),
+    )
+}
+
+/// The rule of [`runs_through_symlink`] on its own: macOS only, and only when Tauri refuses the path
+/// while the standard library finds the program. If both fail, the path is broken for another reason.
+fn through_symlink(is_macos: bool, tauri_refuses: bool, std_finds: bool) -> bool {
+    is_macos && tauri_refuses && std_finds
 }
 
 // ---- no new engine while an update is installed --------------------------------------------
@@ -392,11 +411,7 @@ impl Settings {
 }
 
 pub(crate) fn read_small_file(file: &Path) -> Option<Vec<u8>> {
-    let meta = std::fs::metadata(file).ok()?;
-    if meta.len() > MAX_SMALL_FILE {
-        return None;
-    }
-    std::fs::read(file).ok()
+    read_plain_file(file, MAX_SMALL_FILE)
 }
 
 pub(crate) fn write_json<T: Serialize>(file: &Path, value: &T) -> io::Result<()> {
@@ -485,6 +500,8 @@ pub enum FailureKind {
     Unsaved,
     /// This copy cannot install by itself (a deb package).
     Manual,
+    /// The app was started through a symbolic link (macOS): updates are not possible from there.
+    Location,
     Other,
 }
 
@@ -586,6 +603,8 @@ pub struct UpdateState {
     restored: Mutex<Vec<String>>,
     restore_file: Option<PathBuf>,
     method: InstallMethod,
+    /// The app runs through a symbolic link (see [`runs_through_symlink`]).
+    symlinked: bool,
 }
 
 impl UpdateState {
@@ -604,6 +623,7 @@ impl UpdateState {
             restored: Mutex::new(Vec::new()),
             restore_file: data_dir.map(|d| d.join("restore-after-update.json")),
             method,
+            symlinked: runs_through_symlink(),
         }
     }
 
@@ -718,6 +738,18 @@ pub fn updating_error() -> CommandError {
     }
 }
 
+/// Refuses an update check from a place where the app cannot update itself, with a kind of its own
+/// so that the window can say it in one calm sentence instead of showing an I/O error.
+fn location_allows_update(symlinked: bool) -> Result<(), UpdateFailure> {
+    if symlinked {
+        return Err(failure(
+            FailureKind::Location,
+            "the app was started through a symbolic link",
+        ));
+    }
+    Ok(())
+}
+
 pub async fn check(
     app: &AppHandle,
     state: &UpdateState,
@@ -729,6 +761,7 @@ pub async fn check(
     if state.installing.load(Ordering::SeqCst) || state.gate.is_closed() {
         return Err(failure(FailureKind::Busy, "an update is being installed"));
     }
+    location_allows_update(state.symlinked)?;
     let found = app
         .updater()
         .map_err(from_updater)?
@@ -1478,6 +1511,25 @@ mod tests {
             cfg!(feature = "update-driver")
         );
         assert!(!download_allowed(&url("http://example.com/x")));
+    }
+
+    #[test]
+    fn an_app_started_through_a_symbolic_link_does_not_check_for_updates() {
+        assert!(location_allows_update(false).is_ok());
+        let refused = location_allows_update(true).unwrap_err();
+        assert_eq!(refused.kind, FailureKind::Location);
+        assert!(!refused.engines_stopped);
+    }
+
+    #[test]
+    fn only_a_macos_start_that_tauri_refuses_but_the_system_finds_counts_as_a_link() {
+        assert!(through_symlink(true, true, true));
+        // Windows and Linux are never flagged.
+        assert!(!through_symlink(false, true, true));
+        // A normal start: Tauri accepts the path.
+        assert!(!through_symlink(true, false, true));
+        // Both fail: something else is wrong with the path, and the real error stays visible.
+        assert!(!through_symlink(true, true, false));
     }
 
     #[test]

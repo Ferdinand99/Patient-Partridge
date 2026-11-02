@@ -327,7 +327,7 @@ mod tests {
     }
 
     #[test]
-    fn the_file_is_written_atomically_and_holds_only_paths_and_the_active_tab() {
+    fn the_file_leaves_no_temporary_file_and_holds_only_paths_and_the_active_tab() {
         let dir = TempDir::new();
         let mut session = Session::load(Some(dir.file()), true);
         session.save(true, list(&["/a.pdf"], Some(0))).unwrap();

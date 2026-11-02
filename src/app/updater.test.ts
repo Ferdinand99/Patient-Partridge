@@ -125,6 +125,7 @@ describe("failureText", () => {
       "busy",
       "unsaved",
       "manual",
+      "location",
       "other",
     ] as const;
     for (const kind of kinds) {
@@ -207,6 +208,26 @@ describe("checking", () => {
     api.checkUpdate.mockRejectedValueOnce({ kind: "invalidSignature", message: "x", enginesStopped: false });
     await vi.advanceTimersByTimeAsync(CHECK_INTERVAL_MS);
     expect(sheetText()).toContain("signature");
+  });
+
+  it("tells once, calmly, that the app cannot update from where it is, and never shows an I/O error", async () => {
+    const { api } = make();
+    const location = { kind: "location", message: "the app was started through a symbolic link", enginesStopped: false };
+    api.checkUpdate.mockRejectedValue(location);
+    await vi.advanceTimersByTimeAsync(FIRST_CHECK_DELAY_MS);
+    expect(sheetText()).toContain(
+      "Automatic updates aren't available from this location. Move Patient Partridge to the Applications folder.",
+    );
+    expect(sheetText()).not.toMatch(/I\/O|symbolic link|did not work/);
+    await click(button("OK"));
+    expect(layer().hidden).toBe(true);
+    // The next automatic checks are quiet.
+    await vi.advanceTimersByTimeAsync(CHECK_INTERVAL_MS * 2);
+    expect(api.checkUpdate).toHaveBeenCalledTimes(3);
+    expect(layer().hidden).toBe(true);
+    // A person who asks is told again.
+    await click(document.getElementById("check-updates"));
+    expect(sheetText()).toContain("Move Patient Partridge to the Applications folder");
   });
 
   it("tells a person who asked what went wrong", async () => {

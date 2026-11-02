@@ -1,0 +1,34 @@
+# The tools that make the AppImage are pinned by SHA-256 (scripts/linux-tools.lock.json). One of
+# them comes from a rolling release that its authors replace from time to time. This compares the
+# files online with the pins once a week, so that a replaced tool is found while there is time,
+# and not in the Linux build of a release, which runs last, after the macOS app is notarised.
+# It reports only by failing.
+name: AppImage tools
+
+on:
+  schedule:
+    - cron: "43 6 * * 1"
+  push:
+    branches: [main]
+    paths:
+      - scripts/linux-tools.mjs
+      - scripts/linux-tools.lock.json
+      - .github/workflows/linux-tools.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pins:
+    name: Pinned tools are still the files online
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+      - name: Compare the pins with the files online
+        run: node scripts/linux-tools.mjs --check
