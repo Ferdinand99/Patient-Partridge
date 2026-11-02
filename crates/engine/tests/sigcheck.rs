@@ -1296,6 +1296,85 @@ fn a_set_within_the_limit_is_still_read() {
     assert!(!matches!(info.state, S::Trusted | S::UnknownSigner));
 }
 
+/// A file whose signature holds a name of `count` parts in `field`, written with `tag`.
+fn hidden_file(field: ImplicitField, tag: u8, count: usize) -> (SignedFile, SignOptions) {
+    let signer = p256("Hostile");
+    let options = SignOptions {
+        contents_size: 1024 * 1024 - 64,
+        ..SignOptions::default()
+    };
+    let mut file = sign(&signer, &options);
+    replace_signature(&mut file, &hidden_set_signature(field, tag, count));
+    (file, options)
+}
+
+const IMPLICIT_FIELDS: [ImplicitField; 4] = [
+    ImplicitField::SignedAttributes,
+    ImplicitField::UnsignedAttributes,
+    ImplicitField::Certificates,
+    ImplicitField::Revocations,
+];
+
+#[test]
+fn a_set_behind_a_primitive_tag_is_refused_at_once_in_every_implicit_field() {
+    // The `der` crate decodes the content of an implicit field, sorts what is in it, and only then
+    // looks at whether the tag was constructed. With the constructed bit off, a walk that enters
+    // only constructed elements sees one small element, while the decoder sorts tens of thousands
+    // of parts: a quarter of a megabyte took minutes. The tag is checked in every place it matters,
+    // written right and written wrong, and the time of each is bounded.
+    for field in IMPLICIT_FIELDS {
+        for tag in [field.constructed_tag(), field.primitive_tag()] {
+            let (file, options) = hidden_file(field, tag, 20_000);
+            let started = std::time::Instant::now();
+            let info = run(&file, &options);
+            let took = started.elapsed();
+            assert_eq!(
+                (info.state, info.reason),
+                (S::Unsupported, R::TooLarge),
+                "{field:?} {tag:#04x}"
+            );
+            assert!(
+                took < std::time::Duration::from_secs(5),
+                "{field:?} {tag:#04x}: {took:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_primitive_element_of_a_context_class_is_small_or_refused() {
+    use partridge_engine::sigcheck::check_shape;
+    use partridge_testkit::signed::der::{seq, tlv};
+    // A key identifier, a unique identifier: a few dozen bytes, as in a real signature.
+    for tag in [0x80u8, 0x81, 0x82, 0x83, 0x9e] {
+        assert_eq!(
+            check_shape(&seq(&[tlv(tag, &[7u8; 64])])),
+            Ok(()),
+            "{tag:#04x}"
+        );
+        assert_eq!(
+            check_shape(&seq(&[tlv(tag, &[7u8; 1024])])),
+            Ok(()),
+            "{tag:#04x}"
+        );
+        assert_eq!(
+            check_shape(&seq(&[tlv(tag, &[7u8; 1025])])),
+            Err(R::TooLarge),
+            "{tag:#04x}"
+        );
+    }
+    // The other classes that are not universal are held to the same size.
+    for tag in [0x40u8, 0xc0] {
+        assert_eq!(
+            check_shape(&seq(&[tlv(tag, &[7u8; 1025])])),
+            Err(R::TooLarge),
+            "{tag:#04x}"
+        );
+    }
+    // A universal primitive element (a string, a key, a signature) may be big.
+    assert_eq!(check_shape(&seq(&[tlv(0x04, &[7u8; 5000])])), Ok(()));
+}
+
 #[test]
 fn the_time_for_the_check_is_kept() {
     // When the time is up before the file is hashed, the signature is not checked to the end, and
@@ -1321,6 +1400,56 @@ fn the_time_for_the_check_is_kept() {
     )
     .unwrap();
     expect(&info, S::Unsupported, R::TooLarge);
+}
+
+#[test]
+fn once_the_time_is_up_a_signature_is_not_read_or_decoded_at_all() {
+    // A signature that comes after the time ran out is not parsed and not verified: it is "not
+    // checked" for the time, whatever it holds. Here it holds nothing that parses; without the
+    // look at the clock the answer would be about the damage instead.
+    let signer = p256("Test Signer");
+    let options = SignOptions::default();
+    let mut file = sign(&signer, &options);
+    let (from, to) = (file.contents_at + 1 + 200, file.contents_end - 1);
+    for b in &mut file.bytes[from..to] {
+        *b = b'0';
+    }
+    let raw = raw_of(&file, &options);
+    let trust = TrustList::empty();
+    let mut progress = |_: u32| {};
+    let late = std::time::Instant::now();
+    let mut work = Work::new(HASH_BUDGET, &mut progress).with_deadline(late);
+    let mut source: &[u8] = &file.bytes;
+    let info = check(
+        0,
+        &raw,
+        &mut source,
+        file.bytes.len() as u64,
+        &Settings {
+            trust: &trust,
+            now: NOW,
+        },
+        &mut work,
+    )
+    .unwrap();
+    expect(&info, S::Unsupported, R::TooLarge);
+    // With time to spare the same file is judged on what it holds.
+    let mut progress = |_: u32| {};
+    let mut work = Work::new(HASH_BUDGET, &mut progress);
+    let mut source: &[u8] = &file.bytes;
+    let info = check(
+        0,
+        &raw,
+        &mut source,
+        file.bytes.len() as u64,
+        &Settings {
+            trust: &trust,
+            now: NOW,
+        },
+        &mut work,
+    )
+    .unwrap();
+    assert_ne!(info.reason, R::TooLarge);
 }
 
 // ---- the chain -----------------------------------------------------------------------------------

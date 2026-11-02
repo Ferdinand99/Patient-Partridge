@@ -153,7 +153,7 @@
         signature({
           state: "broken", reason: "signature_invalid",
           signer: "<img src=x onerror=alert(1)> Trusted Bank AS",
-          statedReason: "<b>VERIFIED</b> by Acrobat",
+          statedReason: "<b>VERIFIED</b> by Some Reader",
           statedLocation: "javascript:alert(1)",
         }),
       ],

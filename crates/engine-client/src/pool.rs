@@ -253,7 +253,7 @@ impl EnginePool {
             // Another file: whatever is there now is what the user chose to replace.
             Some(t) => (t.to_path_buf(), FileStamp::read(t).ok()),
         };
-        let outcome = save_document(
+        let mut outcome = save_document(
             &client,
             doc,
             &path,
@@ -279,7 +279,30 @@ impl EnginePool {
         source.stamp =
             Some(FileStamp::read(&outcome.path).unwrap_or_else(|_| FileStamp::unknown()));
         source.saved = true;
+        drop(source);
+        outcome.replaced = self.mark_replaced(handle, &outcome.path);
         Ok(outcome)
+    }
+
+    /// Every other open document whose engine reads the file at `path` is told apart: what its
+    /// engine holds is the file as it was, and the path now leads to something else. Like a document
+    /// that was saved itself, it is not asked about its signatures any more. Their handles are
+    /// returned so that the window can say so.
+    fn mark_replaced(&self, handle: u64, path: &Path) -> Vec<u64> {
+        let st = state(&self.state);
+        let mut replaced = Vec::new();
+        for (other, entry) in st.docs.iter() {
+            if *other == handle {
+                continue;
+            }
+            let mut source = entry.source.lock().unwrap_or_else(|e| e.into_inner());
+            if same_file(&source.original, path) {
+                source.saved = true;
+                replaced.push(*other);
+            }
+        }
+        replaced.sort_unstable();
+        replaced
     }
 
     fn entry(&self, handle: u64) -> Result<(Arc<EngineClient>, u64), ClientError> {
@@ -329,7 +352,7 @@ impl EnginePool {
         if saved {
             return Err(ClientError::Engine {
                 code: ErrorCode::SourceChanged,
-                message: "the document was saved after it was opened; the signatures of the                           file it was opened from say nothing about the file that was written"
+                message: "the document was saved after it was opened; the signatures of the file it was opened from say nothing about the file that was written"
                     .to_string(),
             });
         }

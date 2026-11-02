@@ -16,12 +16,23 @@
 //!   reader stopped reading, it did not find the signature false.
 //! - Before the `der` crate sees a byte, [`check_shape`] walks the structure with limits on depth
 //!   and on the number of elements in a set. The crate sorts every set it decodes with an insertion
-//!   sort, so a set of some hundred thousand elements in a megabyte would take minutes.
+//!   sort, so a set of some hundred thousand elements in a megabyte would take minutes. The walk
+//!   does not trust the constructed bit of a context tag: the crate decodes the content of a field
+//!   it expects (the certificates, the revocation data, the signed and unsigned attributes) and
+//!   looks at that bit afterwards, so a primitive tag cannot be taken to hide nothing. A primitive
+//!   element that is not of the universal class is refused above [`MAX_OPAQUE`] bytes.
+//! - In the engine process the decoding itself runs on a thread of its own ([`start_parser`]) and
+//!   is waited for only until the time of the check is up ([`parse_within`]), so that a shape
+//!   nobody thought of cannot hold up the pages of the document.
 //! - [`Cms::verify`] checks the signature over the signed attributes with the key of the signer's
 //!   certificate, and the attributes themselves (content type, one message digest, the binding to
 //!   the signer's certificate when the signer wrote it). It does not look at the file.
 //! - [`Cms::digest_matches`] compares the digest the signer signed with a digest of the file.
 //! - [`Cms::trust`] says whether the signer's certificate leads to a certificate on a trust list.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use cms::content_info::ContentInfo;
 use cms::signed_data::{SignedData, SignerIdentifier, SignerInfo};
@@ -80,6 +91,14 @@ const MAX_SET_ELEMENTS: usize = 256;
 /// number of elements added so far for every element read. About a million comparisons, which take
 /// a few milliseconds.
 const MAX_SET_WORK: u64 = 1 << 20;
+
+/// Longest primitive element that is not of the universal class (a key identifier, a unique
+/// identifier of a certificate). The `der` crate may decode the content of such an element as a
+/// whole structure before it notices that the tag is wrong, so what is inside one must stay small.
+const MAX_OPAQUE: usize = 1024;
+
+/// The longest the thread that decodes a signature is waited for when no other time is given.
+const PARSE_LIMIT: Duration = Duration::from_secs(10);
 
 /// The digest algorithms that are checked. SHA-1 is known and refused: collisions are practical.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -302,7 +321,14 @@ pub fn check_shape(der: &[u8]) -> Result<(), SignatureReason> {
                 return Err(TooLarge);
             }
         }
-        if tag & 0x20 != 0 {
+        if tag & 0x20 == 0 {
+            // A primitive element has nothing to walk, but `der` decodes the content of a field it
+            // expects before it looks at the constructed bit of the tag, so a primitive element of
+            // a context class may be read as the set it stands for. Only a small one is let through.
+            if tag & 0xc0 != 0 && content.len() > MAX_OPAQUE {
+                return Err(TooLarge);
+            }
+        } else {
             if stack.len() >= MAX_DEPTH {
                 return Err(TooLarge);
             }
@@ -321,11 +347,130 @@ pub fn check_shape(der: &[u8]) -> Result<(), SignatureReason> {
 
 /// Reads the CMS wrapper of a signature. `der` is exactly one element.
 pub fn parse(der: &[u8]) -> Result<Cms, SignatureReason> {
-    use SignatureReason::*;
+    check_form(der)?;
+    decode(der)
+}
+
+/// What is checked without decoding: one definite element, and a structure within the limits.
+fn check_form(der: &[u8]) -> Result<(), SignatureReason> {
     if der_element_len(der) != Some(der.len()) {
-        return Err(EncodingUnsupported);
+        return Err(SignatureReason::EncodingUnsupported);
     }
-    check_shape(der)?;
+    check_shape(der)
+}
+
+/// One request for the thread that decodes signatures, and where its answer goes.
+struct Job {
+    der: Vec<u8>,
+    answer: mpsc::SyncSender<Result<Cms, SignatureReason>>,
+}
+
+/// The thread that decodes signatures, once it was started.
+struct Parser {
+    jobs: Mutex<mpsc::Sender<Job>>,
+    /// True from the moment a job is handed over until the thread is done with it. A thread that
+    /// is still busy with a job nobody waits for any more is not given another.
+    busy: Arc<AtomicBool>,
+}
+
+static PARSER: OnceLock<Parser> = OnceLock::new();
+
+/// Test builds only: how long the thread that decodes signatures waits before it starts on a job.
+#[cfg(debug_assertions)]
+static PARSE_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Test builds only: makes the thread that decodes signatures slow, so that a test can show that
+/// the caller does not wait for it.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_parse_delay_for_tests(millis: u64) {
+    PARSE_DELAY_MS.store(millis, Ordering::Relaxed);
+}
+
+/// Starts the thread that decodes signatures for [`parse_within`]. It has to run before the
+/// sandbox is applied: a process that is locked in cannot start a thread. Returns false when the
+/// thread could not be started, and then signatures are decoded on the thread that asks.
+pub fn start_parser() -> bool {
+    if PARSER.get().is_some() {
+        return true;
+    }
+    let (jobs, queue) = mpsc::channel::<Job>();
+    let busy = Arc::new(AtomicBool::new(false));
+    let (ready, started) = mpsc::channel();
+    let flag = busy.clone();
+    let spawned = std::thread::Builder::new()
+        .name("signature-parser".into())
+        // The decoder recurses with the depth of the structure, which is limited; this leaves room.
+        .stack_size(4 * 1024 * 1024)
+        .spawn(move || {
+            let _ = ready.send(());
+            for job in queue {
+                #[cfg(debug_assertions)]
+                std::thread::sleep(Duration::from_millis(
+                    PARSE_DELAY_MS.load(Ordering::Relaxed),
+                ));
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode(&job.der)))
+                        .unwrap_or(Err(SignatureReason::Unreadable));
+                flag.store(false, Ordering::Release);
+                // Nobody may be waiting any more; the answer is then dropped.
+                let _ = job.answer.send(result);
+            }
+        });
+    // The thread says when it has started: a thread that is still starting up when the system
+    // call filter is put on every thread would be killed halfway.
+    if spawned.is_err() || started.recv().is_err() {
+        return false;
+    }
+    PARSER
+        .set(Parser {
+            jobs: Mutex::new(jobs),
+            busy,
+        })
+        .is_ok()
+}
+
+/// As [`parse`], but the decoding is waited for only until `deadline` (at most [`PARSE_LIMIT`] when
+/// there is none), when the thread of [`start_parser`] runs. A signature that takes longer is
+/// refused as too large, and the thread is left to finish by itself: the caller does not wait for
+/// it, so no shape of a signature can hold up the pages of the document. While the thread is busy
+/// with such a signature the next ones are refused at once.
+pub fn parse_within(der: &[u8], deadline: Option<Instant>) -> Result<Cms, SignatureReason> {
+    use SignatureReason::*;
+    check_form(der)?;
+    let Some(parser) = PARSER.get() else {
+        return decode(der);
+    };
+    if parser.busy.swap(true, Ordering::AcqRel) {
+        return Err(TooLarge);
+    }
+    let (answer, reply) = mpsc::sync_channel(1);
+    let sent = parser
+        .jobs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .send(Job {
+            der: der.to_vec(),
+            answer,
+        });
+    if sent.is_err() {
+        parser.busy.store(false, Ordering::Release);
+        return Err(Unreadable);
+    }
+    let wait = deadline
+        .map(|d| d.saturating_duration_since(Instant::now()))
+        .unwrap_or(PARSE_LIMIT)
+        .min(PARSE_LIMIT);
+    match reply.recv_timeout(wait) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(TooLarge),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(Unreadable),
+    }
+}
+
+/// Decodes a signature that passed [`check_form`].
+fn decode(der: &[u8]) -> Result<Cms, SignatureReason> {
+    use SignatureReason::*;
     let info = ContentInfo::from_der(der).map_err(|_| Unreadable)?;
     if info.content_type != ID_SIGNED_DATA {
         return Err(Unreadable);

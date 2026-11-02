@@ -2902,7 +2902,7 @@ describe("App: the verdict on a signature belongs to the bytes it was made from"
     expect(badge().classList.contains("sig-stale")).toBe(true);
     badge().click();
     expect(q("#signature-panel").textContent).toContain("has not been checked");
-    expect(q("#signature-panel").textContent).toContain("Open the file again");
+    expect(q("#signature-panel").textContent).toContain("close this tab and open the file again");
     expect(q("#signature-panel").textContent).not.toContain("Signature intact");
     // Nothing offers to check again (the engine would answer for the file it opened), and
     // coming back to the tab asks nothing.
@@ -2940,6 +2940,44 @@ describe("App: the verdict on a signature belongs to the bytes it was made from"
     key("S", { ctrlKey: true, shiftKey: true });
     await flush();
     expect(badge().hidden).toBe(true);
+  });
+
+  it("drops the verdict at once when the engine refuses to draw from a file that changed", async () => {
+    const m = make({ signatures: signed });
+    // The first page is drawn from other bytes than the ones that were checked: the engine says
+    // so, whatever the check had found before.
+    m.api.render.mockRejectedValue({ code: "source_changed", message: "the file has changed" });
+    await m.app.openPath("/docs/signed.pdf");
+    await flush();
+    expect(badge().hidden).toBe(false);
+    expect(badge().textContent).toBe(STALE);
+    expect(badge().textContent).not.toContain("intact");
+    badge().click();
+    const text = q("#signature-panel").textContent ?? "";
+    expect(text).toContain("The file on the disk has been changed");
+    expect(text).not.toContain("Signature intact");
+    expect(q("#signature-panel").querySelector("button.btn:not(.btn-icon)")).toBeNull();
+    // It stays dropped, and nothing asked the engine for a second verdict.
+    await new Promise((r) => setTimeout(r, 20));
+    expect((m.api as unknown as { getSignatures: ReturnType<typeof vi.fn> }).getSignatures).toHaveBeenCalledTimes(1);
+  });
+
+  it("drops the verdict of a tab whose file was replaced by a save in another tab", async () => {
+    const m = await openSigned("/docs/one.pdf");
+    await m.app.openPath("/docs/two.pdf");
+    await flush();
+    expect(badge().textContent).toBe(INTACT);
+    // The second tab saves a copy over the file the first one is open on (the app process says
+    // which documents were open on the file it replaced).
+    m.api.saveAs.mockResolvedValueOnce({ path: "/docs/target.pdf", name: "target.pdf", replaced: [1] });
+    key("S", { ctrlKey: true, shiftKey: true });
+    await flush();
+    tab("one.pdf").click();
+    await flush();
+    expect(badge().textContent).toBe(STALE);
+    badge().click();
+    expect(q("#signature-panel").textContent).toContain("The file on the disk has been changed");
+    expect(q("#signature-panel").textContent).not.toContain("Signature intact");
   });
 
   it("keeps the verdict of another tab", async () => {

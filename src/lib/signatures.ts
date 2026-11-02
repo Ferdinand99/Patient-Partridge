@@ -46,6 +46,9 @@ export interface SignaturesInfo {
   items: SignatureItem[];
 }
 
+/** What is said wherever a signature could not be checked: it is no reason to trust the file. */
+export const DO_NOT_RELY = "Do not rely on this signature. The file may have been changed, and changing a file can cause this.";
+
 /** The words for each state. Plain, and the same everywhere they are used. */
 export const STATE_LABEL: Record<SignatureState, string> = {
   trusted: "Signature intact; signer trusted",
@@ -63,7 +66,7 @@ export const STATE_MEANING: Record<SignatureState, string> = {
     "The part of the file this signature covers is as it was when the holder of the key signed it. Who that is has not been verified.",
   changed: "The file is not the same as the one that was signed.",
   broken: "The signature does not hold. Nothing in the file can be taken as signed by it.",
-  unsupported: "This version cannot check this signature. That says nothing for or against it.",
+  unsupported: `This version cannot check this signature. ${DO_NOT_RELY}`,
 };
 
 /** The reasons, by the code the engine sends. */
@@ -78,8 +81,7 @@ export const REASON_TEXT: Record<string, string> = {
     "The signature leaves out more of the file than the space for itself, so it cannot vouch for the whole file.",
   contents_mismatch: "The signature that the PDF library lists is not the one stored in the file at the signed place.",
   contents_padding: "Other data follows the signature inside the space made for it.",
-  unreadable:
-    "This version could not read the signature data, so it could not check whether the file was changed since. That says nothing for or against the file.",
+  unreadable: "This version could not read the signature data, so it could not check whether the file was changed since.",
   no_signer_certificate: "The signature does not carry the certificate of the signer.",
   certificate_mismatch: "The certificate in the signature is not the one the signer named.",
   attributes_invalid: "The signed attributes are missing, repeated or wrong.",
@@ -89,10 +91,8 @@ export const REASON_TEXT: Record<string, string> = {
   algorithm_unsupported: "The signature algorithm or the kind of key is not supported.",
   key_too_small: "The key is too short to be checked safely.",
   no_signed_attributes: "The signature has no signed attributes. That form is not checked.",
-  encoding_unsupported:
-    "The signature is not encoded in the strict form (DER) that this version requires, so it could not be checked. That says nothing for or against the file.",
-  too_large:
-    "The signature or the file is too large for the limits of the check, or the check ran out of time. That says nothing for or against the file.",
+  encoding_unsupported: "The signature is not encoded in the strict form (DER) that this version requires, so it could not be checked.",
+  too_large: "The signature or the file is too large for the limits of the check, or the check ran out of time.",
   no_trust_list:
     "This version of Patient Partridge ships no trust list, so no signer can be verified. The signature itself is intact.",
   not_in_trust_list: "The signer's certificate does not lead to a certificate on the trust list.",
@@ -141,9 +141,16 @@ export const NOT_CHECKED: readonly string[] = [
 /** The badge for a tab whose document is no longer the file the signatures were checked on. */
 export const STALE_LABEL = "Not checked for this version";
 
-/** What the panel says about such a tab. */
-export const STALE_TEXT =
-  "The signatures were checked on the file as it was opened. This tab now shows a version that was saved or changed since, and that version has not been checked. Earlier results do not apply to it. Open the file again to check it.";
+/** Why a tab no longer holds the file the signatures were checked on. */
+export type StaleReason = "changed" | "file_changed";
+
+/** What the panel says about such a tab, by why it is one. */
+export const STALE_TEXT: Record<StaleReason, string> = {
+  changed:
+    "The signatures were checked on the file as it was opened. This tab now shows a version that was saved or changed since, and that version has not been checked. Earlier results do not apply to it. Do not rely on them for this version. To check the file, close this tab and open the file again.",
+  file_changed:
+    "The signatures were checked on the file as it was opened. The file on the disk has been changed since, so that result does not apply to the file as it is now. Do not rely on it. To check the file, close this tab and open the file again.",
+};
 
 /** What the badge shows for a document. */
 export interface Summary {

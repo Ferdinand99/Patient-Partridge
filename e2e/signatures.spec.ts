@@ -104,7 +104,7 @@ test("text in the file that looks like markup, a script or a verdict is shown as
   await expect(badge(page)).toHaveClass(/sig-broken/);
   await badge(page).click();
   await expect(panel(page)).toContainText("<img src=x onerror=alert(1)> Trusted Bank AS");
-  await expect(panel(page)).toContainText("<b>VERIFIED</b> by Acrobat");
+  await expect(panel(page)).toContainText("<b>VERIFIED</b> by Some Reader");
   await expect(panel(page)).toContainText("javascript:alert(1)");
   await expect(panel(page).locator("img, script, a, b")).toHaveCount(0);
   await expect(panel(page).locator(".sig-state strong")).toHaveText("Signature broken");

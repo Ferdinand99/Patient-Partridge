@@ -1,8 +1,10 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
+  DO_NOT_RELY,
   NOT_CHECKED,
   REASON_TEXT,
+  STALE_TEXT,
   STATE_LABEL,
   STATE_MEANING,
   certificateTimeText,
@@ -172,5 +174,23 @@ describe("the badge", () => {
     expect(unlistedText(3)).toMatch(/3 more places/);
     expect(omittedText(64, 64)).toBeNull();
     expect(omittedText(70, 64)).toBe("6 more signatures are listed in the file but not described here.");
+  });
+});
+
+describe("what is said where a signature could not be checked", () => {
+  it("tells the reader not to rely on it, in plain words and with no promise", () => {
+    expect(DO_NOT_RELY).toBe(
+      "Do not rely on this signature. The file may have been changed, and changing a file can cause this.",
+    );
+    expect(STATE_MEANING.unsupported).toContain(DO_NOT_RELY);
+    for (const text of [...Object.values(STATE_MEANING), ...Object.values(REASON_TEXT), ...Object.values(STALE_TEXT)]) {
+      // Nothing calms the reader about a signature that was not checked, and nothing promises.
+      expect(text).not.toMatch(/says nothing for or against/i);
+      expect(text).not.toMatch(/legal|court|guarantee/i);
+    }
+    for (const text of Object.values(STALE_TEXT)) {
+      expect(text).toContain("Do not rely");
+      expect(text).toContain("close this tab and open the file again");
+    }
   });
 });

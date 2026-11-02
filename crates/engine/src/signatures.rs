@@ -50,10 +50,14 @@ pub const MAX_CONTENTS: usize = 1024 * 1024;
 /// many signatures over a big file would otherwise take minutes.
 pub const HASH_BUDGET: u64 = 2 * 1024 * 1024 * 1024;
 
-/// The longest the check of the signatures of one document may take, in all. The engine of a
+/// The longest the check of the signatures of one document may take, in all: the scan of the file,
+/// the signatures, and the look at the file afterwards that ties the report to it. The engine of a
 /// document answers one request at a time, so drawing a page waits while this runs. What is not
-/// done when the time is up is reported as not checked, or (for the scan of the file) as a check
-/// that could not be made; it is never reported as good.
+/// done when the time is up is reported as not checked, or (for the scan of the file and the look
+/// afterwards) as a check that could not be made; it is never reported as good. Two things are
+/// not cut short by the clock: a single read of the file that does not return, and (when the
+/// engine runs without the thread of `sigcheck::start_parser`) the decoding of a signature that
+/// passed the limits on its shape.
 pub const CHECK_TIME: Duration = Duration::from_secs(10);
 
 /// Most numbers of a byte range read from PDFium.
@@ -142,7 +146,13 @@ impl<'a> Work<'a> {
         self
     }
 
-    fn out_of_time(&self) -> bool {
+    /// The time after which no more is done, if one was set.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    /// True when the time of the check is up.
+    pub fn out_of_time(&self) -> bool {
         self.deadline.is_some_and(|d| Instant::now() >= d)
     }
 
@@ -278,6 +288,10 @@ fn judge(
     if gap < 2 {
         bail!(RangeLeavesGap);
     }
+    // The time may be up already (an earlier signature took it): what is left is not looked at.
+    if work.out_of_time() {
+        bail!(TooLarge);
+    }
     let mut gap_bytes = vec![0u8; gap as usize];
     file.read_exact_at(gap_start, &mut gap_bytes)?;
     info.stated_location = location(file, file_len, gap_start, &gap_bytes, second_start)
@@ -301,7 +315,7 @@ fn judge(
     }
 
     // 4. The signature itself.
-    let cms = match sigcheck::parse(&from_file[..der_len]) {
+    let cms = match sigcheck::parse_within(&from_file[..der_len], work.deadline()) {
         Ok(cms) => cms,
         Err(reason) => bail!(reason),
     };
@@ -795,13 +809,16 @@ fn read_failure(error: &io::Error) -> Failure {
 }
 
 /// Describes and checks the signatures of `document`, which was opened from the file behind
-/// `source`. `now` is the time of the check in seconds since 1970.
+/// `source`. `now` is the time of the check in seconds since 1970. `deadline` is when the whole
+/// check must be done (see [`CHECK_TIME`]); the caller sets it and uses the same one for what it
+/// does after the report.
 pub fn report(
     pdfium: &Pdfium,
     document: &PdfDocument<'_>,
     source: &Mutex<SourceGuard>,
     trust: &TrustList,
     now: i64,
+    deadline: Instant,
     progress: &mut dyn FnMut(u32),
 ) -> Result<SignatureReport, Failure> {
     let Some(handle) = raw_document(document) else {
@@ -815,7 +832,6 @@ pub fn report(
     let total = unsafe { bindings.FPDF_GetSignatureCount(handle) }.max(0) as u32;
     let file_len = lock(source).file_len();
     // How many places look like the start of a signature, whatever PDFium lists.
-    let deadline = Instant::now() + CHECK_TIME;
     let marks = lock(source)
         .count_occurrences(b"/ByteRange", Some(deadline), progress)
         .map_err(|e| {

@@ -21,7 +21,7 @@ use std::path::PathBuf;
 
 use partridge_protocol::ErrorCode;
 
-use crate::{limits, sandbox, stdio, Args, Engine};
+use crate::{limits, sandbox, sigcheck, stdio, Args, Engine};
 
 /// An engine that is ready for its first request.
 pub struct Prepared {
@@ -136,6 +136,9 @@ pub fn prepare(args: Args) -> Prepared {
         sandbox::enter_isolation().err()
     };
     limits::exit_with_parent();
+    // The thread that decodes signatures is started here for the same reason: a process that is
+    // locked in starts no more threads. Without it a signature is decoded on the thread that asks.
+    sigcheck::start_parser();
 
     // From here on the engine does not open files.
     let locked = if test_switch("PARTRIDGE_TEST_FAIL_SANDBOX") {

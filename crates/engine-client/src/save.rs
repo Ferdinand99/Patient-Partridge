@@ -87,6 +87,10 @@ pub struct SaveOutcome {
     /// The file the document comes from was touched since it was opened, while parts of it were
     /// unread, and this is a copy of what the engine had read (see [`DocInfo::touched`]).
     pub touched: bool,
+    /// Other open documents that were read from the file that was replaced (the handles the pool
+    /// gave out). What their engines hold is no longer the file at that path. The pool fills this
+    /// in; a save on its own leaves it empty.
+    pub replaced: Vec<u64>,
 }
 
 /// Why a save did not happen. Whatever the reason, the file it was meant for is as it was.
@@ -712,6 +716,7 @@ pub(crate) fn save_document(
         path: requested.to_path_buf(),
         bytes: total,
         touched: info.touched,
+        replaced: Vec::new(),
     })
 }
 

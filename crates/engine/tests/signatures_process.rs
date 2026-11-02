@@ -301,3 +301,165 @@ fn a_hostile_signature_does_not_hold_up_the_pages() {
         assert_eq!(report.items[0].reason, SignatureReason::TooLarge, "{set:?}");
     }
 }
+
+#[test]
+fn a_set_behind_a_primitive_tag_does_not_hold_up_the_pages() {
+    // The decoder reads the content of an implicit field before it looks at the constructed bit of
+    // its tag. A quarter of a megabyte behind the tag `0x80` instead of `0xA0` kept the engine
+    // busy for minutes and the pages of the document waited all that time. Each field where this
+    // can be done is tried, with the tag that hides the set, in the engine as it ships.
+    for field in [
+        ImplicitField::SignedAttributes,
+        ImplicitField::UnsignedAttributes,
+        ImplicitField::Certificates,
+        ImplicitField::Revocations,
+    ] {
+        let dir = Dir::new("hidden-set");
+        let pool = EnginePool::new(config(), 4);
+        let options = SignOptions {
+            contents_size: 1024 * 1024 - 64,
+            ..SignOptions::default()
+        };
+        let mut file = signed_file(&signer(KeyKind::P256), &options);
+        replace_signature(
+            &mut file,
+            &hidden_set_signature(field, field.primitive_tag(), 20_000),
+        );
+        let path = dir.write("hidden.pdf", &file.bytes);
+        let (handle, _) = pool.open(&path, None).unwrap();
+        let started = std::time::Instant::now();
+        let report = pool.signatures(handle, NOW).unwrap();
+        let drawn = pool.render(handle, 0, 100, 130);
+        let took = started.elapsed();
+        assert!(drawn.is_ok(), "{field:?}");
+        assert!(
+            took < std::time::Duration::from_secs(20),
+            "{field:?}: the check and a page took {took:?}"
+        );
+        assert_eq!(report.items.len(), 1);
+        assert_eq!(
+            report.items[0].state,
+            SignatureState::Unsupported,
+            "{field:?}"
+        );
+        assert_eq!(
+            report.items[0].reason,
+            SignatureReason::TooLarge,
+            "{field:?}"
+        );
+    }
+}
+
+/// Changes the file at `path` in place, the way another program that does not replace the file by
+/// a rename would: one digit of the page text, or one byte more at the end.
+fn change_in_place(path: &str, original: &[u8], how: &str) {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut file = fs::OpenOptions::new().write(true).open(path).unwrap();
+    match how {
+        "digit" => {
+            let at = original
+                .windows(7)
+                .position(|w| w == b"Pay 100")
+                .expect("the page text is in the file");
+            file.seek(SeekFrom::Start(at as u64 + 4)).unwrap();
+            file.write_all(b"9").unwrap();
+        }
+        _ => {
+            file.seek(SeekFrom::End(0)).unwrap();
+            file.write_all(b"\n").unwrap();
+        }
+    }
+    file.sync_all().unwrap();
+}
+
+#[test]
+fn a_page_is_not_drawn_from_other_bytes_than_the_ones_that_were_checked() {
+    // A signed file is checked, and then something writes into it in place. The engine reads
+    // pages as it needs them, so the first page drawn afterwards would come from the new bytes
+    // while the verdict, "intact", is about the old ones. The draw is refused with the same answer
+    // as any other read of a file that changed, and a new question gets the same.
+    for how in ["digit", "byte"] {
+        let dir = Dir::new("written-in-place");
+        let pool = EnginePool::new(config(), 4);
+        let file = signed_file(&signer(KeyKind::P256), &SignOptions::default());
+        let path = dir.write("signed.pdf", &file.bytes);
+        let (handle, _) = pool.open(&path, None).unwrap();
+        let report = pool.signatures(handle, NOW).unwrap();
+        assert_eq!(
+            report.items[0].state,
+            SignatureState::UnknownSigner,
+            "{how}"
+        );
+        change_in_place(&path, &file.bytes, how);
+
+        for attempt in 0..2 {
+            match pool.render(handle, 0, 300, 390 + attempt) {
+                Err(ClientError::Engine { code, .. }) => {
+                    assert_eq!(code, partridge_protocol::ErrorCode::SourceChanged, "{how}")
+                }
+                other => panic!(
+                    "{how}: a page was drawn from changed bytes: {:?}",
+                    other.map(|b| b.rgba.len())
+                ),
+            }
+        }
+        // Text and a new question are refused as well.
+        assert!(
+            matches!(
+                pool.page_text(handle, 0),
+                Err(ClientError::Engine {
+                    code: partridge_protocol::ErrorCode::SourceChanged,
+                    ..
+                })
+            ),
+            "{how}"
+        );
+        assert!(
+            matches!(
+                pool.signatures(handle, NOW),
+                Err(ClientError::Engine {
+                    code: partridge_protocol::ErrorCode::SourceChanged,
+                    ..
+                })
+            ),
+            "{how}"
+        );
+    }
+}
+
+#[test]
+fn saving_over_a_file_that_is_open_in_another_tab_ends_the_verdict_of_that_tab() {
+    let dir = Dir::new("saved-over-open");
+    let pool = EnginePool::new(config(), 4);
+    let signed = signed_file(&signer(KeyKind::P256), &SignOptions::default());
+    let other = dir.write("other.pdf", &signed.bytes);
+    let target = dir.write("target.pdf", &signed.bytes);
+    let unrelated = dir.write("unrelated.pdf", &signed.bytes);
+
+    let (saved_from, _) = pool.open(&other, None).unwrap();
+    let (on_target, _) = pool.open(&target, None).unwrap();
+    let (apart, _) = pool.open(&unrelated, None).unwrap();
+    for handle in [saved_from, on_target, apart] {
+        assert!(pool.signatures(handle, NOW).is_ok());
+    }
+
+    let options = SaveOptions {
+        allow_signed: true,
+        overwrite_changed: false,
+    };
+    let outcome = pool
+        .save_as(saved_from, std::path::Path::new(&target), options)
+        .unwrap();
+    // The document that was open on the file is named, the one that was saved and the one on
+    // another file are not.
+    assert_eq!(outcome.replaced, vec![on_target]);
+    // It is no longer answered for: its engine holds the file as it was, and the path is another.
+    assert!(matches!(
+        pool.signatures(on_target, NOW),
+        Err(ClientError::Engine {
+            code: partridge_protocol::ErrorCode::SourceChanged,
+            ..
+        })
+    ));
+    assert!(pool.signatures(apart, NOW).is_ok());
+}

@@ -14,8 +14,10 @@
 // A result is about the bytes it was computed from, and only about those. The engine checks the
 // file the document was opened from. As soon as the tab holds anything else (a save, a copy saved
 // under another name, an edit in memory), `invalidate` drops the result and the tab shows
-// "Not checked for this version" until the file is opened again. A result is never kept, shown or
-// asked for again for such a tab.
+// "Not checked for this version" until the tab is closed and the file opened again. A result is
+// never kept, shown or asked for again for such a tab. The same goes when the engine finds that the
+// file it reads from has other bytes than the ones that were checked: the window is told, and the
+// result is dropped at once.
 
 import {
   NOT_CHECKED,
@@ -23,6 +25,7 @@ import {
   STALE_TEXT,
   STATE_LABEL,
   STATE_MEANING,
+  type StaleReason,
   certificateTimeText,
   knownState,
   omittedText,
@@ -51,7 +54,7 @@ type Entry =
    * badge is there to say so: it is for a document that had signatures, and `null` while the answer
    * that tells is still on its way (it is used for that and for nothing else).
    */
-  | { kind: "stale"; shown: boolean | null };
+  | { kind: "stale"; shown: boolean | null; why: StaleReason };
 
 const SVG = "http://www.w3.org/2000/svg";
 
@@ -207,7 +210,9 @@ export class SignaturePanel {
    * for this tab; the badge of a document that had signatures says that this version was not
    * checked. Asking the engine again would not help: it goes on reading the file it opened.
    */
-  invalidate(doc: number): void {
+  invalidate(doc: number, why: StaleReason = "changed"): void {
+    // A wait that is not over means the engine was not asked yet.
+    const notAsked = this.timers.has(doc);
     clearTimeout(this.timers.get(doc));
     this.timers.delete(doc);
     const entry = this.entries.get(doc);
@@ -216,7 +221,8 @@ export class SignaturePanel {
       case "stale":
         return;
       case "loading":
-        // The answer on its way is about the old file. It only tells whether to say anything.
+        // The answer on its way (or, if the wait before asking is not over, the one that will be
+        // asked for) is about the old file. It only tells whether to say anything.
         shown = null;
         break;
       case "ready":
@@ -229,8 +235,11 @@ export class SignaturePanel {
         // Never asked, and now it will not be: nothing is known about this version.
         shown = false;
     }
-    this.entries.set(doc, { kind: "stale", shown });
+    this.entries.set(doc, { kind: "stale", shown, why });
     if (this.current === doc) this.render();
+    // Whether the document is signed at all is still not known: ask now, and let the answer decide
+    // only whether the badge is there. Without this a signed document would end with no badge.
+    if (notAsked && entry?.kind === "loading") this.ask(doc, true);
   }
 
   /** A document was closed: what is known about it goes. */
@@ -278,16 +287,17 @@ export class SignaturePanel {
     );
   }
 
-  private ask(doc: number): void {
+  /** `forStale`: the tab no longer holds the checked bytes, and the answer only tells whether to say so. */
+  private ask(doc: number, forStale = false): void {
     const getSignatures = this.deps.api.getSignatures;
     if (!getSignatures) return;
-    this.entries.set(doc, { kind: "loading" });
+    if (!forStale) this.entries.set(doc, { kind: "loading" });
     getSignatures.call(this.deps.api, doc).then(
       (info) => {
         // The document may be gone by now, or its tab may hold other bytes than the ones checked.
         const now = this.entries.get(doc);
         if (now?.kind === "stale" && now.shown === null) {
-          this.entries.set(doc, { kind: "stale", shown: summarise(info) !== null });
+          this.entries.set(doc, { kind: "stale", shown: summarise(info) !== null, why: now.why });
           if (this.current === doc) this.render();
           return;
         }
@@ -298,7 +308,9 @@ export class SignaturePanel {
       () => {
         const now = this.entries.get(doc);
         if (now?.kind === "stale" && now.shown === null) {
-          this.entries.set(doc, { kind: "stale", shown: false });
+          // The engine could not say whether the document is signed. A document that was changed
+          // may well be one that was, so the badge says that this version was not checked.
+          this.entries.set(doc, { kind: "stale", shown: true, why: now.why });
           if (this.current === doc) this.render();
           return;
         }
@@ -364,13 +376,13 @@ export class SignaturePanel {
     if (entry.kind === "stale") {
       this.body.append(
         el(doc, "p", "sig-lead", "Only this panel reports on a signature. A picture of a signature on a page is only a picture."),
-        el(doc, "p", "sig-alert", STALE_TEXT),
+        el(doc, "p", "sig-alert", STALE_TEXT[entry.why]),
       );
       return;
     }
     if (entry.kind === "error") {
       this.body.append(
-        el(doc, "p", "sig-note", "The signatures of this document could not be checked just now. This says nothing about whether it is signed."),
+        el(doc, "p", "sig-note", "The signatures of this document could not be checked just now. This says nothing about whether it is signed. If it is, do not rely on its signature."),
       );
       const retry = el(doc, "button", "btn", "Check again");
       retry.type = "button";

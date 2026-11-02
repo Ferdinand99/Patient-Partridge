@@ -1335,6 +1335,91 @@ pub fn hostile_set_signature(set: HostileSet, count: usize) -> Vec<u8> {
     seq(&[oid("1.2.840.113549.1.7.2"), tlv(0xA0, &data)])
 }
 
+/// The four places of a `SignedData` where a set is written with an implicit tag, and so where
+/// the decoder reads the content of an element before it looks at whether the tag is the right one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImplicitField {
+    /// The signed attributes of the signer, `[0]`.
+    SignedAttributes,
+    /// The unsigned attributes of the signer, `[1]`.
+    UnsignedAttributes,
+    /// The certificates, `[0]`.
+    Certificates,
+    /// The revocation data, `[1]`.
+    Revocations,
+}
+
+impl ImplicitField {
+    /// The tag number of the field: 0 or 1.
+    pub fn number(self) -> u8 {
+        match self {
+            ImplicitField::SignedAttributes | ImplicitField::Certificates => 0,
+            ImplicitField::UnsignedAttributes | ImplicitField::Revocations => 1,
+        }
+    }
+
+    /// The tag the field has when it is written right: constructed, of the context class.
+    pub fn constructed_tag(self) -> u8 {
+        0xA0 | self.number()
+    }
+
+    /// The same tag with the constructed bit off.
+    pub fn primitive_tag(self) -> u8 {
+        0x80 | self.number()
+    }
+}
+
+/// A `SignedData` for one signer in which `field` is written with `tag` and holds an element with a
+/// name of `count` different parts, written in descending order: the worst case for a decoder that
+/// sorts a set with an insertion sort. With the right tag (see [`ImplicitField::constructed_tag`])
+/// the set is in plain sight; with the primitive one it is hidden inside an element that a walk
+/// that follows only constructed elements does not enter. The signature in it is not real.
+pub fn hidden_set_signature(field: ImplicitField, tag: u8, count: usize) -> Vec<u8> {
+    let mut parts: Vec<Vec<u8>> = (0..count)
+        .map(|i| seq(&[oid("2.5.4.3"), octets(&(i as u32).to_be_bytes())]))
+        .collect();
+    parts.reverse();
+    let name = seq(&[tlv(0x31, &cat(&parts))]);
+    let algorithm = seq(&[oid("1.2.840.113549.1.1.11")]);
+    // What the field holds: a certificate, a revocation list or an attribute, each of which has
+    // the name (or a value set) as one of its first parts, so that it is decoded in full before
+    // anything after it can be found wrong.
+    let content = match field {
+        ImplicitField::Certificates => seq(&[seq(&[int(1), algorithm, name])]),
+        ImplicitField::Revocations => seq(&[seq(&[algorithm, name])]),
+        ImplicitField::SignedAttributes | ImplicitField::UnsignedAttributes => {
+            let values: Vec<Vec<u8>> = parts.iter().map(|p| octets(p)).collect();
+            seq(&[oid("1.2.840.113549.1.9.4"), tlv(0x31, &cat(&values))])
+        }
+    };
+    let hidden = tlv(tag, &content);
+    let small = tlv(
+        0xA0,
+        &seq(&[oid("1.2.840.113549.1.9.4"), tlv(0x31, &octets(&[0u8; 32]))]),
+    );
+    let sha256 = seq(&[oid("2.16.840.1.101.3.4.2.1")]);
+    let sid = seq(&[seq(&[]), int(1)]);
+    let mut info_parts = vec![int(1), sid, sha256.clone()];
+    let mut data_parts = vec![
+        int(1),
+        tlv(0x31, &sha256),
+        seq(&[oid("1.2.840.113549.1.7.1")]),
+    ];
+    match field {
+        ImplicitField::SignedAttributes => info_parts.push(hidden.clone()),
+        _ => info_parts.push(small),
+    }
+    info_parts.push(sha256);
+    info_parts.push(octets(&[0u8; 64]));
+    match field {
+        ImplicitField::UnsignedAttributes => info_parts.push(hidden),
+        ImplicitField::Certificates | ImplicitField::Revocations => data_parts.push(hidden),
+        ImplicitField::SignedAttributes => {}
+    }
+    data_parts.push(tlv(0x31, &seq(&info_parts)));
+    seq(&[oid("1.2.840.113549.1.7.2"), tlv(0xA0, &seq(&data_parts))])
+}
+
 /// Puts `der`, padded with zeros, in the place of the signature of `file`.
 pub fn replace_signature(file: &mut SignedFile, der: &[u8]) {
     let room = (file.contents_end - file.contents_at - 2) / 2;

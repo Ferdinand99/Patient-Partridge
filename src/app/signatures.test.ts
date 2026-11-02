@@ -325,7 +325,7 @@ describe("the signature panel", () => {
           reason: "signature_invalid",
           signer: hostile,
           organisation: "<script>alert(2)</script>",
-          statedReason: "<b>VERIFIED</b> by Acrobat - signature valid",
+          statedReason: "<b>VERIFIED</b> by Some Reader - signature valid",
           statedLocation: "javascript:alert(3)",
           claimedTime: "<i>now</i>",
           subFilter: "<u>sub</u>",
@@ -340,7 +340,7 @@ describe("the signature panel", () => {
     expect(panelEl().querySelector("img, script, b, i, u, a")).toBeNull();
     const text = panelEl().textContent ?? "";
     expect(text).toContain(hostile);
-    expect(text).toContain("<b>VERIFIED</b> by Acrobat - signature valid");
+    expect(text).toContain("<b>VERIFIED</b> by Some Reader - signature valid");
     expect(text).toContain("Signature broken");
     expect(panelEl().querySelector(".sig-state strong")?.textContent).toBe("Signature broken");
     // Every element in the panel is one that this file made.
@@ -401,9 +401,28 @@ describe("a verdict is only for the bytes it was made from", () => {
     expect(text).not.toContain("Signature intact");
     expect(text).not.toContain("Test Signer");
     expect(text).toContain("has not been checked");
-    expect(text).toContain("Open the file again");
+    // The way to a check is one that exists: the tab is closed and the file opened again.
+    expect(text).toContain("close this tab and open the file again");
+    expect(text).not.toContain("Open the file again to check it");
+    expect(text).toContain("Do not rely");
     expect(panelEl().querySelector("button.btn:not(.btn-icon)")).toBeNull();
     expect(panelEl().hidden).toBe(false);
+  });
+
+  it("says in other words that the file on the disk changed, when the engine found it", async () => {
+    const { panel } = make(report([item("unknown_signer")]));
+    panel.setDocument(1);
+    await flush();
+    badge().click();
+    panel.invalidate(1, "file_changed");
+    expect(badge().textContent).toBe(STALE);
+    const text = panelEl().textContent ?? "";
+    expect(text).not.toContain("Signature intact");
+    expect(text).toContain("The file on the disk has been changed");
+    expect(text).toContain("Do not rely");
+    // The first reason stays: a later one does not rewrite it.
+    panel.invalidate(1);
+    expect(panelEl().textContent).toContain("The file on the disk has been changed");
   });
 
   it("covers a check that was still on its way: the answer only says whether to speak", async () => {
@@ -427,14 +446,40 @@ describe("a verdict is only for the bytes it was made from", () => {
     expect(badge().hidden).toBe(true);
   });
 
-  it("does not let a scheduled check run for a tab that was invalidated", async () => {
+  it("asks once for a tab that was invalidated before the wait was over, so a signed document keeps a badge", async () => {
     vi.useFakeTimers();
     const { panel, getSignatures } = make(report([item("unknown_signer")]), 1200);
     panel.setDocument(1);
     panel.invalidate(1);
     await vi.advanceTimersByTimeAsync(3000);
-    expect(getSignatures).not.toHaveBeenCalled();
+    // Asked at once (the timer is not left to run), and once only.
+    expect(getSignatures).toHaveBeenCalledOnce();
+    expect(badge().textContent).toBe(STALE);
+    expect(panel.summary).toBeNull();
+  });
+
+  it("keeps no badge for an invalidated tab of a document that is not signed", async () => {
+    vi.useFakeTimers();
+    const { panel, getSignatures } = make(report([]), 1200);
+    panel.setDocument(1);
+    panel.invalidate(1);
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(getSignatures).toHaveBeenCalledOnce();
     expect(badge().hidden).toBe(true);
+  });
+
+  it("says that this version was not checked when the answer that was on its way fails", async () => {
+    const reject: ((e: Error) => void)[] = [];
+    const getSignatures = vi.fn(() => new Promise<SignaturesInfo>((_, no) => reject.push(no)));
+    const panel = new SignaturePanel(document, { api: { getSignatures }, delayMs: 0 });
+    panel.setDocument(1);
+    panel.invalidate(1);
+    expect(badge().hidden).toBe(true);
+    reject[0](new Error("the document was saved"));
+    await flush();
+    // Whether it is signed is not known, and a changed document may well be a signed one.
+    expect(badge().hidden).toBe(false);
+    expect(badge().textContent).toBe(STALE);
   });
 
   it("covers a check that failed, and does not offer to try again", async () => {

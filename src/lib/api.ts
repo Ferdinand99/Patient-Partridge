@@ -29,6 +29,8 @@ export interface SavedFile {
   name: string;
   /** The original was touched while it was open, with parts of it unread: this copy holds what was read. */
   touched?: boolean;
+  /** Other open documents (by their handle) that were read from the file this save replaced. */
+  replaced?: number[];
 }
 
 export interface OpenedDocument {

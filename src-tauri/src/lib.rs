@@ -461,6 +461,9 @@ struct SavedInfo {
     /// The file was touched while the document was open, with parts of it unread: this is a copy
     /// of what the app had read of it.
     touched: bool,
+    /// Other open documents that were read from the file this save replaced. What the window
+    /// shows for them (a check of their signatures, say) is about a file that is no longer there.
+    replaced: Vec<u64>,
 }
 
 impl From<SaveOutcome> for SavedInfo {
@@ -473,6 +476,7 @@ impl From<SaveOutcome> for SavedInfo {
                 .unwrap_or_default(),
             path: outcome.path.to_string_lossy().into_owned(),
             touched: outcome.touched,
+            replaced: outcome.replaced,
         }
     }
 }
@@ -1047,9 +1051,11 @@ mod tests {
             path: PathBuf::from("/docs/report.pdf"),
             bytes: 10,
             touched: false,
+            replaced: vec![3, 4],
         });
         assert_eq!(info.name, "report.pdf");
         assert_eq!(info.path, "/docs/report.pdf");
+        assert_eq!(info.replaced, vec![3, 4]);
     }
 
     #[test]

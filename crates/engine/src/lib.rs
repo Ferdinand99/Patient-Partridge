@@ -14,6 +14,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use partridge_protocol::{
     ErrorCode, FontScript, PageSize, Request, RequestBody, Response, ResponseBody,
@@ -156,6 +157,10 @@ pub struct Engine {
     missed_fonts: Arc<AtomicU8>,
     /// The certificates a signer may lead to for a signature to be called trusted (see `sigcheck`).
     trust: sigcheck::TrustList,
+    /// True once a report on the signatures of the document was handed out. From then on a read of
+    /// the file that finds other bytes than the ones that were checked is refused (see
+    /// [`Engine::refuse_if_changed`]).
+    verdict_given: bool,
 }
 
 impl Engine {
@@ -204,6 +209,7 @@ impl Engine {
             sandbox: String::new(),
             refusal: None,
             trust: sigcheck::TrustList::shipped(),
+            verdict_given: false,
         }
     }
 
@@ -316,9 +322,9 @@ impl Engine {
             }
             RequestBody::Outline { doc } => {
                 let document = self.document(doc)?;
-                Ok(ResponseBody::Outline {
-                    items: text::outline(document),
-                })
+                let items = text::outline(document);
+                self.refuse_if_changed()?;
+                Ok(ResponseBody::Outline { items })
             }
             RequestBody::PageText { doc, page } => self.with_page(doc, page, |p| {
                 let chars = text::page_chars(p, true).map_err(|_| {
@@ -371,13 +377,27 @@ impl Engine {
             }
             RequestBody::Signatures { doc, now } => {
                 let document = self.document(doc)?;
-                self.check_source(progress)?;
+                // One time limit for all of it: the look at the file before, the check of each
+                // signature, and the look at the file after, which is what makes the report
+                // about this file and no other.
+                let deadline = Instant::now() + signatures::CHECK_TIME;
+                self.check_source_until(Some(deadline), progress)?;
                 let Some(source) = self.source.clone() else {
                     return fail(ErrorCode::Internal, "the document has no file behind it");
                 };
-                let report =
-                    signatures::report(pdfium, document, &source, &self.trust, now, progress)?;
-                self.check_source(progress)?;
+                let report = signatures::report(
+                    pdfium,
+                    document,
+                    &source,
+                    &self.trust,
+                    now,
+                    deadline,
+                    progress,
+                )?;
+                self.check_source_until(Some(deadline), progress)?;
+                if report.total > 0 || report.unlisted > 0 || !report.items.is_empty() {
+                    self.verdict_given = true;
+                }
                 Ok(ResponseBody::Signatures { report })
             }
             RequestBody::SaveBegin { doc } => {
@@ -435,11 +455,37 @@ impl Engine {
 
     /// Fails when the file the document is read from changed, or a read of it failed.
     fn check_source(&self, progress: &mut dyn FnMut(u32)) -> Result<(), Failure> {
+        self.check_source_until(None, progress)
+    }
+
+    /// As [`Engine::check_source`], and fails when `deadline` passes before it is done.
+    fn check_source_until(
+        &self,
+        deadline: Option<Instant>,
+        progress: &mut dyn FnMut(u32),
+    ) -> Result<(), Failure> {
         match &self.source {
             Some(source) => source::lock(source)
-                .verify(progress)
+                .verify_until(deadline, progress)
                 .map_err(save::source_failure),
             None => Ok(()),
+        }
+    }
+
+    /// After a report on the signatures was handed out, a verdict stands for the bytes it was made
+    /// from and for no others. A read of the file that finds other bytes (the guard hands them to
+    /// PDFium all the same) must not be shown as part of the same document: the answer is
+    /// `SourceChanged`, and the window drops the verdict. Before any report there is no verdict to
+    /// protect, and a document is drawn as it always was.
+    fn refuse_if_changed(&self) -> Result<(), Failure> {
+        if !self.verdict_given {
+            return Ok(());
+        }
+        match &self.source {
+            Some(source) if source::lock(source).has_changed() => {
+                Err(save::source_failure(source::Problem::Changed))
+            }
+            _ => Ok(()),
         }
     }
 
@@ -464,7 +510,9 @@ impl Engine {
         let page = pages
             .get(page as PdfPageIndex)
             .map_err(|_| (ErrorCode::Corrupt, "the page could not be read".to_string()))?;
-        f(&page)
+        let out = f(&page)?;
+        self.refuse_if_changed()?;
+        Ok(out)
     }
 
     fn open(
@@ -539,6 +587,7 @@ impl Engine {
                 "the page was drawn at a wrong size",
             );
         }
+        self.refuse_if_changed()?;
         Ok(ResponseBody::Rendered {
             width,
             height,
