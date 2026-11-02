@@ -569,7 +569,7 @@ impl DocAnnots {
         if keeps {
             self.made.insert(new_id, snapshot.recipe.clone());
         }
-        let result = write_annotation(page, document, snapshot)
+        let result = write_annotation(page, document, page_index, snapshot)
             .and_then(|()| self.finish_added(page, page_index, new_id));
         if result.is_err() {
             self.roll_back(page, before);
@@ -785,6 +785,7 @@ impl DocAnnots {
 fn write_annotation(
     page: &mut PdfPage<'static>,
     document: &mut PdfDocument<'static>,
+    page_index: u32,
     snapshot: &Snapshot,
 ) -> Result<(), Failure> {
     match &snapshot.recipe {
@@ -839,14 +840,35 @@ fn write_annotation(
             color,
             width,
             strokes,
-        } => write_ink(page, document, snapshot, *color, *width, strokes),
+        } => write_ink(page, document, page_index, snapshot, *color, *width, strokes),
         Recipe::Stamp { stamp, x, y } => write_stamp(page, document, snapshot, *stamp, *x, *y),
     }
 }
 
+/// The raw handle PDFium has for a document. `pdfium-render` keeps it to itself; the text it gives
+/// for `Debug` names it, and a test (`the_raw_handle_of_a_document_can_be_read`) fails if that
+/// ever stops being so.
+pub fn raw_document(document: &PdfDocument<'_>) -> Option<FPDF_DOCUMENT> {
+    let text = format!("{document:?}");
+    let start = text.find("0x")? + 2;
+    let hex: String = text[start..]
+        .chars()
+        .take_while(char::is_ascii_hexdigit)
+        .collect();
+    let value = usize::from_str_radix(&hex, 16).ok()?;
+    (value != 0).then_some(value as FPDF_DOCUMENT)
+}
+
+/// A drawing is an ink annotation with a list of strokes (`InkList`), a colour and a line width, as
+/// other readers expect it; PDFium makes the appearance from those when the page is drawn.
+/// `pdfium-render` has no way to add a stroke to the list, so this goes through PDFium's own
+/// functions, on a second handle for the same page of the same document (changes made through one
+/// handle are in the document, which the other sees). The functions are called only with handles
+/// that PDFium gave out here and with data that was checked.
 fn write_ink(
     page: &mut PdfPage<'static>,
     document: &mut PdfDocument<'static>,
+    page_index: u32,
     snapshot: &Snapshot,
     color: [u8; 4],
     width: f32,
@@ -854,14 +876,25 @@ fn write_ink(
 ) -> Result<(), Failure> {
     let mapper = Mapper::new(page);
     // The strokes in page space, and their bounding box.
-    let mut paths: Vec<Vec<(f32, f32)>> = Vec::new();
+    let mut paths: Vec<Vec<FS_POINTF>> = Vec::new();
     let (mut left, mut bottom) = (f32::MAX, f32::MAX);
     let (mut right, mut top) = (f32::MIN, f32::MIN);
     for stroke in strokes {
-        let points: Vec<(f32, f32)> = stroke
+        let mut points: Vec<(f32, f32)> = stroke
             .iter()
             .filter_map(|p| mapper.to_page(page, p[0], p[1]))
             .collect();
+        if points.len() == 1 {
+            // A dot: a ring of points so small that the line, drawn at its width, is a dot.
+            let (x, y) = points[0];
+            let r = (width * 0.2).max(0.05);
+            points = (0..=8)
+                .map(|i| {
+                    let a = i as f32 * std::f32::consts::FRAC_PI_4;
+                    (x + r * a.cos(), y + r * a.sin())
+                })
+                .collect();
+        }
         for (x, y) in &points {
             left = left.min(*x);
             right = right.max(*x);
@@ -869,48 +902,63 @@ fn write_ink(
             top = top.max(*y);
         }
         if !points.is_empty() {
-            paths.push(points);
+            paths.push(points.into_iter().map(|(x, y)| FS_POINTF { x, y }).collect());
         }
     }
     if paths.is_empty() {
         return fail(ErrorCode::AnnotationRefused, "that place is not on the page");
     }
     let pad = width / 2.0 + 1.0;
-    let bounds = rect_of([left - pad, bottom - pad, right + pad, top + pad]);
-    let mut annotation = page.annotations_mut().create_ink_annotation().map_err(refused)?;
-    annotation.set_bounds(bounds).map_err(refused)?;
-    for points in &paths {
-        let (x0, y0) = points[0];
-        let mut path = PdfPagePathObject::new(
-            document,
-            PdfPoints::new(x0),
-            PdfPoints::new(y0),
-            Some(pdf_color(color)),
-            Some(PdfPoints::new(width)),
-            None,
-        )
-        .map_err(refused)?;
-        for (x, y) in &points[1..] {
-            path.line_to(PdfPoints::new(*x), PdfPoints::new(*y))
-                .map_err(refused)?;
+    let rect = FS_RECTF {
+        left: left - pad,
+        top: top + pad,
+        right: right + pad,
+        bottom: bottom - pad,
+    };
+    let Some(handle) = raw_document(document) else {
+        return fail(ErrorCode::AnnotationRefused, "the document cannot be changed");
+    };
+    let bindings = document.bindings();
+    let text = snapshot.text.as_str();
+    // SAFETY: `handle` is the live document's handle. The page, and the annotation, are opened
+    // here and closed here, and are used between. The points outlive the calls that read them.
+    unsafe {
+        let raw_page = bindings.FPDF_LoadPage(handle, page_index as std::os::raw::c_int);
+        if raw_page.is_null() {
+            return fail(ErrorCode::Corrupt, "the page could not be read");
         }
-        if points.len() == 1 {
-            // A dot: a line of no length that the round caps turn into a circle.
-            path.line_to(PdfPoints::new(x0 + 0.01), PdfPoints::new(y0))
-                .map_err(refused)?;
+        let annotation = bindings.FPDFPage_CreateAnnot(raw_page, 15 as FPDF_ANNOTATION_SUBTYPE);
+        let done = if annotation.is_null() {
+            false
+        } else {
+            let mut ok = bindings.FPDFAnnot_SetRect(annotation, &rect) != 0
+                && bindings.FPDFAnnot_SetColor(
+                    annotation,
+                    0 as FPDFANNOT_COLORTYPE,
+                    color[0] as _,
+                    color[1] as _,
+                    color[2] as _,
+                    color[3] as _,
+                ) != 0
+                && bindings.FPDFAnnot_SetBorder(annotation, 0.0, 0.0, width) != 0;
+            for points in &paths {
+                ok = ok
+                    && bindings.FPDFAnnot_AddInkStroke(annotation, points.as_ptr(), points.len())
+                        >= 0;
+            }
+            if ok && !text.is_empty() {
+                ok = bindings.FPDFAnnot_SetStringValue_str(annotation, "Contents", text) != 0;
+            }
+            bindings.FPDFPage_CloseAnnot(annotation);
+            ok
+        };
+        bindings.FPDF_ClosePage(raw_page);
+        if done {
+            Ok(())
+        } else {
+            fail(ErrorCode::AnnotationRefused, "the drawing could not be written")
         }
-        path.set_line_cap(PdfPageObjectLineCap::Round).map_err(refused)?;
-        path.set_line_join(PdfPageObjectLineJoin::Round)
-            .map_err(refused)?;
-        annotation
-            .objects_mut()
-            .add_object(PdfPageObject::from(path))
-            .map_err(refused)?;
     }
-    if !snapshot.text.is_empty() {
-        annotation.set_contents(&snapshot.text).map_err(refused)?;
-    }
-    Ok(())
 }
 
 /// Size of a stamp in points on the page as it is drawn.

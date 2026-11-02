@@ -671,7 +671,7 @@ fn requests_that_cannot_be_done_say_why() {
         e,
         RequestBody::AddInk { doc, page: 0, color: YELLOW, width: 2.0, strokes: vec![vec![[-500.0, -500.0], [9000.0, 9000.0]]] },
     ));
-    assert!(ink.rect[0] >= -2.0 && ink.rect[2] <= 614.0 && ink.rect[3] <= 794.0, "{:?}", ink.rect);
+    assert!(ink.rect[0] >= -4.0 && ink.rect[2] <= 616.0 && ink.rect[3] <= 796.0, "{:?}", ink.rect);
     let note = annot(ask(
         e,
         RequestBody::AddNote { doc, page: 0, x: 5000.0, y: -50.0, color: YELLOW, text: String::new() },

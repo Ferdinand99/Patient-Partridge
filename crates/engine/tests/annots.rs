@@ -232,3 +232,42 @@ fn every_stamp_is_drawn_and_written() {
     assert!(objects.iter().all(|n| *n >= 2));
     assert!(contains(&saved, b"/Stamp"));
 }
+
+#[test]
+fn the_raw_handle_of_a_document_can_be_read() {
+    // The drawing code reaches PDFium's own document handle through the text `pdfium-render` gives
+    // for `Debug`. If that text ever changes, this fails and the code must be looked at again.
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let doc = open(e, &kit::simple_pdf(3), None).unwrap();
+    let pages = e
+        .edit_for_tests(doc, |document| {
+            let handle = partridge_engine::annots::raw_document(document).expect("no handle");
+            // The handle is the document's: PDFium counts its pages through it.
+            let counted = unsafe { document.bindings().FPDF_GetPageCount(handle) };
+            (counted, document.pages().len())
+        })
+        .unwrap();
+    assert_eq!(pages.0, 3);
+    assert_eq!(pages.1, 3);
+}
+
+#[test]
+fn a_drawing_has_a_list_of_strokes_as_other_readers_expect() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let doc = open(e, &kit::simple_pdf(1), None).unwrap();
+    annot(ask(
+        e,
+        RequestBody::AddInk {
+            doc,
+            page: 0,
+            color: [0, 0, 255, 255],
+            width: 3.0,
+            strokes: vec![vec![[100.0, 100.0], [150.0, 120.0]], vec![[200.0, 100.0], [250.0, 130.0], [300.0, 100.0]]],
+        },
+    ));
+    let saved = save_all(e, doc);
+    assert!(contains(&saved, b"/InkList"), "the drawing has no InkList");
+    assert!(contains(&saved, b"/Subtype/Ink") || contains(&saved, b"/Subtype /Ink"));
+}
