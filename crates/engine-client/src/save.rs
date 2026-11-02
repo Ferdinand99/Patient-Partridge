@@ -132,6 +132,18 @@ pub enum SaveError {
     OwnerWouldChange,
     /// The access rights of the file could not be given to the new file.
     AccessNotKept,
+    /// The pages to copy out of a document come from a document that is protected by a password,
+    /// and the new document would not be.
+    Unprotected,
+    /// A document to insert pages from is protected by a password; its pages would join this
+    /// document without that protection.
+    InsertProtected,
+    /// A document to insert pages from is signed; its pages would come without the signature.
+    InsertSigned { signatures: u32 },
+    /// The user stopped the work.
+    Cancelled,
+    /// The new file would replace the document itself.
+    OverSource,
 }
 
 impl SaveError {
@@ -154,6 +166,11 @@ impl SaveError {
             SaveError::HardLink => "save_hard_link",
             SaveError::OwnerWouldChange => "save_owner_changes",
             SaveError::AccessNotKept => "save_access_kept",
+            SaveError::Unprotected => "save_unprotected",
+            SaveError::InsertProtected => "insert_protected",
+            SaveError::InsertSigned { .. } => "insert_signed",
+            SaveError::Cancelled => "cancelled",
+            SaveError::OverSource => "extract_over_source",
         }
     }
 }
@@ -208,6 +225,25 @@ impl fmt::Display for SaveError {
             SaveError::AccessNotKept => write!(
                 f,
                 "the access rights of the file could not be given to the new file"
+            ),
+            SaveError::Unprotected => write!(
+                f,
+                "the document is protected by a password and the new file would not be"
+            ),
+            SaveError::InsertProtected => write!(
+                f,
+                "the document is protected by a password, and its pages would join this one without that protection"
+            ),
+            SaveError::InsertSigned { signatures } => write!(
+                f,
+                "the document has {signatures} digital signature{}, and its pages would come without {}",
+                if *signatures == 1 { "" } else { "s" },
+                if *signatures == 1 { "it" } else { "them" }
+            ),
+            SaveError::Cancelled => write!(f, "it was stopped"),
+            SaveError::OverSource => write!(
+                f,
+                "the new file would replace the document it is made from"
             ),
         }
     }
@@ -536,12 +572,19 @@ pub fn verify_written(
     print: Option<&Fingerprint>,
 ) -> Result<(), SaveError> {
     let verify = |why: String| SaveError::Verify(why);
+    // Whatever a bug above may have done to the document, a file of no pages is never put in place.
+    if expected.pages == 0 {
+        return Err(verify("the document has no pages".into()));
+    }
     let text = path.to_string_lossy();
     let client = EngineClient::new(config.clone());
     let result = (|| {
         let opened = client
             .open(&text, password)
             .map_err(|e| verify(format!("it does not open ({e})")))?;
+        if opened.pages.is_empty() {
+            return Err(verify("it has no pages".into()));
+        }
         if opened.pages.len() as u32 != expected.pages {
             return Err(verify(format!(
                 "it has {} pages, the document has {}",
@@ -622,6 +665,11 @@ pub(crate) fn save_document(
     original: Option<&Path>,
 ) -> Result<SaveOutcome, ClientError> {
     let info = client.doc_info(doc).map_err(from_engine)?;
+    // A document of no pages is not a document to write, whatever the engine believes: the check
+    // that follows compares the file with the engine's own description, and 0 equals 0.
+    if info.pages == 0 {
+        return Err(SaveError::Verify("the document has no pages".into()).into());
+    }
     // A file that was touched while parts of it were unread is not replaced: the engine's document
     // may not be the file's. A copy is the way out.
     let replaces_original = original.is_some_and(|o| same_file(o, target));
@@ -640,6 +688,49 @@ pub(crate) fn save_document(
     if print.failed > 0 {
         return Err(SaveError::SourceUnreadable.into());
     }
+    if print.pages == 0 || print.pages != info.pages {
+        return Err(SaveError::Verify(format!(
+            "the document has {} pages in one description and {} in the other",
+            info.pages, print.pages
+        ))
+        .into());
+    }
+    let outcome = write_checked(
+        target,
+        expected,
+        options,
+        info,
+        print,
+        &mut |sink| client.save_to(doc, sink),
+        verify,
+        still_open,
+    )?;
+    Ok(SaveOutcome {
+        touched: info.touched,
+        ..outcome
+    })
+}
+
+/// Something that hands the bytes of a new file to the function it is given, piece by piece, and
+/// says how many there were.
+pub(crate) type Streamer<'a> =
+    dyn FnMut(&mut dyn FnMut(&[u8]) -> io::Result<()>) -> Result<u64, SaveStreamError> + 'a;
+
+/// The common end of a save and of copying pages out to a new file: the bytes that `stream` hands
+/// over go to a new file next to `target`, which is flushed, read back, checked by `verify`, and
+/// only then put in place of `target` in one step (see the rules at the top of this module). `info`
+/// and `print` describe the document that is expected to be in the file.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_checked(
+    target: &Path,
+    expected: Option<&FileStamp>,
+    options: SaveOptions,
+    info: DocInfo,
+    print: Fingerprint,
+    stream: &mut Streamer<'_>,
+    verify: &dyn Fn(&Path, DocInfo, &Fingerprint) -> Result<(), SaveError>,
+    still_open: &dyn Fn() -> bool,
+) -> Result<SaveOutcome, ClientError> {
     let requested = target;
     let target = resolve(target);
     let existing = check_target(&target)?;
@@ -657,7 +748,7 @@ pub(crate) fn save_document(
     }
     let mut written: u64 = 0;
     let mut sum = Fnv::new();
-    let total = client.save_to(doc, &mut |piece| {
+    let total = stream(&mut |piece| {
         file.write_all(piece)?;
         sum.update(piece);
         written += piece.len() as u64;
@@ -715,7 +806,7 @@ pub(crate) fn save_document(
     Ok(SaveOutcome {
         path: requested.to_path_buf(),
         bytes: total,
-        touched: info.touched,
+        touched: false,
         replaced: Vec::new(),
     })
 }
@@ -1455,6 +1546,38 @@ mod tests {
             assert!(err.to_string().contains(needle), "{mode}: {err}");
             assert_untouched(&dir, &path);
         }
+    }
+
+    #[test]
+    fn a_document_of_no_pages_is_never_written_whatever_the_engine_says() {
+        let dir = Dir::new("nopages");
+        let path = original_in(&dir);
+        let (client, doc) = client("save-no-pages");
+        let stamp = FileStamp::read(&path).unwrap();
+        // The engine describes the document as one of no pages, and a file of no pages would agree
+        // with that description. The file is not even started.
+        let err = save_error(save(
+            &client,
+            doc,
+            &path,
+            Some(&stamp),
+            SaveOptions::default(),
+        ));
+        assert!(matches!(err, SaveError::Verify(_)), "{err}");
+        assert_untouched(&dir, &path);
+        // The check of a written file refuses a description of no pages as well.
+        let config = EngineConfig::new(fake_engine());
+        let none = DocInfo {
+            pages: 0,
+            security: 0,
+            signatures: 0,
+            maybe_signed: false,
+            touched: false,
+        };
+        assert!(matches!(
+            verify_written(&config, &path, None, none, None),
+            Err(SaveError::Verify(_))
+        ));
     }
 
     #[test]

@@ -64,6 +64,26 @@
         <symbol id="i-trash" viewBox="0 0 24 24">
           <path d="M5 7h14M9.5 7V4.75h5V7M7 7l.75 12.25a1 1 0 0 0 1 .95h6.5a1 1 0 0 0 1-.95L17 7" />
         </symbol>
+        <symbol id="i-pg-turn-left" viewBox="0 0 24 24">
+          <path d="M8.75 4.5L4.5 8.75l4.25 4.25" /><path d="M4.5 8.75h8.25a6.5 6.5 0 0 1 0 13H10" />
+        </symbol>
+        <symbol id="i-pg-turn-right" viewBox="0 0 24 24">
+          <path d="M15.25 4.5l4.25 4.25-4.25 4.25" /><path d="M19.5 8.75h-8.25a6.5 6.5 0 0 0 0 13H14" />
+        </symbol>
+        <symbol id="i-pg-crop" viewBox="0 0 24 24">
+          <path d="M7 3.5v13.5h13.5" /><path d="M3.5 7H17v13.5" />
+        </symbol>
+        <symbol id="i-pg-copy-out" viewBox="0 0 24 24">
+          <path d="M7 3.5h6.5L18 8v4" /><path d="M13.5 3.5V8H18" /><path d="M6 3.5v16a1 1 0 0 0 1 1h5" />
+          <path d="M14 18.5h6.5M17.5 15.5l3 3-3 3" />
+        </symbol>
+        <symbol id="i-pg-add" viewBox="0 0 24 24">
+          <path d="M7 3.5h6.5L18 8v11.5a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1v-15a1 1 0 0 1 1-1z" /><path d="M12 11v6M9 14h6" />
+        </symbol>
+        <symbol id="i-pg-add-file" viewBox="0 0 24 24">
+          <path d="M9 3.5h5.5L19 8v5" /><path d="M14.5 3.5V8H19" /><path d="M8 3.5a1 1 0 0 0-1 1v15a1 1 0 0 0 1 1h4" />
+          <path d="M16 15.5v6M13 18.5h6" />
+        </symbol>
       </defs>
     </svg>
 
@@ -142,7 +162,33 @@
             </button>
           </div>
         </div>
+        <div class="pagetools" id="pagetools" role="toolbar" aria-label="Page tools" aria-orientation="horizontal" hidden>
+          <button class="btn btn-icon btn-plain" id="pt-left" type="button" title="Turn left (Shift+R)" aria-label="Turn the picked pages left" disabled>
+            <svg class="icon" aria-hidden="true"><use href="#i-pg-turn-left"></use></svg>
+          </button>
+          <button class="btn btn-icon btn-plain" id="pt-right" type="button" title="Turn right (R)" aria-label="Turn the picked pages right" disabled>
+            <svg class="icon" aria-hidden="true"><use href="#i-pg-turn-right"></use></svg>
+          </button>
+          <button class="btn btn-icon btn-plain" id="pt-delete" type="button" title="Delete the picked pages (Delete)" aria-label="Delete the picked pages" disabled>
+            <svg class="icon" aria-hidden="true"><use href="#i-trash"></use></svg>
+          </button>
+          <button class="btn btn-icon btn-plain" id="pt-crop" type="button" title="Crop the picked pages…" aria-label="Crop the picked pages" disabled>
+            <svg class="icon" aria-hidden="true"><use href="#i-pg-crop"></use></svg>
+          </button>
+          <button class="btn btn-icon btn-plain" id="pt-extract" type="button" title="Copy the picked pages to a new file…" aria-label="Copy the picked pages to a new file" disabled>
+            <svg class="icon" aria-hidden="true"><use href="#i-pg-copy-out"></use></svg>
+          </button>
+          <span class="toolbar-sep" aria-hidden="true"></span>
+          <button class="btn btn-icon btn-plain" id="pt-blank" type="button" title="Add a blank page" aria-label="Add a blank page" disabled>
+            <svg class="icon" aria-hidden="true"><use href="#i-pg-add"></use></svg>
+          </button>
+          <button class="btn btn-icon btn-plain" id="pt-insert" type="button" title="Add pages from a PDF…" aria-label="Add pages from a PDF" disabled>
+            <svg class="icon" aria-hidden="true"><use href="#i-pg-add-file"></use></svg>
+          </button>
+          <span class="vh" id="pt-status" role="status" aria-live="polite"></span>
+        </div>
         <div class="thumbs" id="thumbs" role="tabpanel" aria-labelledby="side-tab-pages" tabindex="-1"></div>
+        <div class="vh" id="pt-announce" role="status" aria-live="polite"></div>
         <div class="outline" id="outline" role="tabpanel" aria-labelledby="side-tab-contents" tabindex="-1" hidden></div>
       </aside>
 
@@ -199,6 +245,9 @@
 
       <!-- Says how far a long copy has got. Shown only while one runs. -->
       <div class="copy-status" id="copy-status" role="status" aria-live="polite" hidden></div>
+
+      <!-- Says what a page tool is doing while it works. Covers nothing but a corner of the window, so the tabs and the buttons stay in use. -->
+      <div class="busy-strip" id="busy-strip" hidden></div>
 
       <div class="sheet-layer" id="notice-layer" hidden></div>
     </div>

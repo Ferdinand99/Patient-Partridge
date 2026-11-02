@@ -2,9 +2,11 @@
 import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenedDocument, SavedFile, SavedPosition } from "../lib/api";
+import type { PageToolsApi, PagesChanged } from "../lib/pagesapi";
 import type { SignatureItem, SignaturesInfo } from "../lib/signatures";
 import { THEME_KEY } from "../lib/theme";
 import { App } from "./app";
+import type { PageOps } from "./pageops";
 
 const putImageData = vi.fn();
 
@@ -111,8 +113,12 @@ function make(
     reopenTabs?: boolean;
     /** How long a tab of the last session may take to open at the start. */
     sessionOpenLimitMs?: number;
+    /** The page tools (the page panel and the tools are not there without them). */
+    pages?: PageToolsApi;
     /** What the engine says about the signatures of every document; none is asked for without it. */
     signatures?: SignaturesInfo;
+    /** How long a close, a quit, a save and a print wait for a page tool before they ask. */
+    changeGraceMs?: number;
   } = {},
 ) {
   let nextDoc = 1;
@@ -184,6 +190,9 @@ function make(
     sessionOpenLimitMs: options.sessionOpenLimitMs,
     signaturesDelayMs: 0,
     viewLimits: options.viewLimits,
+    pages: options.pages,
+    pageBusyDelayMs: 1000,
+    changeGraceMs: options.changeGraceMs,
     print: {
       encode: vi.fn(() => Promise.resolve(new Blob(["jpeg"]))),
       createUrl: vi.fn(() => `blob:test/${++urlCounter}`),
@@ -2852,6 +2861,583 @@ describe("App: a save that cannot replace the file", () => {
     expect(m.app.unsavedCount).toBe(1);
   });
 });
+
+describe("App: page tools", () => {
+  const changed = (pages: number, snapshot = 0, count = 1): PagesChanged => ({
+    pages: Array.from({ length: pages }, () => letter),
+    snapshot,
+    count,
+    formFields: 0,
+  });
+
+  function fakePages() {
+    return {
+      pagesDelete: vi.fn((_d: number, pages: number[]) => Promise.resolve(changed(3 - pages.length, 7, pages.length))),
+      pagesReorder: vi.fn(() => Promise.resolve(changed(3, 8))),
+      pagesRotate: vi.fn((_d: number, pages: number[], _t: number) => Promise.resolve(changed(3, 0, pages.length))),
+      pagesCrop: vi.fn(() => Promise.resolve({ pages: [letter, letter, letter], before: [], after: [] })),
+      pagesSetBoxes: vi.fn(() => Promise.resolve(changed(3))),
+      pagesInsertBlank: vi.fn(() => Promise.resolve(changed(4, 9))),
+      pagesRestore: vi.fn((_d: number, snapshot: number) => Promise.resolve(changed(3, snapshot + 100, 0))),
+      pagesInsertPdf: vi.fn(() => Promise.resolve({ changed: changed(5, 11, 2), inserted: 2 })),
+      pagesExtract: vi.fn(() => Promise.resolve(null)),
+      pagesCancel: vi.fn(() => Promise.resolve("idle" as const)),
+    };
+  }
+
+  const opsOf = (app: App) => (app as unknown as { pageOps: PageOps }).pageOps;
+
+  /** A document that has been turned once, so that it has unsaved changes. */
+  async function changedDocument() {
+    const pages = fakePages();
+    const made = make({ pages: pages as unknown as PageToolsApi });
+    await made.app.openPath("/a.pdf");
+    await flush();
+    await opsOf(made.app).rotate([0], 1);
+    return { ...made, pages, ops: opsOf(made.app) };
+  }
+
+  describe("a tool that is working on a document that looks clean", () => {
+    const firstTab = (app: App) => (app as unknown as { tabs: { id: number }[] }).tabs[0].id;
+
+    /** A document with nothing unsaved and a turn that has not answered yet. */
+    async function turningCleanDocument() {
+      const pages = fakePages();
+      const made = make({ pages: pages as unknown as PageToolsApi });
+      await made.app.openPath("/a.pdf");
+      await flush();
+      let finish!: (c: PagesChanged) => void;
+      pages.pagesRotate.mockImplementationOnce(() => new Promise((r) => (finish = r)));
+      const ops = opsOf(made.app);
+      const turning = ops.rotate([0], 1);
+      await flush();
+      return { ...made, pages, ops, turning, finish: (c: PagesChanged = changed(3, 0, 1)) => finish(c) };
+    }
+
+    it("closing its tab waits for it, and then asks about the change it made", async () => {
+      const { app, turning, finish } = await turningCleanDocument();
+      const closing = app.requestClose(firstTab(app));
+      await flush();
+      expect(tabTitles()).toEqual(["a.pdf"]);
+      expect(notice()).toBeNull();
+      finish();
+      await turning;
+      await flush();
+      // The tab is dirty now: the question is asked, and the tab is still there.
+      expect(notice()?.textContent).toContain("Save changes");
+      expect(tabTitles()).toEqual(["a.pdf"]);
+      click(button("Cancel"));
+      expect(await closing).toBe(false);
+    });
+
+    it("quitting waits for it, and asks about the change it made", async () => {
+      const { app, api, turning, finish } = await turningCleanDocument();
+      const quitting = app.requestQuit();
+      await flush();
+      expect(api.quitApp).not.toHaveBeenCalled();
+      expect(notice()).toBeNull();
+      finish();
+      await turning;
+      await flush();
+      expect(notice()?.textContent).toContain("Save changes");
+      expect(api.quitApp).not.toHaveBeenCalled();
+      click(button("Cancel"));
+      await quitting;
+    });
+
+    it("printing waits for it, so that the pages printed are those it leaves", async () => {
+      const { app, turning, finish } = await turningCleanDocument();
+      const printing = app.printActive();
+      await flush();
+      expect(document.querySelector(".print-dialog")).toBeNull();
+      finish();
+      await turning;
+      await flush();
+      expect(document.querySelector(".print-dialog")).not.toBeNull();
+      document.querySelector<HTMLElement>(".print-dialog .btn-secondary")?.click();
+      await printing;
+    });
+  });
+
+
+  describe("a change that takes long, on one of two documents", () => {
+    const tabsOf = (app: App) => (app as unknown as { tabs: { id: number; doc: number }[] }).tabs;
+    const lost = { code: "engine_stopped", message: "the engine stopped" };
+
+    /** Two documents. A turn of the first has not answered yet. The grace before a question is short. */
+    async function turningFirst(graceMs = 20, firstDirty = false) {
+      const pages = fakePages();
+      const made = make({ pages: pages as unknown as PageToolsApi, changeGraceMs: graceMs });
+      await made.app.openPath("/a.pdf");
+      await flush();
+      await made.app.openPath("/b.pdf");
+      await flush();
+      click(tab("a.pdf"));
+      await flush();
+      if (firstDirty) made.app.recordEdit(edit);
+      let finish!: (c: PagesChanged) => void;
+      let fail!: (e: unknown) => void;
+      pages.pagesRotate.mockImplementationOnce(
+        () =>
+          new Promise<PagesChanged>((resolve, reject) => {
+            finish = resolve;
+            fail = reject;
+          }),
+      );
+      const ops = opsOf(made.app);
+      const turning = ops.rotate([0], 1);
+      await flush();
+      const [a, b] = tabsOf(made.app);
+      return {
+        ...made,
+        pages,
+        ops,
+        turning,
+        a,
+        b,
+        finish: (c: PagesChanged = changed(3, 0, 1)) => finish(c),
+        fail: (e: unknown = lost) => fail(e),
+      };
+    }
+
+    const later = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const edit = { label: "edit", undo: () => Promise.resolve(), redo: () => Promise.resolve() };
+
+    it("a save of the other document does not wait for it", async () => {
+      const { app, api, finish, turning, b } = await turningFirst(60_000);
+      click(tab("b.pdf"));
+      await flush();
+      app.recordEdit(edit);
+      const saved = app.saveActive();
+      await flush();
+      expect(api.save).toHaveBeenCalledOnce();
+      expect(api.save.mock.calls[0][0]).toBe(b.doc);
+      expect(await saved).toBe(true);
+      finish();
+      await turning;
+    });
+
+    it("closing the other document does not wait for it, and asks nothing", async () => {
+      const { app, finish, turning, b } = await turningFirst(60_000);
+      expect(await app.requestClose(b.id)).toBe(true);
+      expect(tabTitles()).toEqual(["a.pdf"]);
+      expect(notice()).toBeNull();
+      finish();
+      await turning;
+    });
+
+    it("printing the other document does not wait for it", async () => {
+      const { app, finish, turning } = await turningFirst(60_000);
+      click(tab("b.pdf"));
+      await flush();
+      const printing = app.printActive();
+      await flush();
+      expect(document.querySelector(".print-dialog")).not.toBeNull();
+      document.querySelector<HTMLElement>(".print-dialog .btn-secondary")?.click();
+      await printing;
+      finish();
+      await turning;
+    });
+
+    it("a save of the document that is being changed waits a moment, and then says why it did not save", async () => {
+      const pages = fakePages();
+      const { app, api } = make({ pages: pages as unknown as PageToolsApi, changeGraceMs: 20 });
+      await app.openPath("/a.pdf");
+      await flush();
+      const ops = opsOf(app);
+      await ops.rotate([0], 1);
+      let finish!: (c: PagesChanged) => void;
+      pages.pagesRotate.mockImplementationOnce(() => new Promise<PagesChanged>((r) => (finish = r)));
+      const second = ops.rotate([1], 1);
+      await flush();
+      const saved = app.saveActive();
+      await later(80);
+      await flush();
+      expect(notice()?.textContent).toContain("is being changed");
+      expect(api.save).not.toHaveBeenCalled();
+      click(button("OK"));
+      expect(await saved).toBe(false);
+      finish(changed(3, 0, 1));
+      await second;
+    });
+
+    it("closing it asks, after a moment, whether to wait or to close now and lose the change", async () => {
+      const { app, a, finish, turning } = await turningFirst();
+      const closing = app.requestClose(a.id);
+      await later(80);
+      await flush();
+      expect(notice()?.textContent).toContain('"a.pdf" is still being changed');
+      expect(notice()?.textContent).toContain("that change and the changes to this document that you have not saved are lost");
+      expect(tabTitles()).toEqual(["a.pdf", "b.pdf"]);
+      // Wait: nothing is closed, nothing is lost.
+      click(button("Wait"));
+      expect(await closing).toBe(false);
+      expect(tabTitles()).toEqual(["a.pdf", "b.pdf"]);
+      finish();
+      await turning;
+    });
+
+    it("closing it now ends the document at once, and the change that was under way says nothing", async () => {
+      const { app, api, a, fail, turning } = await turningFirst();
+      const closing = app.requestClose(a.id);
+      await later(80);
+      await flush();
+      click(button("Close now"));
+      expect(await closing).toBe(true);
+      expect(tabTitles()).toEqual(["b.pdf"]);
+      expect(api.close).toHaveBeenCalledWith(a.doc);
+      // The engine of the document is ended with it: the turn fails, and that is not said again.
+      fail();
+      await turning;
+      await flush();
+      expect(notice()).toBeNull();
+    });
+
+    it("closing it again while the first request waits brings the question up at once", async () => {
+      const { app, a, finish, turning } = await turningFirst(60_000);
+      const first = app.requestClose(a.id);
+      await flush();
+      expect(notice()).toBeNull();
+      expect(await app.requestClose(a.id)).toBe(false);
+      await flush();
+      expect(notice()?.textContent).toContain("is still being changed");
+      click(button("Wait"));
+      expect(await first).toBe(false);
+      finish();
+      await turning;
+    });
+
+    it("a change that ends while the question is open leaves the ordinary questions to follow", async () => {
+      const { app, a, finish, turning } = await turningFirst();
+      const closing = app.requestClose(a.id);
+      await later(80);
+      await flush();
+      finish();
+      await turning;
+      await flush();
+      click(button("Close now"));
+      await flush();
+      // The change was made: the document has changes that are not saved, and is not closed unasked.
+      expect(notice()?.textContent).toContain("Save changes");
+      click(button("Cancel"));
+      expect(await closing).toBe(false);
+      expect(tabTitles()).toEqual(["a.pdf", "b.pdf"]);
+    });
+
+    it("quitting asks, after a moment, whether to wait or to quit now", async () => {
+      const { app, api, finish, turning } = await turningFirst();
+      const quitting = app.requestQuit();
+      await later(80);
+      await flush();
+      expect(notice()?.textContent).toContain('"a.pdf" is still being changed');
+      expect(notice()?.textContent).toContain("If you quit now");
+      click(button("Wait"));
+      await quitting;
+      expect(api.quitApp).not.toHaveBeenCalled();
+      expect(api.stayOpen).toHaveBeenCalledOnce();
+      finish();
+      await turning;
+    });
+
+    it("quitting now quits at once when nothing else is unsaved", async () => {
+      const { app, api, finish, turning } = await turningFirst();
+      const quitting = app.requestQuit();
+      await later(80);
+      await flush();
+      click(button("Quit now"));
+      await quitting;
+      expect(api.quitApp).toHaveBeenCalledOnce();
+      expect(notice()).toBeNull();
+      finish();
+      await turning;
+    });
+
+    it("quitting now does not ask about the document whose change was given up, though it has other changes unsaved", async () => {
+      const { app, api, finish, turning } = await turningFirst(20, true);
+      const quitting = app.requestQuit();
+      await later(80);
+      await flush();
+      click(button("Quit now"));
+      await quitting;
+      expect(notice()).toBeNull();
+      expect(api.save).not.toHaveBeenCalled();
+      expect(api.quitApp).toHaveBeenCalledOnce();
+      finish();
+      await turning;
+    });
+
+    it("quitting now still asks about the other documents that have changes that are not saved", async () => {
+      const { app, api, finish, turning } = await turningFirst();
+      click(tab("b.pdf"));
+      await flush();
+      app.recordEdit(edit);
+      const quitting = app.requestQuit();
+      await later(80);
+      await flush();
+      click(button("Quit now"));
+      await flush();
+      // Only b.pdf is asked about: the change to a.pdf was given up with the choice.
+      expect(notice()?.textContent).toContain('Save changes to "b.pdf"?');
+      click(button("Save and quit"));
+      await quitting;
+      expect(api.save).toHaveBeenCalledOnce();
+      expect(api.save.mock.calls[0][0]).toBe(tabsOf(app)[1].doc);
+      expect(api.quitApp).toHaveBeenCalledOnce();
+      finish();
+      await turning;
+    });
+
+    it("a second request to quit brings the question up at once", async () => {
+      const { app, api, finish, turning } = await turningFirst(60_000);
+      const quitting = app.requestQuit();
+      await flush();
+      expect(notice()).toBeNull();
+      await app.requestQuit();
+      await flush();
+      expect(notice()?.textContent).toContain("is still being changed");
+      click(button("Wait"));
+      await quitting;
+      expect(api.quitApp).not.toHaveBeenCalled();
+      finish();
+      await turning;
+    });
+
+    it("printing it waits a moment, and then says that the print would show the old pages", async () => {
+      const { app, finish, turning } = await turningFirst();
+      const printing = app.printActive();
+      await later(80);
+      await flush();
+      expect(notice()?.textContent).toContain("is being changed");
+      expect(document.querySelector(".print-dialog")).toBeNull();
+      click(button("OK"));
+      await printing;
+      expect(document.querySelector(".print-dialog")).toBeNull();
+      finish();
+      await turning;
+    });
+
+    it("pages being copied out are not called a change, to the user who closes or prints", async () => {
+      const pages = fakePages();
+      const { app } = make({ pages: pages as unknown as PageToolsApi, changeGraceMs: 20 });
+      await app.openPath("/a.pdf");
+      await flush();
+      const [first] = tabsOf(app);
+      let finish!: (v: null) => void;
+      pages.pagesExtract.mockImplementationOnce(() => new Promise<null>((r) => (finish = r)));
+      const copying = opsOf(app).extract([0]);
+      await flush();
+
+      const printing = app.printActive();
+      await later(80);
+      await flush();
+      expect(notice()?.textContent).toContain('Pages are being copied out of "a.pdf"');
+      expect(notice()?.textContent).not.toContain("changed");
+      click(button("OK"));
+      await printing;
+
+      const closing = app.requestClose(first.id);
+      await later(80);
+      await flush();
+      expect(notice()?.textContent).toContain('Pages are being copied out of "a.pdf"');
+      expect(notice()?.textContent).toContain("the copy is given up and the changes to this document that you have not saved are lost");
+      expect(notice()?.textContent).not.toContain("that change");
+      click(button("Wait"));
+      expect(await closing).toBe(false);
+      finish(null);
+      await copying;
+    });
+  });
+  describe("on a signed document", () => {
+    const item: SignatureItem = {
+      index: 0,
+      state: "unknown_signer",
+      reason: "no_trust_list",
+      certificateTime: "valid",
+      subFilter: "adbe.pkcs7.detached",
+      byteRange: [0, 100, 300, 50],
+      fileLen: 350,
+      docMdp: 0,
+      certificates: 1,
+      signer: "Test Signer",
+      organisation: null,
+      issuer: null,
+      serial: null,
+      fingerprint: null,
+      validFrom: null,
+      validTo: null,
+      key: null,
+      digest: null,
+      claimedTime: null,
+      statedReason: null,
+      statedLocation: null,
+      trustAnchor: null,
+    };
+    const signed: SignaturesInfo = { total: 1, unlisted: 0, trustAnchors: 0, items: [item] };
+    const badge = () => q<HTMLButtonElement>("#signature-badge");
+    const INTACT = "Signature intact; signer not verified";
+    const STALE = "Not checked for this version";
+    const tools: [string, (ops: PageOps) => Promise<unknown>][] = [
+      ["a turn", (ops) => ops.rotate([0], 1)],
+      ["a crop", (ops) => ops.crop([0], [10, 10, 10, 10])],
+      ["a delete", (ops) => ops.remove([2])],
+      ["a move", (ops) => ops.reorder([1, 0, 2], [0])],
+      ["a blank page", (ops) => ops.insertBlank(1, 612, 792)],
+      ["pages added from a file", (ops) => ops.insertFiles(1, ["/b.pdf"])],
+    ];
+
+    it.each(tools)("%s drops the verdict at once and it does not come back", async (_name, run) => {
+      const pages = fakePages();
+      const m = make({ pages: pages as unknown as PageToolsApi, signatures: signed });
+      await m.app.openPath("/docs/signed.pdf");
+      await flush();
+      expect(badge().textContent).toBe(INTACT);
+      await run(opsOf(m.app));
+      await flush();
+      expect(badge().textContent).toBe(STALE);
+      // Taking the change back leaves the document unchanged in memory, but the verdict stays gone.
+      key("z", { ctrlKey: true });
+      await flush();
+      expect(badge().textContent).toBe(STALE);
+      expect(badge().textContent).not.toContain("intact");
+    });
+
+    it("a change that fails leaves the verdict as it was", async () => {
+      const pages = fakePages();
+      pages.pagesRotate.mockRejectedValueOnce({ code: "page_change_failed", message: "refused" });
+      const m = make({ pages: pages as unknown as PageToolsApi, signatures: signed });
+      await m.app.openPath("/docs/signed.pdf");
+      await flush();
+      const turning = opsOf(m.app).rotate([0], 1);
+      await flush();
+      click(button("OK"));
+      await turning;
+      await flush();
+      expect(badge().textContent).toBe(INTACT);
+    });
+  });
+
+  it("a save waits for a tool that is working, so that it writes the pages as they are then", async () => {
+    const { app, api, pages, ops } = await changedDocument();
+    let finish!: (c: PagesChanged) => void;
+    pages.pagesRotate.mockImplementationOnce(() => new Promise((r) => (finish = r)));
+    const second = ops.rotate([1], 1);
+    await flush();
+    const saved = app.saveActive();
+    await flush();
+    expect(api.save).not.toHaveBeenCalled();
+    finish(changed(3, 0, 1));
+    await second;
+    await saved;
+    expect(api.save).toHaveBeenCalledOnce();
+  });
+
+  it("taking a change back does not start while a tool works, and says nothing about it", async () => {
+    const { pages, ops } = await changedDocument();
+    let finish!: (c: PagesChanged) => void;
+    pages.pagesRotate.mockImplementationOnce(() => new Promise((r) => (finish = r)));
+    const second = ops.rotate([1], 1);
+    await flush();
+    const calls = pages.pagesRotate.mock.calls.length;
+    key("z", { ctrlKey: true });
+    await flush();
+    // Nothing was asked of the engine, and no box says that something failed.
+    expect(pages.pagesRotate.mock.calls.length).toBe(calls);
+    expect(notice()).toBeNull();
+    finish(changed(3, 0, 1));
+    await second;
+  });
+
+  it("a second tool that is asked for while one works is not started and shows nothing", async () => {
+    const { pages, ops } = await changedDocument();
+    let finish!: (c: PagesChanged) => void;
+    pages.pagesRotate.mockImplementationOnce(() => new Promise((r) => (finish = r)));
+    const first = ops.rotate([1], 1);
+    await flush();
+    // Deleting every page would be refused with a box, if it were looked at at all.
+    expect(await ops.remove([0, 1, 2])).toBeNull();
+    expect(notice()).toBeNull();
+    expect(pages.pagesDelete).not.toHaveBeenCalled();
+    finish(changed(3, 0, 1));
+    await first;
+  });
+
+  it("the result of a search is dropped when the pages change, because page numbers mean other pages", async () => {
+    const { app, ops } = await changedDocument();
+    key("f", { ctrlKey: true });
+    const input = q<HTMLInputElement>("#find-input");
+    input.value = "hello";
+    input.dispatchEvent(new Event("input"));
+    await new Promise((r) => setTimeout(r, 120));
+    await flush();
+    expect(q("#find-status").textContent).toBe("1 of 1");
+    await ops.rotate([2], 1);
+    await flush();
+    expect(q("#find-status").textContent).not.toBe("1 of 1");
+    expect(document.querySelectorAll(".hl-find")).toHaveLength(0);
+    expect(app.currentView).not.toBeNull();
+  });
+
+  it("a search that was kept for a document behind another is dropped when its pages change", async () => {
+    const pages = fakePages();
+    const { app } = make({ pages: pages as unknown as PageToolsApi });
+    await app.openPath("/a.pdf");
+    await flush();
+    key("f", { ctrlKey: true });
+    const input = q<HTMLInputElement>("#find-input");
+    input.value = "hello";
+    input.dispatchEvent(new Event("input"));
+    await new Promise((r) => setTimeout(r, 120));
+    await flush();
+    expect(q("#find-status").textContent).toBe("1 of 1");
+    // Another document comes to the front; the pages of the first change while it is behind.
+    await app.openPath("/b.pdf");
+    await flush();
+    (app as unknown as { applyPages(doc: number, pages: unknown[]): void }).applyPages(1, [letter, letter]);
+    click(tab("a.pdf"));
+    await flush();
+    expect(q("#find-status").textContent).not.toBe("1 of 1");
+  });
+
+  it("the contents of the side panel are read again after the pages change", async () => {
+    const { api, ops } = await changedDocument();
+    click(q("#sidebar-toggle"));
+    click(q("#side-tab-contents"));
+    await flush();
+    const before = api.getOutline.mock.calls.length;
+    expect(before).toBeGreaterThan(0);
+    await ops.rotate([1], 1);
+    await flush();
+    // The bookmarks point at page numbers, which now mean other pages: they are asked for again.
+    expect(api.getOutline.mock.calls.length).toBeGreaterThan(before);
+  });
+
+  it("an undo that fails because the engine let go of the copy says so, and does not claim that nothing was lost", async () => {
+    const { pages, ops } = await changedDocument();
+    await ops.remove([1]);
+    // The first delete of a document says what a delete leaves; that is answered first.
+    click(button("OK"));
+    await flush();
+    pages.pagesRestore.mockRejectedValueOnce({ code: "snapshot_gone", message: "" });
+    key("z", { ctrlKey: true });
+    await flush();
+    expect(notice()?.textContent).toMatch(/cannot be taken back any more/);
+    expect(notice()?.textContent).not.toMatch(/Nothing was lost/);
+  });
+
+  it("an undo whose engine died says no second thing: the tab is closed with its own message", async () => {
+    const { pages, ops } = await changedDocument();
+    await ops.remove([1]);
+    click(button("OK"));
+    await flush();
+    pages.pagesRestore.mockRejectedValueOnce({ code: "engine_stopped", message: "gone" });
+    key("z", { ctrlKey: true });
+    await flush();
+    const text = [...document.querySelectorAll(".notice")].map((n) => n.textContent).join(" | ");
+    expect(text).not.toMatch(/Nothing was lost/);
+    expect(text).not.toMatch(/could not be taken back/);
+  });
+});
+
 describe("App: the verdict on a signature belongs to the bytes it was made from", () => {
   const intact: SignatureItem = {
     index: 0,

@@ -11,6 +11,7 @@
 
 mod links;
 mod locate;
+mod pages;
 mod positions;
 mod session;
 mod signatures;
@@ -299,6 +300,15 @@ impl From<ClientError> for CommandError {
                     message: why,
                 }
             }
+            // The same for a change to the pages: it went on, or was silent, for too long.
+            ClientError::EngineStopped(why)
+                if why.starts_with(partridge_engine_client::CHANGE_TOOK_TOO_LONG) =>
+            {
+                CommandError {
+                    code: "change_took_too_long".into(),
+                    message: why,
+                }
+            }
             ClientError::EngineStopped(why) => CommandError {
                 code: "engine_stopped".into(),
                 message: why,
@@ -527,11 +537,36 @@ async fn save_pdf_as(
             message: "the document is not open".into(),
         }));
     };
-    let dialog_app = app.clone();
     // The dialog is the user's to answer for as long as they like; the gate (which an update
     // install closes) is entered only afterwards, so the dialog never holds an update back.
+    let Some(target) = choose_save_target(&app, current).await? else {
+        return Ok(None);
+    };
+    // Not while an update is being installed: it would end the engine in the middle of the save.
+    let _permit = update_state
+        .gate()
+        .enter()
+        .map_err(|_| updates::updating_error())?;
+    let options = SaveOptions {
+        allow_signed,
+        overwrite_changed: false,
+    };
+    let outcome = blocking(move || pool.save_as(doc, &target, options)).await?;
+    let info = SavedInfo::from(outcome);
+    update_state.move_doc(doc, &info.path);
+    Ok(Some(info))
+}
+
+/// Asks the user where to write a file, with the dialog of the system, which the app opens itself:
+/// the window cannot name a file to write. `start` is the file the dialog starts from (its folder
+/// and its name). `None` when the user cancels.
+async fn choose_save_target(
+    app: &AppHandle,
+    start: PathBuf,
+) -> Result<Option<PathBuf>, CommandError> {
+    let dialog_app = app.clone();
     let chosen = tauri::async_runtime::spawn_blocking(move || {
-        let mut start = current;
+        let mut start = start;
         // A name typed without an ending gets `.pdf`. The dialog asked about replacing the name as
         // it was typed; when the name with the ending is another file that exists, the dialog is
         // shown again with that name, so the system asks the question about the right file and
@@ -568,29 +603,14 @@ async fn save_pdf_as(
         code: "internal".into(),
         message: e.to_string(),
     })?;
-    let target = match chosen {
-        None => return Ok(None),
-        Some(Ok(path)) => path,
-        Some(Err(())) => {
-            return Err(CommandError {
-                code: "save_write_failed".into(),
-                message: "the place that was chosen is not a file on this computer".into(),
-            })
-        }
-    };
-    // Not while an update is being installed: it would end the engine in the middle of the save.
-    let _permit = update_state
-        .gate()
-        .enter()
-        .map_err(|_| updates::updating_error())?;
-    let options = SaveOptions {
-        allow_signed,
-        overwrite_changed: false,
-    };
-    let outcome = blocking(move || pool.save_as(doc, &target, options)).await?;
-    let info = SavedInfo::from(outcome);
-    update_state.move_doc(doc, &info.path);
-    Ok(Some(info))
+    match chosen {
+        None => Ok(None),
+        Some(Ok(path)) => Ok(Some(path)),
+        Some(Err(())) => Err(CommandError {
+            code: "save_write_failed".into(),
+            message: "the place that was chosen is not a file on this computer".into(),
+        }),
+    }
 }
 
 /// Quits the app after the user has decided what happens to the changes that are not saved.
@@ -901,6 +921,16 @@ pub fn run() {
             set_dirty,
             save_pdf,
             save_pdf_as,
+            pages::pages_delete,
+            pages::pages_reorder,
+            pages::pages_rotate,
+            pages::pages_crop,
+            pages::pages_set_boxes,
+            pages::pages_insert_blank,
+            pages::pages_restore,
+            pages::pages_insert_pdf,
+            pages::pages_extract,
+            pages::pages_cancel,
             quit_app,
             stay_open,
             set_position,
@@ -1436,6 +1466,11 @@ mod tests {
             partridge_engine_client::TOOK_TOO_LONG
         )));
         assert_eq!(too_long.code, "save_took_too_long");
+        let change = CommandError::from(ClientError::EngineStopped(format!(
+            "{}: it did not answer within 300 seconds",
+            partridge_engine_client::CHANGE_TOOK_TOO_LONG
+        )));
+        assert_eq!(change.code, "change_took_too_long");
         let password = CommandError::from(ClientError::Engine {
             code: ErrorCode::PasswordRequired,
             message: "locked".into(),

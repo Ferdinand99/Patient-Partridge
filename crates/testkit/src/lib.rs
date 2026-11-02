@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use md5::{Digest, Md5};
 
+mod pages;
+pub use pages::*;
 pub mod signed;
 
 /// One page of a generated document.
@@ -765,6 +767,17 @@ fn rc4(key: &[u8], data: &[u8]) -> Vec<u8> {
 /// `user_password` to open. The pages are blank so nothing has to be encrypted besides the
 /// handler's own entries.
 pub fn encrypted_pdf(user_password: &str, pages: usize) -> Vec<u8> {
+    encrypted_pdf_with(user_password, pages, -4, false)
+}
+
+/// As [`encrypted_pdf`], with the permissions `permissions` (the `/P` entry) and, when `r3` is true,
+/// the 128 bit RC4 handler of revision 3 instead of the 40 bit one of revision 2.
+pub fn encrypted_pdf_with(
+    user_password: &str,
+    pages: usize,
+    permissions: i32,
+    r3: bool,
+) -> Vec<u8> {
     let mut padded = [0u8; 32];
     let pw = user_password.as_bytes();
     let n = pw.len().min(32);
@@ -775,21 +788,49 @@ pub fn encrypted_pdf(user_password: &str, pages: usize) -> Vec<u8> {
     let owner: Vec<u8> = (0u8..32)
         .map(|i| i.wrapping_mul(7).wrapping_add(3))
         .collect();
-    let permissions: i32 = -4;
     let id: [u8; 16] = *b"partridge-test-1";
 
-    // Algorithm 2 for revision 2: the file key.
+    // Algorithm 2: the file key.
     let mut md5 = Md5::new();
     md5.update(padded);
     md5.update(&owner);
     md5.update(permissions.to_le_bytes());
     md5.update(id);
-    let key = md5.finalize()[..5].to_vec();
-    // Algorithm 4: the user entry is the padding string encrypted with the file key.
-    let user = rc4(&key, &PADDING);
+    let mut digest = md5.finalize().to_vec();
+    let key_len = if r3 { 16 } else { 5 };
+    if r3 {
+        for _ in 0..50 {
+            let mut again = Md5::new();
+            again.update(&digest[..key_len]);
+            digest = again.finalize().to_vec();
+        }
+    }
+    let key = digest[..key_len].to_vec();
+    // Algorithm 4 (revision 2): the user entry is the padding string encrypted with the file key.
+    // Algorithm 5 (revision 3): the hash of the padding and the file id, encrypted 20 times with
+    // the key changed by the round, then padded to 32 bytes.
+    let user = if r3 {
+        let mut seed = Md5::new();
+        seed.update(PADDING);
+        seed.update(id);
+        let mut data = rc4(&key, &seed.finalize());
+        for round in 1..=19u8 {
+            let k: Vec<u8> = key.iter().map(|b| b ^ round).collect();
+            data = rc4(&k, &data);
+        }
+        data.extend_from_slice(&[0u8; 16]);
+        data
+    } else {
+        rc4(&key, &PADDING)
+    };
 
+    let handler = if r3 {
+        "/V 2 /R 3 /Length 128"
+    } else {
+        "/V 1 /R 2"
+    };
     let encrypt_object = format!(
-        "<< /Filter /Standard /V 1 /R 2 /P {permissions} /O <{}> /U <{}> >>",
+        "<< /Filter /Standard {handler} /P {permissions} /O <{}> /U <{}> >>",
         hex(&owner),
         hex(&user)
     )
