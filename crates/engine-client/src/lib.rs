@@ -40,8 +40,12 @@ pub use spawn::{spawn_engine, EngineProcess, SandboxPolicy, SpawnRequest, Spawne
 
 pub use partridge_protocol::{FontScript, LinkTarget, OutlineItem, PageLink, TextMatch};
 
+mod pages;
+pub use pages::{ExportError, Exported, PagesChanged, PagesCropped};
 mod pool;
-pub use pool::EnginePool;
+pub use pool::{
+    Cancelled, EnginePool, ExtractOptions, InsertOptions, InsertOutcome, PageProgress,
+};
 mod save;
 pub use save::{verify_written, DocInfo, Fingerprint, SaveError, SaveOptions, SaveOutcome};
 mod spawn;
@@ -61,6 +65,9 @@ const SAVE_PASSES: u64 = 4;
 /// What the error of an engine that was stopped for taking too long starts with. The app turns it
 /// into its own error code, so that the window can say what happened.
 pub const TOOK_TOO_LONG: &str = "it was still working when the overall time limit ended";
+
+/// Largest answer to a page tool: 100 000 page sizes of 8 bytes, or 10 000 pairs of boxes.
+const PAGES_ANSWER_LIMIT: usize = 2 * 1024 * 1024;
 
 /// Largest outline answer: 5 000 entries of at most 512 bytes of title and 9 bytes of framing.
 const MAX_OUTLINE_ANSWER: usize = 3 * 1024 * 1024;
@@ -623,6 +630,8 @@ impl EngineClient {
             RequestBody::SaveChunk { len, .. } => {
                 (SAVE_DATA_HEADER_LEN + (*len as usize).min(MAX_SAVE_CHUNK)).max(IDLE_LIMIT)
             }
+            // The size of every page, for up to MAX_PAGES pages, and a list of boxes.
+            RequestBody::Pages(_) => PAGES_ANSWER_LIMIT,
             // A search answer holds at most 2 000 matches of 8 bytes: it fits the idle limit.
             _ => IDLE_LIMIT,
         }
@@ -648,7 +657,8 @@ impl EngineClient {
         let patience = match body {
             RequestBody::DocInfo { .. }
             | RequestBody::Fingerprint { .. }
-            | RequestBody::SaveBegin { .. } => self.config.save_stall,
+            | RequestBody::SaveBegin { .. }
+            | RequestBody::Pages(_) => self.config.save_stall,
             _ => self.config.timeout,
         };
         let result = self.wait_for_answer(running, id, body, patience);

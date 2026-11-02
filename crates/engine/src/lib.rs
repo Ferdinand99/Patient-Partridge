@@ -26,6 +26,7 @@ use source::{GuardedReader, SourceFile, SourceGuard};
 pub mod fds;
 pub mod fonts;
 pub mod limits;
+pub mod pages;
 pub mod sandbox;
 pub mod save;
 pub mod source;
@@ -141,6 +142,11 @@ pub struct Engine {
     docs: HashMap<u32, PdfDocument<'static>>,
     /// The serialised form of a document between `SaveBegin` and `SaveEnd`.
     saves: HashMap<u32, Vec<u8>>,
+    /// What the page tools keep for each document (copies for taking a change back, a document
+    /// being handed over to be inserted).
+    tools: HashMap<u32, pages::PageTools>,
+    /// The passwords the documents were opened with, to load copies of them.
+    passwords: HashMap<u32, pages::Secret>,
     next_doc: u32,
     /// The one document the app handed over. `Open` takes it.
     document: Option<Box<dyn SourceFile>>,
@@ -193,6 +199,8 @@ impl Engine {
             pdfium_version: version,
             docs: HashMap::new(),
             saves: HashMap::new(),
+            tools: HashMap::new(),
+            passwords: HashMap::new(),
             next_doc: 1,
             document: None,
             source: None,
@@ -299,8 +307,11 @@ impl Engine {
                 // Closing an unknown id is not an error: the end state is the same.
                 self.docs.remove(&doc);
                 self.saves.remove(&doc);
+                self.tools.remove(&doc);
+                self.passwords.remove(&doc);
                 Ok(ResponseBody::Closed)
             }
+            RequestBody::Pages(request) => pages::handle(self, pdfium, request, progress),
             RequestBody::Outline { doc } => {
                 let document = self.document(doc)?;
                 Ok(ResponseBody::Outline {
@@ -409,6 +420,14 @@ impl Engine {
         self.docs.get_mut(&doc).map(edit)
     }
 
+    /// Test builds only: sets what the page tools keep for a document (smaller limits than the
+    /// real ones, to see what happens when they are reached).
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn set_page_tools_for_tests(&mut self, doc: u32, tools: pages::PageTools) {
+        self.tools.insert(doc, tools);
+    }
+
     /// Fails when the file the document is read from changed, or a read of it failed.
     fn check_source(&self, progress: &mut dyn FnMut(u32)) -> Result<(), Failure> {
         match &self.source {
@@ -468,6 +487,17 @@ impl Engine {
         let doc = pdfium
             .load_pdf_from_reader(GuardedReader::new(guard.clone()), password)
             .map_err(|e| map_open_error(e, password.is_some()))?;
+        // A file can claim any number of pages in a few bytes. The window lays out every page that
+        // is reported, so the number is held to what a real document has.
+        if doc.pages().len() as usize > partridge_protocol::MAX_PAGES {
+            return fail(
+                ErrorCode::TooManyPages,
+                format!(
+                    "the document has more than {} pages, which is more than Patient Partridge opens",
+                    partridge_protocol::MAX_PAGES
+                ),
+            );
+        }
         self.source = Some(guard);
         // One unreadable page must not refuse the whole document: it gets a placeholder size.
         let page_list = doc.pages();
@@ -479,6 +509,10 @@ impl Engine {
             .collect();
         let id = self.next_doc;
         self.next_doc = self.next_doc.wrapping_add(1).max(1);
+        if let Some(password) = password {
+            self.passwords
+                .insert(id, pages::Secret(password.to_string()));
+        }
         self.docs.insert(id, doc);
         Ok(ResponseBody::Opened { doc: id, pages })
     }
@@ -575,6 +609,7 @@ fn warm_up(pdfium: &'static Pdfium) {
         let _ = text::page_links(&page, pages.len() as usize);
     }
     let _ = text::outline(&doc);
+    pages::warm_up(pdfium, &doc);
 }
 
 fn map_open_error(error: PdfiumError, password_given: bool) -> Failure {

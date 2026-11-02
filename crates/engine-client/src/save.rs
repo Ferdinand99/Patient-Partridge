@@ -128,6 +128,18 @@ pub enum SaveError {
     OwnerWouldChange,
     /// The access rights of the file could not be given to the new file.
     AccessNotKept,
+    /// The pages to copy out of a document come from a document that is protected by a password,
+    /// and the new document would not be.
+    Unprotected,
+    /// A document to insert pages from is protected by a password; its pages would join this
+    /// document without that protection.
+    InsertProtected,
+    /// A document to insert pages from is signed; its pages would come without the signature.
+    InsertSigned { signatures: u32 },
+    /// The user stopped the work.
+    Cancelled,
+    /// The new file would replace the document itself.
+    OverSource,
 }
 
 impl SaveError {
@@ -150,6 +162,11 @@ impl SaveError {
             SaveError::HardLink => "save_hard_link",
             SaveError::OwnerWouldChange => "save_owner_changes",
             SaveError::AccessNotKept => "save_access_kept",
+            SaveError::Unprotected => "save_unprotected",
+            SaveError::InsertProtected => "insert_protected",
+            SaveError::InsertSigned { .. } => "insert_signed",
+            SaveError::Cancelled => "cancelled",
+            SaveError::OverSource => "extract_over_source",
         }
     }
 }
@@ -204,6 +221,25 @@ impl fmt::Display for SaveError {
             SaveError::AccessNotKept => write!(
                 f,
                 "the access rights of the file could not be given to the new file"
+            ),
+            SaveError::Unprotected => write!(
+                f,
+                "the document is protected by a password and the new file would not be"
+            ),
+            SaveError::InsertProtected => write!(
+                f,
+                "the document is protected by a password, and its pages would join this one without that protection"
+            ),
+            SaveError::InsertSigned { signatures } => write!(
+                f,
+                "the document has {signatures} digital signature{}, and its pages would come without {}",
+                if *signatures == 1 { "" } else { "s" },
+                if *signatures == 1 { "it" } else { "them" }
+            ),
+            SaveError::Cancelled => write!(f, "it was stopped"),
+            SaveError::OverSource => write!(
+                f,
+                "the new file would replace the document it is made from"
             ),
         }
     }
@@ -636,6 +672,39 @@ pub(crate) fn save_document(
     if print.failed > 0 {
         return Err(SaveError::SourceUnreadable.into());
     }
+    let outcome = write_checked(
+        target,
+        expected,
+        options,
+        info,
+        print,
+        &mut |sink| client.save_to(doc, sink),
+        verify,
+        still_open,
+    )?;
+    Ok(SaveOutcome {
+        touched: info.touched,
+        ..outcome
+    })
+}
+
+/// The common end of a save and of copying pages out to a new file: the bytes that `stream` hands
+/// over go to a new file next to `target`, which is flushed, read back, checked by `verify`, and
+/// only then put in place of `target` in one step (see the rules at the top of this module). `info`
+/// and `print` describe the document that is expected to be in the file.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_checked(
+    target: &Path,
+    expected: Option<&FileStamp>,
+    options: SaveOptions,
+    info: DocInfo,
+    print: Fingerprint,
+    stream: &mut dyn FnMut(
+        &mut dyn FnMut(&[u8]) -> io::Result<()>,
+    ) -> Result<u64, SaveStreamError>,
+    verify: &dyn Fn(&Path, DocInfo, &Fingerprint) -> Result<(), SaveError>,
+    still_open: &dyn Fn() -> bool,
+) -> Result<SaveOutcome, ClientError> {
     let requested = target;
     let target = resolve(target);
     let existing = check_target(&target)?;
@@ -653,7 +722,7 @@ pub(crate) fn save_document(
     }
     let mut written: u64 = 0;
     let mut sum = Fnv::new();
-    let total = client.save_to(doc, &mut |piece| {
+    let total = stream(&mut |piece| {
         file.write_all(piece)?;
         sum.update(piece);
         written += piece.len() as u64;
@@ -711,7 +780,7 @@ pub(crate) fn save_document(
     Ok(SaveOutcome {
         path: requested.to_path_buf(),
         bytes: total,
-        touched: info.touched,
+        touched: false,
     })
 }
 

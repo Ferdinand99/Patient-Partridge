@@ -289,6 +289,15 @@ fn main() {
                     digest: 7,
                 },
             ),
+            // The page tools have a stand-in of their own (fake_pages_engine).
+            RequestBody::Pages(_) => reply(
+                &mut output,
+                id,
+                ResponseBody::Error {
+                    code: ErrorCode::InvalidRequest,
+                    message: "this stand-in has no page tools".into(),
+                },
+            ),
         }
     }
 }

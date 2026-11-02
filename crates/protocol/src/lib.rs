@@ -16,8 +16,11 @@
 use std::fmt;
 use std::io::{self, Read, Write};
 
+mod pages;
+pub use pages::*;
+
 /// Version of this protocol. Both sides check it in the `Hello` exchange.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Largest frame (payload) either side accepts: 128 MiB, enough for the biggest allowed bitmap.
 pub const MAX_FRAME_LEN: usize = 128 * 1024 * 1024;
@@ -196,6 +199,17 @@ pub enum ErrorCode {
     /// Reading the file the document comes from failed at least once, so the document may be
     /// missing parts. Nothing is serialised.
     SourceUnreadable = 17,
+    /// The document has more pages than the page tools (or the reader) take.
+    TooManyPages = 40,
+    /// The copy of the document that a page change was to go back to is gone: the engine keeps
+    /// only a few, and the oldest are let go of.
+    SnapshotGone = 41,
+    /// The document to insert is not a usable PDF.
+    ImportFailed = 42,
+    /// PDFium refused a page change.
+    PageChangeFailed = 43,
+    /// A save, an insert or a copy of the document is under way.
+    Busy = 44,
 }
 
 impl ErrorCode {
@@ -218,6 +232,11 @@ impl ErrorCode {
             15 => ErrorCode::SaveTooLarge,
             16 => ErrorCode::SourceChanged,
             17 => ErrorCode::SourceUnreadable,
+            40 => ErrorCode::TooManyPages,
+            41 => ErrorCode::SnapshotGone,
+            42 => ErrorCode::ImportFailed,
+            43 => ErrorCode::PageChangeFailed,
+            44 => ErrorCode::Busy,
             _ => return None,
         })
     }
@@ -242,6 +261,11 @@ impl ErrorCode {
             ErrorCode::SaveTooLarge => "save_too_large",
             ErrorCode::SourceChanged => "source_changed",
             ErrorCode::SourceUnreadable => "source_unreadable",
+            ErrorCode::TooManyPages => "too_many_pages",
+            ErrorCode::SnapshotGone => "snapshot_gone",
+            ErrorCode::ImportFailed => "import_failed",
+            ErrorCode::PageChangeFailed => "page_change_failed",
+            ErrorCode::Busy => "busy",
         }
     }
 }
@@ -298,6 +322,8 @@ pub enum RequestBody {
     /// the script, a font that did not pass the check, or the budget of font data used up).
     /// Text in those scripts that the PDF does not carry a font for is drawn as blanks.
     FontReport,
+    /// A page tool: delete, reorder, rotate, crop, insert, extract (see the `pages` module).
+    Pages(PagesRequest),
 }
 
 /// One entry of the table of contents.
@@ -423,6 +449,8 @@ pub enum ResponseBody {
     FontReport {
         missed: Vec<FontScript>,
     },
+    /// The answer to a page tool.
+    Pages(PagesResponse),
     Error {
         code: ErrorCode,
         message: String,
@@ -571,6 +599,7 @@ impl Request {
                 out.push(TAG_REQ_FONT_REPORT);
                 put_u32(&mut out, self.id);
             }
+            RequestBody::Pages(request) => request.encode(self.id, &mut out),
         }
         out
     }
@@ -621,6 +650,9 @@ impl Request {
             TAG_REQ_SAVE_END => RequestBody::SaveEnd { doc: r.u32()? },
             TAG_REQ_FINGERPRINT => RequestBody::Fingerprint { doc: r.u32()? },
             TAG_REQ_FONT_REPORT => RequestBody::FontReport,
+            t if (pages::FIRST_REQUEST_TAG..=pages::LAST_REQUEST_TAG).contains(&t) => {
+                RequestBody::Pages(PagesRequest::decode(t, &mut r)?)
+            }
             other => return Err(ProtocolError::UnknownTag(other)),
         };
         r.finish()?;
@@ -660,6 +692,7 @@ impl Response {
                 out.push(TAG_RES_OPENED);
                 put_u32(&mut out, self.id);
                 put_u32(&mut out, *doc);
+                let pages = &pages[..pages.len().min(MAX_PAGES)];
                 put_u32(&mut out, pages.len() as u32);
                 for p in pages {
                     put_f32(&mut out, p.width);
@@ -793,6 +826,7 @@ impl Response {
                     out.push(script.code());
                 }
             }
+            ResponseBody::Pages(response) => response.encode(self.id, &mut out),
             ResponseBody::Error { code, message } => {
                 out.push(TAG_RES_ERROR);
                 put_u32(&mut out, self.id);
@@ -841,6 +875,9 @@ impl Response {
                 // Each page takes 8 bytes: check before reserving anything.
                 if count > r.remaining() / 8 {
                     return Err(ProtocolError::Truncated);
+                }
+                if count > MAX_PAGES {
+                    return Err(ProtocolError::InvalidLength);
                 }
                 let mut pages = Vec::with_capacity(count);
                 for _ in 0..count {
@@ -1020,6 +1057,9 @@ impl Response {
                         .push(FontScript::from_code(raw).ok_or(ProtocolError::UnknownValue(raw))?);
                 }
                 ResponseBody::FontReport { missed }
+            }
+            t if (pages::FIRST_RESPONSE_TAG..=pages::LAST_RESPONSE_TAG).contains(&t) => {
+                ResponseBody::Pages(PagesResponse::decode(t, &mut r)?)
             }
             TAG_RES_ERROR => {
                 let raw = r.u8()?;

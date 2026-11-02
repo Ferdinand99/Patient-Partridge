@@ -7,6 +7,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use md5::{Digest, Md5};
 
+mod pages;
+pub use pages::*;
+
 /// One page of a generated document.
 pub struct PageSpec {
     pub width: u32,
