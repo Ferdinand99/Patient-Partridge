@@ -245,7 +245,7 @@ impl State {
 
         self.annotate(doc, count, &pages);
 
-        self.save(doc, count);
+        self.save(doc, count, &pages);
 
         match self.ask(RequestBody::Close { doc }) {
             ResponseBody::Closed => {}
@@ -363,6 +363,13 @@ impl State {
             // The ones made are listed, and the others did not go away.
             let after = match self.ask(RequestBody::ListAnnots { doc, page }) {
                 ResponseBody::Annots { items } => items,
+                // A page of a damaged file that PDFium could load the first time may not load again
+                // (a page tree that does not match its own count reads once and then not): the
+                // changes to that page are over.
+                ResponseBody::Error {
+                    code: ErrorCode::Corrupt,
+                    ..
+                } => continue,
                 other => panic!("unexpected answer to ListAnnots: {other:?}"),
             };
             if after.len() < MAX_ANNOTS_PER_PAGE {
@@ -434,7 +441,7 @@ impl State {
     }
 
     /// The three requests of a save, and a look at the file that comes out.
-    fn save(&mut self, doc: u32, count: u32) {
+    fn save(&mut self, doc: u32, count: u32, sizes: &[PageSize]) {
         let (pages, security) = match self.ask(RequestBody::DocInfo { doc }) {
             ResponseBody::DocInfo {
                 pages, security, ..
@@ -519,6 +526,9 @@ impl State {
 
         // The original, read afresh as the saved file will be.
         let fresh = self.fresh_look(count);
+        // And the pages of the document in this session, to tell the pages that read the same in a
+        // session and in a fresh read from those that do not.
+        let live = self.looks(doc, sizes, count);
 
         // The saved file opens again. (A file that PDFium had to repair may not; then the app's
         // check would refuse the save. One that opens must be the same document.)
@@ -542,22 +552,29 @@ impl State {
                 // this, not taken from the document the changes were made in: reading the outline
                 // fills PDFium's list of pages, so a page that a fresh read cannot load (a page
                 // tree that does not match its own count) reads in that session and not in the next
-                // one, and the two are not like for like. A page that either side cannot read is
-                // not compared: PDFium repairs a damaged file when it opens it and can write the
-                // repaired tree in a form it cannot read back, and the app's check of a saved file
-                // refuses exactly that (`crates/engine-client/src/save.rs`).
+                // one, and the two are not like for like. For the same reason a page is only
+                // compared when this session and the fresh read of the original agree about it
+                // (a page tree with a kid that is not an object makes PDFium number the pages
+                // differently in the two, and then it writes the tree it numbered in the session).
+                // A page that any of the three cannot read is not compared either: PDFium repairs a
+                // damaged file when it opens it and can write the repaired tree in a form it cannot
+                // read back, and the app's check of a saved file refuses exactly that
+                // (`crates/engine-client/src/save.rs`).
                 if let Some(before) = fresh {
                     let after = self.looks(again, &pages, count);
-                    for ((page, (was_size, was_text)), (_, (now_size, now_text))) in
-                        before.iter().zip(after.iter())
+                    for (((page, was), (_, now)), (_, here)) in
+                        before.iter().zip(after.iter()).zip(live.iter())
                     {
-                        if let (Some(was), Some(now)) = (was_text, now_text) {
-                            assert_eq!(was, now, "page {page} of the saved file reads another text");
-                            assert_eq!(
-                                was_size, now_size,
-                                "page {page} of the saved file has another size"
-                            );
+                        let (Some(was_text), Some(now_text), Some(here_text)) =
+                            (&was.1, &now.1, &here.1)
+                        else {
+                            continue;
+                        };
+                        if was_text != here_text || was.0 != here.0 {
+                            continue;
                         }
+                        assert_eq!(was_text, now_text, "page {page} of the saved file reads another text");
+                        assert_eq!(was.0, now.0, "page {page} of the saved file has another size");
                     }
                 }
                 self.ask(RequestBody::Close { doc: again });
