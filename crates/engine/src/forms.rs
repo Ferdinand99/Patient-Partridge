@@ -16,26 +16,22 @@
 //! other fields. The rest (a link, a jump, a launch, a submit, a named action) end in a callback
 //! that this module does not give, so they do nothing.
 //!
-//! So the module makes sure that no action that changes the document can fire:
+//! So the module makes sure that no action that changes the document can fire. What it does is
+//! described in `form_actions`; in short:
 //!
 //! - When the environment is made (while the window asks what kind of form the document has, which
-//!   is a request that may take long), the document is written out once and searched for the names
-//!   `/ResetForm` and `/Hide` (the written file has every object in the open, also those the
-//!   original keeps in compressed streams). A document that has neither cannot reset or hide
-//!   anything, and nothing more is needed. If a read of the file failed or the file changed
-//!   meanwhile, the written document may lack objects, and the document is treated as holding one.
-//! - In a document that has one of them, a widget that has an action of its own (`/A` or `/AA`) is
-//!   not filled in: it is listed read only and marked, and a request for it is refused.
-//! - PDFium reads some events of a widget from the field above it, not from the widget: the
-//!   dictionary of additional actions is looked up through `/Parent`, up to 32 levels, and its
-//!   keystroke and validate events can hold a reset or a hide as well as a script. PDFium also
-//!   builds a field from the field down, through `/Kids`, so a widget listed in the `/Kids` of a
-//!   field belongs to that field whatever its own `/Parent` says. The plain interface shows none of
-//!   this, so the written document is searched for it: when an object that some other object names
-//!   as its `/Parent`, or an object that has `/Kids`, has additional actions (`/AA`), every widget
-//!   of the document is treated like a widget with an action of its own.
-//!   (That is wider than needed: it also catches the events PDFium reads from the widget alone, and
-//!   widgets under other fields. Narrowing it to the chain of one widget is left for later.)
+//!   is a request that may take long), the document is written out once, so that every object is
+//!   in the open, also those the original keeps in compressed streams. A document with neither
+//!   `/ResetForm` nor `/Hide` in it cannot reset or hide anything, and nothing more is needed. If a
+//!   read of the file failed or the file changed meanwhile, the written document may lack objects,
+//!   and the whole form is left alone.
+//! - Otherwise every object is read and the actions of every dictionary are followed (`/A` and
+//!   `/AA`, through references and `/Next`) to see whether they reach a reset or a hide. When the
+//!   keystroke, validate, format or calculate event of any dictionary does (PDFium reads those from
+//!   a field other than the widget, and the file does not say which), or when the search cannot be
+//!   settled, every widget is left alone: listed read only, marked, and a request for it refused.
+//! - A widget whose own `/A` or `/AA` reaches one is left alone, and only that widget. A reset
+//!   button, and widgets with scripts that reach neither, do not stop anything else.
 //! - The widget that is named is the one that gets the focus and the key, never the widget found at
 //!   a point, so a button that lies over a field is never pressed.
 //! - No push button is listed, and nothing calls the functions that run the actions of a document
@@ -71,6 +67,7 @@ use partridge_protocol::{
 use pdfium_render::prelude::*;
 
 use crate::annots::raw_document;
+use crate::form_actions::{self, Scan};
 use crate::source::SourceGuard;
 use crate::Failure;
 
@@ -101,9 +98,6 @@ const FF_NO_TOGGLE_TO_OFF: i32 = 1 << 14;
 const FF_COMBO_EDITABLE: i32 = 1 << 18;
 const FF_MULTISELECT: i32 = 1 << 21;
 const FF_COMB: i32 = 1 << 24;
-
-/// The names of the two actions that change a document when they fire.
-const STATE_ACTIONS: [&[u8]; 2] = [b"/ResetForm", b"/Hide"];
 
 /// Most bytes (UTF-16) of text that one listing of a page reads from PDFium. A hostile document can
 /// make a thousand fields share one list of choices; this keeps the work of a listing bounded.
@@ -139,11 +133,8 @@ pub struct FormEnv {
     handle: FPDF_FORMHANDLE,
     /// PDFium keeps the pointer to this until the environment is closed, so it must not move.
     _info: Pin<Box<FPDF_FORMFILLINFO>>,
-    /// The document holds a reset or a hide action somewhere (or could not be searched).
-    state_actions: bool,
-    /// The document holds a reset or a hide, and a field above a widget has additional actions (or
-    /// the document could not be searched): every widget is left alone.
-    parent_actions: bool,
+    /// What the actions of the document can do to the form (see `form_actions`).
+    scan: Scan,
     /// The permissions of the document allow filling in forms.
     may_fill: bool,
     /// The pages that hold widgets of a field that has them on more than one page, by full name,
@@ -168,195 +159,6 @@ impl Drop for FormEnv {
         // engine drops this before the document it belongs to.
         unsafe { self.bindings.FPDFDOC_ExitFormFillEnvironment(self.handle) };
     }
-}
-
-/// True when `bytes` holds the PDF name `name` (such as `/Hide`) as a whole name: the byte after it
-/// is white space or a delimiter, so `/HideToolbar` is not `/Hide`.
-fn has_name(bytes: &[u8], name: &[u8]) -> bool {
-    let regular = is_regular;
-    let mut from = 0;
-    while let Some(at) = bytes[from..]
-        .windows(name.len())
-        .position(|window| window == name)
-    {
-        let end = from + at + name.len();
-        if bytes.get(end).is_none_or(|b| !regular(*b)) {
-            return true;
-        }
-        from = from + at + 1;
-    }
-    false
-}
-
-/// Whether a document written out holds an action that changes a document when it fires.
-fn holds_state_action(bytes: &[u8]) -> bool {
-    STATE_ACTIONS.iter().any(|name| has_name(bytes, name))
-}
-
-/// Whether `b` can be part of a name or a number (it is not white space or a delimiter).
-fn is_regular(b: u8) -> bool {
-    !matches!(
-        b,
-        0 | 9
-            | 10
-            | 12
-            | 13
-            | 32
-            | b'('
-            | b')'
-            | b'<'
-            | b'>'
-            | b'['
-            | b']'
-            | b'{'
-            | b'}'
-            | b'/'
-            | b'%'
-    )
-}
-
-fn skip_space(bytes: &[u8], mut at: usize) -> usize {
-    while bytes
-        .get(at)
-        .is_some_and(|b| matches!(b, 0 | 9 | 10 | 12 | 13 | 32))
-    {
-        at += 1;
-    }
-    at
-}
-
-/// The unsigned number that starts at `at`, and where it ends. At most ten digits.
-fn number_at(bytes: &[u8], at: usize) -> Option<(u64, usize)> {
-    let digits = bytes[at.min(bytes.len())..]
-        .iter()
-        .take_while(|b| b.is_ascii_digit())
-        .count();
-    if digits == 0 || digits > 10 {
-        return None;
-    }
-    let text = std::str::from_utf8(&bytes[at..at + digits]).ok()?;
-    Some((text.parse().ok()?, at + digits))
-}
-
-/// The number of the object whose header (`12 0 obj`) starts at `at`.
-fn header_at(bytes: &[u8], at: usize) -> Option<u64> {
-    let (number, end) = number_at(bytes, at)?;
-    let next = skip_space(bytes, end);
-    if next == end {
-        return None;
-    }
-    let (_, end) = number_at(bytes, next)?;
-    let next = skip_space(bytes, end);
-    if next == end || !bytes[next..].starts_with(b"obj") {
-        return None;
-    }
-    bytes
-        .get(next + 3)
-        .is_none_or(|b| !is_regular(*b))
-        .then_some(number)
-}
-
-/// The objects of a document as PDFium writes it, each with its number and its bytes (up to the
-/// header of the next one). A writer puts every object on lines of its own: a string in a written
-/// dictionary has its line breaks and brackets escaped, so a header at the start of a line is the
-/// start of an object, whatever the strings in the objects before it say. A stream can hold any
-/// bytes, and a header-like line in one only cuts the stream into more parts, which can make the
-/// search find more, never less.
-///
-/// The objects are found one at a time, so a file of nothing but headers (hundreds of megabytes of
-/// `1 0 obj` lines) costs no memory beyond the bytes themselves.
-fn written_objects(bytes: &[u8]) -> WrittenObjects<'_> {
-    WrittenObjects {
-        bytes,
-        next: next_header(bytes, 0),
-    }
-}
-
-/// The place and number of the first object header at or after `from` that starts a line.
-fn next_header(bytes: &[u8], from: usize) -> Option<(usize, u64)> {
-    (from..bytes.len()).find_map(|at| {
-        let line_start = at == 0 || matches!(bytes[at - 1], b'\r' | b'\n');
-        if line_start && bytes[at].is_ascii_digit() {
-            header_at(bytes, at).map(|number| (at, number))
-        } else {
-            None
-        }
-    })
-}
-
-struct WrittenObjects<'a> {
-    bytes: &'a [u8],
-    /// The header of the object that comes next.
-    next: Option<(usize, u64)>,
-}
-
-impl<'a> Iterator for WrittenObjects<'a> {
-    type Item = (u64, &'a [u8]);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let (start, number) = self.next.take()?;
-        self.next = next_header(self.bytes, start + 1);
-        let end = self.next.map_or(self.bytes.len(), |(next, _)| next);
-        Some((number, &self.bytes[start..end]))
-    }
-}
-
-/// Whether a written document holds a field above a widget that has additional actions.
-///
-/// PDFium reads the keystroke and validate events (and format and calculate, which only hold
-/// scripts here) of a widget from its field, looking up `/Parent` as far as 32 levels. Those events
-/// can hold a reset or a hide. PDFium builds a field the other way round, though: from the field
-/// down through `/Kids`, and a widget in the `/Kids` of a field belongs to it whatever its own
-/// `/Parent` says (or whether it has one). So two kinds of object count when they have an `/AA`:
-/// the objects that some object names as its `/Parent` (a grandparent is the `/Parent` of a
-/// parent), and the objects that have `/Kids`. A `/Parent` that is a dictionary written in place
-/// counts when the object holds an `/AA` at all. More than needed is caught on purpose: an `/AA` in
-/// the same object as a `/Parent` or as `/Kids` is not told apart from one that sits in a different
-/// dictionary of it, and a field that has `/Kids` and `/AA` is caught even when none of its
-/// widgets can be reached from it.
-fn holds_parent_action(bytes: &[u8]) -> bool {
-    let mut parents: Vec<u64> = Vec::new();
-    let mut with_actions: Vec<u64> = Vec::new();
-    for (number, body) in written_objects(bytes) {
-        let actions = has_name(body, b"/AA");
-        if actions {
-            with_actions.push(number);
-            if has_name(body, b"/Kids") {
-                return true;
-            }
-        }
-        let mut from = 0;
-        while let Some(at) = body[from..]
-            .windows(b"/Parent".len())
-            .position(|w| w == b"/Parent")
-        {
-            let end = from + at + b"/Parent".len();
-            from = end;
-            if body.get(end).is_some_and(|b| is_regular(*b)) {
-                continue;
-            }
-            let value = skip_space(body, end);
-            if body[value.min(body.len())..].starts_with(b"<<") {
-                if actions {
-                    return true;
-                }
-                continue;
-            }
-            if let Some((parent, after)) = number_at(body, value) {
-                let next = skip_space(body, after);
-                if let Some((_, after)) = number_at(body, next) {
-                    let r = skip_space(body, after);
-                    if body.get(r) == Some(&b'R') {
-                        parents.push(parent);
-                    }
-                }
-            }
-        }
-    }
-    parents.sort_unstable();
-    with_actions
-        .iter()
-        .any(|number| parents.binary_search(number).is_ok())
 }
 
 fn refused(message: &str) -> Failure {
@@ -434,15 +236,20 @@ impl FormEnv {
             FormKind::None => return Err(unsupported("this document has no form")),
         }
         // Written out once, the document shows every action it holds, also those kept in compressed
-        // parts of the original. If it cannot be written, it is treated as holding one.
+        // parts of the original. If it cannot be written, or the file changed or failed to read on
+        // the way, the whole form is left alone.
         let written = crate::save::serialise_up_to(document, MAX_SAVE_BYTES, progress);
         let damaged = source.is_some_and(|guard| crate::source::lock(guard).damaged());
-        let (state_actions, parent_actions) = match written {
+        let scan = match written {
             Ok(bytes) if !damaged => {
-                let state = holds_state_action(&bytes);
-                (state, state && holds_parent_action(&bytes))
+                // A document with neither a reset nor a hide anywhere cannot clear or hide anything.
+                if form_actions::needs_scan(&bytes) {
+                    form_actions::scan(&bytes, progress)
+                } else {
+                    Scan::nothing()
+                }
             }
-            _ => (true, true),
+            _ => Scan::everything(),
         };
         // SAFETY: a read of the permissions.
         let may_fill = unsafe { bindings.FPDF_GetDocPermissions(handle) } as u32 & PERMIT_FILL != 0;
@@ -463,8 +270,7 @@ impl FormEnv {
             document: handle,
             handle: form,
             _info: info,
-            state_actions,
-            parent_actions,
+            scan,
             may_fill,
             spread: RefCell::new(HashMap::new()),
             #[cfg(debug_assertions)]
@@ -825,21 +631,31 @@ impl<'e> LoadedPage<'e> {
         if ff & FF_REQUIRED != 0 {
             flags |= field_flag::REQUIRED;
         }
-        if unsafe { b.FPDFAnnot_HasKey(a, "AA") } != 0 || unsafe { b.FPDFAnnot_HasKey(a, "A") } != 0
-        {
+        let has_aa = unsafe { b.FPDFAnnot_HasKey(a, "AA") } != 0;
+        let has_a = unsafe { b.FPDFAnnot_HasKey(a, "A") } != 0;
+        if has_aa || has_a {
             flags |= field_flag::ACTION;
-            // In a document that holds a reset or a hide, a widget with an action of its own could
-            // fire it when it gets the focus, is pressed or is left: it is left alone.
-            if self.env.state_actions {
+            // A widget whose own actions reach a reset or a hide could fire it when it gets the
+            // focus, is pressed or is left: it is left alone.
+            let rect = [raw.left, raw.bottom, raw.right, raw.top];
+            let rect = [
+                rect[0].min(rect[2]),
+                rect[1].min(rect[3]),
+                rect[0].max(rect[2]),
+                rect[1].max(rect[3]),
+            ];
+            if self
+                .env
+                .scan
+                .blocks_widget(self.index, ordinal, has_a, has_aa, rect)
+            {
                 flags |= field_flag::ACTION_BLOCKED | field_flag::READ_ONLY;
             }
         }
-        // The same for every widget when a field above some widget has additional actions: PDFium
-        // reads some of them through `/Parent` and gets the widgets of a field from its `/Kids`, and
-        // the plain interface does not say which widget belongs to which field above it, nor
-        // whether a widget's own `/Parent` leads to that field (see the top of this file).
-        if self.env.parent_actions {
-            flags |= field_flag::ACTION | field_flag::ACTION_BLOCKED | field_flag::READ_ONLY;
+        // When the search found an event that PDFium reads from a field other than the widget
+        // (or could not settle), no widget can be told apart from the others: all are left alone.
+        if self.env.scan.whole_form {
+            flags |= field_flag::FORM_BLOCKED | field_flag::ACTION_BLOCKED | field_flag::READ_ONLY;
         }
         if !self.env.may_fill {
             flags |= field_flag::READ_ONLY;
@@ -1070,12 +886,5 @@ impl<'e> LoadedPage<'e> {
 /// For the tests of the engine: whether a written document holds a reset or a hide.
 #[doc(hidden)]
 pub fn holds_state_action_for_tests(bytes: &[u8]) -> bool {
-    holds_state_action(bytes)
-}
-
-/// For the tests of the engine: whether a written document holds a field above a widget that has
-/// additional actions.
-#[doc(hidden)]
-pub fn holds_parent_action_for_tests(bytes: &[u8]) -> bool {
-    holds_parent_action(bytes)
+    form_actions::holds_state_action(bytes)
 }

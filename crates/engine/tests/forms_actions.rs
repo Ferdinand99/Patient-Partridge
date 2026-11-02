@@ -1,9 +1,11 @@
 //! What filling in a form must not do, and what it must do for every widget of a field.
 //!
-//! - No action of the PDF changes the document while a field is filled in: not a reset, not a hide,
-//!   whichever event of whichever field carries it (focus, blur, press, release, keystroke, format,
-//!   validate, calculate), also when it sits on the field above a widget or above that, and also
-//!   when the file keeps those fields in an object stream.
+//! - No action of the PDF changes the document while a field is filled in: not a reset, not a hide.
+//!   A widget whose own actions reach one (through `/Next`, an indirect action or an array, with
+//!   names written with escapes, in an object stream) is left alone, and so is every widget of a
+//!   form in which the keystroke, validate, format or calculate event of any dictionary reaches one,
+//!   or in which the search cannot settle (a loop, a missing target, too long a chain). Ordinary
+//!   forms (a "Clear form" button, date and number fields with scripts, radio groups) stay fillable.
 //! - The widget that is named is the one that changes, never the one that happens to lie on top of
 //!   it at a point.
 //! - A field with widgets on several pages gets a new appearance on every page.
@@ -366,9 +368,7 @@ fn a_field_with_an_action_that_could_change_the_form_is_left_alone_and_says_so()
     let engine = &mut guard.0;
     let (doc, _file) = open(engine, &kit::forms_actions_pdf());
     let list = fields(engine, doc, 0);
-    let blocked = [
-        "box_a", "box_u", "box_d", "text_fo", "text_bl", "text_k", "text_f", "text_v", "text_c",
-    ];
+    let blocked = ["box_a", "box_u", "box_d", "text_fo", "text_bl"];
     for name in blocked {
         let field = one(&list, name);
         assert!(
@@ -387,13 +387,36 @@ fn a_field_with_an_action_that_could_change_the_form_is_left_alone_and_says_so()
         }
     }
     // The others are filled in as usual.
-    for name in ["keep", "victim", "plain", "plain_box", "under_box"] {
+    for name in [
+        "keep",
+        "victim",
+        "plain",
+        "plain_box",
+        "under_box",
+        "text_script",
+        "box_link",
+    ] {
         let field = one(&list, name);
         assert!(
-            !field.has(field_flag::ACTION_BLOCKED) && !field.has(field_flag::READ_ONLY),
+            !field.has(field_flag::ACTION_BLOCKED)
+                && !field.has(field_flag::FORM_BLOCKED)
+                && !field.has(field_flag::READ_ONLY),
             "{name}"
         );
     }
+    // The scripts and the link do not stop a field from being filled in, next to the buttons that
+    // reset the form.
+    for name in ["text_script", "box_link"] {
+        let field = one(&list, name);
+        match set(engine, doc, 0, &field, value_for(&field)) {
+            ResponseBody::FormFields { fields: now } => {
+                assert_eq!(one(&now, "keep").value, "kept", "{name}");
+                assert_eq!(one(&now, "victim").value, "victim value", "{name}");
+            }
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+    let list = fields(engine, doc, 0);
     // The buttons are not fields the reader fills in.
     assert!(list
         .iter()
@@ -403,33 +426,36 @@ fn a_field_with_an_action_that_could_change_the_form_is_left_alone_and_says_so()
 }
 
 #[test]
-fn an_event_on_the_field_above_a_widget_that_pdfium_reads_from_the_widget_alone_still_leaves_every_widget_alone(
-) {
+fn an_event_on_the_field_above_a_widget_that_pdfium_reads_from_the_widget_alone_blocks_nothing() {
     // The blur and focus events of a widget are read from the widget alone, so the reset on the
-    // field above `par` cannot fire. The rule does not tell them apart from the events PDFium reads
-    // through the parent, and it cannot tell which widget sits under which field, so it leaves
-    // every widget of the form alone, also the ones with no parent. That is wider than needed.
+    // field above `par` cannot fire when `par` is filled in. Nothing is left alone for it: only the
+    // check box with the reset of its own is. The reset is shown not to fire by filling in `par`
+    // and looking at `keep`.
     let mut guard = engine();
     let engine = &mut guard.0;
     let (doc, _file) = open(engine, &kit::forms_parent_event_pdf());
     let _ = ask(engine, RequestBody::FormInfo { doc });
     let list = fields(engine, doc, 0);
-    for name in ["keep", "box_a", "par"] {
+    for name in ["keep", "par"] {
         let field = one(&list, name);
         assert!(
-            field.has(field_flag::ACTION_BLOCKED) && field.has(field_flag::READ_ONLY),
+            !field.has(field_flag::ACTION_BLOCKED)
+                && !field.has(field_flag::FORM_BLOCKED)
+                && !field.has(field_flag::READ_ONLY),
             "{name}: {:#x}",
             field.flags
         );
-        match set(engine, doc, 0, &field, value_for(&field)) {
-            ResponseBody::Error {
-                code: ErrorCode::FormFieldRefused,
-                ..
-            } => {}
-            other => panic!("{name}: {other:?}"),
-        }
     }
-    assert_eq!(one(&fields(engine, doc, 0), "keep").value, "kept");
+    assert!(one(&list, "box_a").has(field_flag::ACTION_BLOCKED));
+    assert!(!one(&list, "box_a").has(field_flag::FORM_BLOCKED));
+    let par = one(&list, "par");
+    match set(engine, doc, 0, &par, FormValue::Text("typed".into())) {
+        ResponseBody::FormFields { fields: now } => {
+            assert_eq!(one(&now, "par").value, "typed");
+            assert_eq!(one(&now, "keep").value, "kept");
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]
@@ -535,7 +561,7 @@ fn a_reset_or_a_hide_on_the_field_above_a_widget_does_not_fire_because_the_widge
             assert!(
                 field.has(field_flag::ACTION_BLOCKED)
                     && field.has(field_flag::READ_ONLY)
-                    && field.has(field_flag::ACTION),
+                    && field.has(field_flag::FORM_BLOCKED),
                 "{name} (packed {packed}): {:#x}",
                 field.flags
             );
@@ -554,10 +580,10 @@ fn a_reset_or_a_hide_on_the_field_above_a_widget_does_not_fire_because_the_widge
             );
             assert_eq!(names(&now), names(&list), "{name} hid a field");
         }
-        // The field with no parent is left alone too: the plain interface does not say which widget
-        // sits under which field, so one action above a widget stops them all.
+        // The field with no parent is left alone too: an event that PDFium reads from the field above
+        // a widget reaches a reset, and no link between objects says which widget it belongs to.
         let keep = one(&list, "keep");
-        assert!(keep.has(field_flag::ACTION_BLOCKED) && keep.has(field_flag::READ_ONLY));
+        assert!(keep.has(field_flag::FORM_BLOCKED) && keep.has(field_flag::READ_ONLY));
         assert_eq!(names(&fields(engine, doc, 0)), names(&list));
     }
 }
@@ -601,7 +627,7 @@ fn a_reset_or_a_hide_on_a_field_does_not_fire_for_a_widget_in_its_kids_whose_par
                 assert!(
                     field.has(field_flag::ACTION_BLOCKED)
                         && field.has(field_flag::READ_ONLY)
-                        && field.has(field_flag::ACTION),
+                        && field.has(field_flag::FORM_BLOCKED),
                     "{name}, {what} ({parent:?}): {:#x}",
                     field.flags
                 );
@@ -702,61 +728,6 @@ fn actions_on_the_field_above_a_widget_that_cannot_change_a_form_block_nothing()
             }
         }
     }
-}
-
-#[test]
-fn the_search_for_actions_above_a_widget_follows_parents_and_ignores_the_rest() {
-    use partridge_engine::forms::holds_parent_action_for_tests as holds;
-    // A field named as a parent by a widget, with additional actions.
-    assert!(holds(
-        b"%PDF-1.5\r\n4 0 obj\r\n<</Type/Annot/Parent 5 0 R>>\r\nendobj\r\n5 0 obj\r\n<</T(a)/AA<</K 6 0 R>>>>\r\nendobj\r\n"
-    ));
-    // Two levels: the actions sit on the parent of the parent.
-    assert!(holds(
-        b"4 0 obj\r\n<</Parent 5 0 R>>\r\nendobj\r\n5 0 obj\r\n<</Parent 6 0 R>>\r\nendobj\r\n6 0 obj\r\n<</AA<<>>>>\r\nendobj\r\n"
-    ));
-    // The order of the objects does not matter.
-    assert!(holds(
-        b"6 0 obj\r\n<</AA<<>>>>\r\nendobj\r\n4 0 obj\r\n<</Parent 6 0 R>>\r\nendobj\r\n"
-    ));
-    // A parent written in place.
-    assert!(holds(
-        b"4 0 obj\r\n<</Parent<</T(a)/AA<<>>>>>>\r\nendobj\r\n"
-    ));
-    // A text that looks like an end of object does not hide the actions behind it.
-    assert!(holds(
-        b"4 0 obj\r\n<</Parent 5 0 R>>\r\nendobj\r\n5 0 obj\r\n<</T(endobj)/AA<<>>>>\r\nendobj\r\n"
-    ));
-    // Actions on a widget that has no parent, and a parent without actions, are not it.
-    assert!(!holds(
-        b"4 0 obj\r\n<</Subtype/Widget/AA<<>>>>\r\nendobj\r\n"
-    ));
-    assert!(!holds(
-        b"4 0 obj\r\n<</Parent 5 0 R>>\r\nendobj\r\n5 0 obj\r\n<</T(a)>>\r\nendobj\r\n"
-    ));
-    // A field with kids and additional actions, whatever its widgets say about their parents.
-    assert!(holds(
-        b"7 0 obj\r\n<</FT/Tx/T(t)/AA<</K 9 0 R>>/Kids[8 0 R 6 0 R]>>\r\nendobj\r\n"
-    ));
-    assert!(holds(
-        b"4 0 obj\r\n<</Subtype/Widget/T(t)>>\r\nendobj\r\n7 0 obj\r\n<</Kids[4 0 R]/AA<<>>>>\r\nendobj\r\n"
-    ));
-    // Kids without actions (the page tree, a field), and other names that start the same way.
-    assert!(!holds(
-        b"2 0 obj\r\n<</Type/Pages/Kids[3 0 R]/Count 1>>\r\nendobj\r\n"
-    ));
-    assert!(!holds(
-        b"7 0 obj\r\n<</KidsOfNobody[8 0 R]/AA<<>>>>\r\nendobj\r\n"
-    ));
-    // The page tree's parents and an object with actions that nothing names as a parent.
-    assert!(!holds(
-        b"3 0 obj\r\n<</Parent 2 0 R>>\r\nendobj\r\n7 0 obj\r\n<</AA<<>>>>\r\nendobj\r\n"
-    ));
-    // Other names that start the same way.
-    assert!(!holds(
-        b"4 0 obj\r\n<</ParentTree 5 0 R>>\r\nendobj\r\n5 0 obj\r\n<</AAA 1>>\r\nendobj\r\n"
-    ));
-    assert!(!holds(b""));
 }
 
 // ---- what the engine does before the first listing and when the file cannot be read ----------
@@ -896,5 +867,431 @@ fn a_form_whose_file_failed_to_read_while_it_was_searched_is_treated_as_holding_
                 field.flags
             );
         }
+    }
+}
+
+// ---- what an action reaches ------------------------------------------------------------------------
+
+/// Every widget of the form is left alone, says why, and refuses a request; nothing was reset.
+fn assert_whole_form_left_alone(engine: &mut Engine, doc: u32, what: &str) {
+    // The window asks what kind of form it is before it lists the fields.
+    let _ = ask(engine, RequestBody::FormInfo { doc });
+    let list = fields(engine, doc, 0);
+    assert!(list.len() >= 2, "{what}: {:?}", names(&list));
+    for field in &list {
+        assert!(
+            field.has(field_flag::ACTION_BLOCKED)
+                && field.has(field_flag::READ_ONLY)
+                && field.has(field_flag::FORM_BLOCKED),
+            "{what}: {}: {:#x}",
+            field.name,
+            field.flags
+        );
+        match set(engine, doc, 0, field, value_for(field)) {
+            ResponseBody::Error {
+                code: ErrorCode::FormFieldRefused,
+                ..
+            } => {}
+            other => panic!("{what}: {}: {other:?}", field.name),
+        }
+    }
+    let now = fields(engine, doc, 0);
+    assert_eq!(one(&now, "keep").value, "kept", "{what} reset a field");
+    assert_eq!(names(&now), names(&list), "{what} hid a field");
+}
+
+/// The field `target` is left alone for an action of its own, and nothing else is; the other fields
+/// are filled in, and none of them resets `keep`.
+fn assert_only_the_target_left_alone(engine: &mut Engine, doc: u32, what: &str) {
+    let _ = ask(engine, RequestBody::FormInfo { doc });
+    let list = fields(engine, doc, 0);
+    assert_eq!(names(&list), ["keep", "plain", "target"], "{what}");
+    let target = one(&list, "target");
+    assert!(
+        target.has(field_flag::ACTION_BLOCKED)
+            && target.has(field_flag::READ_ONLY)
+            && !target.has(field_flag::FORM_BLOCKED),
+        "{what}: {:#x}",
+        target.flags
+    );
+    match set(engine, doc, 0, &target, value_for(&target)) {
+        ResponseBody::Error {
+            code: ErrorCode::FormFieldRefused,
+            ..
+        } => {}
+        other => panic!("{what}: {other:?}"),
+    }
+    for name in ["keep", "plain"] {
+        let field = one(&list, name);
+        assert!(
+            !field.has(field_flag::ACTION_BLOCKED)
+                && !field.has(field_flag::FORM_BLOCKED)
+                && !field.has(field_flag::READ_ONLY),
+            "{what}: {name}: {:#x}",
+            field.flags
+        );
+    }
+    match set(
+        engine,
+        doc,
+        0,
+        &one(&list, "plain"),
+        FormValue::Text("typed".into()),
+    ) {
+        ResponseBody::FormFields { fields: now } => {
+            assert_eq!(one(&now, "keep").value, "kept", "{what}");
+            assert_eq!(one(&now, "plain").value, "typed", "{what}");
+        }
+        other => panic!("{what}: {other:?}"),
+    }
+}
+
+const SCRIPT: &str = "<< /S /JavaScript /JS (1;) >>";
+
+/// Ways a widget's own action can reach a reset or a hide: the objects to put in the file (they are
+/// numbered from 6) and the entries of the widget.
+fn own_reaches() -> Vec<(&'static str, Vec<String>, String)> {
+    let reset = "<< /S /ResetForm >>".to_string();
+    let uri = "<< /S /URI /URI (https://example.com/) >>";
+    vec![
+        (
+            "a reset on focus",
+            vec![],
+            "/AA << /Fo << /S /ResetForm >> >>".into(),
+        ),
+        (
+            "a hide of keep on blur",
+            vec![],
+            "/AA << /Bl << /S /Hide /T (keep) /H true >> >>".into(),
+        ),
+        ("a reset as /A", vec![], "/A << /S /ResetForm >>".into()),
+        (
+            "a reset through /Next of a script",
+            vec![],
+            format!("/AA << /Fo << /S /JavaScript /JS (1;) /Next {reset} >> >>"),
+        ),
+        (
+            "an indirect action",
+            vec![reset.clone()],
+            "/AA << /Fo 6 0 R >>".into(),
+        ),
+        (
+            "an indirect /AA",
+            vec!["<< /Fo << /S /ResetForm >> >>".into()],
+            "/AA 6 0 R".into(),
+        ),
+        (
+            "/Next as a reference",
+            vec![
+                reset.clone(),
+                "<< /S /JavaScript /JS (1;) /Next 6 0 R >>".into(),
+            ],
+            "/AA << /Fo 7 0 R >>".into(),
+        ),
+        (
+            "an array of /Next",
+            vec![],
+            format!("/AA << /Fo << /S /JavaScript /JS (1;) /Next [ {uri} {reset} ] >> >>"),
+        ),
+        (
+            "an array of references, itself a reference",
+            vec![reset.clone(), "[ 6 0 R ]".into()],
+            "/AA << /Fo << /S /Named /N /NextPage /Next 7 0 R >> >>".into(),
+        ),
+        (
+            "a chain of four",
+            vec![
+                reset.clone(),
+                "<< /S /URI /URI (https://example.com/) /Next 6 0 R >>".into(),
+                "<< /S /JavaScript /JS (2;) /Next 7 0 R >>".into(),
+                "<< /S /Named /N /NextPage /Next 8 0 R >>".into(),
+            ],
+            "/A 9 0 R".into(),
+        ),
+        (
+            "a type given as a reference",
+            vec!["/ResetForm".into()],
+            "/AA << /Fo << /S 6 0 R >> >>".into(),
+        ),
+        (
+            "names written with escapes",
+            vec![],
+            "/A#41 << /F#6F << /S /Reset#46orm >> >>".into(),
+        ),
+        (
+            "an escaped /Next",
+            vec![],
+            "/AA << /Bl << /S /JavaScript /JS (1;) /Ne#78t << /S /Hi#64e /T (keep) /H true >> >> >>"
+                .into(),
+        ),
+    ]
+}
+
+#[test]
+fn a_widget_whose_own_action_reaches_a_reset_or_a_hide_is_left_alone_however_the_action_is_written()
+{
+    for packed in [false, true] {
+        for (what, actions, extra) in own_reaches() {
+            let actions: Vec<&str> = actions.iter().map(String::as_str).collect();
+            let mut guard = engine();
+            let engine = &mut guard.0;
+            let (doc, _file) = open(engine, &kit::forms_action_pdf(&actions, &extra, packed));
+            assert_only_the_target_left_alone(engine, doc, &format!("{what} (packed {packed})"));
+            ask(engine, RequestBody::Close { doc });
+        }
+    }
+}
+
+#[test]
+fn scripts_and_links_that_do_not_reach_a_reset_or_a_hide_block_nothing_next_to_a_reset_button() {
+    // The document holds a reset (the button `clear`), and the widget has actions that are scripts,
+    // links and a long chain of them that goes nowhere.
+    let chain: Vec<String> = (0..5)
+        .map(|i| {
+            let next = if i < 4 {
+                format!("/Next {} 0 R", 7 + i)
+            } else {
+                String::new()
+            };
+            format!("<< /S /JavaScript /JS ({i};) {next} >>")
+        })
+        .collect();
+    let chain: Vec<&str> = chain.iter().map(String::as_str).collect();
+    let cases: [(&str, &[&str], &str); 5] = [
+        (
+            "a script on focus",
+            &[],
+            "/AA << /Fo << /S /JavaScript /JS (1;) >> >>",
+        ),
+        (
+            "a link",
+            &[],
+            "/A << /S /URI /URI (https://example.com/reset) >>",
+        ),
+        (
+            "a script with /Next to a link",
+            &[],
+            "/AA << /Fo << /S /JavaScript /JS (1;) /Next << /S /URI /URI (https://example.com/) >> >> >>",
+        ),
+        ("a chain of scripts", &chain, "/AA << /Fo 6 0 R >>"),
+        ("an empty /AA", &[], "/AA << >>"),
+    ];
+    for (what, actions, extra) in cases {
+        let mut guard = engine();
+        let engine = &mut guard.0;
+        let (doc, _file) = open(engine, &kit::forms_action_pdf(actions, extra, false));
+        let _ = ask(engine, RequestBody::FormInfo { doc });
+        let list = fields(engine, doc, 0);
+        assert_eq!(names(&list), ["keep", "plain", "target"], "{what}");
+        for field in &list {
+            assert!(
+                !field.has(field_flag::ACTION_BLOCKED)
+                    && !field.has(field_flag::FORM_BLOCKED)
+                    && !field.has(field_flag::READ_ONLY),
+                "{what}: {}: {:#x}",
+                field.name,
+                field.flags
+            );
+            // `keep` is what a reset would clear, so it is left as it is.
+            if field.name == "keep" {
+                continue;
+            }
+            match set(engine, doc, 0, field, value_for(field)) {
+                ResponseBody::FormFields { fields: now } => {
+                    assert_eq!(one(&now, "keep").value, "kept", "{what}: {}", field.name);
+                }
+                other => panic!("{what}: {}: {other:?}", field.name),
+            }
+        }
+        ask(engine, RequestBody::Close { doc });
+    }
+}
+
+#[test]
+fn an_event_that_pdfium_reads_from_another_dictionary_that_reaches_a_reset_leaves_the_whole_form_alone(
+) {
+    // Keystroke, validate, format and calculate, with the action written in several ways, on the
+    // widget's own /AA (PDFium looks for them on the field first, and the file does not say which
+    // dictionary that is).
+    let shapes: [(&str, &[&str], &str); 3] = [
+        ("directly", &[], "<< /S /ResetForm >>"),
+        (
+            "through /Next",
+            &[],
+            "<< /S /JavaScript /JS (1;) /Next << /S /Hide /T (keep) /H true >> >>",
+        ),
+        ("as an indirect action", &["<< /S /ResetForm >>"], "6 0 R"),
+    ];
+    for event in ["K", "V", "F", "C"] {
+        for (how, actions, action) in shapes {
+            for packed in [false, true] {
+                let mut guard = engine();
+                let engine = &mut guard.0;
+                let extra = format!("/AA << /{event} {action} >>");
+                let (doc, _file) = open(engine, &kit::forms_action_pdf(actions, &extra, packed));
+                assert_whole_form_left_alone(
+                    engine,
+                    doc,
+                    &format!("/{event} {how} (packed {packed})"),
+                );
+                ask(engine, RequestBody::Close { doc });
+            }
+        }
+    }
+}
+
+#[test]
+fn two_dictionaries_with_one_full_name_do_not_let_a_reset_or_a_hide_through() {
+    // PDFium joins them by name alone: no `/Kids` and no `/Parent` link the two. The `/AA` sits on
+    // a plain object that no page shows, or on a widget of its own.
+    let events = [
+        ("a reset on the keystroke", "/K << /S /ResetForm >>"),
+        ("a reset on the validate event", "/V << /S /ResetForm >>"),
+        (
+            "a hide of keep on the validate event",
+            "/V << /S /Hide /T (keep) /H true >>",
+        ),
+    ];
+    for (what, aa) in events {
+        for holder_widget in [false, true] {
+            let mut guard = engine();
+            let engine = &mut guard.0;
+            let (doc, _file) = open(engine, &kit::forms_same_name_pdf(aa, holder_widget));
+            assert_whole_form_left_alone(
+                engine,
+                doc,
+                &format!("{what} (holder is a widget: {holder_widget})"),
+            );
+            ask(engine, RequestBody::Close { doc });
+        }
+    }
+}
+
+#[test]
+fn a_search_that_cannot_settle_leaves_the_whole_form_alone() {
+    // A loop in /Next, a reference to nothing, and a chain that is too long: each counts as reaching
+    // a reset, for the whole form, though no reset is in the chain.
+    let long: Vec<String> = (0..40)
+        .map(|i| {
+            if i < 39 {
+                format!("<< /S /JavaScript /JS (1;) /Next {} 0 R >>", 7 + i)
+            } else {
+                SCRIPT.to_string()
+            }
+        })
+        .collect();
+    let long: Vec<&str> = long.iter().map(String::as_str).collect();
+    let loop_two = [
+        "<< /S /JavaScript /JS (1;) /Next 7 0 R >>",
+        "<< /S /JavaScript /JS (2;) /Next 6 0 R >>",
+    ];
+    let loop_one = ["<< /S /JavaScript /JS (1;) /Next 6 0 R >>"];
+    let cases: [(&str, &[&str], &str); 7] = [
+        ("a loop of two actions", &loop_two, "/AA << /Fo 6 0 R >>"),
+        (
+            "an action that is its own next",
+            &loop_one,
+            "/AA << /Bl 6 0 R >>",
+        ),
+        (
+            "a /Next that is nowhere",
+            &[],
+            "/AA << /Fo << /S /JavaScript /JS (1;) /Next 900 0 R >> >>",
+        ),
+        ("an action that is nowhere", &[], "/AA << /Fo 900 0 R >>"),
+        ("an /AA that is nowhere", &[], "/AA 900 0 R"),
+        ("a chain of forty scripts", &long, "/AA << /Fo 6 0 R >>"),
+        (
+            "a /Next array that holds a loop",
+            &["<< /S /JavaScript /JS (1;) /Next [ 6 0 R ] >>"],
+            "/A 6 0 R",
+        ),
+    ];
+    for (what, actions, extra) in cases {
+        let mut guard = engine();
+        let engine = &mut guard.0;
+        let (doc, _file) = open(engine, &kit::forms_action_pdf(actions, extra, false));
+        assert_whole_form_left_alone(engine, doc, what);
+        ask(engine, RequestBody::Close { doc });
+    }
+    // A chain of five scripts goes nowhere and blocks nothing: it is the length that counts.
+    let mut short_chain: Vec<String> = long.iter().take(5).map(|s| s.to_string()).collect();
+    short_chain[4] = SCRIPT.to_string();
+    let short_chain: Vec<&str> = short_chain.iter().map(String::as_str).collect();
+    let mut guard = engine();
+    let engine = &mut guard.0;
+    let (doc, _file) = open(
+        engine,
+        &kit::forms_action_pdf(&short_chain, "/AA << /Fo 6 0 R >>", false),
+    );
+    let _ = ask(engine, RequestBody::FormInfo { doc });
+    assert!(fields(engine, doc, 0)
+        .iter()
+        .all(|f| !f.has(field_flag::ACTION_BLOCKED) && !f.has(field_flag::READ_ONLY)));
+}
+
+#[test]
+fn ordinary_forms_with_a_clear_button_stay_fillable() {
+    // A "Clear form" button (a reset) next to date and number fields with format, keystroke,
+    // validate and calculate scripts, on one widget and on two, and radio groups. Scripts never run,
+    // so none of them can clear anything.
+    for two_widgets in [false, true] {
+        let mut guard = engine();
+        let engine = &mut guard.0;
+        let (doc, _file) = open(engine, &kit::forms_clear_pdf(two_widgets));
+        assert!(matches!(
+            ask(engine, RequestBody::FormInfo { doc }),
+            ResponseBody::FormInfo { .. }
+        ));
+        let list = fields(engine, doc, 0);
+        let expected = if two_widgets { 9 } else { 7 };
+        assert_eq!(list.len(), expected, "{:?}", names(&list));
+        if !two_widgets {
+            // The scripts are on the widget itself, so the field says it has actions.
+            for name in ["born", "amount"] {
+                assert!(one(&list, name).has(field_flag::ACTION));
+            }
+        }
+        for field in &list {
+            assert!(
+                !field.has(field_flag::ACTION_BLOCKED)
+                    && !field.has(field_flag::FORM_BLOCKED)
+                    && !field.has(field_flag::READ_ONLY),
+                "two_widgets {two_widgets}: {}: {:#x}",
+                field.name,
+                field.flags
+            );
+        }
+        // Every one of them can be filled in, and no change clears `keep`.
+        for round in 0..list.len() {
+            let now = fields(engine, doc, 0);
+            let field = &now[round];
+            // `keep` is what a reset would clear, so it is left as it is.
+            if field.name == "keep" {
+                continue;
+            }
+            match set(engine, doc, 0, field, value_for(field)) {
+                ResponseBody::FormFields { fields: after } => {
+                    assert_eq!(
+                        one(&after, "keep").value,
+                        "kept",
+                        "two_widgets {two_widgets}: {}",
+                        field.name
+                    );
+                }
+                other => panic!("two_widgets {two_widgets}: {}: {other:?}", field.name),
+            }
+        }
+        let after = fields(engine, doc, 0);
+        assert!(after
+            .iter()
+            .filter(|f| f.name == "choice")
+            .any(|f| f.has(field_flag::CHECKED)));
+        assert!(one(&after, "agree").has(field_flag::CHECKED));
+        assert!(after
+            .iter()
+            .filter(|f| f.name == "born")
+            .all(|f| f.value == "typed"));
+        ask(engine, RequestBody::Close { doc });
     }
 }

@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ACTIONS_NOTICE,
   BLOCKED_NOTICE,
+  FORM_BLOCKED_NOTICE,
   FormLayer,
   XFA_NOTICE,
   type FormEdit,
@@ -72,6 +73,7 @@ function field(over: Partial<FormFieldInfo> & Pick<FormFieldInfo, "index" | "nam
     comb: false,
     action: false,
     actionBlocked: false,
+    formBlocked: false,
     turns: 0,
     rect: [150, 68, 400, 92],
     fontSize: 12,
@@ -623,11 +625,13 @@ describe("what the form bar says", () => {
     // Once, when the page is shown.
     expect(r.bar()).toBe(BLOCKED_NOTICE);
     expect(BLOCKED_NOTICE).toContain("cannot be filled in here");
-    expect(BLOCKED_NOTICE).toContain("can clear or hide fields");
+    expect(BLOCKED_NOTICE).toContain("Some fields");
+    expect(BLOCKED_NOTICE).toContain("an action that could clear or hide fields");
     expect(BLOCKED_NOTICE).not.toContain("button");
     expect(BLOCKED_NOTICE).toContain("another PDF reader");
     // The field says it too.
     expect(r.control(0).title).toContain("Name - This field cannot be filled in here");
+    expect(r.control(0).title).toContain("it has an action that could clear or hide fields");
     expect(r.control(1).title).toBe("");
     // The reader puts the message away, then tries the field: it comes back, once.
     r.host.querySelector<HTMLButtonElement>(".form-bar-close")?.click();
@@ -646,6 +650,31 @@ describe("what the form bar says", () => {
     (r.control(1) as HTMLInputElement).focus();
     (r.control(1) as HTMLInputElement).dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
     expect(r.bar()).toBe("");
+    expect(r.api.setFormField).not.toHaveBeenCalled();
+  });
+
+  it("says something true when no field can be filled in: no 'some', and no script on a plain field", async () => {
+    const r = await rig(
+      [[field({ index: 0, name: "a", readOnly: true, actionBlocked: true, formBlocked: true, tooltip: "Name" }), field({ index: 1, name: "b", readOnly: true, actionBlocked: true, formBlocked: true })]],
+      { kind: "acro", actions: false },
+    );
+    expect(r.bar()).toBe(FORM_BLOCKED_NOTICE);
+    expect(FORM_BLOCKED_NOTICE).not.toContain("Some fields");
+    expect(FORM_BLOCKED_NOTICE).not.toContain("script");
+    expect(FORM_BLOCKED_NOTICE).not.toContain("action");
+    expect(FORM_BLOCKED_NOTICE).toContain("cannot be sure");
+    expect(FORM_BLOCKED_NOTICE).toContain("another PDF reader");
+    // A plain field is not told that it has an action or a script.
+    for (const index of [0, 1]) {
+      expect(r.control(index).title).not.toMatch(/script|has an action/);
+      expect(r.control(index).title).toContain("No field of this form can be filled in here");
+    }
+    expect(r.control(0).title).toContain("Name - ");
+    // Pressing a field says the same words as the bar.
+    r.host.querySelector<HTMLButtonElement>(".form-bar-close")?.click();
+    expect(r.bar()).toBe("");
+    r.control(1).dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+    expect(r.bar()).toBe(FORM_BLOCKED_NOTICE);
     expect(r.api.setFormField).not.toHaveBeenCalled();
   });
 

@@ -139,9 +139,13 @@ pub mod field_flag {
     /// The field has an action of its own (a script, a format, a button action). The reader never
     /// runs it.
     pub const ACTION: u16 = 1024;
-    /// The field has an action of its own that could change the document (a reset or a hide are in
-    /// the document), so it is left alone: it is also marked read only.
+    /// The field has an action of its own that reaches a reset or a hide of the form (or the form
+    /// could not be told apart), so it is left alone: it is also marked read only.
     pub const ACTION_BLOCKED: u16 = 2048;
+    /// No field of the form can be filled in: the form has actions that could clear or hide fields
+    /// and the reader cannot tell which fields they belong to (or could not search the document). It
+    /// comes with [`ACTION_BLOCKED`] and [`READ_ONLY`], and the field itself need not have an action.
+    pub const FORM_BLOCKED: u16 = 4096;
     /// All the bits that mean something.
     pub const ALL: u16 = READ_ONLY
         | REQUIRED
@@ -154,7 +158,8 @@ pub mod field_flag {
         | NO_TOGGLE_OFF
         | COMB
         | ACTION
-        | ACTION_BLOCKED;
+        | ACTION_BLOCKED
+        | FORM_BLOCKED;
 }
 
 /// One choice of a combo box or a list box.

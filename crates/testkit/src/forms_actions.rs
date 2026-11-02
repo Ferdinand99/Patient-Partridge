@@ -8,8 +8,9 @@
 //!   hide
 //! - `box_a` has `/A /ResetForm`, `box_u` has `/AA /U /ResetForm`, `box_d` has `/AA /D /Hide`
 //!   aimed at `victim`
-//! - `text_fo`, `text_bl`, `text_k`, `text_f`, `text_v` and `text_c` have `/ResetForm` as the action
-//!   of that event (focus, blur, keystroke, format, validate, calculate)
+//! - `text_fo` and `text_bl` have `/ResetForm` as the action of that event (focus, blur)
+//! - `text_script` has scripts on blur and keystroke and `box_link` a link: none of them reaches a
+//!   reset, so they stay free next to the buttons that do
 //! - `plain` and `plain_box` have no action
 //! - `under_box` is a check box with no action, and a push button `over` with `/A /ResetForm` is
 //!   drawn over its middle (it is later in the page, so it is the one found at that point)
@@ -121,16 +122,9 @@ pub fn forms_actions_pdf() -> Vec<u8> {
         row(4),
         "/AA << /D << /S /Hide /T (victim) /H true >> >>",
     ));
-    for (i, (name, event)) in [
-        ("text_fo", "Fo"),
-        ("text_bl", "Bl"),
-        ("text_k", "K"),
-        ("text_f", "F"),
-        ("text_v", "V"),
-        ("text_c", "C"),
-    ]
-    .into_iter()
-    .enumerate()
+    for (i, (name, event)) in [("text_fo", "Fo"), ("text_bl", "Bl")]
+        .into_iter()
+        .enumerate()
     {
         fields.push(text(
             &mut objs,
@@ -141,6 +135,22 @@ pub fn forms_actions_pdf() -> Vec<u8> {
             &format!("/AA << /{event} {RESET} >>"),
         ));
     }
+    // Actions of widgets that cannot change the form stay free, in a document that holds a reset.
+    fields.push(text(
+        &mut objs,
+        page,
+        "text_script",
+        row(8),
+        "",
+        "/AA << /Bl << /S /JavaScript /JS (1;) >> /K << /S /JavaScript /JS (event.rc = true;) >> >>",
+    ));
+    fields.push(check_box(
+        &mut objs,
+        page,
+        "box_link",
+        row(9),
+        "/A << /S /URI /URI (https://example.com/) >>",
+    ));
     fields.push(text(&mut objs, page, "plain", row(11), "", ""));
     fields.push(check_box(&mut objs, page, "plain_box", row(12), ""));
     // A check box with a push button over its middle, one before it and one after it in the page,
@@ -635,8 +645,8 @@ pub fn forms_kids_actions_pdf(events: Option<&str>, parent: KidsParent) -> Vec<u
 /// A form that holds a reset (on the check box `box_a`), a field `keep` ("kept") with no parent and
 /// the text field `par`, whose actions (blur and focus, both a reset) are on the field above its
 /// one widget, not on the widget. PDFium reads those two events from the widget alone, so they are
-/// harmless here, but the rule of the engine does not tell them apart from the events it reads
-/// through the parent (see `forms_parent_actions_pdf`) and leaves every widget of the form alone.
+/// harmless here, and the rule of the engine (which looks at the events PDFium reads from another
+/// dictionary, and at the actions of the widget itself) leaves `keep` and `par` free.
 pub fn forms_parent_event_pdf() -> Vec<u8> {
     let mut objs = Objects::new(6);
     let page = 4;
@@ -661,4 +671,190 @@ pub fn forms_parent_event_pdf() -> Vec<u8> {
         extra: format!("/Annots [{keep} 0 R {boxed} 0 R {kid} 0 R]"),
     };
     build(&[spec], &catalog(&[keep, boxed, parent]), "", objs.bodies)
+}
+
+/// A push button `clear` with `/A /ResetForm`, as an ordinary form has to clear it. It is no field
+/// that the reader fills in.
+fn clear_button(objs: &mut Objects, page: usize, y: u32) -> usize {
+    objs.add(format!(
+        "<< /Type /Annot /Subtype /Widget /FT /Btn /Ff 65536 /T (clear) \
+         /Rect [400 {y} 480 {top}] /F 4 /P {page} 0 R /MK << /BG [0.8 0.8 0.8] /CA (Clear) >> \
+         /A {RESET} >>",
+        top = y + 20
+    ))
+}
+
+/// A form in which the way an action is written is the thing tried. The objects `actions` are
+/// numbered from 6 in the order given (so `"6 0 R"` is the first), and the fields come after them:
+///
+/// - `keep` holds "kept", and `plain` has no action
+/// - `target` has `target_extra` among the entries of its dictionary (for example `/AA << /Fo 6 0 R
+///   >>`), so that what the action does can be judged by what happens to the other fields
+/// - `clear` is a push button with `/A /ResetForm`, so that the document holds a reset whatever the
+///   actions say
+///
+/// With `packed` the objects are kept in an object stream.
+pub fn forms_action_pdf(actions: &[&str], target_extra: &str, packed: bool) -> Vec<u8> {
+    let mut objs = Objects::new(6);
+    let page = 4;
+    for action in actions {
+        objs.add(action.as_bytes());
+    }
+    let keep = text(&mut objs, page, "keep", 740, "kept", "");
+    let plain = text(&mut objs, page, "plain", 700, "", "");
+    let target = text(&mut objs, page, "target", 660, "", target_extra);
+    let clear = clear_button(&mut objs, page, 620);
+    let fields = [keep, plain, target, clear];
+    let annot_list: String = fields.iter().fold(String::new(), |mut s, f| {
+        let _ = write!(s, "{f} 0 R ");
+        s
+    });
+    let spec = PageSpec {
+        width: 612,
+        height: 792,
+        content: Some("0 g 10 10 1 1 re f\n".to_string()),
+        extra: format!("/Annots [{annot_list}]"),
+    };
+    let objects = build_objects(&[spec], &catalog(&fields), objs.bodies);
+    if packed {
+        assemble_packed(&objects, 6)
+    } else {
+        assemble(&objects, "")
+    }
+}
+
+/// Two dictionaries with one full name, `t`, that PDFium joins by name alone (no `/Kids` and no
+/// `/Parent` links them), and `keep` ("kept"). `aa` is the content of an `/AA` dictionary (such as
+/// `/K << /S /ResetForm >>`) that sits on the first of the two. That one is a plain object that no
+/// page shows, or with `holder_widget` a widget of its own on the page; the second is a widget on the
+/// page with no action. All three are listed in `/Fields`.
+pub fn forms_same_name_pdf(aa: &str, holder_widget: bool) -> Vec<u8> {
+    let mut objs = Objects::new(6);
+    let page = 4;
+    let keep = text(&mut objs, page, "keep", 740, "kept", "");
+    let first = if holder_widget {
+        text(&mut objs, page, "t", 700, "", &format!("/AA << {aa} >>"))
+    } else {
+        objs.add(format!("<< /FT /Tx /T (t) /AA << {aa} >> >>"))
+    };
+    let second = text(&mut objs, page, "t", 660, "", "");
+    let annots = if holder_widget {
+        format!("{keep} 0 R {first} 0 R {second} 0 R")
+    } else {
+        format!("{keep} 0 R {second} 0 R")
+    };
+    let spec = PageSpec {
+        width: 612,
+        height: 792,
+        content: Some("0 g 10 10 1 1 re f\n".to_string()),
+        extra: format!("/Annots [{annots}]"),
+    };
+    build(&[spec], &catalog(&[keep, first, second]), "", objs.bodies)
+}
+
+/// An ordinary form with a "Clear form" button (a reset) and fields that have the scripts such a
+/// form has: `born` has a date format and keystroke script, `amount` a number format, keystroke,
+/// validate and calculate script. With `two_widgets` each of them is a field with two widgets and
+/// the scripts are on the field; otherwise field and widget are one object. The other fields are
+/// `keep` ("kept") and `name` (text), `agree` (a check box) and `choice`, a group of two radio
+/// buttons. Nothing here reaches a reset except the button, and every field can be filled in.
+pub fn forms_clear_pdf(two_widgets: bool) -> Vec<u8> {
+    let script = |js: &str| format!("<< /S /JavaScript /JS ({js}) >>");
+    let date = format!(
+        "/F {} /K {}",
+        script(r#"AFDate_FormatEx\("dd.mm.yyyy"\);"#),
+        script(r#"AFDate_KeystrokeEx\("dd.mm.yyyy"\);"#)
+    );
+    let number = format!(
+        "/F {} /K {} /V {} /C {}",
+        script(r#"AFNumber_Format\(2, 0, 0, 0, "", true\);"#),
+        script(r#"AFNumber_Keystroke\(2, 0, 0, 0, "", true\);"#),
+        script(r"AFRange_Validate\(true, 0, true, 1000\);"),
+        script(r#"AFSimple_Calculate\("SUM", new Array\("born"\)\);"#)
+    );
+    let mut objs = Objects::new(6);
+    let page = 4;
+    let mut fields = Vec::new();
+    let mut annots = Vec::new();
+    let keep = text(&mut objs, page, "keep", 740, "kept", "");
+    fields.push(keep);
+    annots.push(keep);
+    let name = text(&mut objs, page, "name", 710, "", "");
+    fields.push(name);
+    annots.push(name);
+    for (field_name, y, aa) in [("born", 680u32, &date), ("amount", 650u32, &number)] {
+        if two_widgets {
+            let field = objs.reserve();
+            let mut kids = String::new();
+            for x in [100u32, 320] {
+                let widget = objs.add(format!(
+                    "<< /Type /Annot /Subtype /Widget /Parent {field} 0 R \
+                     /Rect [{x} {y} {right} {top}] /F 4 /P {page} 0 R /DA (/Helv 12 Tf 0 g) >>",
+                    right = x + 200,
+                    top = y + 20
+                ));
+                let _ = write!(kids, "{widget} 0 R ");
+                annots.push(widget);
+            }
+            objs.set(
+                field,
+                format!("<< /FT /Tx /T ({field_name}) /AA << {aa} >> /Kids [{kids}] >>"),
+            );
+            fields.push(field);
+        } else {
+            let field = text(
+                &mut objs,
+                page,
+                field_name,
+                y,
+                "",
+                &format!("/AA << {aa} >>"),
+            );
+            fields.push(field);
+            annots.push(field);
+        }
+    }
+    let agree = check_box(&mut objs, page, "agree", 610, "");
+    fields.push(agree);
+    annots.push(agree);
+    // A group of two radio buttons.
+    let group = objs.reserve();
+    let mut kids = String::new();
+    for (i, state) in ["A", "B"].into_iter().enumerate() {
+        let on = objs.add(stream_object(
+            "/Type /XObject /Subtype /Form /BBox [0 0 16 16]",
+            "q 0 g 4 4 8 8 re f Q",
+        ));
+        let off = objs.add(stream_object(
+            "/Type /XObject /Subtype /Form /BBox [0 0 16 16]",
+            "",
+        ));
+        let x = 100 + 40 * i as u32;
+        let widget = objs.add(format!(
+            "<< /Type /Annot /Subtype /Widget /Parent {group} 0 R /Rect [{x} 580 {right} 596] \
+             /F 4 /P {page} 0 R /AS /Off /AP << /N << /{state} {on} 0 R /Off {off} 0 R >> >> >>",
+            right = x + 16
+        ));
+        let _ = write!(kids, "{widget} 0 R ");
+        annots.push(widget);
+    }
+    objs.set(
+        group,
+        format!("<< /FT /Btn /Ff 32768 /T (choice) /V /Off /Kids [{kids}] >>"),
+    );
+    fields.push(group);
+    let clear = clear_button(&mut objs, page, 540);
+    fields.push(clear);
+    annots.push(clear);
+    let annot_list: String = annots.iter().fold(String::new(), |mut s, f| {
+        let _ = write!(s, "{f} 0 R ");
+        s
+    });
+    let spec = PageSpec {
+        width: 612,
+        height: 792,
+        content: Some("0 g 10 10 1 1 re f\n".to_string()),
+        extra: format!("/Annots [{annot_list}]"),
+    };
+    build(&[spec], &catalog(&fields), "", objs.bodies)
 }

@@ -47,8 +47,10 @@ export interface FormFieldInfo {
   noToggleOff: boolean;
   comb: boolean;
   action: boolean;
-  /** The field has an action that could change the form: it is left alone (and read only). */
+  /** The field has an action that reaches a reset or a hide: it is left alone (and read only). */
   actionBlocked: boolean;
+  /** No field of the form can be filled in: the reader cannot tell which fields its actions touch. */
+  formBlocked: boolean;
   /** Quarter turns clockwise. */
   turns: number;
   /** Left, top, right and bottom in points from the top left of the page as it is drawn. */
@@ -108,7 +110,11 @@ export const ACTIONS_NOTICE =
 
 /** What the form bar says about fields that are left alone for the action they carry. */
 export const BLOCKED_NOTICE =
-  "Some fields in this form cannot be filled in here. This form can clear or hide fields, and Patient Partridge cannot check whether these fields would do that: they have actions or scripts of their own, or the fields above them do, and Patient Partridge does not run those. It leaves them as they are, so that nothing you have typed gets cleared. To fill them in, use another PDF reader.";
+  "Some fields in this form cannot be filled in here. Each of them has an action that could clear or hide fields, and Patient Partridge does not run such actions. It leaves these fields as they are, so that nothing you have typed gets cleared. To fill them in, use another PDF reader.";
+
+/** What the form bar says when no field of the form can be filled in. */
+export const FORM_BLOCKED_NOTICE =
+  "The fields in this form cannot be filled in here, because Patient Partridge cannot be sure that filling them in would not clear or hide other fields. It leaves them as they are. To fill them in, use another PDF reader.";
 
 /** What the form bar says when the form of a document cannot be read. */
 export const UNREADABLE_NOTICE = "The form of this document could not be read, so it cannot be filled in here.";
@@ -372,7 +378,8 @@ export class FormLayer {
         state.list = list;
         this.render(page, state);
         if (list.some((f) => f.action)) this.say("actions", ACTIONS_NOTICE);
-        if (list.some((f) => f.actionBlocked)) this.say("blocked", BLOCKED_NOTICE);
+        if (list.some((f) => f.formBlocked)) this.say("blocked", FORM_BLOCKED_NOTICE);
+        else if (list.some((f) => f.actionBlocked)) this.say("blocked", BLOCKED_NOTICE);
       })
       .catch(() => {
         if (this.pages.get(page) === state) {
@@ -559,7 +566,10 @@ export class FormLayer {
       el.title = `${field.tooltip ? `${field.tooltip} - ` : ""}The value of this field is too long to change here.`;
     }
     if (field.actionBlocked) {
-      el.title = `${field.tooltip ? `${field.tooltip} - ` : ""}This field cannot be filled in here: it has an action or a script that Patient Partridge does not run, and this form can clear or hide fields.`;
+      const why = field.formBlocked
+        ? "No field of this form can be filled in here: Patient Partridge cannot be sure that filling it in would not clear or hide other fields."
+        : "This field cannot be filled in here: it has an action that could clear or hide fields, and Patient Partridge does not run actions.";
+      el.title = `${field.tooltip ? `${field.tooltip} - ` : ""}${why}`;
     }
     if (field.required) el.setAttribute("aria-required", "true");
     if (field.readOnly || field.valueCut) el.setAttribute("aria-readonly", "true");
@@ -779,7 +789,8 @@ export class FormLayer {
    * that it does not look like a fault. The words are those the bar gave when the page was shown.
    */
   private explainBlocked(view: FieldView): void {
-    const say = () => this.tell(BLOCKED_NOTICE);
+    const notice = view.field.formBlocked ? FORM_BLOCKED_NOTICE : BLOCKED_NOTICE;
+    const say = () => this.tell(notice);
     view.el.addEventListener("mousedown", say);
     view.el.addEventListener("click", say);
     view.el.addEventListener("focus", say);
@@ -964,7 +975,8 @@ export class FormLayer {
       undo: async () => {
         if (cannotBack) {
           this.tell(cannotBack);
-          throw new Error(cannotBack);
+          // The engine is not asked, so nothing changed: a clean refusal, as the engine's own.
+          throw Object.assign(new Error(cannotBack), { code: "form_field_refused" });
         }
         await run(back);
       },

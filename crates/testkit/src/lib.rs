@@ -512,7 +512,7 @@ pub fn hostile_annots_pdf() -> Vec<u8> {
 pub const FOREIGN_LONG_END: &str = "LONGCOMMENTEND";
 
 /// The comment of the first highlight of `foreign_annots_pdf`: about 6 KiB, with lines ended by
-/// CR as Acrobat writes them.
+/// CR as many desktop readers write them.
 pub fn foreign_long_comment() -> String {
     let mut text = String::new();
     let mut n = 0;
@@ -538,7 +538,7 @@ fn deflate(data: &[u8]) -> Vec<u8> {
     encoder.finish().expect("compressing in memory")
 }
 
-/// A one page document with annotations written the way Acrobat writes them, for the tests of
+/// A one page document with annotations written the way many desktop readers write them, for the tests of
 /// what the reader must not lose or leave behind (objects 6 to 19 are the annotations):
 /// - 6: a highlight with a long comment (CR line ends), rich text, name, dates, opacity, a layer,
 ///   a subject, an author and a popup (7); 8 is a reply to it.

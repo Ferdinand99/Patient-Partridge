@@ -26,6 +26,7 @@ pub mod annots;
 #[cfg(unix)]
 pub mod fds;
 pub mod fonts;
+pub mod form_actions;
 pub mod forms;
 pub mod limits;
 pub mod sandbox;

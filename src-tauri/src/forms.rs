@@ -43,6 +43,8 @@ pub struct FieldOut {
     action: bool,
     /// The field has an action that could change the form, so it is left alone (and read only).
     action_blocked: bool,
+    /// No field of the form can be filled in (see `field_flag::FORM_BLOCKED`).
+    form_blocked: bool,
     /// Quarter turns clockwise.
     turns: u8,
     /// Left, top, right and bottom in points from the top left of the page as it is drawn.
@@ -101,6 +103,7 @@ pub fn field_out(field: FormField) -> FieldOut {
         comb: has(field_flag::COMB),
         action: has(field_flag::ACTION),
         action_blocked: has(field_flag::ACTION_BLOCKED),
+        form_blocked: has(field_flag::FORM_BLOCKED),
         turns: field.turns,
         rect: field.rect.map(round2),
         font_size: round2(field.font_size),

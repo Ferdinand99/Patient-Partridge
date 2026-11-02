@@ -36,6 +36,7 @@
     comb: false,
     action: false,
     actionBlocked: false,
+    formBlocked: false,
     turns: 0,
     fontSize: 12,
     tooltip: "",
