@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.2.0](https://github.com/Ferdinand99/Patient-Partridge/compare/v0.1.0...v0.2.0) (2026-11-02)
+
+
+### Features
+
+* annotations (highlight, underline, strike-out, notes, drawing, stamps) ([#40](https://github.com/Ferdinand99/Patient-Partridge/issues/40)) ([fb4753d](https://github.com/Ferdinand99/Patient-Partridge/commit/fb4753d8686cc881cdf53e2c5229ae840c352957))
+* draw text in Chinese, Japanese, Korean, Arabic, Hebrew and Thai with the system's fonts ([c89d3bc](https://github.com/Ferdinand99/Patient-Partridge/commit/c89d3bc66a28e81ae23f5e922160f64e83c861e1))
+* fill in PDF forms and save them for other readers ([#41](https://github.com/Ferdinand99/Patient-Partridge/issues/41)) ([a26c710](https://github.com/Ferdinand99/Patient-Partridge/commit/a26c710350ea81033571858e8c612fde5e225e66))
+* safe save path for documents (atomic write, checked, dirty state) ([c0640e5](https://github.com/Ferdinand99/Patient-Partridge/commit/c0640e5ee791cec6d61d55edefc349fa5a423b57))
+
+
+### Bug Fixes
+
+* form text that is refused, a lost engine in a form, and Save buttons ([#46](https://github.com/Ferdinand99/Patient-Partridge/issues/46)) ([2709134](https://github.com/Ferdinand99/Patient-Partridge/commit/2709134c1c336fd57c1a563779300abe3709d25b))
+* keep a long form message inside its bar ([#48](https://github.com/Ferdinand99/Patient-Partridge/issues/48)) ([3317190](https://github.com/Ferdinand99/Patient-Partridge/commit/331719099f8186aa3dcdd32123e27a67d7f16578))
+* small fixes to saving (files changed before the first save, files with no owner, and the saving box) ([1776234](https://github.com/Ferdinand99/Patient-Partridge/commit/177623407bead41ea5a191ea1400e35ddd5521ea))
+* say once that updates are not possible when the app runs through a symbolic link ([1553f87](https://github.com/Ferdinand99/Patient-Partridge/commit/1553f87f4250a61634513cab40c989937abf004a))
+* **viewer:** small fixes to copying, the text limits and the reopened tabs ([f2697e6](https://github.com/Ferdinand99/Patient-Partridge/commit/f2697e65f69c6ed8487773dc889802d21433f3ed))
+
 ## 0.1.0 (2026-11-01)
 
 
