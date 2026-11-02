@@ -11,20 +11,28 @@
 //!   unless something that stays points at them. So a deleted page is gone from the file, not just
 //!   hidden. A bookmark that pointed at it stays in the list and leads nowhere.
 //! - Rotating and cropping change the page's entries in place. Nothing else is touched.
-//! - A page that is copied from another document (an insert, an extract, a move) is copied with
-//!   everything it refers to, but not with what refers to it: bookmarks, the form's field tree
-//!   (a field gets no parent), links to pages that come later in the same copy, the structure
-//!   tree and the signature are not carried over.
-//! - A move is therefore done on as few pages as possible: the pages that can stay in their order
-//!   are not touched, and only the others are copied from a snapshot of the document and put in
-//!   their places.
+//! - A page that is copied from another document (an insert, an extract) is copied with everything
+//!   it refers to, but not with what refers to it: bookmarks, the form's field tree, links to pages
+//!   that come later in the same copy, the structure tree and the signature are not carried over.
+//!   PDFium also leaves the `/Parent` of a copied annotation (a pop-up note's note, a field's
+//!   widget's field) pointing at the number it had in the other document, which means something
+//!   else, or nothing, in this one. That is a limit of the copy in PDFium; the README says so.
+//! - A move copies nothing: PDFium's own move changes the order in the page tree, so links,
+//!   bookmarks, form fields and the structure of the pages stay as they were. The pages that can
+//!   stay in their order are not touched, and the others are moved in a few steps.
+//! - A copy of pages points into the document it came from until the document is written out and
+//!   read in again. The document is therefore put through exactly that, with the other document
+//!   still alive, before the other document is let go of.
 //!
 //! To take a change back the engine keeps copies of the document as it was (snapshots, in memory,
-//! at most [`MAX_UNDO_BYTES`] and [`MAX_UNDO_STEPS`] of them, the oldest let go first). `Restore`
+//! at most [`MAX_UNDO_BYTES`] and [`MAX_UNDO_STEPS`] of them, the oldest let go first), each with
+//! the number of pages it must show when it is read in again; a copy that shows another number is
+//! refused, because the document it would put in place is not the one that was kept. `Restore`
 //! loads one and keeps the state it leaves, so that the same step can be redone. Rotating and
 //! cropping are taken back by the app with the opposite change and need no snapshot.
 
 use std::collections::VecDeque;
+use std::os::raw::{c_int, c_ulong};
 
 use partridge_protocol::{
     ErrorCode, PageSize, PagesRequest, PagesResponse, ResponseBody, MAX_BLANK_SIDE, MAX_EDIT_PAGES,
@@ -54,6 +62,9 @@ impl Drop for Secret {
 struct Snapshot {
     token: u32,
     bytes: Vec<u8>,
+    /// How many pages the document had when the copy was taken, and so must have when it is read
+    /// in again.
+    pages: usize,
 }
 
 struct Import {
@@ -110,10 +121,14 @@ impl PageTools {
         }
     }
 
-    fn keep(&mut self, bytes: Vec<u8>) -> u32 {
+    fn keep(&mut self, bytes: Vec<u8>, pages: usize) -> u32 {
         let token = self.next_token;
         self.next_token = self.next_token.wrapping_add(1).max(1);
-        self.snapshots.push_back(Snapshot { token, bytes });
+        self.snapshots.push_back(Snapshot {
+            token,
+            bytes,
+            pages,
+        });
         self.evict();
         // The copy just kept may be the one that was let go of, when it alone is too big.
         if self.snapshots.iter().any(|s| s.token == token) {
@@ -151,6 +166,13 @@ impl PageTools {
         {
             None
         }
+    }
+
+    /// Keeps a copy of some bytes as a change would, saying that the document in them has `pages`
+    /// pages (for tests: a copy that does not read back with that many pages is refused).
+    #[doc(hidden)]
+    pub fn keep_for_tests(&mut self, bytes: Vec<u8>, pages: usize) -> u32 {
+        self.keep(bytes, pages)
     }
 
     /// How many bytes of copies are held, for tests.
@@ -380,22 +402,128 @@ pub(crate) fn handle(
     Ok(ResponseBody::Pages(response))
 }
 
-/// The document may be changed: it is open, no save or copy is holding its bytes, and it has no
-/// more pages than the tools take. Returns the number of pages.
-fn editable(engine: &Engine, doc: u32) -> Result<usize, Failure> {
-    editable_with(engine, doc, false)
+/// What a change asks of the permissions of a protected document (an unprotected one allows all).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Right {
+    /// Nothing: taking a change back.
+    Free,
+    /// Insert, delete, move and turn pages (assembling the document).
+    Assemble,
+    /// Change what a page holds: its boxes.
+    Modify,
+    /// Copy content out of the document into another.
+    Extract,
+}
+
+/// `/P` bits of the permissions, counted from 1 as the PDF specification does: modify the contents
+/// (4), copy content (5), assemble the document (11).
+const PERMIT_MODIFY: u32 = 1 << 3;
+const PERMIT_EXTRACT: u32 = 1 << 4;
+const PERMIT_ASSEMBLE: u32 = 1 << 10;
+
+/// Refuses a change that the document's permissions do not allow, as the branches for notes and
+/// forms refuse theirs. The permissions are those of the security handler's `/P` entry (the call
+/// that answers for the owner, so a document opened with its owner password allows what the owner
+/// may do). A document that is not protected allows everything.
+fn permitted(document: &PdfDocument<'_>, right: Right) -> Result<(), Failure> {
+    let (needed, what) = match right {
+        Right::Free => return Ok(()),
+        Right::Assemble => (
+            PERMIT_ASSEMBLE,
+            "the document does not allow pages to be inserted, deleted, moved or turned",
+        ),
+        Right::Modify => (
+            PERMIT_MODIFY,
+            "the document does not allow the contents of its pages to be changed",
+        ),
+        Right::Extract => (
+            PERMIT_EXTRACT,
+            "the document does not allow its pages to be copied",
+        ),
+    };
+    let revision = document.permissions().security_handler_revision();
+    if let Ok(PdfSecurityHandlerRevision::Unprotected) = revision {
+        return Ok(());
+    }
+    let Some(handle) = raw_document(document) else {
+        return fail(ErrorCode::PagesNotAllowed, what);
+    };
+    // SAFETY: a read of the permissions, with the live document's handle.
+    let bits = unsafe { document.bindings().FPDF_GetDocPermissions(handle) } as u32;
+    // Before revision 3 there is no bit of its own for assembling: changing the contents covers it.
+    let needed = match (right, revision) {
+        (Right::Assemble, Ok(PdfSecurityHandlerRevision::Revision2)) => PERMIT_MODIFY,
+        _ => needed,
+    };
+    if bits & needed != 0 {
+        Ok(())
+    } else {
+        fail(ErrorCode::PagesNotAllowed, what)
+    }
+}
+
+/// The raw handle PDFium has for a document. `pdfium-render` keeps it to itself; the text it gives
+/// for `Debug` names it, and the page tools fail their tests if that ever stops being so.
+#[doc(hidden)]
+pub fn raw_document(document: &PdfDocument<'_>) -> Option<FPDF_DOCUMENT> {
+    let text = format!("{document:?}");
+    let start = text.find("0x")? + 2;
+    let hex: String = text[start..]
+        .chars()
+        .take_while(char::is_ascii_hexdigit)
+        .collect();
+    let value = usize::from_str_radix(&hex, 16).ok()?;
+    if value == 0 || value % std::mem::align_of::<usize>() != 0 {
+        return None;
+    }
+    // The handle must be the one of this document: it has as many pages as the document.
+    let handle = value as FPDF_DOCUMENT;
+    // SAFETY: the value was printed by the document for its own handle; PDFium only reads it.
+    let pages = unsafe { document.bindings().FPDF_GetPageCount(handle) };
+    (pages >= 0 && pages as usize == document.pages().len() as usize).then_some(handle)
+}
+
+/// Moves pages inside the document so that the first of `indices` becomes page `dest` and the rest
+/// follow it in the order given (PDFium takes them out of the page tree and puts them back, and
+/// copies nothing). No page of this document may be open while this runs.
+fn move_pages(document: &PdfDocument<'_>, indices: &[c_int], dest: usize) -> Result<(), Failure> {
+    let Some(handle) = raw_document(document) else {
+        return Err(failed("the document cannot be moved about"));
+    };
+    // SAFETY: `handle` is the live document's, `indices` is a valid array of the length given. PDFium
+    // checks the numbers and refuses a list with a number out of range or repeated.
+    let done = unsafe {
+        document.bindings().FPDF_MovePages(
+            handle,
+            indices.as_ptr(),
+            indices.len() as c_ulong,
+            dest as c_int,
+        )
+    };
+    if document.bindings().is_true(done) {
+        Ok(())
+    } else {
+        Err(failed("PDFium could not move the pages"))
+    }
+}
+
+/// The document may be changed: it is open, no save or copy is holding its bytes, it has no more
+/// pages than the tools take, and its permissions allow what is asked. Returns the number of pages.
+fn editable(engine: &Engine, doc: u32, right: Right) -> Result<usize, Failure> {
+    editable_with(engine, doc, false, right)
 }
 
 /// As [`editable`], and for a change to the list of pages itself (a delete, a move, a page added
 /// or copied) the list must be sound: every place in it is a page that can be found. PDFium
 /// crashes when it adds a page to a list that holds something that is not a page (found by the
 /// fuzz target), so such a document is refused here, before PDFium is asked.
-fn editable_list(engine: &Engine, doc: u32) -> Result<usize, Failure> {
-    editable_with(engine, doc, true)
+fn editable_list(engine: &Engine, doc: u32, right: Right) -> Result<usize, Failure> {
+    editable_with(engine, doc, true, right)
 }
 
-fn editable_with(engine: &Engine, doc: u32, sound: bool) -> Result<usize, Failure> {
+fn editable_with(engine: &Engine, doc: u32, sound: bool, right: Right) -> Result<usize, Failure> {
     let document = engine.document(doc)?;
+    permitted(document, right)?;
     if engine.saves.contains_key(&doc) {
         return fail(
             ErrorCode::Busy,
@@ -465,10 +593,32 @@ fn take_snapshot(
     progress: &mut dyn FnMut(u32),
 ) -> Result<u32, Failure> {
     let limit = tools(engine, doc).max_undo_bytes;
+    let pages = engine.document(doc)?.pages().len() as usize;
     match serialise(engine, doc, limit, progress)? {
-        Some(bytes) => Ok(tools(engine, doc).keep(bytes)),
+        Some(bytes) => Ok(tools(engine, doc).keep(bytes, pages)),
         None => Ok(0),
     }
+}
+
+/// A copy of a document read in again, with the pages it must have. A copy that shows another
+/// number is not the document that was kept (PDFium does not always read back what it wrote, on a
+/// damaged file), and putting it in place would replace the user's document with another one.
+fn load_copy(
+    pdfium: &'static Pdfium,
+    bytes: Vec<u8>,
+    password: Option<&str>,
+    pages: usize,
+) -> Result<PdfDocument<'static>, Failure> {
+    let loaded = pdfium
+        .load_pdf_from_byte_vec(bytes, password)
+        .map_err(|_| failed("the copy of the document could not be read"))?;
+    let found = loaded.pages().len() as usize;
+    if found != pages || found == 0 {
+        return Err(failed(&format!(
+            "the copy of the document has {found} pages, not the {pages} it was made from"
+        )));
+    }
+    Ok(loaded)
 }
 
 /// A change failed half way. The document is put back from the copy kept for this change, and the
@@ -485,13 +635,15 @@ fn recover(
 ) -> Failure {
     let password = password_of(engine, doc);
     // The copy stays: the change did not happen, so it still describes the document.
-    let bytes = engine
+    let kept = engine
         .tools
         .get(&doc)
         .and_then(|t| t.snapshots.iter().find(|s| s.token == token))
-        .map(|s| s.bytes.clone());
-    match bytes {
-        Some(bytes) if token != 0 => put_back(engine, pdfium, doc, bytes, password, original),
+        .map(|s| (s.bytes.clone(), s.pages));
+    match kept {
+        Some((bytes, pages)) if token != 0 => {
+            put_back(engine, pdfium, doc, bytes, pages, password, original)
+        }
         _ => lose(engine, doc),
     }
 }
@@ -501,10 +653,11 @@ fn put_back(
     pdfium: &'static Pdfium,
     doc: u32,
     bytes: Vec<u8>,
+    pages: usize,
     password: Option<String>,
     original: Failure,
 ) -> Failure {
-    match pdfium.load_pdf_from_byte_vec(bytes, password.as_deref()) {
+    match load_copy(pdfium, bytes, password.as_deref(), pages) {
         Ok(loaded) => {
             engine.docs.insert(doc, loaded);
             original
@@ -549,21 +702,139 @@ fn changed_with(
 /// the form fields on it. PDFium keeps the list of fields of a form (the form refers to them, not
 /// the page), so a field on a deleted page stays in the file; what was typed into it should not.
 /// Only text fields are cleared here: other kinds keep what they hold, and a field that is grouped
-/// under a parent field keeps the value its parent holds.
+/// under a parent field keeps the value its parent holds. The default value, the tooltip and the
+/// appearance of the fields on the page are cleared as well (see [`clear_widget_text`]). The text
+/// a tag holds for the page (its alternative text) is out of reach and stays in the file.
 fn clear_form_fields(document: &PdfDocument<'_>, index: u32) -> u32 {
-    let Ok(page) = document.pages().get(index as PdfPageIndex) else {
-        return 0;
-    };
-    let mut fields = 0;
-    for mut annotation in page.annotations().iter() {
-        if let Some(field) = annotation.as_form_field_mut() {
-            fields += 1;
-            if let Some(text) = field.as_text_field_mut() {
-                let _ = text.set_value("");
+    let fields = {
+        let Ok(page) = document.pages().get(index as PdfPageIndex) else {
+            return 0;
+        };
+        let mut fields = 0;
+        for mut annotation in page.annotations().iter() {
+            if let Some(field) = annotation.as_form_field_mut() {
+                fields += 1;
+                if let Some(text) = field.as_text_field_mut() {
+                    let _ = text.set_value("");
+                }
             }
         }
-    }
+        fields
+    };
+    clear_widget_text(document, index);
     fields
+}
+
+/// What PDFium's subtype number is for a widget (`FPDF_ANNOT_WIDGET`), and its number for a string
+/// (`FPDF_OBJECT_STRING`).
+const SUBTYPE_WIDGET: i32 = 20;
+const OBJECT_STRING: i32 = 3;
+
+/// Overwrites the other text a form field of a page keeps in its own dictionary, and drops its
+/// appearance (the picture of what was typed, which holds the text as drawing instructions): the
+/// default value, the tooltip, the value of fields other than text fields when it is a string, the
+/// rich text value. Fields grouped under a parent keep what the parent holds, which is out of reach.
+fn clear_widget_text(document: &PdfDocument<'_>, index: u32) {
+    let Some(handle) = raw_document(document) else {
+        return;
+    };
+    let bindings = document.bindings();
+    // SAFETY: `handle` is the live document's; the page and every annotation handle are opened and
+    // closed here, and PDFium only gets handles it gave out.
+    unsafe {
+        let page = bindings.FPDF_LoadPage(handle, index as c_int);
+        if page.is_null() {
+            return;
+        }
+        let count = bindings.FPDFPage_GetAnnotCount(page).max(0);
+        for position in 0..count {
+            let annotation = bindings.FPDFPage_GetAnnot(page, position);
+            if annotation.is_null() {
+                continue;
+            }
+            if bindings.FPDFAnnot_GetSubtype(annotation) == SUBTYPE_WIDGET {
+                for key in ["V", "DV", "TU", "RV"] {
+                    if bindings.FPDFAnnot_HasKey(annotation, key) != 0
+                        && bindings.FPDFAnnot_GetValueType(annotation, key) == OBJECT_STRING
+                    {
+                        bindings.FPDFAnnot_SetStringValue_str(annotation, key, "");
+                    }
+                }
+                bindings.FPDFAnnot_SetAP(
+                    annotation,
+                    0 as FPDF_ANNOT_APPEARANCEMODE,
+                    std::ptr::null(),
+                );
+            }
+            bindings.FPDFPage_CloseAnnot(annotation);
+        }
+        bindings.FPDF_ClosePage(page);
+    }
+}
+
+/// Empties the signature a copied signature field holds, so that the data of a signature (the
+/// byte ranges, the signer's certificate in `/Contents`) does not travel with the page. The look of
+/// the field stays. Returns how many fields were emptied.
+fn drop_copied_signatures(document: &PdfDocument<'_>) -> usize {
+    let Some(handle) = raw_document(document) else {
+        return 0;
+    };
+    let bindings = document.bindings();
+    let mut emptied = 0;
+    // SAFETY: as in `clear_widget_text`.
+    unsafe {
+        for index in 0..bindings.FPDF_GetPageCount(handle).max(0) {
+            let page = bindings.FPDF_LoadPage(handle, index);
+            if page.is_null() {
+                continue;
+            }
+            let count = bindings.FPDFPage_GetAnnotCount(page).max(0);
+            for position in 0..count {
+                let annotation = bindings.FPDFPage_GetAnnot(page, position);
+                if annotation.is_null() {
+                    continue;
+                }
+                if bindings.FPDFAnnot_GetSubtype(annotation) == SUBTYPE_WIDGET
+                    && bindings.FPDFAnnot_HasKey(annotation, "V") != 0
+                    && bindings.FPDFAnnot_GetValueType(annotation, "V") != OBJECT_STRING
+                    && is_signature_field(bindings, annotation)
+                    && bindings.FPDFAnnot_SetStringValue_str(annotation, "V", "") != 0
+                {
+                    emptied += 1;
+                    // The copy leaves `/Parent` as it was in the other document, where it means
+                    // some other object here, which may be the signature itself.
+                    if bindings.FPDFAnnot_HasKey(annotation, "Parent") != 0 {
+                        bindings.FPDFAnnot_SetStringValue_str(annotation, "Parent", "");
+                    }
+                }
+                bindings.FPDFPage_CloseAnnot(annotation);
+            }
+            bindings.FPDF_ClosePage(page);
+        }
+    }
+    emptied
+}
+
+/// True when the widget names itself as a signature field (`/FT /Sig`).
+///
+/// # Safety
+/// `annotation` must be a live annotation handle of `bindings`.
+unsafe fn is_signature_field(
+    bindings: &dyn PdfiumLibraryBindings,
+    annotation: FPDF_ANNOTATION,
+) -> bool {
+    if bindings.FPDFAnnot_HasKey(annotation, "FT") == 0 {
+        return false;
+    }
+    let mut units = [0u16; 8];
+    let needed = bindings.FPDFAnnot_GetStringValue(
+        annotation,
+        "FT",
+        units.as_mut_ptr(),
+        std::mem::size_of_val(&units) as std::os::raw::c_ulong,
+    );
+    // "Sig" is three UTF-16 units and a terminator: eight bytes.
+    needed == 8 && units[..3] == [b'S' as u16, b'i' as u16, b'g' as u16]
 }
 
 fn delete(
@@ -573,7 +844,7 @@ fn delete(
     pages: &[u32],
     progress: &mut dyn FnMut(u32),
 ) -> Result<PagesResponse, Failure> {
-    let count = editable_list(engine, doc)?;
+    let count = editable_list(engine, doc, Right::Assemble)?;
     let sorted = page_list(pages, count)?;
     if sorted.len() >= count {
         return fail(
@@ -627,7 +898,7 @@ fn reorder(
     order: &[u32],
     progress: &mut dyn FnMut(u32),
 ) -> Result<PagesResponse, Failure> {
-    let count = editable_list(engine, doc)?;
+    let count = editable_list(engine, doc, Right::Assemble)?;
     if order.len() != count {
         return fail(
             ErrorCode::InvalidRequest,
@@ -649,8 +920,8 @@ fn reorder(
     if order.iter().enumerate().all(|(i, &p)| p as usize == i) {
         return changed(engine, doc, 0, 0);
     }
-    // The document as it is now: the source of the pages that move, and the copy that takes the
-    // move back. A document that cannot be saved cannot be reordered either.
+    // The document as it is now: the copy that takes the move back, and that the document is put
+    // back from when a step fails. A document that cannot be saved cannot be reordered either.
     let Some(bytes) = serialise(engine, doc, MAX_SAVE_BYTES, progress)? else {
         return fail(
             ErrorCode::SaveTooLarge,
@@ -661,34 +932,33 @@ fn reorder(
     let fail_at = tools(engine, doc).fail_at();
     let password = password_of(engine, doc);
     let moved = stable.iter().filter(|s| !**s).count();
+    let before = page_sizes(engine.document(doc)?);
     let result = (|| {
-        let source = pdfium
-            .load_pdf_from_byte_slice(&bytes, password.as_deref())
-            .map_err(|_| failed("a copy of the document could not be read"))?;
         let document = engine.docs.get_mut(&doc).ok_or_else(gone)?;
-        // The pages that move leave first (the last ones first, so the numbers of the others
-        // stay what they are) ...
-        let mut leaving: Vec<u32> = (0..count)
+        // The pages that have to move go to the end first, in the order of the places they are
+        // going to, in one step. What is left at the front is the pages that stay, in their
+        // order, which is also the order they have in the new document.
+        let leaving: Vec<c_int> = (0..count)
             .filter(|i| !stable[*i])
-            .map(|i| order[i])
+            .map(|i| order[i] as c_int)
             .collect();
-        leaving.sort_unstable_by(|a, b| b.cmp(a));
-        for (i, &index) in leaving.iter().enumerate() {
-            if injected(fail_at, i) {
+        let staying = count - leaving.len();
+        let at_the_end = leaving
+            .iter()
+            .enumerate()
+            .all(|(i, &p)| p as usize == staying + i);
+        let mut calls = 0;
+        if !at_the_end {
+            if injected(fail_at, calls) {
                 return Err(failed("a failure made by a test"));
             }
-            let page = document
-                .pages()
-                .get(index as PdfPageIndex)
-                .map_err(|_| failed("a page could not be read"))?;
-            page.delete()
-                .map_err(|_| failed("PDFium could not move a page"))?;
-            if i % 16 == 15 {
-                progress(i as u32 + 1);
-            }
+            move_pages(document, &leaving, staying)?;
+            calls += 1;
         }
-        // ... and come back from the copy, in their new places, from the front.
+        // Then each run of places that took a page that moved gets its pages, from the front. The
+        // pages of the next run are the first of those at the end, in the order they have to go in.
         let mut place = 0;
+        let mut done = 0;
         while place < count {
             if stable[place] {
                 place += 1;
@@ -698,14 +968,16 @@ fn reorder(
             while end < count && !stable[end] {
                 end += 1;
             }
-            document
-                .pages_mut()
-                .copy_pages_from_document(
-                    &source,
-                    &range_string(&order[place..end]),
-                    place as PdfPageIndex,
-                )
-                .map_err(|_| failed("PDFium could not put a page in its new place"))?;
+            let from = staying + done;
+            if from != place {
+                if injected(fail_at, calls) {
+                    return Err(failed("a failure made by a test"));
+                }
+                let run: Vec<c_int> = (from..from + (end - place)).map(|i| i as c_int).collect();
+                move_pages(document, &run, place)?;
+                calls += 1;
+            }
+            done += end - place;
             progress(end as u32);
             place = end;
         }
@@ -714,15 +986,25 @@ fn reorder(
                 "the document has the wrong number of pages after the move",
             ));
         }
+        // Every place must hold the page that was asked for. A page cannot be told from another
+        // by its size alone, but a move that went wrong shows up there first.
+        let now = page_sizes(document);
+        if now
+            .iter()
+            .zip(order)
+            .any(|(size, &from)| *size != before[from as usize])
+        {
+            return Err(failed("the pages are not in the order that was asked for"));
+        }
         Ok(())
     })();
     let limit = tools(engine, doc).max_undo_bytes;
     if let Err(e) = result {
         // Put the document back from the copy.
-        return Err(put_back(engine, pdfium, doc, bytes, password, e));
+        return Err(put_back(engine, pdfium, doc, bytes, count, password, e));
     }
     let token = if bytes.len() <= limit {
-        tools(engine, doc).keep(bytes)
+        tools(engine, doc).keep(bytes, count)
     } else {
         0
     };
@@ -735,7 +1017,7 @@ fn rotate(
     pages: &[u32],
     turns: u8,
 ) -> Result<PagesResponse, Failure> {
-    let count = editable(engine, doc)?;
+    let count = editable(engine, doc, Right::Assemble)?;
     if !(1..=3).contains(&turns) {
         return fail(
             ErrorCode::InvalidRequest,
@@ -775,7 +1057,7 @@ fn crop(
     pages: &[u32],
     margins: [f32; 4],
 ) -> Result<PagesResponse, Failure> {
-    let count = editable(engine, doc)?;
+    let count = editable(engine, doc, Right::Modify)?;
     let sorted = page_list(pages, count)?;
     if margins
         .iter()
@@ -838,7 +1120,7 @@ fn set_boxes(
     pages: &[u32],
     boxes: &[[f32; 4]],
 ) -> Result<PagesResponse, Failure> {
-    let count = editable(engine, doc)?;
+    let count = editable(engine, doc, Right::Modify)?;
     if pages.len() != boxes.len() {
         return fail(ErrorCode::InvalidRequest, "every page needs a box");
     }
@@ -884,7 +1166,7 @@ fn insert_blank(
     height: f32,
     progress: &mut dyn FnMut(u32),
 ) -> Result<PagesResponse, Failure> {
-    let count = editable_list(engine, doc)?;
+    let count = editable_list(engine, doc, Right::Assemble)?;
     if at as usize > count {
         return fail(
             ErrorCode::PageOutOfRange,
@@ -942,41 +1224,43 @@ fn restore(
     token: u32,
     progress: &mut dyn FnMut(u32),
 ) -> Result<PagesResponse, Failure> {
-    editable(engine, doc)?;
-    if !engine
-        .tools
-        .get(&doc)
-        .is_some_and(|t| t.snapshots.iter().any(|s| s.token == token))
-    {
-        return fail(
-            ErrorCode::SnapshotGone,
-            "the engine no longer holds a copy of the document to go back to",
-        );
-    }
-    // The state that is left, so that the step can be done again.
-    let leaving = take_snapshot(engine, doc, progress)?;
-    let password = password_of(engine, doc);
-    let tools = tools(engine, doc);
-    let Some(at) = tools.snapshots.iter().position(|s| s.token == token) else {
-        // Making room for the copy of the state being left let go of the one we want.
+    editable(engine, doc, Right::Free)?;
+    // The copy to go back to leaves the queue first, so that keeping the copy of the state being
+    // left (which makes room by letting the oldest go) cannot let go of the one that is wanted.
+    // That happened for a document of more than half the limit: the step could not be taken back.
+    let target = {
+        let queue = &mut tools(engine, doc).snapshots;
+        queue
+            .iter()
+            .position(|s| s.token == token)
+            .and_then(|at| queue.remove(at))
+    };
+    let Some(target) = target else {
         return fail(
             ErrorCode::SnapshotGone,
             "the engine no longer holds a copy of the document to go back to",
         );
     };
-    let target = tools
-        .snapshots
-        .remove(at)
-        .expect("the position was just found");
-    let loaded = pdfium
-        .load_pdf_from_byte_vec(target.bytes, password.as_deref())
-        .map_err(|_| failed("the copy of the document could not be read"))?;
-    engine.docs.insert(doc, loaded);
-    changed(engine, doc, leaving, 0)
+    // The state that is left, so that the step can be done again. 0 when it is too big to keep:
+    // the step can still be taken back, but not made again.
+    let leaving = take_snapshot(engine, doc, progress)?;
+    let password = password_of(engine, doc);
+    match load_copy(pdfium, target.bytes, password.as_deref(), target.pages) {
+        Ok(loaded) => {
+            engine.docs.insert(doc, loaded);
+            changed(engine, doc, leaving, 0)
+        }
+        Err(e) => {
+            // The document stays as it is. The copy that did not read back as the document it was
+            // made from is not kept, and neither is the copy of the state that was not left.
+            tools(engine, doc).snapshots.retain(|s| s.token != leaving);
+            Err(e)
+        }
+    }
 }
 
 fn import_begin(engine: &mut Engine, doc: u32, size: u32) -> Result<PagesResponse, Failure> {
-    editable(engine, doc)?;
+    editable(engine, doc, Right::Assemble)?;
     let size = size as usize;
     if size == 0 || size > MAX_IMPORT_BYTES {
         return fail(
@@ -1030,7 +1314,7 @@ fn import_end(
     at: u32,
     progress: &mut dyn FnMut(u32),
 ) -> Result<PagesResponse, Failure> {
-    let count = editable_list(engine, doc)?;
+    let count = editable_list(engine, doc, Right::Assemble)?;
     let Some(import) = engine.tools.get_mut(&doc).and_then(|t| t.import.take()) else {
         return fail(ErrorCode::InvalidRequest, "no insert is under way");
     };
@@ -1066,7 +1350,15 @@ fn import_end(
             format!("the page tools work on documents of up to {MAX_EDIT_PAGES} pages"),
         );
     }
-    let token = take_snapshot(engine, doc, progress)?;
+    // The document as it is now: the copy that takes the insert back, and that the document is put
+    // back from when a step fails.
+    let Some(bytes) = serialise(engine, doc, MAX_SAVE_BYTES, progress)? else {
+        return fail(
+            ErrorCode::SaveTooLarge,
+            "the document is too big for pages to be inserted",
+        );
+    };
+    let password = password_of(engine, doc);
     let result = (|| {
         let document = engine.docs.get_mut(&doc).ok_or_else(gone)?;
         document
@@ -1082,11 +1374,30 @@ fn import_end(
                 "the document has the wrong number of pages after the insert",
             ));
         }
-        Ok(())
+        // The copied pages still point into `source` for some things that PDFium does not carry
+        // over (a pop-up note's `/Parent`). Written out and read in again, with `source` still
+        // alive, the document is one that stands on its own. Dropping `source` before that left
+        // the next save reading memory that was freed.
+        let written = save::serialise(document)?;
+        load_copy(pdfium, written, password.as_deref(), count + added)
     })();
-    if let Err(e) = result {
-        return Err(recover(engine, pdfium, doc, token, e));
+    match result {
+        Ok(loaded) => {
+            engine.docs.insert(doc, loaded);
+            drop(source);
+        }
+        Err(e) => {
+            let original = put_back(engine, pdfium, doc, bytes, count, password, e);
+            drop(source);
+            return Err(original);
+        }
     }
+    let limit = tools(engine, doc).max_undo_bytes;
+    let token = if bytes.len() <= limit {
+        tools(engine, doc).keep(bytes, count)
+    } else {
+        0
+    };
     changed(engine, doc, token, added)
 }
 
@@ -1097,7 +1408,7 @@ fn export_begin(
     pages: &[u32],
     progress: &mut dyn FnMut(u32),
 ) -> Result<PagesResponse, Failure> {
-    let count = editable_list(engine, doc)?;
+    let count = editable_list(engine, doc, Right::Extract)?;
     if pages.is_empty() || pages.len() > MAX_EDIT_PAGES {
         return fail(
             ErrorCode::InvalidRequest,
@@ -1121,6 +1432,14 @@ fn export_begin(
         .map_err(|_| failed("PDFium could not copy the pages"))?;
     if fresh.pages().len() as usize != pages.len() {
         return Err(failed("the new document has the wrong number of pages"));
+    }
+    // The pages come without the signature; its data must not stay behind in the bytes. An object
+    // that was copied in is written whether or not anything still refers to it, so the emptied
+    // signature would still be written; written out and read in again, it is an object of a loaded
+    // file, which a save leaves out when nothing refers to it.
+    if drop_copied_signatures(&fresh) > 0 {
+        let written = save::serialise_up_to(&fresh, MAX_SAVE_BYTES, progress)?;
+        fresh = load_copy(pdfium, written, None, pages.len())?;
     }
     let bytes = save::serialise_up_to(&fresh, MAX_SAVE_BYTES, progress)?;
     let (size, print) = (bytes.len(), save::fingerprint(&fresh, progress));
@@ -1163,6 +1482,9 @@ pub fn warm_up(pdfium: &'static Pdfium, source: &PdfDocument<'_>) {
     let _ = fresh
         .pages_mut()
         .create_page_at_index(PdfPagePaperSize::a4(), 0);
+    let _ = move_pages(&fresh, &[1], 0);
+    clear_widget_text(&fresh, 0);
+    drop_copied_signatures(&fresh);
     if let Ok(mut page) = fresh.pages().get(0) {
         page.set_rotation(PdfPageRenderRotation::Degrees90);
         let _ = page

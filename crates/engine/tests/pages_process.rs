@@ -708,3 +708,160 @@ fn a_document_with_a_broken_list_of_pages_cannot_take_the_engine_down() {
         );
     }
 }
+
+// ---- files like real programs write them, through the real engine --------------------------------
+
+fn short<T: std::fmt::Debug>(r: Result<T, ClientError>) -> String {
+    match r {
+        Ok(v) => format!("{v:?}").chars().take(60).collect(),
+        Err(e) => e.to_string(),
+    }
+}
+
+fn save_options() -> SaveOptions {
+    SaveOptions::default()
+}
+
+/// A move or an insert of a page with a pop-up note or a field on two pages used to stop the engine
+/// at the next save, 20 times in 20, and take the unsaved changes of the document with it.
+#[test]
+fn a_move_or_an_insert_of_ordinary_files_does_not_stop_the_engine_at_the_save() {
+    let dir = Dir::new("ordinary");
+    let pool = pool();
+    for (name, bytes, pages) in [
+        ("popup", kit::popup_note_pdf(), 3usize),
+        ("field", kit::shared_field_pdf(), 2),
+        ("first", kit::first_key_pdf(), 3),
+    ] {
+        // Moved.
+        let path = dir.write(&format!("{name}-move.pdf"), &bytes);
+        let (h, found) = pool.open(&text(&path), None).unwrap();
+        assert_eq!(found.len(), pages, "{name}");
+        let order: Vec<u32> = (0..pages as u32).rev().collect();
+        let moved = pool.pages_reorder(h, &order).unwrap();
+        pool.pages_rotate(h, &[0], 1).unwrap();
+        pool.save(h, save_options())
+            .unwrap_or_else(|e| panic!("{name}: save after a move: {e}"));
+        let (again, saved) = pool.open(&text(&path), None).unwrap();
+        assert_eq!(saved.len(), pages, "{name}");
+        let back = pool.pages_restore(h, moved.snapshot);
+        assert!(back.is_ok(), "{name}: undo of the move: {}", short(back));
+        pool.pages_delete(h, &[0]).unwrap();
+        pool.save(h, save_options())
+            .unwrap_or_else(|e| panic!("{name}: save after a delete: {e}"));
+        pool.close(h);
+        pool.close(again);
+
+        // Inserted into a clean document, by an engine of its own.
+        let target_path = dir.write(&format!("{name}-target.pdf"), &kit::marked_pdf(4));
+        let source_path = dir.write(&format!("{name}-source.pdf"), &bytes);
+        let (t, _) = pool.open(&text(&target_path), None).unwrap();
+        let inserted = pool
+            .insert_pdf(
+                t,
+                2,
+                &text(&source_path),
+                None,
+                InsertOptions {
+                    allow_protected: true,
+                    allow_signed: true,
+                },
+                &nothing,
+            )
+            .unwrap_or_else(|e| panic!("{name}: insert: {e}"));
+        assert_eq!(inserted.changed.pages.len(), 4 + pages, "{name}");
+        pool.save(t, save_options())
+            .unwrap_or_else(|e| panic!("{name}: save after an insert: {e}"));
+        let (_, saved) = pool.open(&text(&target_path), None).unwrap();
+        assert_eq!(saved.len(), 4 + pages, "{name}");
+        let undone = pool.pages_restore(t, inserted.changed.snapshot);
+        assert!(
+            undone.is_ok(),
+            "{name}: undo of the insert: {}",
+            short(undone)
+        );
+        pool.save(t, save_options())
+            .unwrap_or_else(|e| panic!("{name}: save after the undo: {e}"));
+        pool.close(t);
+    }
+}
+
+/// The fuzz target found a damaged, protected file that PDFium reads with one page and writes out so
+/// that it reads back with none. After an insert, an undo and a redo the document of no pages was
+/// put in place, and the save replaced the file with it. Nothing of that may happen now.
+#[test]
+fn a_document_that_reads_back_with_no_pages_never_replaces_the_file() {
+    let dir = Dir::new("nopages");
+    let bytes = kit::page_count_lost_pdf();
+    let path = dir.write("lost.pdf", &bytes);
+    let one = dir.write("one.pdf", &kit::simple_pdf(1));
+    let pool = pool();
+    let password = Some(kit::PAGE_COUNT_LOST_PASSWORD);
+    let Ok((h, pages)) = pool.open(&text(&path), password) else {
+        panic!("the file opens with its password");
+    };
+    assert_eq!(pages.len(), 1);
+    let _ = pool.pages_rotate(h, &[0], 1);
+    let inserted = pool.insert_pdf(
+        h,
+        0,
+        &text(&one),
+        None,
+        InsertOptions {
+            allow_protected: true,
+            allow_signed: true,
+        },
+        &nothing,
+    );
+    if let Ok(done) = inserted {
+        // However it went, taking it back and making it again never gives a document of no pages.
+        if let Ok(undone) = pool.pages_restore(h, done.changed.snapshot) {
+            assert!(!undone.pages.is_empty());
+            if let Ok(redone) = pool.pages_restore(h, undone.snapshot) {
+                assert!(!redone.pages.is_empty());
+            }
+        }
+    }
+    let before = fs::read(&path).unwrap();
+    let saved = pool.save(h, save_options());
+    let after = fs::read(&path).unwrap();
+    if saved.is_ok() || after != before {
+        let check = self::pool();
+        let (_, found) = check
+            .open(&text(&path), password)
+            .unwrap_or_else(|e| panic!("the file written by the save does not open: {e}"));
+        assert!(!found.is_empty(), "the save wrote a document of no pages");
+    }
+}
+
+#[test]
+fn a_document_that_forbids_changes_refuses_every_tool_and_stays_intact() {
+    let dir = Dir::new("forbids");
+    let bytes = kit::encrypted_r3_with_permissions_pdf("pw", 3, 0xFFFF_F0C0);
+    let path = dir.write("locked.pdf", &bytes);
+    let pool = pool();
+    let (h, _) = pool.open(&text(&path), Some("pw")).unwrap();
+    for error in [
+        client_error(pool.pages_delete(h, &[0])),
+        client_error(pool.pages_reorder(h, &[2, 1, 0])),
+        client_error(pool.pages_rotate(h, &[0], 1)),
+        client_error(pool.pages_insert_blank(h, 0, 100.0, 100.0)),
+        client_error(pool.pages_crop(h, &[0], [1.0, 1.0, 1.0, 1.0])),
+    ] {
+        assert_eq!(code_of(error), ErrorCode::PagesNotAllowed);
+    }
+    let copy = dir.0.join("copy.pdf");
+    let error = client_error(pool.extract_pages(
+        h,
+        &[0],
+        &copy,
+        ExtractOptions {
+            allow_signed: true,
+            allow_unprotected: true,
+        },
+        &nothing,
+    ));
+    assert_eq!(code_of(error), ErrorCode::PagesNotAllowed);
+    assert!(!copy.exists());
+    assert!(pool.pages_delete(h, &[0]).is_err());
+}

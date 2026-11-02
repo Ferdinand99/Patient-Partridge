@@ -389,12 +389,26 @@ fn pages_move_to_their_new_places() {
     assert_eq!(sizes.len(), 5);
     assert_ne!(snapshot, 0);
     assert_eq!(order_of(e, doc, 5), vec![4, 2, 0, 3, 1]);
-    // Links to and from a page that moved stop working: they pointed at the page that was there
-    // before, and the copy that took its place is not what they name.
-    assert!(
-        links(e, doc, 0).is_empty(),
-        "the link of the moved last page"
-    );
+    // A move copies nothing, so every link, bookmark and field goes with its page: the page at
+    // place `p` was page `order[p]`, and its link names the page that followed it (the last links
+    // to the first), which is now at the place where `order` holds that number.
+    let order = [4usize, 2, 0, 3, 1];
+    let place_of = |page: usize| order.iter().position(|&p| p == page).unwrap() as u32;
+    for (place, &page) in order.iter().enumerate() {
+        assert_eq!(
+            links(e, doc, place as u32)[0].target,
+            LinkTarget::Page(place_of((page + 1) % 5)),
+            "the link of the page at place {place}"
+        );
+    }
+    let items = outline(e, doc);
+    for (page, item) in items.iter().enumerate() {
+        assert_eq!(
+            item.page,
+            Some(place_of(page)),
+            "the bookmark of page {page}"
+        );
+    }
     // Everything of every page is still in the file, once.
     let saved = save_all(e, doc);
     for page in 0..5 {
@@ -412,12 +426,11 @@ fn pages_move_to_their_new_places() {
 }
 
 #[test]
-fn a_move_touches_only_the_pages_that_have_to_move() {
+fn a_move_changes_the_order_only_and_keeps_links_and_bookmarks() {
     let mut guard = engine();
     let e = &mut guard.0;
     let (doc, _file) = open_doc(e, &kit::marked_pdf(4));
-    // The last page goes to the front; the other three keep their order, and so keep their links
-    // to each other.
+    // The last page goes to the front; the other three keep their order.
     let (_, _, count) = changed(page_op(
         e,
         PagesRequest::Reorder {
@@ -427,16 +440,19 @@ fn a_move_touches_only_the_pages_that_have_to_move() {
     ));
     assert_eq!(count, 1, "one page had to move");
     assert_eq!(order_of(e, doc, 4), vec![3, 0, 1, 2]);
-    // Page 0 (now at place 1) still links to page 1 (now at place 2), page 1 to page 2 (place 3).
+    // Page 0 (now at place 1) still links to page 1 (now at place 2), page 1 to page 2 (place 3),
+    // and the page that moved (the last, now first) keeps its link to the first page (place 1),
+    // which links to it from the end.
     assert_eq!(links(e, doc, 1)[0].target, LinkTarget::Page(2));
     assert_eq!(links(e, doc, 2)[0].target, LinkTarget::Page(3));
-    // The bookmarks of the pages that did not move still lead to them. The one of the page that
-    // moved (the last) leads nowhere: a copy of a page is not what the bookmark pointed at.
+    assert_eq!(links(e, doc, 3)[0].target, LinkTarget::Page(0));
+    assert_eq!(links(e, doc, 0)[0].target, LinkTarget::Page(1));
+    // Every bookmark leads to its page, also that of the page that moved.
     let items = outline(e, doc);
     assert_eq!(items[0].page, Some(1));
     assert_eq!(items[1].page, Some(2));
     assert_eq!(items[2].page, Some(3));
-    assert_eq!(items[3].page, None, "the bookmark of the moved page");
+    assert_eq!(items[3].page, Some(0));
 }
 
 #[test]
@@ -1823,7 +1839,7 @@ fn a_change_that_fails_half_way_leaves_the_document_as_it_was_when_a_copy_was_ke
                 doc,
                 order: vec![4, 3, 2, 1, 0],
             },
-            2,
+            1,
         ),
         (
             "blank page",
@@ -1889,4 +1905,658 @@ fn a_change_that_fails_half_way_without_a_copy_closes_the_document_instead_of_ke
     ] {
         assert_eq!(code_of(ask(e, body)), ErrorCode::UnknownDocument);
     }
+}
+
+// ---- files like real programs write them --------------------------------------------------------
+//
+// A pop-up note and a field shown on two pages both have a `/Parent`, the key that PDFium's page copy
+// leaves alone. A copy of such a page used to point into the document it came from, which was let
+// go of, and the next save read freed memory.
+
+/// Every document that has something PDFium's page copy does not carry over.
+fn copy_trouble() -> Vec<(&'static str, Vec<u8>)> {
+    vec![
+        ("pop-up note", kit::popup_note_pdf()),
+        ("field on two pages", kit::shared_field_pdf()),
+        ("first key", kit::first_key_pdf()),
+    ]
+}
+
+fn page_count(engine: &mut Engine, doc: u32) -> u32 {
+    info(engine, doc).0
+}
+
+#[test]
+fn a_move_of_pages_with_notes_and_shared_fields_saves_goes_back_and_goes_on() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    for (name, bytes) in copy_trouble() {
+        let (doc, _f) = open_doc(e, &bytes);
+        let n = page_count(e, doc);
+        let order: Vec<u32> = (0..n).rev().collect();
+        let (_, snapshot, _) = changed(page_op(
+            e,
+            PagesRequest::Reorder {
+                doc,
+                order: order.clone(),
+            },
+        ));
+        assert_ne!(snapshot, 0, "{name}");
+        let saved = save_all(e, doc);
+        let (again, _f2) = open_doc(e, &saved);
+        assert_eq!(page_count(e, again), n, "{name}: the saved file");
+        // Back, forward, a delete, and a save after each.
+        let (_, redo, _) = changed(page_op(e, PagesRequest::Restore { doc, snapshot }));
+        assert_eq!(page_count(e, doc), n, "{name}");
+        save_all(e, doc);
+        changed(page_op(
+            e,
+            PagesRequest::Restore {
+                doc,
+                snapshot: redo,
+            },
+        ));
+        save_all(e, doc);
+        changed(page_op(
+            e,
+            PagesRequest::Delete {
+                doc,
+                pages: vec![0],
+            },
+        ));
+        let saved = save_all(e, doc);
+        let (again, _f3) = open_doc(e, &saved);
+        assert_eq!(page_count(e, again), n - 1, "{name}: after the delete");
+    }
+}
+
+#[test]
+fn inserting_pages_with_notes_and_shared_fields_saves_goes_back_and_goes_on() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    for (name, bytes) in copy_trouble() {
+        let (target, _f) = open_doc(e, &kit::marked_pdf(4));
+        let (source, _f2) = open_doc(e, &bytes);
+        let n = page_count(e, source);
+        let (copy, _) = export(e, source, (0..n).collect());
+        let (sizes, snapshot, count) = insert_document(e, target, &copy, 2, 4096).unwrap();
+        assert_eq!((sizes.len() as u32, count), (4 + n, n), "{name}");
+        // The save used to stop the engine here.
+        let saved = save_all(e, target);
+        let (again, _f3) = open_doc(e, &saved);
+        assert_eq!(page_count(e, again), 4 + n, "{name}: the saved file");
+        let (_, redo, _) = changed(page_op(
+            e,
+            PagesRequest::Restore {
+                doc: target,
+                snapshot,
+            },
+        ));
+        assert_eq!(page_count(e, target), 4, "{name}");
+        save_all(e, target);
+        changed(page_op(
+            e,
+            PagesRequest::Restore {
+                doc: target,
+                snapshot: redo,
+            },
+        ));
+        assert_eq!(page_count(e, target), 4 + n, "{name}");
+        changed(page_op(
+            e,
+            PagesRequest::Delete {
+                doc: target,
+                pages: vec![0],
+            },
+        ));
+        changed(page_op(
+            e,
+            PagesRequest::InsertBlank {
+                doc: target,
+                at: 0,
+                width: 100.0,
+                height: 100.0,
+            },
+        ));
+        let saved = save_all(e, target);
+        let (again, _f4) = open_doc(e, &saved);
+        assert_eq!(page_count(e, again), 4 + n, "{name}: after more changes");
+    }
+}
+
+#[test]
+fn every_order_of_five_pages_is_reached_and_a_move_keeps_links_and_bookmarks() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let (doc, _f) = open_doc(e, &kit::marked_pdf(5));
+    // All 120 orders, one after the other: the order the pages are in now is read from their text,
+    // and the next one is asked for in terms of it.
+    let mut orders: Vec<Vec<usize>> = Vec::new();
+    fn permute(rest: &mut Vec<usize>, so_far: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
+        if rest.is_empty() {
+            out.push(so_far.clone());
+            return;
+        }
+        for i in 0..rest.len() {
+            let page = rest.remove(i);
+            so_far.push(page);
+            permute(rest, so_far, out);
+            so_far.pop();
+            rest.insert(i, page);
+        }
+    }
+    permute(&mut (0..5).collect(), &mut Vec::new(), &mut orders);
+    assert_eq!(orders.len(), 120);
+    let mut now: Vec<usize> = (0..5).collect();
+    for want in orders {
+        let order: Vec<u32> = want
+            .iter()
+            .map(|page| now.iter().position(|p| p == page).unwrap() as u32)
+            .collect();
+        changed(page_op(e, PagesRequest::Reorder { doc, order }));
+        now = order_of(e, doc, 5);
+        assert_eq!(now, want);
+    }
+    // Whatever the order, every page still has its link, its bookmark, its note and its field.
+    let last = now.clone();
+    let place_of = |page: usize| last.iter().position(|&p| p == page).unwrap() as u32;
+    for (place, &page) in last.iter().enumerate() {
+        assert_eq!(
+            links(e, doc, place as u32)[0].target,
+            LinkTarget::Page(place_of((page + 1) % 5))
+        );
+        assert_eq!(notes_on(e, doc, place as u32), 1);
+        assert_eq!(field_values_on(e, doc, place as u32).len(), 1);
+    }
+    for (page, item) in outline(e, doc).iter().enumerate() {
+        assert_eq!(item.page, Some(place_of(page)));
+    }
+    let saved = save_all(e, doc);
+    for page in 0..5 {
+        assert_has(&saved, page);
+    }
+}
+
+#[test]
+fn a_larger_move_with_runs_of_pages_that_stay_is_exact() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let (doc, _f) = open_doc(e, &kit::marked_pdf(9));
+    // A fixed sequence of mixed orders: runs that stay, pairs that swap, one page far away, a
+    // reverse, then back to the start.
+    let wants: [[usize; 9]; 6] = [
+        [0, 1, 2, 3, 4, 5, 6, 7, 8],
+        [3, 4, 0, 1, 2, 8, 5, 6, 7],
+        [8, 1, 2, 3, 4, 5, 6, 7, 0],
+        [1, 0, 3, 2, 5, 4, 7, 6, 8],
+        [8, 7, 6, 5, 4, 3, 2, 1, 0],
+        [0, 1, 2, 3, 4, 5, 6, 7, 8],
+    ];
+    let mut now: Vec<usize> = (0..9).collect();
+    for want in wants {
+        let order: Vec<u32> = want
+            .iter()
+            .map(|page| now.iter().position(|p| p == page).unwrap() as u32)
+            .collect();
+        let moved_expected = {
+            let stable = partridge_engine::pages::stable_places(&order);
+            stable.iter().filter(|s| !**s).count() as u32
+        };
+        let r = page_op(e, PagesRequest::Reorder { doc, order });
+        if want.iter().enumerate().all(|(i, &p)| now[i] == p) {
+            // Already in that order: nothing is done.
+            assert_eq!(changed(r).1, 0);
+        } else {
+            let (_, _, count) = changed(r);
+            assert_eq!(count, moved_expected);
+        }
+        now = order_of(e, doc, 9);
+        assert_eq!(now, want);
+    }
+}
+
+// ---- a copy that does not read back as what was kept ----------------------------------------------
+
+#[test]
+fn a_copy_that_reads_back_with_other_pages_is_refused_and_the_document_stays() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let (doc, _f) = open_doc(e, &kit::marked_pdf(3));
+    let bytes = save_all(e, doc);
+    // The copy is a good document of three pages, said to have five (as a copy of a damaged file
+    // that PDFium writes and reads back differently would be).
+    let mut tools = PageTools::default();
+    let token = tools.keep_for_tests(bytes, 5);
+    e.set_page_tools_for_tests(doc, tools);
+    let before = fingerprint(e, doc);
+    assert_eq!(
+        page_op(
+            e,
+            PagesRequest::Restore {
+                doc,
+                snapshot: token
+            }
+        )
+        .unwrap_err(),
+        ErrorCode::PageChangeFailed
+    );
+    assert_eq!(page_count(e, doc), 3);
+    assert_eq!(fingerprint(e, doc), before);
+    // The copy that does not read back is not kept, and the state that was not left is not either.
+    assert_eq!(
+        page_op(
+            e,
+            PagesRequest::Restore {
+                doc,
+                snapshot: token
+            }
+        )
+        .unwrap_err(),
+        ErrorCode::SnapshotGone
+    );
+    // The document still takes changes and saves.
+    changed(page_op(
+        e,
+        PagesRequest::Rotate {
+            doc,
+            pages: vec![0],
+            turns: 1,
+        },
+    ));
+    assert!(save_all(e, doc).starts_with(b"%PDF-"));
+}
+
+#[test]
+fn a_document_that_reads_back_with_no_pages_is_never_put_in_place_of_the_open_one() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let doc = open(
+        e,
+        &kit::page_count_lost_pdf(),
+        Some(kit::PAGE_COUNT_LOST_PASSWORD),
+    )
+    .expect("the file opens");
+    assert_eq!(page_count(e, doc), 1);
+    // A copy of the page, put in at the front. The document PDFium writes after that reads back
+    // with no pages, so the insert is refused and the document is as it was.
+    let (copy, _) = export(e, doc, vec![0]);
+    let result = insert_document(e, doc, &copy, 0, 4096);
+    assert_eq!(result.unwrap_err(), ErrorCode::PageChangeFailed);
+    assert_eq!(page_count(e, doc), 1);
+    // Taking steps back and forward never gives a document of fewer pages than it had.
+    let bytes = save_all(e, doc);
+    let again = open(e, &bytes, Some(kit::PAGE_COUNT_LOST_PASSWORD)).unwrap();
+    assert!(page_count(e, again) >= 1);
+    let (_, snapshot, _) = changed(page_op(
+        e,
+        PagesRequest::InsertBlank {
+            doc,
+            at: 1,
+            width: 100.0,
+            height: 100.0,
+        },
+    ));
+    if snapshot != 0 {
+        let r = page_op(e, PagesRequest::Restore { doc, snapshot });
+        if let Ok(PagesResponse::Changed {
+            pages,
+            snapshot: redo,
+            ..
+        }) = r
+        {
+            assert!(!pages.is_empty());
+            if redo != 0 {
+                let again = page_op(
+                    e,
+                    PagesRequest::Restore {
+                        doc,
+                        snapshot: redo,
+                    },
+                );
+                if let Ok(PagesResponse::Changed { pages, .. }) = again {
+                    assert!(!pages.is_empty());
+                }
+            }
+        }
+    }
+    assert!(page_count(e, doc) >= 1);
+}
+
+#[test]
+fn a_document_over_half_the_limit_can_be_taken_back_and_made_again() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let (doc, _f) = open_doc(e, &kit::marked_pdf(4));
+    let size = save_all(e, doc).len();
+    // Room for one and a half copies of the document: the copy of the state that is left must not
+    // push out the copy that is wanted.
+    e.set_page_tools_for_tests(doc, PageTools::with_limits(size * 3 / 2, 32));
+    let (_, token, _) = changed(page_op(
+        e,
+        PagesRequest::Delete {
+            doc,
+            pages: vec![0],
+        },
+    ));
+    assert_ne!(token, 0, "a copy was kept");
+    let (sizes, redo, _) = changed(page_op(
+        e,
+        PagesRequest::Restore {
+            doc,
+            snapshot: token,
+        },
+    ));
+    assert_eq!(sizes.len(), 4, "the delete was taken back");
+    assert_ne!(redo, 0, "and can be made again");
+    let (sizes, undo_again, _) = changed(page_op(
+        e,
+        PagesRequest::Restore {
+            doc,
+            snapshot: redo,
+        },
+    ));
+    assert_eq!(sizes.len(), 3);
+    assert_ne!(undo_again, 0);
+    let (sizes, _, _) = changed(page_op(
+        e,
+        PagesRequest::Restore {
+            doc,
+            snapshot: undo_again,
+        },
+    ));
+    assert_eq!(sizes.len(), 4);
+}
+
+// ---- what a delete leaves ----------------------------------------------------------------------
+
+#[test]
+fn a_deleted_page_takes_the_typed_text_the_look_of_it_and_the_notes_of_its_field_with_it() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let (doc, _f) = open_doc(e, &kit::form_leftovers_pdf());
+    let before = save_all(e, doc);
+    for (what, needle) in kit::form_leftovers_gone()
+        .into_iter()
+        .chain(kit::form_leftovers_kept())
+    {
+        assert!(contains(&before, &needle), "the file holds the {what}");
+    }
+    changed(page_op(
+        e,
+        PagesRequest::Delete {
+            doc,
+            pages: vec![1],
+        },
+    ));
+    let after = save_all(e, doc);
+    for (what, needle) in kit::form_leftovers_gone() {
+        assert!(
+            !contains(&after, &needle),
+            "the file still holds the {what} of the deleted page"
+        );
+    }
+    // What PDFium gives no way to remove stays, and the README says so. If this fails because PDFium
+    // now lets go of the text of a tag, say so in the README and take the line out.
+    for (what, needle) in kit::form_leftovers_kept() {
+        assert!(
+            contains(&after, &needle),
+            "the {what} of the deleted page is no longer in the file: update what the README says stays"
+        );
+    }
+    assert!(contains(&after, &kit::hex_form("KEEP")));
+}
+
+// ---- what a copy of pages takes with it ----------------------------------------------------------
+
+#[test]
+fn the_data_of_a_signature_does_not_travel_with_a_copy_of_its_page() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    for (name, bytes) in [
+        ("signature field", kit::signed_pdf()),
+        ("signature under a group", kit::signed_nested_pdf()),
+    ] {
+        let (doc, _f) = open_doc(e, &bytes);
+        assert!(contains(&save_all(e, doc), "/ByteRange"), "{name}: source");
+        let (copy, _) = export(e, doc, vec![0]);
+        assert!(!contains(&copy, "ByteRange"), "{name}: copied out");
+        assert!(!contains(&copy, "3030303030"), "{name}: copied out");
+        // Inserted into another document and saved, the same.
+        let (target, _f2) = open_doc(e, &kit::simple_pdf(2));
+        insert_document(e, target, &copy, 1, 4096).unwrap();
+        let saved = save_all(e, target);
+        assert!(!contains(&saved, "ByteRange"), "{name}: inserted");
+        // The document that was copied from is not changed.
+        assert!(
+            contains(&save_all(e, doc), "/ByteRange"),
+            "{name}: source after"
+        );
+        // And the copy does not look signed when it is opened: no signature words in the bytes.
+        let (again, _f3) = open_doc(e, &copy);
+        let ResponseBody::DocInfo { maybe_signed, .. } =
+            ask(e, RequestBody::DocInfo { doc: again })
+        else {
+            panic!("no DocInfo");
+        };
+        assert!(!maybe_signed, "{name}");
+    }
+}
+
+#[test]
+fn a_popup_in_a_copy_has_lost_its_note_and_that_is_a_limit_of_the_page_copy_in_pdfium() {
+    // PDFium's page copy leaves the `/Parent` of a copied annotation as it was in the document it
+    // came from. In the copy that number means something else. This pins that, so that a PDFium
+    // that repairs it is noticed and the README can drop the line about it.
+    fn popup_knows_its_note(e: &mut Engine, doc: u32, page: u32) -> bool {
+        e.edit_for_tests(doc, |d| {
+            let handle = partridge_engine::pages::raw_document(d).expect("a handle");
+            let bindings = d.bindings();
+            // SAFETY: the handle is the document's; the page and annotations are closed again.
+            unsafe {
+                let raw_page = bindings.FPDF_LoadPage(handle, page as i32);
+                assert!(!raw_page.is_null());
+                let mut found = false;
+                for i in 0..bindings.FPDFPage_GetAnnotCount(raw_page) {
+                    let annotation = bindings.FPDFPage_GetAnnot(raw_page, i);
+                    if bindings.FPDFAnnot_GetSubtype(annotation) == 16 {
+                        let note = bindings.FPDFAnnot_GetLinkedAnnot(annotation, "Parent");
+                        if !note.is_null() {
+                            found = bindings.FPDFAnnot_GetSubtype(note) == 1;
+                            bindings.FPDFPage_CloseAnnot(note);
+                        }
+                    }
+                    bindings.FPDFPage_CloseAnnot(annotation);
+                }
+                bindings.FPDF_ClosePage(raw_page);
+                found
+            }
+        })
+        .unwrap()
+    }
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let (doc, _f) = open_doc(e, &kit::popup_note_pdf());
+    assert!(popup_knows_its_note(e, doc, 1), "in the document itself");
+    let (copy, _) = export(e, doc, vec![1]);
+    let (again, _f2) = open_doc(e, &copy);
+    assert!(
+        !popup_knows_its_note(e, again, 0),
+        "PDFium repairs the parent of a copied pop-up now: update the README"
+    );
+}
+
+// ---- permissions ---------------------------------------------------------------------------------
+
+/// The permissions of a document that allows nothing but reading (bits 1, 2 clear; 7, 8 and the
+/// high bits set as the standard has them).
+const NOTHING: u32 = 0xFFFF_F0C0;
+const MODIFY: u32 = 1 << 3;
+const EXTRACT: u32 = 1 << 4;
+const ASSEMBLE: u32 = 1 << 10;
+
+/// Which of the tools a document with these permissions lets through: (delete, move, turn, blank
+/// page, begin an insert, crop, set boxes, copy out).
+fn tools_allowed(e: &mut Engine, bytes: &[u8]) -> [bool; 8] {
+    let doc = open(e, bytes, Some("pw")).unwrap();
+    let mut out = [false; 8];
+    let mut check = |slot: usize, r: Result<PagesResponse, ErrorCode>, e_code: ErrorCode| {
+        out[slot] = match r {
+            Ok(_) => true,
+            Err(code) => {
+                assert_eq!(code, e_code, "slot {slot}");
+                false
+            }
+        };
+    };
+    let denied = ErrorCode::PagesNotAllowed;
+    check(
+        0,
+        page_op(
+            e,
+            PagesRequest::Delete {
+                doc,
+                pages: vec![0],
+            },
+        ),
+        denied,
+    );
+    // A page to move needs two pages, after a delete there are two left: ask in terms of them.
+    let now = page_count(e, doc);
+    let order: Vec<u32> = (0..now).rev().collect();
+    check(1, page_op(e, PagesRequest::Reorder { doc, order }), denied);
+    check(
+        2,
+        page_op(
+            e,
+            PagesRequest::Rotate {
+                doc,
+                pages: vec![0],
+                turns: 1,
+            },
+        ),
+        denied,
+    );
+    check(
+        3,
+        page_op(
+            e,
+            PagesRequest::InsertBlank {
+                doc,
+                at: 0,
+                width: 100.0,
+                height: 100.0,
+            },
+        ),
+        denied,
+    );
+    check(
+        4,
+        page_op(e, PagesRequest::ImportBegin { doc, size: 10 }),
+        denied,
+    );
+    check(
+        5,
+        page_op(
+            e,
+            PagesRequest::Crop {
+                doc,
+                pages: vec![0],
+                margins: [10.0, 10.0, 10.0, 10.0],
+            },
+        ),
+        denied,
+    );
+    check(
+        6,
+        page_op(
+            e,
+            PagesRequest::SetBoxes {
+                doc,
+                pages: vec![0],
+                boxes: vec![[10.0, 10.0, 200.0, 200.0]],
+            },
+        ),
+        denied,
+    );
+    check(
+        7,
+        page_op(
+            e,
+            PagesRequest::ExportBegin {
+                doc,
+                pages: vec![0],
+            },
+        ),
+        denied,
+    );
+    ask(e, RequestBody::SaveEnd { doc });
+    out
+}
+
+#[test]
+fn a_protected_document_allows_the_tools_its_permissions_allow_revision_2() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    // Revision 2 has no bit for assembling: modifying the contents covers inserting, deleting,
+    // moving and turning pages.
+    let cases: [(u32, [bool; 8]); 4] = [
+        (NOTHING, [false; 8]),
+        (
+            NOTHING | MODIFY,
+            [true, true, true, true, true, true, true, false],
+        ),
+        (
+            NOTHING | EXTRACT,
+            [false, false, false, false, false, false, false, true],
+        ),
+        (NOTHING | ASSEMBLE, [false; 8]),
+    ];
+    for (p, want) in cases {
+        let bytes = kit::encrypted_with_permissions_pdf("pw", 4, p);
+        assert_eq!(tools_allowed(e, &bytes), want, "permissions {p:#x}");
+    }
+}
+
+#[test]
+fn a_protected_document_allows_the_tools_its_permissions_allow_revision_3() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    // Revision 3 has a bit of its own for assembling; changing the contents is another.
+    let cases: [(u32, [bool; 8]); 5] = [
+        (NOTHING, [false; 8]),
+        (
+            NOTHING | ASSEMBLE,
+            [true, true, true, true, true, false, false, false],
+        ),
+        (
+            NOTHING | MODIFY,
+            [false, false, false, false, false, true, true, false],
+        ),
+        (
+            NOTHING | EXTRACT,
+            [false, false, false, false, false, false, false, true],
+        ),
+        (
+            NOTHING | ASSEMBLE | MODIFY | EXTRACT,
+            [true, true, true, true, true, true, true, true],
+        ),
+    ];
+    for (p, want) in cases {
+        let bytes = kit::encrypted_r3_with_permissions_pdf("pw", 4, p);
+        assert_eq!(tools_allowed(e, &bytes), want, "permissions {p:#x}");
+    }
+}
+
+#[test]
+fn a_document_that_forbids_changes_can_still_be_read_and_a_change_cannot_be_undone_into_it() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let bytes = kit::encrypted_r3_with_permissions_pdf("pw", 3, NOTHING);
+    let doc = open(e, &bytes, Some("pw")).unwrap();
+    assert_eq!(page_count(e, doc), 3);
+    assert_eq!(
+        page_op(e, PagesRequest::Restore { doc, snapshot: 1 }).unwrap_err(),
+        ErrorCode::SnapshotGone
+    );
+    assert!(save_all(e, doc).starts_with(b"%PDF-"));
 }

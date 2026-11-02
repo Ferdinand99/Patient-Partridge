@@ -375,3 +375,173 @@ pub fn broken_page_list_pdf(kid: &str) -> Vec<u8> {
 
 /// The things `broken_page_list_pdf` is tried with.
 pub const BROKEN_KIDS: [&str; 5] = ["4 0 R", "99 0 R", "42", "1 0 R", "(text)"];
+
+// ---- documents like the ones real programs write --------------------------------------------------
+//
+// The documents above are made for the tests of one tool each. These carry what real files carry and
+// the page tools have to live with: notes with their pop-ups, a field shown on several pages, the
+// look of typed text, tags with text of their own.
+
+/// Three Letter pages, the second with a note and its pop-up (as notes are written by the programs
+/// that make them: the pop-up names the note with `/Parent`, the note names the pop-up with
+/// `/Popup`).
+pub fn popup_note_pdf() -> Vec<u8> {
+    let page = |extra: &str| {
+        format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R /Resources << /Font << /F1 9 0 R >> >> {extra} >>").into_bytes()
+    };
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>".to_vec(),
+        page(""),
+        page("/Annots [7 0 R 8 0 R]"),
+        page(""),
+        stream_object("", "BT /F1 12 Tf 72 700 Td (Hello) Tj ET"),
+        b"<< /Type /Annot /Subtype /Text /Rect [100 700 120 720] /Contents (A note) /T (Ann) /Popup 8 0 R /P 4 0 R >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Popup /Rect [120 620 300 720] /Parent 7 0 R /Open false /P 4 0 R >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+    ];
+    assemble(&objects, "")
+}
+
+/// Two pages that show one form field: the field is the parent of two widgets, one on each page.
+pub fn shared_field_pdf() -> Vec<u8> {
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [7 0 R] >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [8 0 R] >>".to_vec(),
+        b"<< /Fields [6 0 R] /DA (/Helv 0 Tf 0 g) >>".to_vec(),
+        b"<< /FT /Tx /T (name) /V (Alice) /Kids [7 0 R 8 0 R] >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Widget /Parent 6 0 R /Rect [72 400 272 424] /F 4 /P 3 0 R >>"
+            .to_vec(),
+        b"<< /Type /Annot /Subtype /Widget /Parent 6 0 R /Rect [72 400 272 424] /F 4 /P 4 0 R >>"
+            .to_vec(),
+    ];
+    assemble(&objects, "")
+}
+
+/// What `form_leftovers_pdf` holds on its second page, that a deleted page must take with it
+/// (`(what, text in the file)`): the page text, the typed value of a field, its default value, its
+/// tooltip and the look of the typed text (a drawing, so in the hexadecimal form of its stream).
+pub fn form_leftovers_gone() -> Vec<(&'static str, String)> {
+    vec![
+        ("page text", hex_form("PAGE-ONE-SECRET")),
+        ("typed value", "VALUE-SECRET".into()),
+        ("default value", "DEFAULT-SECRET".into()),
+        ("tooltip", "TOOLTIP-SECRET".into()),
+        ("look of the typed text", hex_form("AP-VALUE-SECRET")),
+    ]
+}
+
+/// What the same page holds that PDFium gives no way to remove: the alternative text and the actual
+/// text of a tag. These stay in the file when the page is deleted, and the README says so.
+pub fn form_leftovers_kept() -> Vec<(&'static str, String)> {
+    vec![
+        ("alternative text of a tag", "ALT-SECRET".into()),
+        ("actual text of a tag", "ACTUAL-SECRET".into()),
+    ]
+}
+
+/// Two pages. The second has a filled-in text field with the look of its value, a default value and
+/// a tooltip, and a tag (a structure element) with alternative text and actual text.
+pub fn form_leftovers_pdf() -> Vec<u8> {
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R /AcroForm 3 0 R /StructTreeRoot 4 0 R /MarkInfo << /Marked true >> >>".to_vec(),
+        b"<< /Type /Pages /Kids [5 0 R 6 0 R] /Count 2 >>".to_vec(),
+        b"<< /Fields [9 0 R] /DA (/Helv 0 Tf 0 g) /DR << /Font << /Helv 8 0 R >> >> >>".to_vec(),
+        b"<< /Type /StructTreeRoot /K [11 0 R] >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 7 0 R /Resources << /Font << /F1 8 0 R >> >> >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 12 0 R /Resources << /Font << /F1 8 0 R >> >> /Annots [9 0 R] >>".to_vec(),
+        hex_stream("", "BT /F1 12 Tf 72 700 Td (KEEP) Tj ET"),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (f1) /V (VALUE-SECRET) /DV (DEFAULT-SECRET) /TU (TOOLTIP-SECRET) /Rect [72 400 272 424] /F 4 /P 6 0 R /DA (/Helv 12 Tf 0 g) /AP << /N 10 0 R >> >>".to_vec(),
+        hex_stream("/Type /XObject /Subtype /Form /BBox [0 0 200 24] /Resources << /Font << /Helv 8 0 R >> >>", "/Tx BMC BT /Helv 12 Tf 2 6 Td (AP-VALUE-SECRET) Tj ET EMC"),
+        b"<< /Type /StructElem /S /Figure /P 4 0 R /Pg 6 0 R /Alt (ALT-SECRET) /ActualText (ACTUAL-SECRET) /K 0 >>".to_vec(),
+        hex_stream("", "BT /F1 12 Tf 72 700 Td (PAGE-ONE-SECRET) Tj ET"),
+    ];
+    assemble(&objects, "")
+}
+
+/// Three pages where the first and the third are one page object that stands twice in the page tree.
+pub fn repeated_page_pdf() -> Vec<u8> {
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R 4 0 R 3 0 R] /Count 3 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Resources << /Font << /F1 7 0 R >> >> >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R /Resources << /Font << /F1 7 0 R >> >> >>".to_vec(),
+        stream_object("", "BT /F1 12 Tf 72 700 Td (REPEATED) Tj ET"),
+        stream_object("", "BT /F1 12 Tf 72 700 Td (MIDDLE) Tj ET"),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+    ];
+    assemble(&objects, "")
+}
+
+/// One Letter page whose box lies far from the origin, so that the numbers of its boxes are as large
+/// as a file can make them while the page itself is an ordinary size.
+pub fn far_box_pdf() -> Vec<u8> {
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [20000000 20000000 20000612 20000792] >>".to_vec(),
+    ];
+    assemble(&objects, "")
+}
+
+/// Three pages, the last with a `/Contents` that is a dictionary holding a `/First` key. PDFium
+/// copies a page with such an entry without repairing the reference under that key (its page copy
+/// skips `/Parent`, `/Prev` and `/First`), the way it does for a pop-up note's `/Parent`.
+pub fn first_key_pdf() -> Vec<u8> {
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R >>".to_vec(),
+        b"<< /First 7 0 R >>".to_vec(),
+    ];
+    assemble(&objects, "")
+}
+
+/// The password of [`page_count_lost_pdf`].
+pub const PAGE_COUNT_LOST_PASSWORD: &str = "secret";
+
+/// A damaged, password protected document of one page, found by the fuzz target, that PDFium reads
+/// with one page but writes out as a document that reads back with none. Whatever the page tools
+/// do with it, they must never put a document of no pages in place of the one that is open.
+pub fn page_count_lost_pdf() -> Vec<u8> {
+    b"\
+        %PDF-1.4\n%\xe2\xe3\xcf\xd3\n1\x200\x20obj\n<<\x20/Type\x20/Catalog\x20/Pages\x202\x200\x20\
+        R\x20\x20>>\nendobj\n2\x200\x20obj\n<<\x20/Type\x20/\n3\x200\x20obj\n<<\x20/Type\x20/Font\
+        \x20/Subtype\x20/Type1\x20/BaseFont\x20/Helvetica\x20>>\nendobj\n4\x200\x20obj\n<<\x20/Ty\
+        pe\x20/Page\x20/Parent\x202\x200\x20R\x20/MediaBox\x20[0\x200\x20612\x20792]\x20/Resourcd\
+        s\x20<<\x20/Font\x20<<\x20/F1\x203\x200\x20R\x20>>\x20>>\x20\x20>>\nendobj\n5\x200\x20obj\
+        \n<<\x20/Filter\x20/Standard\x20/V\x201\x20/R\x202\x20/P\x20-4\x20/O\x20<030a11\xd3\n1\x20\
+        0\x20obj\n<<\x20/Type\x20/Catalog\x20/Pages\x202\x200\x20R\x20\x20>>\nendobj\n2\x200\x20o\
+        bj\n<<\x20/Type\x20/\n3\x200\x20obj\n<<\x20/Type\x20/Font\x20/Subtype\x20/Type1\x20/BaseF\
+        ont\x20/Helvetica\x20>>\nendobj\n4\x200\x20obj\n<<\x20/Type\x20/Page\x20/Parent\x202\x200\
+        \x20R\x20/MediaBox\x20[0\x200\x20612\x20792]\x20/Resourcds\x20<<\x20/Font\x20<<\x20/F1\x20\
+        3\x200\x20R\x20>>\x20>>\x20\x20>>\nendobj\n5\x200\x20obj\n<<\x20/Filter\x20/Standard\x20/\
+        V\x201\x20/R\x202\x20/P\x20-4\x20/O\x20<030a11181f262d343b424950575e656c737a81888f969da4a\
+        bb2b9c0c7ced5dc>\x20/U\x20<89a909fd5138dd7597952e9fc5b3094947139c79356b9fe1c9b7a0360655bb\
+        c9>\x20>>\nendobj\nxref\n0\x206\n0000000000\x2065535\x20f\x20\n0000000015\x2000000\x20n\x20\
+        \n0000000065\x2000000\x20n\x20\n0000000123\x2000000\x20n\x20\n0000181f262d343b424950575e6\
+        56c737a81888f969da4abb2b9c0c7ced5dc>\x20/U\x20<89a909fd5138dd7597952e9fc5b3094947139c7935\
+        6b9fe1c9b7a0360655bbc9>\x20>>\nendobj\nxref\n0\x206\n0000000000\x2065535\x20f\x20\n000000\
+        0015\x2000000\x20n\x20\n0000000065\x2000000\x20n\x20\n0000000123\x2000000\x20n\x20\n00000\
+        00193\x2000000\x20n\x20\n0000000304\x2000000\x20n\x20\ntrailer\n<<\x20/Size\x206\x20/Root\
+        \x201\x200\x20R\x20/Encrypt\x205\x200\x20R\x20/ID\x20[<7061727472696467652d746573742d31>\x20\
+        <7061727472696467652d746573742d31>]\x20>>\nstartxref\n499\n%%EOF\n"
+        .to_vec()
+}
+
+/// A document protected like [`crate::encrypted_pdf`] (revision 2) with the permissions `p` (the
+/// `/P` entry: bit 4 modify, 5 copy, 11 assemble; bits 1, 2, 7 and 8 stay as the standard has them).
+pub fn encrypted_with_permissions_pdf(user_password: &str, pages: usize, p: u32) -> Vec<u8> {
+    super::encrypted_pdf_with(user_password, pages, p as i32, false)
+}
+
+/// As [`encrypted_with_permissions_pdf`], with the 128 bit RC4 handler of revision 3, which has a
+/// permission bit of its own for assembling the document.
+pub fn encrypted_r3_with_permissions_pdf(user_password: &str, pages: usize, p: u32) -> Vec<u8> {
+    super::encrypted_pdf_with(user_password, pages, p as i32, true)
+}
