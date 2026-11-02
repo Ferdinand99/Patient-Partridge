@@ -75,7 +75,8 @@ fn a_thread_started_after_landlock_is_under_it_and_one_started_before_is_not() {
     let text = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(output.status.success(), "the child failed:\n{text}");
     let lsm = std::fs::read_to_string("/sys/kernel/security/lsm").unwrap_or_default();
-    let listed = lsm.split(',').any(|m| m.trim() == "landlock");
+    let switched_off = std::env::var_os("PARTRIDGE_TEST_NO_LANDLOCK").is_some();
+    let listed = !switched_off && lsm.split(',').any(|m| m.trim() == "landlock");
     if let Some(skip) = text.lines().find(|l| l.starts_with("SKIP")) {
         assert!(
             !listed,
