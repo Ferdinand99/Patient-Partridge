@@ -23,6 +23,7 @@ import type { PageSizePt } from "../viewer/layout";
 import { zoomLabel, type ZoomMode } from "../viewer/zoom";
 import { FindBar } from "./find";
 import type { PageToolsApi } from "../lib/pagesapi";
+import { describePageError } from "../lib/pageerrors";
 import { PageOps, type PageHost } from "./pageops";
 import { PagePanel, type PagePanelHost } from "./pagepanel";
 import { EditHistory, type Edit } from "./history";
@@ -1209,6 +1210,9 @@ export class App {
     this.quitting = true;
     this.quitReveal = () => this.focusTopNotice();
     try {
+      // A page tool that is still working makes a document dirty when it is done: its change must
+      // not be missed because the answer had not come yet.
+      if (this.pageOps?.busy) await this.pageOps.whenIdle();
       const dirty = this.tabs.filter((t) => t.history.dirty);
       if (dirty.length === 0) {
         await this.deps.api.quitApp();
@@ -1264,10 +1268,19 @@ export class App {
     if (!tab || tab.saving || this.pageOps?.busy) return;
     try {
       await (direction === "undo" ? tab.history.undo() : tab.history.redo());
-    } catch {
+    } catch (e) {
+      const error = toAppError(e);
+      // The engine of the document was lost: the tab is closed and the user has been told so (by
+      // the page tools, with what that means for the changes that were not saved). Saying that
+      // nothing was lost would be false.
+      if (isEngineLost(error)) return;
+      const text = describePageError(error, tab.name);
+      const known = ["snapshot_gone", "undo_unavailable", "busy", "save_busy", "pages_not_allowed"].includes(error.code);
       await showNotice(this.noticeLayer, {
-        title: direction === "undo" ? "The change could not be taken back" : "The change could not be made again",
-        detail: "The document is as it was before. Nothing was lost.",
+        title: known ? text.title : direction === "undo" ? "The change could not be taken back" : "The change could not be made again",
+        detail: known
+          ? text.detail
+          : `${error.message ? `${error.message.charAt(0).toUpperCase()}${error.message.slice(1)}. ` : ""}The document is as it was before.`,
         buttons: [{ id: "ok", label: "OK", primary: true }],
       });
     }
@@ -1588,6 +1601,8 @@ export class App {
 
   /** Asks which pages, prepares them, and opens the print dialog of the system. */
   async printActive(): Promise<void> {
+    // A page tool that is still working would have the print run on the old list of pages.
+    if (this.pageOps?.busy) await this.pageOps.whenIdle();
     const tab = this.active;
     if (!tab || this.printing || tab.view.pageCount === 0) return;
     this.printing = true;

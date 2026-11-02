@@ -376,7 +376,10 @@ export class PagePanel {
     // The list is made again when the pages change, and a thumbnail that had the focus is gone with
     // it: the focus goes back to the page the keyboard is on, so that the next key press works.
     const hadFocus = this.listRoot?.contains(this.root.activeElement) ?? false;
+    const doc = this.doc;
     const result = await work;
+    // The user went to another document while the tool worked: what it picked is in the other one.
+    if (this.doc !== doc) return;
     if (result) {
       this.pick(result.select);
       const first = result.select[0];
@@ -458,6 +461,6 @@ export class PagePanel {
       render: (w, h) => this.host.render(t.doc, first, w, h),
     });
     if (!answer) return;
-    await this.apply(this.ops.crop(answer.pages, answer.margins));
+    await this.apply(this.ops.crop(answer.pages, answer.margins, t.doc));
   }
 }

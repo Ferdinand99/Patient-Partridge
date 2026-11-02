@@ -274,15 +274,13 @@ export function dragBox(
  */
 export const TOOL_NOTES = {
   crop:
-    "Cropping hides the edges of a page. It does not remove anything: the text, pictures and everything else outside the box are still in the file, and a program that ignores the crop box shows them. To remove content for good, delete the page.",
+    "Cropping hides the edges of a page. It does not remove anything: the text, pictures and everything else outside the box are still in the file, and a program that ignores the crop box shows them. Deleting a page takes its content out of the file, but a delete is not a way to redact a document either (see what a delete leaves).",
   delete:
-    "Deleting a page removes it from the file, with its text, pictures, fonts and notes, unless something that stays refers to them. Bookmarks that led to it stay in the list and lead nowhere.",
+    "Deleting a page removes it from the file, with its text, pictures, fonts and notes, unless something that stays refers to them. Bookmarks that led to it stay in the list and lead nowhere. A few things stay: the names of form fields that were on it, and, in a tagged document, the alternative text and the actual text of the tags. A delete is not a way to redact a document.",
   deleteForms:
-    "PDFium keeps the list of the form's fields, so form fields that were on a deleted page stay in the file. The text typed into text fields was cleared; other kinds of fields (check boxes, choices) and fields grouped under a parent field may keep what they hold.",
-  move:
-    "Moving a page puts a copy of it in its new place. Links to and from a moved page and its bookmark stop working, and a form field on it is no longer part of the form's field tree. The pages that did not have to move are not touched.",
+    "The form's list of fields still holds the fields that were on the deleted pages, so their names stay in the file. The text typed into text fields, their default values, tooltips and the picture of the typed text were cleared. Other kinds of fields (check boxes, choices) and fields grouped under a parent field may keep what they hold.",
   insert:
-    "Pages from another file are copied with what they show, their notes and their links to pages that come before them in that file. Bookmarks, links to later pages, the structure of tagged documents, form fields (they stay on the page as they look, but cannot be filled in) and signatures do not come with them.",
+    "Pages from another file are copied with what they show, their notes and their links to pages that come before them in that file. Bookmarks, links to later pages, the structure of tagged documents, form fields (they stay on the page as they look, but cannot be filled in) and signatures do not come with them. A pop-up of a note, and a form field shown on several pages, also lose the link to the note or the field they belong to.",
   extract:
     "The new file holds the pages you picked, with what they show and their notes. Bookmarks, links to pages that are not in it, form fields (they stay as they look, but cannot be filled in) and signatures are not carried over, and the new file has no password.",
   protectedSource:
@@ -295,4 +293,8 @@ export const TOOL_NOTES = {
     "is signed. The new file will not have the signature, and a signature cannot be kept when pages are copied.",
   undoGone:
     "This change is too old to take back, or the document is too big for the app to keep a copy of it.",
+  stopTooLate:
+    "This step cannot be stopped any more. It is nearly done.",
+  working:
+    "A change to the pages cannot be stopped half way, so there is no Stop button. Wait until it is done.",
 } as const;

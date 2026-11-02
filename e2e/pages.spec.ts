@@ -22,6 +22,7 @@ type Stand = {
     lastDoc: number;
     failNext: { cmd: string; error: { code: string; message: string } } | null;
     delay: number;
+    working: boolean;
     labels(doc: number): number[];
     sizes(doc: number): number[][];
   };
@@ -91,6 +92,13 @@ async function shownLabels(page: Page, count: number): Promise<number[]> {
 const tool = (page: Page, id: string) => page.locator(`#${id}`);
 const notice = (page: Page) => page.locator(".sheet").last();
 const dirty = (page: Page) => page.locator(".tab-dirty");
+
+/** The first delete and the first insert in a document each say what they leave out: answer that. */
+async function answerNote(page: Page, about: RegExp) {
+  await expect(notice(page)).toContainText(about);
+  await notice(page).getByRole("button", { name: "OK" }).click();
+  await expect(page.locator(".sheet")).toHaveCount(0);
+}
 
 /** Scrolls the list so that the thumbnail exists (only the ones near the visible part do). */
 async function reveal(page: Page, index: number) {
@@ -164,6 +172,7 @@ test("Delete removes the picked pages, the tab and the title show the change, an
   await press(page, 5, ["Control"]);
   await page.keyboard.press("Delete");
   await expect(page.locator("#page-total")).toHaveText("/ 8");
+  await answerNote(page, /What a delete leaves/);
   expect(await labels(page, doc)).toEqual([0, 1, 2, 4, 6, 7, 8, 9]);
   expect(await calls(page, "pages_delete")).toEqual([{ doc, pages: [3, 5] }]);
   await expect(dirty(page)).toBeVisible();
@@ -377,6 +386,7 @@ test.describe("pages from other files", () => {
     await page.evaluate(() => ((window as unknown as { __E2E__: Stand }).__E2E__.dialog = ["/docs/second.pdf", "/docs/third.pdf"]));
     await tool(page, "pt-insert").click();
     await expect.poll(async () => (await labels(page, doc)).length).toBe(15);
+    await answerNote(page, /What comes with added pages/);
     expect(await labels(page, doc)).toEqual([0, 1, 2, 3, 4, 10, 11, 12, 13, 14, 5, 6, 7, 8, 9]);
     expect(await inserts(page)).toEqual([
       { path: "/docs/second.pdf", at: 5, password: null },
@@ -445,9 +455,47 @@ test.describe("pages from other files", () => {
     await page.evaluate(() => ((window as unknown as { __E2E__: Stand }).__E2E__.dialog = ["/docs/bad.pdf"]));
     await tool(page, "pt-insert").click();
     await expect(notice(page)).toContainText("could not be added");
+    // The fault is the other file's, and it is named: the document is not called damaged.
+    await expect(notice(page)).toContainText('"bad.pdf" could not be used');
+    await expect(notice(page)).toContainText('"ten.pdf" was not changed');
+    await expect(notice(page)).not.toContainText("damaged");
     await notice(page).getByRole("button", { name: "OK" }).click();
     expect((await labels(page, doc)).length).toBe(10);
     await expect(dirty(page)).toHaveCount(0);
+  });
+
+  test("a bad second file leaves the document open with the changes it has not saved", async ({ page }) => {
+    const doc = await openDoc(page, "/docs/ten.pdf");
+    await press(page, 2);
+    await page.keyboard.press("Delete");
+    await expect.poll(async () => (await labels(page, doc)).length).toBe(9);
+    await answerNote(page, /What a delete leaves/);
+    await expect(dirty(page)).toBeVisible();
+    await page.evaluate(() => ((window as unknown as { __E2E__: Stand }).__E2E__.dialog = ["/docs/bad.pdf"]));
+    await tool(page, "pt-insert").click();
+    await expect(notice(page)).toContainText('"bad.pdf" could not be used');
+    await notice(page).getByRole("button", { name: "OK" }).click();
+    // The tab is still there, with its pages and its unsaved change.
+    await expect(page.locator(".tab-title")).toHaveCount(1);
+    expect((await labels(page, doc)).length).toBe(9);
+    await expect(dirty(page)).toBeVisible();
+  });
+
+  test("a change in the middle has no Stop button, Escape does not end it, and nothing is lost", async ({ page }) => {
+    const doc = await openDoc(page, "/docs/ten.pdf");
+    await press(page, 4);
+    await page.evaluate(() => ((window as unknown as { __E2E__: Stand }).__E2E__.pages.delay = 1500));
+    await page.keyboard.press("Delete");
+    const box = page.locator(".busy-box");
+    await expect(box).toBeVisible();
+    await expect(box).toContainText("cannot be stopped half way");
+    await expect(box.getByRole("button")).toHaveCount(0);
+    await page.keyboard.press("Escape");
+    await expect(box).toBeVisible();
+    await expect.poll(async () => (await labels(page, doc)).length, { timeout: 8000 }).toBe(9);
+    expect(await cancels(page)).toBe(0);
+    await expect(page.locator(".tab-title")).toHaveCount(1);
+    await expect(dirty(page)).toBeVisible();
   });
 
   test("a slow file shows progress and a Stop button that really stops, and the document is as it was", async ({
@@ -528,6 +576,7 @@ test.describe("saving", () => {
     await press(page, 1);
     await page.keyboard.press("Delete");
     await expect.poll(async () => (await labels(page, doc)).length).toBe(9);
+    await answerNote(page, /What a delete leaves/);
     await press(page, 0);
     await page.keyboard.press("Alt+ArrowDown");
     await expect.poll(async () => (await labels(page, doc))[1]).toBe(0);
@@ -606,6 +655,7 @@ test.describe("when it goes wrong", () => {
     });
     await page.keyboard.press("Delete");
     await expect.poll(async () => (await labels(page, doc)).length).toBe(9);
+    await answerNote(page, /What a delete leaves/);
     // The engine let go of the copy (the stand-in forgets it).
     await page.evaluate((d) => {
       (window as unknown as { __E2E__: Stand }).__E2E__.pages.failNext = {
@@ -615,7 +665,9 @@ test.describe("when it goes wrong", () => {
       void d;
     }, doc);
     await page.keyboard.press("Control+z");
-    await expect(notice(page)).toContainText("could not be taken back");
+    // The words for what happened (the engine let go of the copy), and nothing about being safe.
+    await expect(notice(page)).toContainText("cannot be taken back any more");
+    await expect(notice(page)).not.toContainText("Nothing was lost");
     await notice(page).getByRole("button", { name: "OK" }).click();
     // Still changed, and still dirty.
     expect((await labels(page, doc)).length).toBe(9);

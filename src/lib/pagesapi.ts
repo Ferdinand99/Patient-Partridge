@@ -32,8 +32,12 @@ export interface PagesInserted {
   inserted: number;
 }
 
-/** What stopping the work did: nothing was going on, the transfer was stopped, or the engine was stopped. */
-export type CancelResult = "idle" | "handover" | "stopped";
+/**
+ * What stopping the work did: nothing was going on, the transfer of pages was stopped (the document
+ * is as it was), or the engine is in the middle of a change, which cannot be stopped without losing
+ * the changes that are not saved, so nothing was done and the change finishes.
+ */
+export type CancelResult = "idle" | "handover" | "working";
 
 /** Told how many bytes of a document have gone from one engine to the other. */
 export type PageProgress = (done: number, total: number) => void;

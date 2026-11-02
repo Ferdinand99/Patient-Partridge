@@ -107,6 +107,8 @@ export class DocumentView {
   private mode: ZoomMode = { kind: "fit-width" };
   private frame = 0;
   private lastPage = -1;
+  /** Counts the times the list of pages was replaced. */
+  private generation = 0;
   private wheelAccumulator = 0;
   private painted = false;
   private destroyed = false;
@@ -181,6 +183,9 @@ export class DocumentView {
    */
   replacePages(pages: PageSizePt[], show?: number): void {
     if (this.destroyed) return;
+    // A picture that is on its way for the old page of a number must not be taken for the new page
+    // of that number, which may have the same size: the generation is part of what a render is for.
+    this.generation += 1;
     const had = this.started && this.pageCount > 0 ? Math.max(0, this.lastPage) : 0;
     this.scheduler.setWanted([]);
     for (const index of [...this.mounted.keys()]) this.unmount(index);
@@ -530,7 +535,7 @@ export class DocumentView {
       for (let index = range.first; index <= range.last; index++) {
         const m = this.mounted.get(index) ?? this.mount(index);
         const size = bitmapSize(this.info.pages[index], this.zoom, dpr);
-        const key = `${index}:${size.width}x${size.height}`;
+        const key = `${this.generation}:${index}:${size.width}x${size.height}`;
         m.wantKey = key;
         if (m.drawnKey === key || m.failedKey === key) continue;
         const pageCenter = this.layout.tops[index] + this.layout.heights[index] / 2;

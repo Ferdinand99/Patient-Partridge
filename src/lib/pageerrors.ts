@@ -3,14 +3,54 @@
 
 import { describeError, type AppErrorLike } from "./errors";
 
+function capital(text: string): string {
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
 export interface PageErrorText {
   title: string;
   detail: string;
 }
 
-/** Words for an error of a page tool. `name` is the document, as a person knows it. */
-export function describePageError(error: AppErrorLike, name: string): PageErrorText {
+/**
+ * Words for an error of a page tool. `name` is the document, as a person knows it. `source` is the
+ * other file, when pages were being added from one: what went wrong with that file is told about
+ * that file, and the document is said to be as it was.
+ */
+export function describePageError(error: AppErrorLike, name: string, source?: string): PageErrorText {
+  if (source !== undefined) {
+    switch (error.code) {
+      case "insert_source_failed":
+      case "import_failed":
+      case "corrupt":
+      case "io":
+      case "unsupported":
+      case "too_many_pages":
+        return {
+          title: "The pages could not be added",
+          detail: `"${source}" could not be used${error.message ? ` (${error.message})` : ""}. "${name}" was not changed.`,
+        };
+      default:
+        break;
+    }
+  }
   switch (error.code) {
+    case "insert_source_failed":
+      return {
+        title: "The pages could not be added",
+        detail: `The other file could not be used${error.message ? ` (${error.message})` : ""}. "${name}" was not changed.`,
+      };
+    case "pages_not_allowed":
+      return {
+        title: "This document does not allow that",
+        detail: `${error.message ? `${capital(error.message)}.` : "The permissions of the document do not allow this change."} "${name}" was not changed.`,
+      };
+    case "source_changed":
+    case "source_unreadable":
+      return {
+        title: "The file changed while it was open",
+        detail: `"${name}" was changed by something else after it was opened, or a part of it could not be read, so the page tools cannot be used on it safely. Nothing was changed. Close it and open it again.`,
+      };
     case "too_many_pages":
       return {
         title: "Too many pages for this tool",

@@ -71,6 +71,13 @@ pub struct InsertedInfo {
 /// How far the pages of an insert or a copy have come, in bytes: `[done, total]`.
 type Progress = Channel<[u64; 2]>;
 
+/// A change that was made counts as an unsaved change at once, in the app process, before the answer
+/// is on its way to the window: an update that waits for the commands in flight and then looks at
+/// the documents with unsaved changes must not miss the one that has just been made.
+fn unsaved(update_state: &UpdateState, doc: u64) {
+    update_state.unsaved().set(doc, true);
+}
+
 /// Page changes are not made while an update is being installed: it would end the engine in the
 /// middle of the change.
 fn permit(update_state: &UpdateState) -> Result<updates::OpenPermit, CommandError> {
@@ -89,9 +96,9 @@ pub async fn pages_delete(
 ) -> Result<ChangedInfo, CommandError> {
     let _permit = permit(&update_state)?;
     let pool = engine.0.clone();
-    blocking(move || pool.pages_delete(doc, &pages))
-        .await
-        .map(Into::into)
+    let changed = blocking(move || pool.pages_delete(doc, &pages)).await?;
+    unsaved(&update_state, doc);
+    Ok(changed.into())
 }
 
 #[tauri::command]
@@ -103,9 +110,9 @@ pub async fn pages_reorder(
 ) -> Result<ChangedInfo, CommandError> {
     let _permit = permit(&update_state)?;
     let pool = engine.0.clone();
-    blocking(move || pool.pages_reorder(doc, &order))
-        .await
-        .map(Into::into)
+    let changed = blocking(move || pool.pages_reorder(doc, &order)).await?;
+    unsaved(&update_state, doc);
+    Ok(changed.into())
 }
 
 #[tauri::command]
@@ -118,9 +125,9 @@ pub async fn pages_rotate(
 ) -> Result<ChangedInfo, CommandError> {
     let _permit = permit(&update_state)?;
     let pool = engine.0.clone();
-    blocking(move || pool.pages_rotate(doc, &pages, turns))
-        .await
-        .map(Into::into)
+    let changed = blocking(move || pool.pages_rotate(doc, &pages, turns)).await?;
+    unsaved(&update_state, doc);
+    Ok(changed.into())
 }
 
 /// `margins` are `[left, top, right, bottom]` in points on the page as it is drawn.
@@ -134,9 +141,9 @@ pub async fn pages_crop(
 ) -> Result<CroppedInfo, CommandError> {
     let _permit = permit(&update_state)?;
     let pool = engine.0.clone();
-    blocking(move || pool.pages_crop(doc, &pages, margins))
-        .await
-        .map(Into::into)
+    let cropped = blocking(move || pool.pages_crop(doc, &pages, margins)).await?;
+    unsaved(&update_state, doc);
+    Ok(cropped.into())
 }
 
 #[tauri::command]
@@ -165,9 +172,9 @@ pub async fn pages_insert_blank(
 ) -> Result<ChangedInfo, CommandError> {
     let _permit = permit(&update_state)?;
     let pool = engine.0.clone();
-    blocking(move || pool.pages_insert_blank(doc, at, width, height))
-        .await
-        .map(Into::into)
+    let changed = blocking(move || pool.pages_insert_blank(doc, at, width, height)).await?;
+    unsaved(&update_state, doc);
+    Ok(changed.into())
 }
 
 #[tauri::command]
@@ -220,6 +227,7 @@ pub async fn pages_insert_pdf(
         )
     })
     .await?;
+    unsaved(&update_state, doc);
     Ok(InsertedInfo {
         changed: outcome.changed.into(),
         inserted: outcome.inserted,
@@ -276,14 +284,97 @@ pub async fn pages_extract(
 
 /// Stops the work a page tool is doing on a document. Answers what that did: `"idle"` (nothing was
 /// under way), `"handover"` (the pages being brought in or copied out were stopped, the document is
-/// as it was) or `"stopped"` (the engine was in the middle of a change, which cannot be
-/// interrupted, so the engine was stopped and the document is gone with its unsaved changes; the
-/// file on the disk is untouched).
+/// as it was) or `"working"` (the engine is in the middle of a change, which cannot be interrupted
+/// without losing the unsaved changes of the document: nothing was stopped, and the change
+/// finishes).
 #[tauri::command]
 pub fn pages_cancel(engine: State<'_, Engine>, doc: u64) -> &'static str {
-    match engine.0.cancel_pages(doc) {
+    cancel_word(engine.0.cancel_pages(doc))
+}
+
+/// The word the window knows for what a stop did.
+fn cancel_word(done: Cancelled) -> &'static str {
+    match done {
         Cancelled::Idle => "idle",
         Cancelled::Handover => "handover",
-        Cancelled::EngineStopped => "stopped",
+        Cancelled::Working => "working",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::updates::InstallMethod;
+    use partridge_protocol::PageSize;
+
+    #[test]
+    fn a_page_change_is_refused_while_an_update_is_being_installed_and_allowed_otherwise() {
+        let state = UpdateState::new(None, InstallMethod::Automatic);
+        // Every page command takes a permit first, like opening a document.
+        let permit_now = permit(&state);
+        assert!(permit_now.is_ok());
+        drop(permit_now);
+        state.gate().close();
+        match permit(&state) {
+            Err(e) => assert_eq!(e.code, "updating"),
+            Ok(_) => panic!("a page change was allowed while an update was installing"),
+        }
+        state.gate().reopen();
+        assert!(permit(&state).is_ok());
+    }
+
+    #[test]
+    fn a_change_that_was_made_counts_as_unsaved_before_the_window_has_the_answer() {
+        let state = UpdateState::new(None, InstallMethod::Automatic);
+        assert!(!state.unsaved().any());
+        unsaved(&state, 7);
+        // An update that waits for the commands in flight and then asks must find it.
+        assert!(state.unsaved().any());
+        state.unsaved().set(7, false);
+        assert!(!state.unsaved().any());
+        // Another document is not touched by it.
+        unsaved(&state, 3);
+        state.forget_doc(3);
+        assert!(!state.unsaved().any());
+    }
+
+    #[test]
+    fn what_a_stop_did_is_told_in_the_words_the_window_knows() {
+        assert_eq!(cancel_word(Cancelled::Idle), "idle");
+        assert_eq!(cancel_word(Cancelled::Handover), "handover");
+        // A change under way is not ended: the window is told it is too late, nothing more.
+        assert_eq!(cancel_word(Cancelled::Working), "working");
+    }
+
+    #[test]
+    fn the_sizes_of_a_change_reach_the_window_as_width_and_height_in_points() {
+        let info = ChangedInfo::from(PagesChanged {
+            pages: vec![
+                PageSize {
+                    width: 612.0,
+                    height: 792.0,
+                },
+                PageSize {
+                    width: 300.5,
+                    height: 400.0,
+                },
+            ],
+            snapshot: 4,
+            count: 2,
+            form_fields: 1,
+        });
+        assert_eq!(info.pages, vec![[612.0, 792.0], [300.5, 400.0]]);
+        assert_eq!((info.snapshot, info.count, info.form_fields), (4, 2, 1));
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["formFields"], 1);
+        let crop = CroppedInfo::from(PagesCropped {
+            pages: vec![PageSize {
+                width: 100.0,
+                height: 200.0,
+            }],
+            before: vec![[0.0, 0.0, 100.0, 200.0]],
+            after: vec![[1.0, 2.0, 99.0, 198.0]],
+        });
+        assert_eq!(crop.after, vec![[1.0, 2.0, 99.0, 198.0]]);
     }
 }

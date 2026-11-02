@@ -49,6 +49,8 @@
     failNext: null,
     // How long the commands take, in milliseconds.
     delay: 0,
+    // True while a command of the page tools is in the middle of its work (a stop is too late).
+    working: false,
     labels: (doc) => models.get(doc)?.pages.map((p) => p.id) ?? [],
     sizes: (doc) => models.get(doc)?.pages.map((p) => [p.w, p.h]) ?? [],
     snapshots: (doc) => models.get(doc)?.snaps.size ?? 0,
@@ -134,7 +136,8 @@
 
   async function insertFrom(m, args) {
     const source = SOURCES[args.path];
-    if (!source || source.broken) throw { code: "import_failed", message: "the file could not be used" };
+    // What the engine answers for a file it cannot use: it is the other file that has the fault.
+    if (!source || source.broken) throw { code: "insert_source_failed", message: "the file could not be used" };
     if (source.password) {
       if (!args.password) throw { code: "password_required", message: "locked" };
       if (args.password !== source.password) throw { code: "password_incorrect", message: "wrong" };
@@ -172,7 +175,14 @@
       pg.failNext = null;
       throw error;
     }
-    if (pg.delay && cmd !== "pages_insert_pdf") await delay(pg.delay);
+    if (pg.delay && cmd !== "pages_insert_pdf") {
+      pg.working = cmd.startsWith("pages_");
+      try {
+        await delay(pg.delay);
+      } finally {
+        pg.working = false;
+      }
+    }
     switch (cmd) {
       case "render_page": {
         const m = model(args.doc);
@@ -308,6 +318,8 @@
       }
       case "pages_cancel":
         pg.cancels += 1;
+        // A change that is under way is not stopped; the transfer of a file is.
+        if (pg.working) return "working";
         pg.cancelled = true;
         return "handover";
       default:

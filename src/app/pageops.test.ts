@@ -50,7 +50,7 @@ function setup(over: { target?: Partial<PageTarget> | null; picked?: string[]; b
   layer.hidden = true;
   document.body.append(layer);
   const history = new EditHistory();
-  const target: PageTarget | null =
+  let target: PageTarget | null =
     over.target === null ? null : { doc: 5, name: "book.pdf", history, pages: sizes(10), ...over.target };
   const answers: NoticeResult[] = [];
   const notices: NoticeOptions[] = [];
@@ -77,7 +77,11 @@ function setup(over: { target?: Partial<PageTarget> | null; picked?: string[]; b
     busyChanged: (b) => busy.push(b),
     busyDelayMs: over.busyDelayMs ?? 400,
   });
-  return { api, ops, history, layer, answers, notices, applied, announced, lost, busy };
+  /** The document in front is another one from now on (or none). */
+  const swap = (next: PageTarget | null) => {
+    target = next;
+  };
+  return { api, ops, history, layer, answers, notices, applied, announced, lost, busy, swap, host };
 }
 
 beforeEach(() => {
@@ -127,7 +131,23 @@ describe("deleting pages", () => {
     t.api.pagesDelete.mockResolvedValueOnce(changed(8, 7, 2, 3));
     await t.ops.remove([1, 2]);
     await vi.waitFor(() => expect(t.notices.some((n) => n.title.includes("Form fields"))).toBe(true));
-    expect(t.notices.find((n) => n.title.includes("Form fields"))?.detail).toMatch(/names? .*stay|stay in the file/i);
+    const note = t.notices.find((n) => n.title.includes("Form fields"))?.detail ?? "";
+    expect(note).toMatch(/names? .*stay|stay in the file/i);
+    // The words say what is true: not "for good", and what stays is named.
+    expect(note).not.toMatch(/for good/i);
+    expect(note).toMatch(/default values, tooltips/);
+  });
+
+  it("says once, the first time a page is deleted from a document, what a delete leaves in the file", async () => {
+    const t = setup();
+    await t.ops.remove([1]);
+    await vi.waitFor(() => expect(t.notices.length).toBe(1));
+    expect(t.notices[0].title).toMatch(/What a delete leaves/);
+    expect(t.notices[0].detail).toMatch(/alternative text/);
+    expect(t.notices[0].detail).toMatch(/not a way to redact/);
+    await t.ops.remove([0]);
+    await Promise.resolve();
+    expect(t.notices.length).toBe(1);
   });
 
   it("says when a change cannot be taken back, and the undo then fails the way it says", async () => {
@@ -254,6 +274,69 @@ describe("pages from other files", () => {
     expect((t.api.pagesInsertPdf.mock.calls[1][3] as { allowSigned?: boolean }).allowSigned).toBe(true);
   });
 
+  it("says once, after the first pages are added to a document, what does not come with them", async () => {
+    const t = setup();
+    await t.ops.insertFiles(0);
+    await vi.waitFor(() => expect(t.notices.length).toBe(1));
+    expect(t.notices[0].title).toMatch(/What comes with added pages/);
+    expect(t.notices[0].detail).toMatch(/Bookmarks/);
+    await t.ops.insertFiles(0);
+    await Promise.resolve();
+    expect(t.notices.length).toBe(1);
+  });
+
+  it("does nothing when the document in front is another one after the dialog of the system", async () => {
+    const t = setup();
+    const other: PageTarget = { doc: 9, name: "other.pdf", history: new EditHistory(), pages: sizes(4) };
+    const picking = t.ops.insertFiles(0, undefined);
+    t.swap(other);
+    expect(await picking).toBeNull();
+    expect(t.api.pagesInsertPdf).not.toHaveBeenCalled();
+  });
+
+  it("names the other file when it cannot be used, and says the document was not changed", async () => {
+    const t = setup({ picked: ["/in/scan.pdf"] });
+    t.api.pagesInsertPdf.mockRejectedValueOnce({ code: "insert_source_failed", message: "the PDF engine stopped: it exited" });
+    expect(await t.ops.insertFiles(0)).toBeNull();
+    // The document is not lost: nothing asked the host to close it.
+    expect(t.lost).toEqual([]);
+    const note = t.notices.at(-1);
+    expect(note?.title).toMatch(/could not be added/);
+    expect(note?.detail).toMatch(/"scan.pdf" could not be used/);
+    expect(note?.detail).toMatch(/"book.pdf" was not changed/);
+    expect(note?.detail ?? "").not.toMatch(/damaged/);
+  });
+
+  it("a file that the engine calls damaged is told as a fault of that file, not of the document", async () => {
+    const t = setup({ picked: ["/in/scan.pdf"] });
+    t.api.pagesInsertPdf.mockRejectedValueOnce({ code: "corrupt", message: "" });
+    await t.ops.insertFiles(0);
+    expect(t.notices.at(-1)?.detail).toMatch(/"scan.pdf" could not be used/);
+    expect(t.notices.at(-1)?.detail).toMatch(/"book.pdf" was not changed/);
+  });
+
+  it("when the second of two files fails, the pages of the first are said to stay", async () => {
+    const t = setup({ picked: ["/in/a.pdf", "/in/b.pdf"] });
+    t.api.pagesInsertPdf
+      .mockResolvedValueOnce({ changed: changed(12, 11, 2), inserted: 2 })
+      .mockRejectedValueOnce({ code: "insert_source_failed", message: "it took too long" });
+    await t.ops.insertFiles(0);
+    const note = t.notices.at(-1);
+    expect(note?.detail).toMatch(/"b.pdf" could not be used/);
+    expect(note?.detail).toMatch(/2 pages from the files before it were added and stay/);
+    expect(note?.detail ?? "").not.toMatch(/was not changed/);
+  });
+
+  it("a stop on the second file says the pages of the first stay", async () => {
+    const t = setup({ picked: ["/in/a.pdf", "/in/b.pdf"] });
+    t.api.pagesInsertPdf
+      .mockResolvedValueOnce({ changed: changed(12, 11, 2), inserted: 2 })
+      .mockRejectedValueOnce({ code: "cancelled", message: "" });
+    await t.ops.insertFiles(0);
+    expect(t.announced.join(" ")).toMatch(/added before stay/);
+    expect(t.announced.join(" ")).not.toMatch(/as it was/);
+  });
+
   it("stops at the first file that fails and keeps what came before", async () => {
     const t = setup({ picked: ["/in/a.pdf", "/in/b.pdf", "/in/c.pdf"] });
     t.api.pagesInsertPdf
@@ -339,6 +422,28 @@ describe("when something goes wrong", () => {
     expect(t.history.dirty).toBe(false);
   });
 
+  it("an undo whose engine is lost closes its own document, not the one in front", async () => {
+    const t = setup();
+    await t.ops.remove([1]);
+    // The user goes to another tab while the undo runs.
+    const other: PageTarget = { doc: 9, name: "other.pdf", history: new EditHistory(), pages: sizes(4) };
+    t.api.pagesRestore.mockImplementationOnce(() => {
+      t.swap(other);
+      return Promise.reject({ code: "engine_stopped", message: "gone" });
+    });
+    await expect(t.history.undo()).rejects.toMatchObject({ code: "engine_stopped" });
+    expect(t.lost).toEqual([{ doc: 5, code: "engine_stopped" }]);
+  });
+
+  it("an error of an undo that is not a lost engine closes nothing", async () => {
+    const t = setup();
+    await t.ops.remove([1]);
+    t.api.pagesRestore.mockRejectedValueOnce({ code: "snapshot_gone", message: "" });
+    await expect(t.history.undo()).rejects.toMatchObject({ code: "snapshot_gone" });
+    expect(t.lost).toEqual([]);
+    expect(t.history.dirty).toBe(true);
+  });
+
   it("a stop by the user is quiet", async () => {
     const t = setup();
     t.api.pagesInsertPdf.mockRejectedValueOnce({ code: "cancelled", message: "" });
@@ -421,6 +526,111 @@ describe("working", () => {
     expect(t.layer.hidden).toBe(true);
   });
 
+  it("a change that cannot be stopped has a box without a Stop button, and Escape does nothing in it", async () => {
+    vi.useFakeTimers();
+    const t = setup({ busyDelayMs: 100 });
+    let finish!: (c: PagesChanged) => void;
+    t.api.pagesDelete.mockImplementationOnce(() => new Promise((r) => (finish = r)));
+    const work = t.ops.remove([1]);
+    await vi.advanceTimersByTimeAsync(150);
+    const box = t.layer.querySelector<HTMLElement>(".busy-box");
+    expect(box).not.toBeNull();
+    expect(box?.textContent).toMatch(/cannot be stopped half way/);
+    expect(box?.querySelector("button")).toBeNull();
+    // Escape is taken by the box and ends nothing.
+    const escape = new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+    box?.dispatchEvent(escape);
+    expect(escape.defaultPrevented).toBe(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(t.api.pagesCancel).not.toHaveBeenCalled();
+    finish(changed(9, 7, 1));
+    await work;
+    expect(t.history.undoLabel).toBe("Delete 1 page");
+    expect(t.layer.querySelector(".busy-box")).toBeNull();
+  });
+
+  it("every tool except bringing pages in and copying them out runs without a Stop button", async () => {
+    vi.useFakeTimers();
+    for (const start of [
+      (t: ReturnType<typeof setup>) => t.ops.reorder([1, 0, 2, 3, 4, 5, 6, 7, 8, 9], [0]),
+      (t: ReturnType<typeof setup>) => t.ops.rotate([0], 1),
+      (t: ReturnType<typeof setup>) => t.ops.crop([0], [1, 1, 1, 1]),
+      (t: ReturnType<typeof setup>) => t.ops.insertBlank(0, 612, 792),
+    ]) {
+      document.body.replaceChildren();
+      const t = setup({ busyDelayMs: 50 });
+      const hold = new Promise<never>(() => undefined);
+      for (const fn of [t.api.pagesReorder, t.api.pagesRotate, t.api.pagesCrop, t.api.pagesInsertBlank]) {
+        fn.mockImplementationOnce(() => hold as never);
+      }
+      void start(t);
+      await vi.advanceTimersByTimeAsync(80);
+      const box = t.layer.querySelector<HTMLElement>(".busy-box");
+      expect(box).not.toBeNull();
+      expect(box?.querySelector("button")).toBeNull();
+    }
+  });
+
+  it("a stop that comes too late says so and leaves the work to finish", async () => {
+    vi.useFakeTimers();
+    const t = setup({ busyDelayMs: 100 });
+    t.api.pagesCancel.mockResolvedValueOnce("working" as never);
+    let finish!: (v: { changed: PagesChanged; inserted: number }) => void;
+    t.api.pagesInsertPdf.mockImplementationOnce(() => new Promise((r) => (finish = r)));
+    const work = t.ops.insertFiles(0);
+    await vi.advanceTimersByTimeAsync(150);
+    const box = t.layer.querySelector<HTMLElement>(".busy-box");
+    const stop = box?.querySelector<HTMLButtonElement>("button");
+    expect(stop?.textContent).toBe("Stop");
+    stop?.click();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(t.api.pagesCancel).toHaveBeenCalledOnce();
+    expect(stop?.disabled).toBe(true);
+    expect(box?.textContent).toMatch(/cannot be stopped any more/);
+    finish({ changed: changed(13, 11, 3), inserted: 3 });
+    const result = await work;
+    expect(result?.select).toEqual([0, 1, 2]);
+  });
+
+  it("copying pages out keeps the box away while the dialog of the system is open", async () => {
+    vi.useFakeTimers();
+    const t = setup({ busyDelayMs: 100 });
+    let report!: (d: number, t: number) => void;
+    let finish!: (v: { path: string; name: string }) => void;
+    t.api.pagesExtract.mockImplementationOnce((_d, _p, _o, onProgress) => {
+      report = onProgress;
+      return new Promise((r) => (finish = r));
+    });
+    const work = t.ops.extract([1, 2]);
+    // The delay runs out, and the dialog is still open: nothing is shown over it.
+    await vi.advanceTimersByTimeAsync(500);
+    expect(t.layer.querySelector(".busy-box")).toBeNull();
+    // The pages begin to move: now the box shows, with Stop.
+    report(10, 100);
+    await vi.advanceTimersByTimeAsync(0);
+    const box = t.layer.querySelector<HTMLElement>(".busy-box");
+    expect(box).not.toBeNull();
+    expect(box?.querySelector("button")?.textContent).toBe("Stop");
+    finish({ path: "/x/part.pdf", name: "part.pdf" });
+    await work;
+    expect(t.layer.querySelector(".busy-box")).toBeNull();
+  });
+
+  it("the box does not come up over a question that is open", async () => {
+    vi.useFakeTimers();
+    const t = setup({ busyDelayMs: 100 });
+    // The question is open before the delay has run out; it stays open past it.
+    let answer!: (r: NoticeResult) => void;
+    const original = t.host.notice.bind(t.host);
+    t.host.notice = (options) => (options.password ? new Promise<NoticeResult>((r) => (answer = r)) : original(options));
+    t.api.pagesInsertPdf.mockRejectedValueOnce({ code: "password_required", message: "" });
+    const work = t.ops.insertFiles(0);
+    await vi.advanceTimersByTimeAsync(300);
+    expect(t.layer.querySelector(".busy-box")).toBeNull();
+    answer({ button: "cancel" });
+    await work;
+  });
+
   it("a quick tool never shows the box", async () => {
     vi.useFakeTimers();
     const t = setup();
@@ -444,7 +654,8 @@ describe("working", () => {
     let seen = "";
     const original = t.notices.push.bind(t.notices);
     t.notices.push = (n: NoticeOptions) => {
-      seen = t.layer.querySelector(".busy-box") === null ? "hidden" : "shown";
+      // The first question is the one that must not have the box over it.
+      if (seen === "") seen = t.layer.querySelector(".busy-box") === null ? "hidden" : "shown";
       return original(n);
     };
     const work = t.ops.insertFiles(0);

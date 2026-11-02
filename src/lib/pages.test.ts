@@ -203,8 +203,13 @@ describe("words", () => {
     expect(TOOL_NOTES.crop).toMatch(/does not remove anything/);
     expect(TOOL_NOTES.crop).toMatch(/still in the file/);
     expect(TOOL_NOTES.delete).toMatch(/removes it from the file/);
-    expect(TOOL_NOTES.deleteForms).toMatch(/form fields/i);
-    expect(TOOL_NOTES.move).toMatch(/stop working/);
+    expect(TOOL_NOTES.deleteForms).toMatch(/fields/i);
+    // A delete is not redaction, and no note promises it is.
+    expect(TOOL_NOTES.delete).toMatch(/not a way to redact/);
+    expect(TOOL_NOTES.delete).toMatch(/alternative text/);
+    for (const note of Object.values(TOOL_NOTES)) expect(note).not.toMatch(/for good/i);
+    expect(TOOL_NOTES.crop).not.toMatch(/to remove content/i);
+    expect(TOOL_NOTES.working).toMatch(/cannot be stopped half way/);
     expect(TOOL_NOTES.insert).toMatch(/Bookmarks/);
     expect(TOOL_NOTES.insert).toMatch(/signatures/);
     expect(TOOL_NOTES.extract).toMatch(/no password/);

@@ -62,11 +62,33 @@ export interface OpResult {
 
 const OK = [{ id: "ok", label: "OK", primary: true }];
 
+/** How a tool runs: whether the user may stop it, and whether the box waits for a dialog. */
+interface RunOptions {
+  /** The work can be stopped without a cost (bringing pages in, copying pages out). */
+  stoppable?: boolean;
+  /** The box is held back until `release()` (a dialog of the system is open). */
+  held?: boolean;
+}
+
+/** What failed, besides the error: the other file of an insert, and what had been added before. */
+interface FailContext {
+  /** The name of the file whose pages were being added. */
+  source?: string;
+  /** How many pages of the files before it were added and stay. */
+  added?: number;
+}
+
 export class PageOps {
   private working = false;
   private readonly idleWaiters: (() => void)[] = [];
   private box: BusyBox | null = null;
   private readonly delay: number;
+  /** What the running tool shows in its box, and whether the delay has run out. */
+  private running: { title: string; stoppable: boolean; doc: number } | null = null;
+  private due = false;
+  private holds = 0;
+  /** The notes already shown for a document, so that each is said once. */
+  private readonly noted = new Set<string>();
 
   constructor(
     private readonly api: PageToolsApi,
@@ -109,11 +131,30 @@ export class PageOps {
       this.host.applyPages(t.doc, r.pages, show);
       this.host.announce(`Deleted ${describePages(sorted)}. ${pagesWord(r.pages.length)} left.`);
       if (r.snapshot === 0) void this.host.notice({ title: "This cannot be taken back", detail: TOOL_NOTES.undoGone, buttons: OK });
-      if (r.formFields > 0) {
-        void this.host.notice({ title: "Form fields stay in the file", detail: TOOL_NOTES.deleteForms, buttons: OK });
-      }
+      this.tellWhatStays(t, r.formFields);
       return { select: [show], show };
     });
+  }
+
+  /**
+   * What a delete leaves in the file, said the first time a page is deleted from a document, and
+   * what the form fields on the pages leave, said each time there were any.
+   */
+  private tellWhatStays(t: PageTarget, formFields: number): void {
+    const first = this.firstTime(t.doc, "delete");
+    if (!first && formFields === 0) return;
+    void this.host.notice({
+      title: formFields > 0 ? "Form fields stay in the file" : "What a delete leaves in the file",
+      detail: [first ? TOOL_NOTES.delete : "", formFields > 0 ? TOOL_NOTES.deleteForms : ""].filter((s) => s !== "").join(" "),
+      buttons: OK,
+    });
+  }
+
+  private firstTime(doc: number, what: string): boolean {
+    const key = `${doc}:${what}`;
+    if (this.noted.has(key)) return false;
+    this.noted.add(key);
+    return true;
   }
 
   /** Puts the pages in a new order (for every place, the page that goes there). */
@@ -141,8 +182,8 @@ export class PageOps {
       const back = (4 - turns) as 1 | 2 | 3;
       t.history.push({
         label: `Turn ${pagesWord(sorted.length)}`,
-        undo: () => this.exclusive(async () => this.applyOnly(t.doc, await this.api.pagesRotate(t.doc, sorted, back))),
-        redo: () => this.exclusive(async () => this.applyOnly(t.doc, await this.api.pagesRotate(t.doc, sorted, turns))),
+        undo: () => this.exclusive(t.doc, async () => this.applyOnly(t.doc, await this.api.pagesRotate(t.doc, sorted, back))),
+        redo: () => this.exclusive(t.doc, async () => this.applyOnly(t.doc, await this.api.pagesRotate(t.doc, sorted, turns))),
       });
       this.host.applyPages(t.doc, r.pages);
       this.host.announce(`Turned ${describePages(sorted)}.`);
@@ -151,16 +192,18 @@ export class PageOps {
   }
 
   /** Crops pages: `margins` are left, top, right, bottom in points on the page as it is drawn. */
-  async crop(pages: number[], margins: [number, number, number, number]): Promise<OpResult | null> {
+  async crop(pages: number[], margins: [number, number, number, number], doc?: number): Promise<OpResult | null> {
     const t = await this.start(pages);
-    if (!t) return null;
+    // The box that asked for the margins was open on a document; it is cropped only if it is still
+    // the one in front.
+    if (!t || (doc !== undefined && t.doc !== doc)) return null;
     const sorted = [...new Set(pages)].sort((a, b) => a - b);
     return this.run(t, "Cropping pages", async () => {
       const r = await this.api.pagesCrop(t.doc, sorted, margins);
       t.history.push({
         label: `Crop ${pagesWord(sorted.length)}`,
-        undo: () => this.exclusive(async () => this.applyOnly(t.doc, await this.api.pagesSetBoxes(t.doc, sorted, r.before))),
-        redo: () => this.exclusive(async () => this.applyOnly(t.doc, await this.api.pagesSetBoxes(t.doc, sorted, r.after))),
+        undo: () => this.exclusive(t.doc, async () => this.applyOnly(t.doc, await this.api.pagesSetBoxes(t.doc, sorted, r.before))),
+        redo: () => this.exclusive(t.doc, async () => this.applyOnly(t.doc, await this.api.pagesSetBoxes(t.doc, sorted, r.after))),
       });
       this.host.applyPages(t.doc, r.pages);
       this.host.announce(`Cropped ${describePages(sorted)}. The edges are hidden, not removed.`);
@@ -192,25 +235,33 @@ export class PageOps {
     if (!t) return null;
     const files = paths ?? (await this.host.pickFiles());
     if (files.length === 0) return null;
+    // The dialog of the system was open: the document in front may be another one now, or gone.
+    if (this.host.target()?.doc !== t.doc) return null;
     const first = at;
     let where = at;
     let count = 0;
-    return this.run(t, "Adding pages", async () => {
-      for (const path of files) {
-        let inserted: number | null;
-        try {
-          inserted = await this.insertOne(t, where, path);
-        } catch (e) {
-          // What came before stays; the files after the one that failed are not tried.
-          await this.fail(t, e);
-          break;
+    return this.run(
+      t,
+      "Adding pages",
+      async () => {
+        for (const path of files) {
+          let inserted: number | null;
+          const name = path.split(/[\\/]/).pop() ?? path;
+          try {
+            inserted = await this.insertOne(t, where, path);
+          } catch (e) {
+            // What came before stays; the files after the one that failed are not tried.
+            await this.fail(t, e, { source: name, added: count });
+            break;
+          }
+          if (inserted === null) break;
+          where += inserted;
+          count += inserted;
         }
-        if (inserted === null) break;
-        where += inserted;
-        count += inserted;
-      }
-      return count > 0 ? { select: Array.from({ length: count }, (_, i) => first + i), show: first } : null;
-    });
+        return count > 0 ? { select: Array.from({ length: count }, (_, i) => first + i), show: first } : null;
+      },
+      { stoppable: true },
+    );
   }
 
   /** Copies pages into a new file the user chooses. Resolves with the file, or null when stopped. */
@@ -218,26 +269,39 @@ export class PageOps {
     const t = await this.start(pages);
     if (!t) return null;
     const sorted = [...new Set(pages)].sort((a, b) => a - b);
-    const saved = await this.run(t, `Copying ${pagesWord(sorted.length)}`, async () => {
-      let options = { allowSigned: false, allowUnprotected: false };
-      for (;;) {
-        try {
-          // The dialog of the system is open while this waits: the box with the bar is not needed.
-          return await this.api.pagesExtract(t.doc, sorted, options, (d, n) => this.box?.progress(d, n));
-        } catch (e) {
-          const error = toAppError(e);
-          if (error.code === "save_signed" && !options.allowSigned) {
-            if (!(await this.confirm(`"${t.name}" ${TOOL_NOTES.signedCopy}`, "Copy the pages anyway", "The pages come without the signature"))) return null;
-            options = { ...options, allowSigned: true };
-          } else if (error.code === "save_unprotected" && !options.allowUnprotected) {
-            if (!(await this.confirm(`"${t.name}" ${TOOL_NOTES.unprotectedCopy}`, "Copy the pages anyway", "The new file will not be protected"))) return null;
-            options = { ...options, allowUnprotected: true };
-          } else {
-            throw e;
+    const saved = await this.run(
+      t,
+      `Copying ${pagesWord(sorted.length)}`,
+      async () => {
+        let options = { allowSigned: false, allowUnprotected: false };
+        for (;;) {
+          try {
+            // The dialog of the system is open while this waits, and the box with the bar is held
+            // back until the first piece of the new file moves.
+            let moved = false;
+            return await this.api.pagesExtract(t.doc, sorted, options, (d, n) => {
+              if (!moved) {
+                moved = true;
+                this.release();
+              }
+              this.box?.progress(d, n);
+            });
+          } catch (e) {
+            const error = toAppError(e);
+            if (error.code === "save_signed" && !options.allowSigned) {
+              if (!(await this.confirm(`"${t.name}" ${TOOL_NOTES.signedCopy}`, "Copy the pages anyway", "The pages come without the signature"))) return null;
+              options = { ...options, allowSigned: true };
+            } else if (error.code === "save_unprotected" && !options.allowUnprotected) {
+              if (!(await this.confirm(`"${t.name}" ${TOOL_NOTES.unprotectedCopy}`, "Copy the pages anyway", "The new file will not be protected"))) return null;
+              options = { ...options, allowUnprotected: true };
+            } else {
+              throw e;
+            }
           }
         }
-      }
-    });
+      },
+      { stoppable: true, held: true },
+    );
     if (saved) {
       this.host.announce(`Saved ${pagesWord(sorted.length)} to ${saved.name}.`);
       void this.host.notice({
@@ -263,6 +327,9 @@ export class PageOps {
         if (r.changed.snapshot === 0) {
           void this.host.notice({ title: "This cannot be taken back", detail: TOOL_NOTES.undoGone, buttons: OK });
         }
+        if (this.firstTime(t.doc, "insert")) {
+          void this.host.notice({ title: "What comes with added pages", detail: TOOL_NOTES.insert, buttons: OK });
+        }
         return r.inserted;
       } catch (e) {
         const error = toAppError(e);
@@ -284,7 +351,7 @@ export class PageOps {
   }
 
   private async askPassword(name: string, wrong: boolean): Promise<string | null> {
-    this.box?.hide();
+    this.hold();
     try {
       const answer = await this.host.notice({
         title: wrong ? "That password is not correct" : "This PDF is password protected",
@@ -297,12 +364,12 @@ export class PageOps {
       });
       return answer.button === "open" && answer.password ? answer.password : null;
     } finally {
-      this.box?.show();
+      this.release();
     }
   }
 
   private async confirm(detail: string, yes: string, title: string): Promise<boolean> {
-    this.box?.hide();
+    this.hold();
     try {
       const answer = await this.host.notice({
         title,
@@ -314,7 +381,7 @@ export class PageOps {
       });
       return answer.button === "yes";
     } finally {
-      this.box?.show();
+      this.release();
     }
   }
 
@@ -328,7 +395,7 @@ export class PageOps {
   private snapshotEdit(t: PageTarget, label: string, first: number): Edit {
     let other = first;
     const step = () =>
-      this.exclusive(async () => {
+      this.exclusive(t.doc, async () => {
         if (other === 0) throw { code: "undo_unavailable", message: TOOL_NOTES.undoGone };
         const r = await this.api.pagesRestore(t.doc, other);
         other = r.snapshot;
@@ -341,16 +408,20 @@ export class PageOps {
     this.host.applyPages(doc, r.pages);
   }
 
-  /** Runs taking a change back or making it again, so that nothing else works at the same time. */
-  private async exclusive<T>(work: () => Promise<T>): Promise<T> {
+  /**
+   * Runs taking a change back or making it again for the document `doc`, so that nothing else works
+   * at the same time. When the engine of that document is lost, that document is closed (not the
+   * one in front, which the user may have gone to while this ran), and the error is passed on so
+   * that the caller knows there is nothing more to say about it.
+   */
+  private async exclusive<T>(doc: number, work: () => Promise<T>): Promise<T> {
     if (this.working) throw { code: "busy", message: "another page tool is working" };
     this.setWorking(true);
     try {
       return await work();
     } catch (e) {
       const error = toAppError(e);
-      const t = this.host.target();
-      if (t && isEngineLost(error)) void this.host.lost(t.doc, error);
+      if (isEngineLost(error)) void this.host.lost(doc, error);
       throw e;
     } finally {
       this.setWorking(false);
@@ -373,17 +444,16 @@ export class PageOps {
     return t;
   }
 
-  private async run<T>(t: PageTarget, title: string, work: () => Promise<T>): Promise<T | null> {
+  private async run<T>(t: PageTarget, title: string, work: () => Promise<T>, options: RunOptions = {}): Promise<T | null> {
     // Something else started while a dialog was open (the file dialog of an insert, say).
     if (this.working) return null;
     this.setWorking(true);
+    this.running = { title, stoppable: options.stoppable === true, doc: t.doc };
+    this.due = false;
+    this.holds = options.held ? 1 : 0;
     const timer = setTimeout(() => {
-      this.box = showBusyBox(this.host.layer, {
-        title,
-        detail: "Patient Partridge is working on the pages.",
-        cancelLabel: "Stop",
-        onCancel: () => void this.stop(t),
-      });
+      this.due = true;
+      this.showBox();
     }, this.delay);
     try {
       return await work();
@@ -394,30 +464,78 @@ export class PageOps {
       clearTimeout(timer);
       this.box?.close();
       this.box = null;
+      this.running = null;
+      this.due = false;
+      this.holds = 0;
       this.setWorking(false);
     }
   }
 
-  private async stop(t: PageTarget): Promise<void> {
+  /** The box with the bar shows when the delay has run out and nothing is held back. */
+  private showBox(): void {
+    const run = this.running;
+    if (!run || !this.due || this.holds > 0 || this.box) return;
+    this.box = showBusyBox(
+      this.host.layer,
+      run.stoppable
+        ? {
+            title: run.title,
+            detail: "Patient Partridge is working on the pages.",
+            cancelLabel: "Stop",
+            onCancel: () => void this.stop(run.doc),
+          }
+        : {
+            title: run.title,
+            detail: `Patient Partridge is working on the pages. ${TOOL_NOTES.working}`,
+          },
+    );
+  }
+
+  /** Holds the box back while a question or a dialog of the system is open. */
+  private hold(): void {
+    this.holds += 1;
+    this.box?.hide();
+  }
+
+  private release(): void {
+    if (this.holds === 0) return;
+    this.holds -= 1;
+    if (this.holds > 0) return;
+    if (this.box) this.box.show();
+    else this.showBox();
+  }
+
+  /** Stops what can be stopped without a cost. A change that is under way is left to finish. */
+  private async stop(doc: number): Promise<void> {
     try {
-      await this.api.pagesCancel(t.doc);
+      const result = await this.api.pagesCancel(doc);
+      if (result === "working") this.box?.cannotStop(TOOL_NOTES.stopTooLate);
     } catch {
       // The work fails or finishes by itself; there is nothing to add.
     }
   }
 
-  private async fail(t: PageTarget, error: unknown): Promise<void> {
+  private async fail(t: PageTarget, error: unknown, context: FailContext = {}): Promise<void> {
     const app = toAppError(error);
+    const earlier = context.added ?? 0;
     if (app.code === "cancelled") {
-      this.host.announce("Stopped. The document is as it was.");
+      this.host.announce(
+        earlier > 0
+          ? `Stopped. The ${pagesWord(earlier)} added before stay; the rest were not added.`
+          : "Stopped. The document is as it was.",
+      );
       return;
     }
     if (isEngineLost(app)) {
       await this.host.lost(t.doc, app);
       return;
     }
-    const text = describePageError(app, t.name);
-    await this.host.notice({ title: text.title, detail: text.detail, buttons: OK });
+    const text = describePageError(app, t.name, context.source);
+    const detail =
+      earlier > 0
+        ? `${text.detail.replace(/ "[^"]*" was not changed\.$/, "")} The ${pagesWord(earlier)} from the files before it were added and stay in "${t.name}".`
+        : text.detail;
+    await this.host.notice({ title: text.title, detail, buttons: OK });
   }
 
   private setWorking(on: boolean): void {

@@ -146,3 +146,54 @@ describe("DocumentView.replacePages", () => {
     expect(gone.view.pageCount).toBe(2);
   });
 });
+
+describe("a picture that is on its way when the pages change", () => {
+  it("is not kept for the new page that has the number of the old one", async () => {
+    const held: (() => void)[] = [];
+    const calls: number[] = [];
+    const render = vi.fn((_d: number, p: number, w: number, h: number) => {
+      calls.push(p);
+      return new Promise<ArrayBuffer>((res) => held.push(() => res(new ArrayBuffer(w * h * 4))));
+    });
+    const getPageText = vi.fn(() => Promise.resolve({ text: "", rects: [] as number[] }));
+    const events = { onPageChange: vi.fn(), onZoomChange: vi.fn(), onFatal: vi.fn(), onFirstPaint: vi.fn() };
+    const view = new DocumentView({ doc: 7, pages: [letter, letter, letter] }, { render, getPageText } as unknown as ViewerApi, events);
+    document.body.append(view.element);
+    view.start();
+    await flush();
+    const before = calls.filter((p) => p === 0).length;
+    expect(before).toBe(1);
+    // Page 0 was deleted: the old page 1 is the new page 0, of the same size.
+    view.replacePages([letter, letter]);
+    await flush();
+    for (const go of held.splice(0)) go();
+    await flush();
+    await flush();
+    // The new page 0 asked for a picture of its own, and the old one was not put on it.
+    expect(calls.filter((p) => p === 0).length).toBe(before + 1);
+    const canvas = view.element.querySelector<HTMLElement>('.viewer-page[data-page="0"] canvas');
+    expect(canvas).not.toBeNull();
+  });
+
+  it("is dropped, and the page shows only what was asked for after the change", async () => {
+    const held: { page: number; go: () => void }[] = [];
+    const drawn: number[] = [];
+    const render = vi.fn((_d: number, p: number, w: number, h: number) => new Promise<ArrayBuffer>((res) => held.push({ page: p, go: () => res(new ArrayBuffer(w * h * 4)) })));
+    const getPageText = vi.fn(() => Promise.resolve({ text: "", rects: [] as number[] }));
+    const events = { onPageChange: vi.fn(), onZoomChange: vi.fn(), onFatal: vi.fn(), onFirstPaint: vi.fn(), onPageDrawn: (p: number) => drawn.push(p) };
+    const view = new DocumentView({ doc: 7, pages: [letter, letter] }, { render, getPageText } as unknown as ViewerApi, events);
+    document.body.append(view.element);
+    view.start();
+    await flush();
+    const old = held.splice(0);
+    view.replacePages([letter, letter]);
+    await flush();
+    // The pictures of the old pages arrive first: none of them is taken for a page of the new list.
+    for (const h of old) h.go();
+    await flush();
+    expect(drawn).toEqual([]);
+    for (const h of held.splice(0)) h.go();
+    await flush();
+    expect(drawn.sort()).toEqual([0, 1]);
+  });
+});
