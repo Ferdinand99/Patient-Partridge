@@ -447,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn m1_a_touch_before_the_whole_file_is_known_is_passed_but_marked() {
+    fn a_touch_before_the_whole_file_is_known_is_passed_but_marked() {
         let touched = rig(100_000);
         let mut reader = GuardedReader::new(touched.guard.clone());
         let mut buf = [0u8; 10];
@@ -468,7 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn m1_a_touch_when_every_block_is_known_is_not_marked() {
+    fn a_touch_when_every_block_is_known_is_not_marked() {
         let rig = read_through(40);
         *rig.modified.lock().unwrap() = later(5);
         assert_eq!(lock(&rig.guard).verify(&mut |_| {}), Ok(()));
@@ -476,7 +476,7 @@ mod tests {
     }
 
     #[test]
-    fn m1_a_block_read_for_the_first_time_after_a_touch_is_marked() {
+    fn a_block_read_for_the_first_time_after_a_touch_is_marked() {
         let rig = rig(100_000);
         let mut reader = GuardedReader::new(rig.guard.clone());
         let mut buf = [0u8; 10];
@@ -492,7 +492,7 @@ mod tests {
     }
 
     #[test]
-    fn m1_other_bytes_or_another_size_are_a_change_touched_or_not() {
+    fn other_bytes_or_another_size_are_a_change_touched_or_not() {
         let touched = rig(100_000);
         let mut reader = GuardedReader::new(touched.guard.clone());
         let mut buf = [0u8; 10];
@@ -515,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn n2_a_touch_that_changes_only_the_time_is_not_a_change_once_the_whole_file_is_known() {
+    fn a_touch_that_changes_only_the_time_is_not_a_change_once_the_whole_file_is_known() {
         let rig = read_through(40);
         *rig.modified.lock().unwrap() =
             Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(5));
@@ -530,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn n3_a_failure_of_the_guards_own_look_is_not_held_against_the_file() {
+    fn a_failure_of_the_guards_own_look_is_not_held_against_the_file() {
         let rig = read_through(40);
         rig.broken.store(true, Ordering::SeqCst);
         // The look fails now ...
@@ -643,7 +643,7 @@ mod tests {
     }
 
     #[test]
-    fn n1_checking_a_big_file_reports_progress_with_a_rising_count() {
+    fn checking_a_big_file_reports_progress_with_a_rising_count() {
         let rig = read_through(200);
         let mut seen: Vec<u32> = Vec::new();
         assert_eq!(lock(&rig.guard).verify(&mut |done| seen.push(done)), Ok(()));
@@ -654,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn n1_scanning_a_big_file_reports_progress_with_a_rising_count() {
+    fn scanning_a_big_file_reports_progress_with_a_rising_count() {
         let rig = rig(200 * BLOCK as usize);
         let mut seen: Vec<u32> = Vec::new();
         let found = lock(&rig.guard)

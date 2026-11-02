@@ -361,7 +361,7 @@ fn a_locked_in_engine_cannot_open_files_use_the_network_or_start_programs() {
         "the control should have the planted variable"
     );
 
-    // Linux: the ways round the filter that a review found.
+    // Linux: the known ways round the filter.
     #[cfg(target_os = "linux")]
     {
         for attempt in [
