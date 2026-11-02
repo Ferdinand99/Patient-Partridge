@@ -127,6 +127,19 @@ while IFS=$'\t' read -r name pages note; do
         shown=$(pdftotext -f "$place" -l "$place" "$name" -)
         if grep -q 'PAGE-TEXT-' <<<"$shown"; then fail "$name: place $place is not blank"; fi
         ;;
+      draws)
+        # Every place is drawn like the page of the other file that it was moved from: the same
+        # picture, pixel for pixel, as poppler draws it.
+        ref=${value%%:*}
+        i=1
+        for p in $(tr ',' ' ' <<<"${value#*:}"); do
+          pdftoppm -singlefile -png -r 40 -f "$i" -l "$i" "$name" "cmp-new"
+          pdftoppm -singlefile -png -r 40 -f "$((p + 1))" -l "$((p + 1))" "$ref" "cmp-old"
+          cmp -s cmp-new.png cmp-old.png || fail "$name: place $i is not drawn like page $((p + 1)) of $ref"
+          i=$((i + 1))
+        done
+        rm -f cmp-new.png cmp-old.png
+        ;;
       size1)
         place=2
         got=$(page_info "$name" "$place" | awk -v n="$place" '$1 == "Page" && $2 == n && $3 == "size:" { print $4 "x" $6 }')

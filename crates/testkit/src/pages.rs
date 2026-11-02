@@ -598,3 +598,255 @@ pub fn junk_after_the_kids_pdf() -> Vec<u8> {
     ];
     assemble(&objects, "")
 }
+
+// ---- page trees as real programs write them ----------------------------------------------------------
+
+/// A page with its own text, a coloured bar whose length depends on `n`, a picture and a form, all
+/// drawn with the names `/F1`, `/Im1` and `/Fm1` of the resources the page gets from itself or from
+/// a node above it.
+fn drawn_page(n: usize) -> Vec<u8> {
+    stream_object(
+        "",
+        &format!(
+            "q 0.8 0.2 0.2 rg 20 20 {} 30 re f Q BT /F1 14 Tf 10 100 Td (PAGE {n}) Tj ET \
+             q 40 0 0 40 60 50 cm /Im1 Do Q q 0.3 0 0 0.3 120 10 cm /Fm1 Do Q",
+            20 + 15 * n
+        ),
+    )
+}
+
+/// The picture and the form that the pages of [`inherited_tree_pdf`] and [`root_inherited_pdf`] draw.
+fn picture_and_form() -> [Vec<u8>; 2] {
+    [
+        stream_object(
+            "/Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /ASCIIHexDecode",
+            "00 FF FF 00>",
+        ),
+        stream_object(
+            "/Type /XObject /Subtype /Form /BBox [0 0 100 100]",
+            "0 0 1 rg 0 0 100 100 re f",
+        ),
+    ]
+}
+
+/// Seven pages in a page tree of three levels in which the inner nodes hold what their pages
+/// inherit: `/Resources` (written in place on one node, as a reference on another), `/MediaBox`,
+/// `/CropBox` and `/Rotate`, and the root holds a `/MediaBox` too. Some pages have entries of
+/// their own that win over the ones above them. Every page draws text, a bar, a picture and a form
+/// through the names in the resources, so a page that loses what it inherits is drawn differently.
+///
+/// Object numbers: 2 root, 3 and 4 its nodes, 8 a node below 3, 5 a page under the root; the pages
+/// in order of the document are 6, 7, 9, 10, 11, 12, 5.
+pub fn inherited_tree_pdf() -> Vec<u8> {
+    let resources = |font: u32| {
+        format!("<< /Font << /F1 {font} 0 R >> /XObject << /Im1 16 0 R /Fm1 17 0 R >> >>")
+    };
+    let [image, form] = picture_and_form();
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 7 /MediaBox [0 0 400 300] >>".to_vec(),
+        format!(
+            "<< /Type /Pages /Parent 2 0 R /Kids [6 0 R 7 0 R 8 0 R] /Count 4 /Resources {} /MediaBox [0 0 200 150] >>",
+            resources(13)
+        )
+        .into_bytes(),
+        b"<< /Type /Pages /Parent 2 0 R /Kids [11 0 R 12 0 R] /Count 2 /Resources 25 0 R /MediaBox [0 0 250 250] >>".to_vec(),
+        format!(
+            "<< /Type /Page /Parent 2 0 R /Contents 24 0 R /Resources {} >>",
+            resources(15)
+        )
+        .into_bytes(),
+        b"<< /Type /Page /Parent 3 0 R /Contents 18 0 R >>".to_vec(),
+        b"<< /Type /Page /Parent 3 0 R /Contents 19 0 R /Rotate 90 >>".to_vec(),
+        b"<< /Type /Pages /Parent 3 0 R /Kids [9 0 R 10 0 R] /Count 2 /Rotate 180 /CropBox [10 10 190 140] >>".to_vec(),
+        b"<< /Type /Page /Parent 8 0 R /Contents 20 0 R >>".to_vec(),
+        format!(
+            "<< /Type /Page /Parent 8 0 R /Contents 21 0 R /CropBox [0 0 150 100] /Resources {} >>",
+            resources(14)
+        )
+        .into_bytes(),
+        b"<< /Type /Page /Parent 4 0 R /Contents 22 0 R >>".to_vec(),
+        b"<< /Type /Page /Parent 4 0 R /Contents 23 0 R /MediaBox [0 0 120 160] >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman >>".to_vec(),
+        image,
+        form,
+        drawn_page(0),
+        drawn_page(1),
+        drawn_page(2),
+        drawn_page(3),
+        drawn_page(4),
+        drawn_page(5),
+        drawn_page(6),
+        resources(15).into_bytes(),
+    ];
+    assemble(&objects, "")
+}
+
+/// Three pages under a root that holds all four of the entries a page can inherit, as a document
+/// from most programs does: nothing below the root holds one, so a page can go anywhere in the
+/// tree and keep what it has.
+pub fn root_inherited_pdf() -> Vec<u8> {
+    let [image, form] = picture_and_form();
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 /MediaBox [0 0 300 200] /CropBox [5 5 295 195] /Rotate 90 /Resources << /Font << /F1 6 0 R >> /XObject << /Im1 7 0 R /Fm1 8 0 R >> >> >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /Contents 9 0 R >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /Contents 10 0 R /Rotate 0 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /Contents 11 0 R >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        image,
+        form,
+        drawn_page(0),
+        drawn_page(1),
+        drawn_page(2),
+    ];
+    assemble(&objects, "")
+}
+
+fn plain_page(parent: u32, width: u32) -> Vec<u8> {
+    format!("<< /Type /Page /Parent {parent} 0 R /MediaBox [0 0 {width} 200] >>").into_bytes()
+}
+
+/// Three pages (of the widths 100, 200 and 300) whose list of kids is an object of its own, which
+/// is as valid as writing it in the node.
+pub fn indirect_kids_pdf() -> Vec<u8> {
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids 6 0 R /Count 7 0 R >>".to_vec(),
+        plain_page(2, 100),
+        plain_page(2, 200),
+        plain_page(2, 300),
+        b"[3 0 R 4 0 R 5 0 R]".to_vec(),
+        b"3".to_vec(),
+    ];
+    assemble(&objects, "")
+}
+
+/// Three pages (of the widths 100, 200 and 300) under a node that has words in strings that a
+/// search for words in the bytes of the node would take for the syntax of the file: `stream` and
+/// `endobj` and a closing `>>`. With `before_kids` the strings stand before the list of kids, else
+/// after it.
+pub fn words_in_node_pdf(before_kids: bool) -> Vec<u8> {
+    let words = "/Comment (a stream of pages) /Note (endobj >> stream) /Other << /A (stream) >>";
+    let node = if before_kids {
+        format!("<< /Type /Pages {words} /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>")
+    } else {
+        format!("<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 {words} >>")
+    };
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        node.into_bytes(),
+        plain_page(2, 100),
+        plain_page(2, 200),
+        plain_page(2, 300),
+    ];
+    assemble(&objects, "")
+}
+
+/// As [`trailing_null_kid_pdf`], with the entry that is not there an object with a very big number
+/// (2,000,000) that is `null`, in a table of objects that has a part of its own for it.
+pub fn trailing_far_kid_pdf() -> Vec<u8> {
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 2000000 0 R] /Count 3 >>".to_vec(),
+        ),
+        (3, plain_page(2, 100)),
+        (4, plain_page(2, 200)),
+        (5, plain_page(2, 300)),
+        (2_000_000, b"null".to_vec()),
+    ];
+    assemble_sparse(&objects)
+}
+
+/// A valid document of three pages (the widths 100, 200 and 300) with a very big object number
+/// (2,000,000) for the last page.
+pub fn far_object_number_pdf() -> Vec<u8> {
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R 4 0 R 2000000 0 R] /Count 3 >>".to_vec(),
+        ),
+        (3, plain_page(2, 100)),
+        (4, plain_page(2, 200)),
+        (2_000_000, plain_page(2, 300)),
+    ];
+    assemble_sparse(&objects)
+}
+
+/// A file whose table of objects has a part for each object, with the numbers as given.
+fn assemble_sparse(objects: &[(u32, Vec<u8>)]) -> Vec<u8> {
+    let mut out = b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n".to_vec();
+    let mut at = Vec::with_capacity(objects.len());
+    for (number, body) in objects {
+        at.push((*number, out.len()));
+        out.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = out.len();
+    out.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n");
+    for (number, offset) in &at {
+        out.extend_from_slice(format!("{number} 1\n{offset:010} 00000 n \n").as_bytes());
+    }
+    let size = objects.iter().map(|(n, _)| *n).max().unwrap_or(0) + 1;
+    out.extend_from_slice(
+        format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+    );
+    out
+}
+
+/// Three pages (of the widths 100, 200 and 300) in a file written the way most current programs
+/// write them: the catalog, the nodes and the pages are in an object stream, and the table of
+/// objects is a stream too.
+pub fn object_streams_pdf() -> Vec<u8> {
+    let inner: [(u32, &str); 5] = [
+        (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+        (2, "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>"),
+        (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 200] >>"),
+        (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>"),
+        (5, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] >>"),
+    ];
+    let mut header = String::new();
+    let mut body = String::new();
+    for (number, text) in inner {
+        let _ = write!(header, "{number} {} ", body.len());
+        body.push_str(text);
+        body.push(' ');
+    }
+    let first = header.len();
+    let data = format!("{header}{body}");
+    let mut out = b"%PDF-1.5\n%\xE2\xE3\xCF\xD3\n".to_vec();
+    let stream_at = out.len();
+    out.extend_from_slice(
+        format!(
+            "6 0 obj\n<< /Type /ObjStm /N 5 /First {first} /Length {} >>\nstream\n{data}\nendstream\nendobj\n",
+            data.len()
+        )
+        .as_bytes(),
+    );
+    let table_at = out.len();
+    // Entries of one byte for the kind, two for the place and one for the index.
+    let mut table: Vec<u8> = vec![0, 0, 0, 255];
+    for index in 0..5u8 {
+        table.extend_from_slice(&[2, 0, 6, index]);
+    }
+    table.extend_from_slice(&[1, (stream_at >> 8) as u8, stream_at as u8, 0]);
+    table.extend_from_slice(&[1, (table_at >> 8) as u8, table_at as u8, 0]);
+    out.extend_from_slice(
+        format!(
+            "7 0 obj\n<< /Type /XRef /Size 8 /W [1 2 1] /Root 1 0 R /Length {} >>\nstream\n",
+            table.len()
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(&table);
+    out.extend_from_slice(
+        format!("\nendstream\nendobj\nstartxref\n{table_at}\n%%EOF\n").as_bytes(),
+    );
+    out
+}

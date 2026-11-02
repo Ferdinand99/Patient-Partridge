@@ -33,6 +33,7 @@
 
 use std::collections::VecDeque;
 use std::os::raw::{c_int, c_ulong};
+use std::time::{Duration, Instant};
 
 use partridge_protocol::{
     ErrorCode, PageSize, PagesRequest, PagesResponse, ResponseBody, MAX_BLANK_SIDE, MAX_BOX_VALUE,
@@ -41,7 +42,7 @@ use partridge_protocol::{
 };
 use pdfium_render::prelude::*;
 
-use crate::{fail, sane_size, save, Engine, Failure};
+use crate::{fail, pagetree, sane_size, save, Engine, Failure};
 
 /// A password kept in memory while its document is open (the engine has to load copies of the
 /// document with it). It is overwritten with zeros when it is let go of.
@@ -65,6 +66,10 @@ struct Snapshot {
     /// How many pages the document had when the copy was taken, and so must have when it is read
     /// in again.
     pages: usize,
+    /// A number that stands for the sizes of those pages (see [`sizes_digest`]): a copy that reads
+    /// back as other pages of the same number is not the document that was kept. `None` for a copy
+    /// kept by a test without it.
+    digest: Option<u64>,
 }
 
 struct Import {
@@ -131,13 +136,14 @@ impl PageTools {
         }
     }
 
-    fn keep(&mut self, bytes: Vec<u8>, pages: usize) -> u32 {
+    fn keep(&mut self, bytes: Vec<u8>, pages: usize, digest: Option<u64>) -> u32 {
         let token = self.next_token;
         self.next_token = self.next_token.wrapping_add(1).max(1);
         self.snapshots.push_back(Snapshot {
             token,
             bytes,
             pages,
+            digest,
         });
         self.evict();
         // The copy just kept may be the one that was let go of, when it alone is too big.
@@ -222,7 +228,7 @@ impl PageTools {
     /// pages (for tests: a copy that does not read back with that many pages is refused).
     #[doc(hidden)]
     pub fn keep_for_tests(&mut self, bytes: Vec<u8>, pages: usize) -> u32 {
-        self.keep(bytes, pages)
+        self.keep(bytes, pages, None)
     }
 
     /// How many bytes of copies are held, for tests.
@@ -422,13 +428,15 @@ pub(crate) fn handle(
     let response = match request {
         PagesRequest::Delete { doc, pages } => delete(engine, pdfium, doc, &pages, progress)?,
         PagesRequest::Reorder { doc, order } => reorder(engine, pdfium, doc, &order, progress)?,
-        PagesRequest::Rotate { doc, pages, turns } => rotate(engine, doc, &pages, turns)?,
+        PagesRequest::Rotate { doc, pages, turns } => rotate(engine, doc, &pages, turns, progress)?,
         PagesRequest::Crop {
             doc,
             pages,
             margins,
-        } => crop(engine, doc, &pages, margins)?,
-        PagesRequest::SetBoxes { doc, pages, boxes } => set_boxes(engine, doc, &pages, &boxes)?,
+        } => crop(engine, doc, &pages, margins, progress)?,
+        PagesRequest::SetBoxes { doc, pages, boxes } => {
+            set_boxes(engine, doc, &pages, &boxes, progress)?
+        }
         PagesRequest::InsertBlank {
             doc,
             at,
@@ -609,269 +617,123 @@ fn page_is_sound(document: &PdfDocument<'_>, index: PdfPageIndex) -> bool {
     document.pages().page_size(index).is_ok()
 }
 
-/// Reads the page tree out of a document as PDFium writes it (a classic table of the places of the
-/// objects, the catalog, the nodes of the tree) and says whether it is as it should be: the root
-/// that the catalog names is a node (it has `/Kids`, and its `/Type`, if it has one, is `/Pages`),
-/// every kid of every node is an object that is there with a dictionary, and the pages at the
-/// leaves are as many as the document says it has. Bytes that cannot be read that way (a table of
-/// another kind) are taken as a sound tree: a document is not refused for how it is written.
-fn page_tree_is_sound(bytes: &[u8], count: usize) -> bool {
-    let Some(table) = XrefTable::read(bytes) else {
-        return true;
-    };
-    let Some(root) = table.catalog_pages() else {
-        return false;
-    };
-    let mut leaves = 0usize;
-    let mut visited = 0usize;
-    table.walk(root, 0, &mut leaves, &mut visited) && leaves == count
+/// Reads the page tree out of a copy of the document as PDFium writes it, and refuses a change to
+/// the list of pages when the tree is not one the change can be trusted with (see
+/// [`crate::pagetree`]). A tree that cannot be read is refused too, in words that do not blame the
+/// document. `parents` also asks that every page names the node that lists it, which a move needs.
+fn read_tree(bytes: &[u8], count: usize, parents: bool) -> Result<pagetree::Tree, Failure> {
+    pagetree::read(bytes, count, parents).map_err(|e| (ErrorCode::PageChangeFailed, e.words()))
 }
 
-/// The places of the objects of a document written by PDFium, and the way to read their dictionaries.
-struct XrefTable<'a> {
-    bytes: &'a [u8],
-    /// Object number to the place of `N G obj`; None for a free entry.
-    places: Vec<Option<usize>>,
-    root: u32,
+/// Tells the app now and then that a change is going on, so that a change that takes long (pages
+/// with a lot on them take a fifth of a second each to read) is not taken for a hung engine: the
+/// app ends an engine that says nothing for five minutes.
+struct Pace {
+    last: Instant,
+    done: u32,
 }
 
-/// The words of `bytes`, separated by white space.
-fn words(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
-    bytes
-        .split(|b| b.is_ascii_whitespace())
-        .filter(|w| !w.is_empty())
-}
+/// The longest the app hears nothing from a change that goes on.
+const PACE: Duration = Duration::from_millis(250);
 
-fn number_of(word: Option<&[u8]>) -> Option<usize> {
-    std::str::from_utf8(word?).ok()?.parse().ok()
-}
-
-impl<'a> XrefTable<'a> {
-    fn read(bytes: &'a [u8]) -> Option<XrefTable<'a>> {
-        let start = rfind(bytes, b"startxref")?;
-        let at = number_of(words(&bytes[start + 9..]).next())?;
-        let table = bytes.get(at..)?;
-        if !table.starts_with(b"xref") {
-            return None;
-        }
-        let mut rest = words(&table[4..]);
-        let mut places: Vec<Option<usize>> = Vec::new();
-        loop {
-            let first = rest.next()?;
-            if first == b"trailer" {
-                break;
-            }
-            let first = number_of(Some(first))?;
-            let entries = number_of(rest.next())?;
-            if entries > 1_000_000 || first > 1_000_000 {
-                return None;
-            }
-            if places.len() < first + entries {
-                places.resize(first + entries, None);
-            }
-            for i in 0..entries {
-                let offset = number_of(rest.next())?;
-                let _generation = number_of(rest.next())?;
-                let kind = rest.next()?;
-                places[first + i] = (kind == b"n").then_some(offset);
-            }
-        }
-        let trailer = &table[find(table, b"trailer")?..];
-        let root = reference_after(trailer, b"/Root")?;
-        Some(XrefTable {
-            bytes,
-            places,
-            root,
-        })
-    }
-
-    /// The dictionary of object `number`: the text from after `obj` up to the stream or the end.
-    fn dictionary(&self, number: u32) -> Option<&'a [u8]> {
-        let place = (*self.places.get(number as usize)?)?;
-        let rest = self.bytes.get(place..)?;
-        let header_end = find(rest, b"obj")? + 3;
-        let body = rest.get(header_end..)?;
-        // The nearest end first, so that the cost of a look at an object is that of the object.
-        let end = find(body, b"endobj").unwrap_or(body.len());
-        let end = find(&body[..end], b"stream").unwrap_or(end);
-        let text = &body[..end];
-        // Only white space may come before the dictionary.
-        let open = text.iter().take_while(|b| b.is_ascii_whitespace()).count();
-        text[open..].starts_with(b"<<").then_some(&text[open..])
-    }
-
-    fn catalog_pages(&self) -> Option<u32> {
-        reference_after(self.dictionary(self.root)?, b"/Pages")
-    }
-
-    /// True when the node is sound; adds the pages at its leaves to `leaves`.
-    fn walk(&self, number: u32, depth: usize, leaves: &mut usize, visited: &mut usize) -> bool {
-        *visited += 1;
-        if depth > 64 || *visited > 2_000_000 {
-            return false;
-        }
-        let Some(dict) = self.dictionary(number) else {
-            return false;
-        };
-        let kind = name_after(dict, b"/Type");
-        let Some(kids) = array_after(dict, b"/Kids") else {
-            // A leaf: a page. A dictionary that says it is something else is not one.
-            if kind.is_some_and(|k| k != b"/Page") {
-                return false;
-            }
-            *leaves += 1;
-            return true;
-        };
-        if kind.is_some_and(|k| k != b"/Pages") {
-            return false;
-        }
-        // Every entry of the list must be a reference: a name or an array in it is a kid that PDFium
-        // reads as nothing, which its move of pages does not survive.
-        let Some(kids) = all_references(kids) else {
-            return false;
-        };
-        kids.into_iter()
-            .all(|kid| self.walk(kid, depth + 1, leaves, visited))
-    }
-}
-
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
-}
-
-fn rfind(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).rposition(|w| w == needle)
-}
-
-fn skip_white(bytes: &[u8]) -> &[u8] {
-    let n = bytes.iter().take_while(|b| b.is_ascii_whitespace()).count();
-    &bytes[n..]
-}
-
-/// What follows `key` among the keys of the dictionary itself (not those of a dictionary inside
-/// it, where the same name may mean something else).
-fn value_of<'a>(dict: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
-    let mut dicts = 0usize;
-    let mut arrays = 0usize;
-    let mut i = 0;
-    while i < dict.len() {
-        match dict[i] {
-            b'<' if dict.get(i + 1) == Some(&b'<') => {
-                dicts += 1;
-                i += 2;
-            }
-            b'>' if dict.get(i + 1) == Some(&b'>') => {
-                dicts = dicts.saturating_sub(1);
-                i += 2;
-                if dicts == 0 {
-                    break;
-                }
-            }
-            b'[' => {
-                arrays += 1;
-                i += 1;
-            }
-            b']' => {
-                arrays = arrays.saturating_sub(1);
-                i += 1;
-            }
-            b'(' => {
-                // A string: up to the closing bracket that matches, a backslash takes the next byte.
-                let mut open = 1usize;
-                i += 1;
-                while i < dict.len() && open > 0 {
-                    match dict[i] {
-                        b'\\' => i += 1,
-                        b'(' => open += 1,
-                        b')' => open -= 1,
-                        _ => {}
-                    }
-                    i += 1;
-                }
-            }
-            b'<' => {
-                i += dict[i..]
-                    .iter()
-                    .position(|b| *b == b'>')
-                    .map_or(1, |p| p + 1);
-            }
-            b'/' => {
-                let end = dict[i + 1..]
-                    .iter()
-                    .position(|b| b.is_ascii_whitespace() || b"/<>[]()".contains(b))
-                    .map_or(dict.len(), |p| i + 1 + p);
-                if dicts == 1 && arrays == 0 && &dict[i..end] == key {
-                    return Some(&dict[end..]);
-                }
-                i = end.max(i + 1);
-            }
-            _ => i += 1,
+impl Pace {
+    fn new() -> Pace {
+        Pace {
+            last: Instant::now(),
+            done: 0,
         }
     }
-    None
-}
 
-/// The name that follows `key` (`/Type` then `/Pages`).
-fn name_after<'a>(dict: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
-    let rest = skip_white(value_of(dict, key)?);
-    if !rest.starts_with(b"/") {
-        return None;
+    /// One more step is done.
+    fn step(&mut self, progress: &mut dyn FnMut(u32)) {
+        self.done = self.done.saturating_add(1);
+        if self.last.elapsed() >= PACE {
+            self.last = Instant::now();
+            progress(self.done);
+        }
     }
-    let end = rest[1..]
-        .iter()
-        .position(|b| b.is_ascii_whitespace() || b"/<>[]()".contains(b))
-        .map_or(rest.len(), |p| p + 1);
-    Some(&rest[..end])
 }
 
-/// The text between the brackets of the array that follows `key`.
-fn array_after<'a>(dict: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
-    let rest = skip_white(value_of(dict, key)?);
-    if !rest.starts_with(b"[") {
-        return None;
-    }
-    let end = rest.iter().position(|b| *b == b']')?;
-    Some(&rest[1..end])
+/// What is looked at on a page to tell that a change did not alter it: the size it is drawn at,
+/// how it is turned, its boxes (as PDFium reads them, with what the page inherits), how many
+/// objects its content holds (a picture that lost its resource is gone from the count), and which
+/// fonts the first of its text objects use (a font that lost its resource is drawn with another).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PagePrint {
+    size: [u32; 2],
+    turns: u8,
+    /// The part of the page that is shown, in page coordinates, with what the page inherits.
+    shown: Option<[u32; 4]>,
+    objects: usize,
+    fonts: u64,
 }
 
-/// The object number of the reference (`N G R`) that follows `key`.
-fn reference_after(dict: &[u8], key: &[u8]) -> Option<u32> {
-    references_in(value_of(dict, key)?).first().copied()
+/// How many objects of a page are asked for their font.
+const FONT_LOOK: usize = 512;
+
+fn bits(r: [f32; 4]) -> [u32; 4] {
+    r.map(f32::to_bits)
 }
 
-/// The object numbers of the references (`N G R`) that make up `text` and nothing else.
-fn all_references(text: &[u8]) -> Option<Vec<u32>> {
-    let all: Vec<&[u8]> = words(text).collect();
-    if !all.len().is_multiple_of(3) {
-        return None;
-    }
-    all.chunks(3)
-        .map(|chunk| {
-            if chunk[2] != b"R" || number_of(Some(chunk[1])).is_none() {
-                return None;
-            }
-            u32::try_from(number_of(Some(chunk[0]))?).ok()
-        })
-        .collect()
-}
-
-/// The object numbers of the references (`N G R`) at the start of `text`, one after another.
-fn references_in(text: &[u8]) -> Vec<u32> {
-    let all: Vec<&[u8]> = words(text).collect();
-    let mut out = Vec::new();
-    for chunk in all.chunks(3) {
-        if chunk.len() < 3 || chunk[2] != b"R" {
+fn print_of(page: &PdfPage<'_>) -> PagePrint {
+    let objects = page.objects();
+    let mut fonts: u64 = 0xcbf2_9ce4_8422_2325;
+    for (n, object) in objects.iter().enumerate() {
+        if n >= FONT_LOOK {
             break;
         }
-        let Some(n) = std::str::from_utf8(chunk[0])
+        if let Some(text) = object.as_text_object() {
+            for byte in text.font().name().bytes() {
+                fonts = (fonts ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+            }
+            fonts = (fonts ^ 0xff).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    PagePrint {
+        size: [page.width().value.to_bits(), page.height().value.to_bits()],
+        turns: page.rotation().map(turns_of).unwrap_or(255),
+        shown: page
+            .boundaries()
+            .bounding()
             .ok()
-            .and_then(|w| w.parse::<u32>().ok())
-        else {
-            break;
-        };
-        out.push(n);
+            .map(|b| bits(rect_of(&b.bounds))),
+        objects: objects.len(),
+        fonts,
     }
-    out
+}
+
+/// The print of every page of the document, in order.
+fn page_prints(
+    document: &PdfDocument<'_>,
+    progress: &mut dyn FnMut(u32),
+) -> Result<Vec<PagePrint>, Failure> {
+    let list = document.pages();
+    let mut pace = Pace::new();
+    let mut out = Vec::with_capacity(list.len() as usize);
+    for index in 0..list.len() {
+        let page = list
+            .get(index)
+            .map_err(|_| failed("a page could not be read"))?;
+        out.push(print_of(&page));
+        pace.step(progress);
+    }
+    Ok(out)
+}
+
+/// A number that stands for a list of page sizes, kept with a copy of the document so that a copy
+/// that reads back as other pages of the same number is not taken for it.
+fn sizes_digest(sizes: &[PageSize]) -> u64 {
+    let mut digest: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut put = |v: u32| {
+        for byte in v.to_le_bytes() {
+            digest = (digest ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+        }
+    };
+    for size in sizes {
+        put(size.width.to_bits());
+        put(size.height.to_bits());
+    }
+    digest
 }
 
 /// The password the document was opened with, in a copy that is overwritten with zeros when it is
@@ -916,21 +778,48 @@ fn take_snapshot(
     progress: &mut dyn FnMut(u32),
 ) -> Result<u32, Failure> {
     let limit = tools(engine, doc).max_undo_bytes;
-    let pages = engine.document(doc)?.pages().len() as usize;
+    let sizes = page_sizes(engine.document(doc)?);
     match serialise(engine, doc, limit, progress)? {
-        Some(bytes) => Ok(tools(engine, doc).keep(bytes, pages)),
+        Some(bytes) => Ok(tools(engine, doc).keep(bytes, sizes.len(), Some(sizes_digest(&sizes)))),
         None => Ok(0),
     }
 }
 
+/// As [`take_snapshot`], for a change to the list of pages: the copy of the document is written
+/// out in full first and its page tree is read, and a tree that a change cannot be trusted with is
+/// refused before anything is touched. A document too big to be written out is refused too: it
+/// could not be saved afterwards either.
+fn take_checked_snapshot(
+    engine: &mut Engine,
+    doc: u32,
+    count: usize,
+    progress: &mut dyn FnMut(u32),
+) -> Result<u32, Failure> {
+    let sizes = page_sizes(engine.document(doc)?);
+    let Some(bytes) = serialise(engine, doc, MAX_SAVE_BYTES, progress)? else {
+        return fail(
+            ErrorCode::SaveTooLarge,
+            "the document is too big for its pages to be changed",
+        );
+    };
+    read_tree(&bytes, count, false)?;
+    let limit = tools(engine, doc).max_undo_bytes;
+    Ok(if bytes.len() <= limit {
+        tools(engine, doc).keep(bytes, count, Some(sizes_digest(&sizes)))
+    } else {
+        0
+    })
+}
+
 /// A copy of a document read in again, with the pages it must have. A copy that shows another
-/// number is not the document that was kept (PDFium does not always read back what it wrote, on a
+/// number, or other sizes, is not the document that was kept (PDFium does not always read back what it wrote, on a
 /// damaged file), and putting it in place would replace the user's document with another one.
 fn load_copy(
     pdfium: &'static Pdfium,
     bytes: Vec<u8>,
     password: Option<&str>,
     pages: usize,
+    digest: Option<u64>,
 ) -> Result<PdfDocument<'static>, Failure> {
     let loaded = pdfium
         .load_pdf_from_byte_vec(bytes, password)
@@ -940,6 +829,11 @@ fn load_copy(
         return Err(failed(&format!(
             "the copy of the document has {found} pages, not the {pages} it was made from"
         )));
+    }
+    if digest.is_some_and(|d| sizes_digest(&page_sizes(&loaded)) != d) {
+        return Err(failed(
+            "the copy of the document shows other pages than the ones it was made from",
+        ));
     }
     Ok(loaded)
 }
@@ -962,11 +856,16 @@ fn recover(
         .tools
         .get(&doc)
         .and_then(|t| t.snapshots.iter().find(|s| s.token == token))
-        .map(|s| (s.bytes.clone(), s.pages));
+        .map(|s| (s.bytes.clone(), s.pages, s.digest));
     match kept {
-        Some((bytes, pages)) if token != 0 => {
-            put_back(engine, pdfium, doc, bytes, pages, password, original)
-        }
+        Some((bytes, pages, digest)) if token != 0 => put_back(
+            engine,
+            pdfium,
+            doc,
+            (bytes, pages, digest),
+            password,
+            original,
+        ),
         _ => lose(engine, doc),
     }
 }
@@ -975,12 +874,11 @@ fn put_back(
     engine: &mut Engine,
     pdfium: &'static Pdfium,
     doc: u32,
-    bytes: Vec<u8>,
-    pages: usize,
+    (bytes, pages, digest): (Vec<u8>, usize, Option<u64>),
     password: Option<Secret>,
     original: Failure,
 ) -> Failure {
-    match load_copy(pdfium, bytes, password_str(&password), pages) {
+    match load_copy(pdfium, bytes, password_str(&password), pages, digest) {
         Ok(loaded) => {
             engine.docs.insert(doc, loaded);
             original
@@ -1175,14 +1073,17 @@ fn delete(
             "a document needs at least one page",
         );
     }
-    let token = take_snapshot(engine, doc, progress)?;
+    let token = take_checked_snapshot(engine, doc, count, progress)?;
+    let before = page_sizes(engine.document(doc)?);
     let fail_at = tools(engine, doc).fail_at();
     let miscount = tools(engine, doc).miscount();
     let mut form_fields = 0;
     let result = (|| {
         let document = engine.docs.get_mut(&doc).ok_or_else(gone)?;
+        let mut pace = Pace::new();
         for &index in &sorted {
             form_fields += clear_form_fields(document, index);
+            pace.step(progress);
         }
         for (i, &index) in sorted.iter().rev().enumerate() {
             if injected(fail_at, i) {
@@ -1194,13 +1095,20 @@ fn delete(
                 .map_err(|_| failed("a page could not be read"))?;
             page.delete()
                 .map_err(|_| failed("PDFium could not delete a page"))?;
-            if i % 16 == 15 {
-                progress(i as u32 + 1);
-            }
+            pace.step(progress);
         }
         if document.pages().len() as isize + miscount != (count - sorted.len()) as isize {
             return Err(failed(
                 "the document has the wrong number of pages after the delete",
+            ));
+        }
+        // The pages that stay must be the ones that were not named, in their order.
+        let now = page_sizes(document);
+        let stayed = (0..count).filter(|i| sorted.binary_search(&(*i as u32)).is_err());
+        if now.len() != count - sorted.len() || now.iter().zip(stayed).any(|(s, i)| *s != before[i])
+        {
+            return Err(failed(
+                "the pages that were to stay are not the ones that stayed",
             ));
         }
         Ok(())
@@ -1252,23 +1160,24 @@ fn reorder(
             "the document is too big to be reordered",
         );
     };
+    // PDFium's move stops the process on a list of pages that names something that is not there,
+    // and puts a page under another node without what the old node gave it. The tree is read
+    // from the document as PDFium writes it, and such a document is not moved as it is.
+    let tree = read_tree(&bytes, count, true)?;
     let stable = stable_places(order);
     let fail_at = tools(engine, doc).fail_at();
     let miscount = tools(engine, doc).miscount();
     let scramble = tools(engine, doc).scrambled();
     let password = password_of(engine, doc);
     let moved = stable.iter().filter(|s| !**s).count();
-    // PDFium's move stops the process on a page tree that lists something that is not there (a
-    // kid that is a null object after the last page that can be found, found by the fuzz target):
-    // the pages it can find are all sound, so the check of the list of pages did not see it. The
-    // document as PDFium writes it shows it, and such a document is not moved.
-    if !page_tree_is_sound(&bytes, count) {
-        return fail(
-            ErrorCode::PageChangeFailed,
-            "the list of pages of this document is damaged (it names something that is not there), so its pages cannot be moved",
-        );
+    let sizes = page_sizes(engine.document(doc)?);
+    let digest = sizes_digest(&sizes);
+    let before = page_prints(engine.document(doc)?, progress)?;
+    if !tree.hoists.is_empty() {
+        write_inherited_entries(
+            engine, pdfium, doc, &bytes, &tree, &before, &password, progress,
+        )?;
     }
-    let before = page_sizes(engine.document(doc)?);
     let result = (|| {
         let document = engine.docs.get_mut(&doc).ok_or_else(gone)?;
         // The pages that have to move go to the end first, in the order of the places they are
@@ -1322,32 +1231,81 @@ fn reorder(
                 "the document has the wrong number of pages after the move",
             ));
         }
-        // Every place must hold the page that was asked for. A page cannot be told from another
-        // by its size alone, but a move that went wrong shows up there first.
-        let mut now = page_sizes(document);
+        // Every place must hold the page that was asked for, and the page as it was: its size, its
+        // turn, its boxes and what is drawn on it. A move that went wrong shows up there.
+        let mut now = page_prints(document, progress)?;
         if scramble {
             now.rotate_left(1);
+        }
+        if now.len() != before.len() {
+            return Err(failed(
+                "the document has the wrong number of pages after the move",
+            ));
         }
         if now
             .iter()
             .zip(order)
-            .any(|(size, &from)| *size != before[from as usize])
+            .any(|(print, &from)| *print != before[from as usize])
         {
-            return Err(failed("the pages are not in the order that was asked for"));
+            return Err(failed(
+                "the pages are not in the order that was asked for, or one of them is not as it was",
+            ));
         }
         Ok(())
     })();
     let limit = tools(engine, doc).max_undo_bytes;
     if let Err(e) = result {
         // Put the document back from the copy.
-        return Err(put_back(engine, pdfium, doc, bytes, count, password, e));
+        return Err(put_back(
+            engine,
+            pdfium,
+            doc,
+            (bytes, count, Some(digest)),
+            password,
+            e,
+        ));
     }
     let token = if bytes.len() <= limit {
-        tools(engine, doc).keep(bytes, count)
+        tools(engine, doc).keep(bytes, count, Some(digest))
     } else {
         0
     };
     changed(engine, doc, token, moved)
+}
+
+/// Writes onto the pages the entries they inherit from nodes below the root (`/Resources`,
+/// `/MediaBox`, `/CropBox`, `/Rotate`), so that a page that is moved under another node is the
+/// same page there. PDFium has no call that writes such an entry, so the document as it was
+/// written out gets a part added at its end (see [`pagetree::hoisted`]), is read in again, and
+/// replaces the open document only when every page looks the way it did. Otherwise the document is
+/// left as it is.
+#[allow(clippy::too_many_arguments)]
+fn write_inherited_entries(
+    engine: &mut Engine,
+    pdfium: &'static Pdfium,
+    doc: u32,
+    bytes: &[u8],
+    tree: &pagetree::Tree,
+    before: &[PagePrint],
+    password: &Option<Secret>,
+    progress: &mut dyn FnMut(u32),
+) -> Result<(), Failure> {
+    let refused = |why: &str| -> Failure {
+        (
+            ErrorCode::PageChangeFailed,
+            format!(
+                "the pages could not be prepared for the move ({why}), so they were left as they are"
+            ),
+        )
+    };
+    let written = pagetree::hoisted(bytes, tree).map_err(|e| refused(&e.reason()))?;
+    let loaded = load_copy(pdfium, written, password_str(password), before.len(), None)
+        .map_err(|_| refused("the document did not read back"))?;
+    if page_prints(&loaded, progress)? != before {
+        return Err(refused("a page would have changed"));
+    }
+    engine.docs.insert(doc, loaded);
+    Ok(())
 }
 
 fn rotate(
@@ -1355,6 +1313,7 @@ fn rotate(
     doc: u32,
     pages: &[u32],
     turns: u8,
+    progress: &mut dyn FnMut(u32),
 ) -> Result<PagesResponse, Failure> {
     let count = editable(engine, doc, Right::Assemble)?;
     if !(1..=3).contains(&turns) {
@@ -1366,25 +1325,40 @@ fn rotate(
     let sorted = page_list(pages, count)?;
     {
         let document = engine.document(doc)?;
-        // Look at every page first, so that a page that cannot be read changes nothing.
-        let mut now = Vec::with_capacity(sorted.len());
+        // Each page is read once and turned at once. A page that cannot be read stops the change,
+        // and the pages already turned are turned back, so that a failure changes nothing.
+        let mut turned: Vec<(PdfPageIndex, u8)> = Vec::with_capacity(sorted.len());
+        let mut pace = Pace::new();
+        let mut stopped = None;
         for &index in &sorted {
-            let page = document
+            let read = document
                 .pages()
                 .get(index as PdfPageIndex)
-                .map_err(|_| failed("a page could not be read"))?;
-            now.push(
-                page.rotation()
-                    .map(turns_of)
-                    .map_err(|_| failed("the rotation of a page could not be read"))?,
-            );
+                .map_err(|_| failed("a page could not be read"))
+                .and_then(|mut page| {
+                    let was = page
+                        .rotation()
+                        .map(turns_of)
+                        .map_err(|_| failed("the rotation of a page could not be read"))?;
+                    page.set_rotation(rotation_of(was + turns));
+                    Ok(was)
+                });
+            match read {
+                Ok(was) => turned.push((index as PdfPageIndex, was)),
+                Err(e) => {
+                    stopped = Some(e);
+                    break;
+                }
+            }
+            pace.step(progress);
         }
-        for (&index, turned) in sorted.iter().zip(now) {
-            let mut page = document
-                .pages()
-                .get(index as PdfPageIndex)
-                .map_err(|_| failed("a page could not be read"))?;
-            page.set_rotation(rotation_of(turned + turns));
+        if let Some(e) = stopped {
+            for (index, was) in turned {
+                if let Ok(mut page) = document.pages().get(index) {
+                    page.set_rotation(rotation_of(was));
+                }
+            }
+            return Err(e);
         }
     }
     changed(engine, doc, 0, sorted.len())
@@ -1395,6 +1369,7 @@ fn crop(
     doc: u32,
     pages: &[u32],
     margins: [f32; 4],
+    progress: &mut dyn FnMut(u32),
 ) -> Result<PagesResponse, Failure> {
     let count = editable(engine, doc, Right::Modify)?;
     let sorted = page_list(pages, count)?;
@@ -1411,6 +1386,7 @@ fn crop(
         let document = engine.document(doc)?;
         let mut before = Vec::with_capacity(sorted.len());
         let mut after = Vec::with_capacity(sorted.len());
+        let mut pace = Pace::new();
         // All pages are worked out before the first is changed: one page that cannot be cropped
         // that way stops the crop and leaves the document as it was.
         for &index in &sorted {
@@ -1433,6 +1409,7 @@ fn crop(
             }
             before.push(visible);
             after.push(new);
+            pace.step(progress);
         }
         for (&index, new) in sorted.iter().zip(&after) {
             let mut page = document
@@ -1442,6 +1419,7 @@ fn crop(
             page.boundaries_mut()
                 .set_crop(pdf_rect(new))
                 .map_err(|_| failed("PDFium could not set the crop box"))?;
+            pace.step(progress);
         }
         (before, after)
     };
@@ -1458,6 +1436,7 @@ fn set_boxes(
     doc: u32,
     pages: &[u32],
     boxes: &[[f32; 4]],
+    progress: &mut dyn FnMut(u32),
 ) -> Result<PagesResponse, Failure> {
     let count = editable(engine, doc, Right::Modify)?;
     if pages.len() != boxes.len() {
@@ -1483,6 +1462,7 @@ fn set_boxes(
     }
     {
         let document = engine.document(doc)?;
+        let mut pace = Pace::new();
         for (&index, b) in pages.iter().zip(boxes) {
             let mut page = document
                 .pages()
@@ -1491,6 +1471,7 @@ fn set_boxes(
             page.boundaries_mut()
                 .set_crop(pdf_rect(b))
                 .map_err(|_| failed("PDFium could not set the crop box"))?;
+            pace.step(progress);
         }
     }
     changed(engine, doc, 0, pages.len())
@@ -1525,7 +1506,8 @@ fn insert_blank(
             "the size of the page is not usable",
         );
     }
-    let token = take_snapshot(engine, doc, progress)?;
+    let token = take_checked_snapshot(engine, doc, count, progress)?;
+    let before = page_sizes(engine.document(doc)?);
     let fail_at = tools(engine, doc).fail_at();
     let miscount = tools(engine, doc).miscount();
     let result = (|| {
@@ -1549,6 +1531,34 @@ fn insert_blank(
                 "the document has the wrong number of pages after the insert",
             ));
         }
+        // The new page is the size that was asked for whatever the node it lands in says about
+        // turns and crop boxes, and the other pages are as they were.
+        {
+            let mut page = document
+                .pages()
+                .get(at as PdfPageIndex)
+                .map_err(|_| failed("the new page could not be read"))?;
+            if page.rotation().map(turns_of).unwrap_or(0) != 0 {
+                page.set_rotation(PdfPageRenderRotation::None);
+            }
+            let wanted = [0.0, 0.0, width, height];
+            if visible_box(&page).is_none_or(|shown| shown != wanted) {
+                page.boundaries_mut()
+                    .set_crop(pdf_rect(&wanted))
+                    .map_err(|_| failed("PDFium could not set the box of the new page"))?;
+            }
+        }
+        let now = page_sizes(document);
+        let others = now
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != at as usize)
+            .map(|(_, s)| s);
+        if now.len() != count + 1 || others.zip(&before).any(|(a, b)| a != b) {
+            return Err(failed(
+                "the pages that were there are not as they were after the insert",
+            ));
+        }
         Ok(())
     })();
     if let Err(e) = result {
@@ -1568,12 +1578,10 @@ fn restore(
     // The copy to go back to leaves the queue first, so that keeping the copy of the state being
     // left (which makes room by letting the oldest go) cannot let go of the one that is wanted.
     // That happened for a document of more than half the limit: the step could not be taken back.
-    let target = {
+    let (target, place) = {
         let queue = &mut tools(engine, doc).snapshots;
-        queue
-            .iter()
-            .position(|s| s.token == token)
-            .and_then(|at| queue.remove(at))
+        let place = queue.iter().position(|s| s.token == token);
+        (place.and_then(|at| queue.remove(at)), place.unwrap_or(0))
     };
     let Some(target) = target else {
         return fail(
@@ -1583,9 +1591,25 @@ fn restore(
     };
     // The state that is left, so that the step can be done again. 0 when it is too big to keep:
     // the step can still be taken back, but not made again.
-    let leaving = take_snapshot(engine, doc, progress)?;
+    let leaving = match take_snapshot(engine, doc, progress) {
+        Ok(leaving) => leaving,
+        Err(e) => {
+            // The document was not touched and the copy is as good as it was: it goes back where
+            // it was, so that the step can be tried again.
+            let queue = &mut tools(engine, doc).snapshots;
+            let place = place.min(queue.len());
+            queue.insert(place, target);
+            return Err(e);
+        }
+    };
     let password = password_of(engine, doc);
-    match load_copy(pdfium, target.bytes, password_str(&password), target.pages) {
+    match load_copy(
+        pdfium,
+        target.bytes,
+        password_str(&password),
+        target.pages,
+        target.digest,
+    ) {
         Ok(loaded) => {
             engine.docs.insert(doc, loaded);
             changed(engine, doc, leaving, 0)
@@ -1698,8 +1722,11 @@ fn import_end(
             "the document is too big for pages to be inserted",
         );
     };
+    // PDFium adds pages to the list as it finds it: a list that cannot be trusted is refused first.
+    read_tree(&bytes, count, false)?;
     let password = password_of(engine, doc);
     let miscount = tools(engine, doc).miscount();
+    let digest = sizes_digest(&page_sizes(engine.document(doc)?));
     let result = (|| {
         let document = engine.docs.get_mut(&doc).ok_or_else(gone)?;
         document
@@ -1719,8 +1746,14 @@ fn import_end(
         // over (a pop-up note's `/Parent`). Written out and read in again, with `source` still
         // alive, the document is one that stands on its own. Dropping `source` before that left
         // the next save reading memory that was freed.
-        let written = save::serialise(document)?;
-        load_copy(pdfium, written, password_str(&password), count + added)
+        let written = save::serialise_up_to(document, MAX_SAVE_BYTES, progress)?;
+        load_copy(
+            pdfium,
+            written,
+            password_str(&password),
+            count + added,
+            None,
+        )
     })();
     match result {
         Ok(loaded) => {
@@ -1728,14 +1761,21 @@ fn import_end(
             drop(source);
         }
         Err(e) => {
-            let original = put_back(engine, pdfium, doc, bytes, count, password, e);
+            let original = put_back(
+                engine,
+                pdfium,
+                doc,
+                (bytes, count, Some(digest)),
+                password,
+                e,
+            );
             drop(source);
             return Err(original);
         }
     }
     let limit = tools(engine, doc).max_undo_bytes;
     let token = if bytes.len() <= limit {
-        tools(engine, doc).keep(bytes, count)
+        tools(engine, doc).keep(bytes, count, Some(digest))
     } else {
         0
     };
@@ -1780,7 +1820,7 @@ fn export_begin(
     // file, which a save leaves out when nothing refers to it.
     if drop_copied_signatures(&fresh) > 0 {
         let written = save::serialise_up_to(&fresh, MAX_SAVE_BYTES, progress)?;
-        fresh = load_copy(pdfium, written, None, pages.len())?;
+        fresh = load_copy(pdfium, written, None, pages.len(), None)?;
     }
     let bytes = save::serialise_up_to(&fresh, MAX_SAVE_BYTES, progress)?;
     let (size, print) = (bytes.len(), save::fingerprint(&fresh, progress));

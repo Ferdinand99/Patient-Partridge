@@ -28,6 +28,7 @@ pub mod fds;
 pub mod fonts;
 pub mod limits;
 pub mod pages;
+pub mod pagetree;
 pub mod sandbox;
 pub mod save;
 pub mod sigcheck;

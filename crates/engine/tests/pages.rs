@@ -67,7 +67,12 @@ fn open_doc(engine: &mut Engine, bytes: &[u8]) -> (u32, TempFile) {
 fn page_op(engine: &mut Engine, op: PagesRequest) -> Result<PagesResponse, ErrorCode> {
     match ask(engine, RequestBody::Pages(op)) {
         ResponseBody::Pages(r) => Ok(r),
-        other => Err(code_of(other)),
+        other => {
+            if let ResponseBody::Error { message, .. } = &other {
+                eprintln!("refused: {message}");
+            }
+            Err(code_of(other))
+        }
     }
 }
 
@@ -2187,7 +2192,9 @@ fn a_document_that_reads_back_with_no_pages_is_never_put_in_place_of_the_open_on
     let bytes = save_all(e, doc);
     let again = open(e, &bytes, Some(kit::PAGE_COUNT_LOST_PASSWORD)).unwrap();
     assert!(page_count(e, again) >= 1);
-    let (_, snapshot, _) = changed(page_op(
+    // The list of pages of this document does not read back the way it was written, so a change to
+    // it is refused (or, if it is made, it can be taken back and the document never has fewer pages).
+    let snapshot = match page_op(
         e,
         PagesRequest::InsertBlank {
             doc,
@@ -2195,7 +2202,13 @@ fn a_document_that_reads_back_with_no_pages_is_never_put_in_place_of_the_open_on
             width: 100.0,
             height: 100.0,
         },
-    ));
+    ) {
+        Ok(r) => changed(Ok(r)).1,
+        Err(code) => {
+            assert_eq!(code, ErrorCode::PageChangeFailed);
+            0
+        }
+    };
     if snapshot != 0 {
         let r = page_op(e, PagesRequest::Restore { doc, snapshot });
         if let Ok(PagesResponse::Changed {
@@ -2896,4 +2909,323 @@ fn dictionaries_written_in_place_and_nested_nodes_do_not_make_a_page_tree_look_d
         },
     ));
     assert!(save_all(e, doc).starts_with(b"%PDF-"));
+}
+
+// ---- what a moved page inherits, and the page tree the tools read -----------------------------------
+
+/// The picture of every page, drawn at one size, as the window would ask for it.
+fn pictures(engine: &mut Engine, doc: u32) -> Vec<Vec<u8>> {
+    let n = page_count(engine, doc);
+    (0..n)
+        .map(|page| {
+            match ask(
+                engine,
+                RequestBody::Render {
+                    doc,
+                    page,
+                    width: 300,
+                    height: 200,
+                },
+            ) {
+                ResponseBody::Rendered { rgba, .. } => rgba,
+                other => panic!("page {page}: {other:?}"),
+            }
+        })
+        .collect()
+}
+
+fn page_error(engine: &mut Engine, op: PagesRequest) -> (ErrorCode, String) {
+    match ask(engine, RequestBody::Pages(op)) {
+        ResponseBody::Error { code, message } => (code, message),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+/// How many pixels of a picture are not white.
+fn inked(picture: &[u8]) -> usize {
+    picture
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|p| p[0] != 255 || p[1] != 255 || p[2] != 255)
+        .count()
+}
+
+/// Moves pages about in `bytes` in several ways, one after the other, and checks after each that
+/// every place draws the page that was asked for, pixel for pixel; then that the same holds for
+/// what is saved, and that every step can be taken back to the picture it came from.
+fn assert_moves_keep_every_picture(name: &str, bytes: &[u8]) {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let (doc, _f) = open_doc(e, bytes);
+    let n = page_count(e, doc) as usize;
+    let original = pictures(e, doc);
+    assert!(
+        original.iter().all(|p| inked(p) > 200),
+        "{name}: every page of the document draws something"
+    );
+    for i in 0..n {
+        for j in i + 1..n {
+            assert_ne!(
+                original[i], original[j],
+                "{name}: pages {i} and {j} look alike"
+            );
+        }
+    }
+    // current[i] is the place in the original document of the page now at place i.
+    let mut current: Vec<usize> = (0..n).collect();
+    let mut orders: Vec<Vec<u32>> = vec![
+        (0..n as u32).rev().collect(),
+        (1..n as u32).chain([0]).collect(),
+        (0..n as u32).rev().collect(),
+    ];
+    // One that interleaves, and one that takes the first to the end and the last to the front.
+    orders.push(
+        (0..n as u32)
+            .map(|i| {
+                if i % 2 == 0 {
+                    i / 2
+                } else {
+                    n as u32 - 1 - i / 2
+                }
+            })
+            .collect(),
+    );
+    if n == 7 {
+        orders.insert(0, vec![3, 6, 0, 5, 1, 4, 2]);
+    }
+    let mut swapped: Vec<u32> = (0..n as u32).collect();
+    swapped.swap(0, n - 1);
+    orders.push(swapped);
+    let mut tokens = Vec::new();
+    for order in orders {
+        let before = current.clone();
+        let (sizes, snapshot, _) = changed(page_op(
+            e,
+            PagesRequest::Reorder {
+                doc,
+                order: order.clone(),
+            },
+        ));
+        assert_eq!(sizes.len(), n, "{name}");
+        current = order.iter().map(|&p| before[p as usize]).collect();
+        let now = pictures(e, doc);
+        for (place, picture) in now.iter().enumerate() {
+            assert!(
+                *picture == original[current[place]],
+                "{name}: place {place} after the move {order:?} does not draw page {} as it was",
+                current[place]
+            );
+        }
+        tokens.push((snapshot, before));
+    }
+    // What is written to the disk draws the same.
+    let saved = save_all(e, doc);
+    let reopened = open(e, &saved, None).unwrap();
+    let after = pictures(e, reopened);
+    for (place, picture) in after.iter().enumerate() {
+        assert!(
+            *picture == original[current[place]],
+            "{name}: the saved file draws place {place} differently"
+        );
+    }
+    // Every step taken back, last first, gives the pictures the step started from.
+    for (snapshot, before) in tokens.into_iter().rev() {
+        assert_ne!(snapshot, 0, "{name}: a step that cannot be taken back");
+        changed(page_op(e, PagesRequest::Restore { doc, snapshot }));
+        let now = pictures(e, doc);
+        for (place, picture) in now.iter().enumerate() {
+            assert!(
+                *picture == original[before[place]],
+                "{name}: place {place} draws another picture after the step was taken back"
+            );
+        }
+    }
+}
+
+#[test]
+fn pages_moved_out_of_nodes_that_gave_them_resources_boxes_and_turns_are_drawn_as_they_were() {
+    assert_moves_keep_every_picture("a tree of three levels", &kit::inherited_tree_pdf());
+}
+
+#[test]
+fn pages_that_inherit_from_the_root_only_are_moved_as_they_are() {
+    assert_moves_keep_every_picture("entries at the root", &kit::root_inherited_pdf());
+}
+
+#[test]
+fn the_entries_a_moved_page_needs_are_written_onto_it_and_nothing_else_is_changed() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let (doc, _f) = open_doc(e, &kit::inherited_tree_pdf());
+    let (_, snapshot, _) = changed(page_op(
+        e,
+        PagesRequest::Reorder {
+            doc,
+            order: vec![6, 5, 4, 3, 2, 1, 0],
+        },
+    ));
+    let saved = save_all(e, doc);
+    // The picture and the font are named in the resources of every page now: the form is drawn by
+    // name in all seven page contents, and the resources are found from each page.
+    let reopened = open(e, &saved, None).unwrap();
+    assert_eq!(page_count(e, reopened), 7);
+    // The step can be taken back, and then the document is the one that was opened, which has the
+    // entries where they were: a second move of the same pages again works.
+    changed(page_op(e, PagesRequest::Restore { doc, snapshot }));
+    changed(page_op(
+        e,
+        PagesRequest::Reorder {
+            doc,
+            order: vec![1, 0, 2, 3, 4, 5, 6],
+        },
+    ));
+}
+
+#[test]
+fn a_list_of_pages_that_names_something_that_is_not_there_gets_no_page_tool_that_changes_the_list()
+{
+    let mut guard = engine();
+    let e = &mut guard.0;
+    for (name, bytes) in [
+        ("a reference to nothing", kit::trailing_null_kid_pdf()),
+        (
+            "an object number above a million",
+            kit::trailing_far_kid_pdf(),
+        ),
+        ("a name and an array", kit::junk_after_the_kids_pdf()),
+    ] {
+        let (doc, _f) = open_doc(e, &bytes);
+        assert_eq!(page_count(e, doc), 3, "{name}");
+        let blank = PagesRequest::InsertBlank {
+            doc,
+            at: 3,
+            width: 100.0,
+            height: 100.0,
+        };
+        let delete = PagesRequest::Delete {
+            doc,
+            pages: vec![2],
+        };
+        let reorder = PagesRequest::Reorder {
+            doc,
+            order: vec![2, 1, 0],
+        };
+        for op in [blank, delete, reorder] {
+            let (code, message) = page_error(e, op);
+            assert_eq!(code, ErrorCode::PageChangeFailed, "{name}");
+            assert!(
+                message.contains("does not follow the format"),
+                "{name}: {message}"
+            );
+        }
+        // Pages from another document go in nowhere either.
+        let (copy, _) = export(e, doc, vec![0]);
+        assert_eq!(
+            insert_document(e, doc, &copy, 3, 4096).unwrap_err(),
+            ErrorCode::PageChangeFailed,
+            "{name}"
+        );
+        assert_eq!(page_count(e, doc), 3, "{name}");
+        // The tools that do not change the list work, and the document saves.
+        changed(page_op(
+            e,
+            PagesRequest::Rotate {
+                doc,
+                pages: vec![0],
+                turns: 1,
+            },
+        ));
+        assert!(save_all(e, doc).starts_with(b"%PDF-"), "{name}");
+    }
+}
+
+/// Valid documents of several shapes: every tool that changes the list works on each, the result
+/// saves and reads back with the pages it should have.
+fn ordinary_documents() -> Vec<(&'static str, Vec<u8>)> {
+    vec![
+        ("a flat tree", kit::marked_pdf(5)),
+        ("many blank pages", kit::blank_pages_pdf(30)),
+        ("links, an outline and an attachment", kit::features_pdf()),
+        ("two levels", kit::inline_dictionaries_pdf()),
+        (
+            "a list of kids that is an object of its own",
+            kit::indirect_kids_pdf(),
+        ),
+        (
+            "words in a node, before the kids",
+            kit::words_in_node_pdf(true),
+        ),
+        (
+            "words in a node, after the kids",
+            kit::words_in_node_pdf(false),
+        ),
+        ("a very big object number", kit::far_object_number_pdf()),
+        ("object streams", kit::object_streams_pdf()),
+        ("entries at the root", kit::root_inherited_pdf()),
+        ("entries below the root", kit::inherited_tree_pdf()),
+        ("a password", kit::encrypted_pdf("secret", 4)),
+    ]
+}
+
+#[test]
+fn valid_documents_of_many_shapes_are_changed_by_every_tool_and_never_called_damaged() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    for (name, bytes) in ordinary_documents() {
+        let password = name.contains("password").then_some("secret");
+        let doc = open(e, &bytes, password).unwrap_or_else(|c| panic!("{name}: {c:?}"));
+        let n = page_count(e, doc);
+        assert!(n >= 3, "{name}");
+        let order: Vec<u32> = (0..n).rev().collect();
+        let steps = [
+            PagesRequest::Reorder { doc, order },
+            PagesRequest::Delete {
+                doc,
+                pages: vec![0],
+            },
+            PagesRequest::InsertBlank {
+                doc,
+                at: 1,
+                width: 200.0,
+                height: 100.0,
+            },
+        ];
+        let mut expected = n;
+        for step in steps {
+            let delta: i64 = match &step {
+                PagesRequest::Delete { .. } => -1,
+                PagesRequest::InsertBlank { .. } => 1,
+                _ => 0,
+            };
+            match page_op(e, step) {
+                Ok(r) => {
+                    let (sizes, _, _) = changed(Ok(r));
+                    expected = (expected as i64 + delta) as u32;
+                    assert_eq!(sizes.len() as u32, expected, "{name}");
+                }
+                Err(code) => panic!("{name}: refused with {code:?}"),
+            }
+        }
+        // Pages of another document.
+        let (copy, _) = export(e, doc, vec![0, 1]);
+        let (sizes, _, _) = insert_document(e, doc, &copy, 1, 4096)
+            .unwrap_or_else(|c| panic!("{name}: the insert was refused with {c:?}"));
+        assert_eq!(sizes.len() as u32, expected + 2, "{name}");
+        let saved = save_all(e, doc);
+        let again = open(e, &saved, password).unwrap_or_else(|c| panic!("{name}: {c:?}"));
+        assert_eq!(page_count(e, again), expected + 2, "{name}");
+    }
+}
+
+#[test]
+fn a_refusal_that_is_not_sure_does_not_call_the_document_damaged() {
+    // A file in which the table of objects is not the kind PDFium writes cannot be checked, which
+    // says nothing about the document. The words must not blame it.
+    let message =
+        partridge_engine::pagetree::TreeError::Unreadable("a table of another kind").words();
+    assert!(!message.contains("damaged"), "{message}");
+    assert!(message.contains("could not be checked"), "{message}");
+    let message = partridge_engine::pagetree::TreeError::Damaged("a node has no count").words();
+    assert!(!message.contains("damaged"), "{message}");
 }

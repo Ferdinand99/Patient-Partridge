@@ -651,6 +651,19 @@ fn the_files_for_other_tools_are_written() {
         "blank=1 size1=300x400 text=0,x,1,2",
     );
 
+    // Pages that inherit from the nodes above them, moved: other programs must draw every page
+    // as it was drawn before the move.
+    let (path, h) = open(&kit::inherited_tree_pdf());
+    fs::copy(&path, out.join("inherited-original.pdf")).unwrap();
+    pool.pages_reorder(h, &[6, 5, 4, 3, 2, 1, 0]).unwrap();
+    pool.save(h, SaveOptions::default()).unwrap();
+    keep(
+        "inherited-moved.pdf",
+        &path,
+        7,
+        "draws=inherited-original.pdf:6,5,4,3,2,1,0",
+    );
+
     // Two pages copied out in the other order.
     let (path, h) = open(&kit::marked_pdf(5));
     let part = dir.0.join("part.pdf");
@@ -711,6 +724,99 @@ fn a_document_with_a_broken_list_of_pages_cannot_take_the_engine_down() {
         // The engine of the document still answers.
         assert!(
             pool.render(handle, 0, 20, 20).is_ok() || pool.page_text(handle, 0).is_ok() || true
+        );
+    }
+}
+
+#[test]
+fn a_list_of_pages_that_names_something_that_is_not_there_cannot_take_the_engine_down() {
+    // The sequences that stopped the engine with a null pointer in PDFium: a page added behind the
+    // pages that can be found and then deleted, a delete, a blank page and a delete again, and a
+    // move, on lists of kids that end with a reference to nothing, to an object with a very big
+    // number, and with a name and an array. Every change that goes through the list is refused
+    // with words of its own, and the next tool still works.
+    let dir = Dir::new("trees");
+    let pool = pool();
+    for (name, bytes) in [
+        ("nothing", kit::trailing_null_kid_pdf()),
+        ("far", kit::trailing_far_kid_pdf()),
+        ("junk", kit::junk_after_the_kids_pdf()),
+    ] {
+        let path = dir.write("tree.pdf", &bytes);
+        let (handle, sizes) = pool.open(&text(&path), None).unwrap();
+        assert_eq!(sizes.len(), 3, "{name}");
+        fn refused<T>(name: &str, result: Result<T, ClientError>, what: &str) {
+            match result {
+                Err(ClientError::Engine { code, message }) => {
+                    assert_eq!(code, ErrorCode::PageChangeFailed, "{name}: {what}");
+                    assert!(
+                        message.contains("does not follow the format"),
+                        "{name}: {message}"
+                    );
+                }
+                Err(other) => panic!("{name}: {what}: {other:?}"),
+                Ok(_) => panic!("{name}: {what} was done"),
+            }
+        }
+        refused(
+            name,
+            pool.pages_insert_blank(handle, 3, 100.0, 100.0),
+            "a blank page",
+        );
+        refused(name, pool.pages_delete(handle, &[2]), "a delete");
+        refused(
+            name,
+            pool.pages_delete(handle, &[1]),
+            "a delete of another page",
+        );
+        refused(name, pool.pages_reorder(handle, &[2, 1, 0]), "a move");
+        refused(
+            name,
+            pool.insert_pdf(
+                handle,
+                3,
+                &text(&path),
+                None,
+                InsertOptions::default(),
+                &nothing,
+            ),
+            "an insert",
+        );
+        // The engine is there, nothing was lost, and the tools that leave the list alone work.
+        assert_eq!(
+            pool.pages_rotate(handle, &[0], 1).unwrap().pages.len(),
+            3,
+            "{name}"
+        );
+        pool.save(handle, SaveOptions::default()).unwrap();
+        assert_eq!(pool.open(&text(&path), None).unwrap().1.len(), 3, "{name}");
+    }
+}
+
+#[test]
+fn pages_that_inherit_from_nodes_are_moved_through_the_engine_and_the_saved_file_draws_them_as_before(
+) {
+    let dir = Dir::new("inherit");
+    let path = dir.write("tree.pdf", &kit::inherited_tree_pdf());
+    let pool = pool();
+    let (handle, sizes) = pool.open(&text(&path), None).unwrap();
+    let draw = |h: u64, page: u32| pool.render(h, page, 240, 160).unwrap().rgba;
+    let before: Vec<_> = (0..7).map(|p| draw(handle, p)).collect();
+    let order = [3u32, 6, 0, 5, 1, 4, 2];
+    let moved = pool.pages_reorder(handle, &order).unwrap();
+    for (place, &from) in order.iter().enumerate() {
+        assert_eq!(moved.pages[place], sizes[from as usize], "place {place}");
+        assert!(
+            draw(handle, place as u32) == before[from as usize],
+            "place {place}"
+        );
+    }
+    pool.save(handle, SaveOptions::default()).unwrap();
+    let (again, _) = pool.open(&text(&path), None).unwrap();
+    for (place, &from) in order.iter().enumerate() {
+        assert!(
+            draw(again, place as u32) == before[from as usize],
+            "saved, place {place}"
         );
     }
 }
