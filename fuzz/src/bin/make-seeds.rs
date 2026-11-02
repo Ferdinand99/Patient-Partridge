@@ -826,6 +826,7 @@ fn main() {
         ("first_key", kit::first_key_pdf()),
         ("form_leftovers", kit::form_leftovers_pdf()),
         ("trailing_null_kid", kit::trailing_null_kid_pdf()),
+        ("junk_after_the_kids", kit::junk_after_the_kids_pdf()),
         ("inline_dictionaries", kit::inline_dictionaries_pdf()),
         ("page_count_lost", kit::page_count_lost_pdf()),
         ("mixed_sizes", kit::mixed_size_pdf()),

@@ -725,8 +725,12 @@ impl<'a> XrefTable<'a> {
         if kind.is_some_and(|k| k != b"/Pages") {
             return false;
         }
-        references_in(kids)
-            .into_iter()
+        // Every entry of the list must be a reference: a name or an array in it is a kid that PDFium
+        // reads as nothing, which its move of pages does not survive.
+        let Some(kids) = all_references(kids) else {
+            return false;
+        };
+        kids.into_iter()
             .all(|kid| self.walk(kid, depth + 1, leaves, visited))
     }
 }
@@ -833,6 +837,22 @@ fn array_after<'a>(dict: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
 /// The object number of the reference (`N G R`) that follows `key`.
 fn reference_after(dict: &[u8], key: &[u8]) -> Option<u32> {
     references_in(value_of(dict, key)?).first().copied()
+}
+
+/// The object numbers of the references (`N G R`) that make up `text` and nothing else.
+fn all_references(text: &[u8]) -> Option<Vec<u32>> {
+    let all: Vec<&[u8]> = words(text).collect();
+    if all.len() % 3 != 0 {
+        return None;
+    }
+    all.chunks(3)
+        .map(|chunk| {
+            if chunk[2] != b"R" || number_of(Some(chunk[1])).is_none() {
+                return None;
+            }
+            u32::try_from(number_of(Some(chunk[0]))?).ok()
+        })
+        .collect()
 }
 
 /// The object numbers of the references (`N G R`) at the start of `text`, one after another.

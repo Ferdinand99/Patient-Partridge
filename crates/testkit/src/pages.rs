@@ -584,3 +584,17 @@ pub fn inline_dictionaries_pdf() -> Vec<u8> {
     objects.swap(2, 2);
     assemble(&objects, "")
 }
+
+/// As [`trailing_null_kid_pdf`], with the entries after the pages in the list of kids a name and an
+/// array instead of a reference to an object that is not there.
+pub fn junk_after_the_kids_pdf() -> Vec<u8> {
+    let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec();
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R /MediaBox [0 0 0 0]] /Count 3 >>".to_vec(),
+        page.clone(),
+        page.clone(),
+        page,
+    ];
+    assemble(&objects, "")
+}

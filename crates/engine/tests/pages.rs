@@ -2841,31 +2841,37 @@ fn a_page_far_from_the_origin_is_refused_for_a_crop_and_no_answer_is_made_that_t
 fn a_page_list_that_names_something_that_is_not_there_is_not_moved_but_everything_else_works() {
     let mut guard = engine();
     let e = &mut guard.0;
-    let (doc, _f) = open_doc(e, &kit::trailing_null_kid_pdf());
-    assert_eq!(page_count(e, doc), 3);
-    // PDFium's move stops the process on this tree; the tools look at the tree first, and refuse.
-    assert_eq!(
-        page_op(
+    for (name, bytes) in [
+        ("a reference to nothing", kit::trailing_null_kid_pdf()),
+        ("a name and an array", kit::junk_after_the_kids_pdf()),
+    ] {
+        let (doc, _f) = open_doc(e, &bytes);
+        assert_eq!(page_count(e, doc), 3, "{name}");
+        // PDFium's move stops the process on this tree; the tools look at the tree first, and refuse.
+        assert_eq!(
+            page_op(
+                e,
+                PagesRequest::Reorder {
+                    doc,
+                    order: vec![2, 1, 0],
+                },
+            )
+            .unwrap_err(),
+            ErrorCode::PageChangeFailed,
+            "{name}"
+        );
+        assert_eq!(page_count(e, doc), 3, "{name}");
+        // The document is whole and the other tools work on it, and it saves.
+        changed(page_op(
             e,
-            PagesRequest::Reorder {
+            PagesRequest::Rotate {
                 doc,
-                order: vec![2, 1, 0],
+                pages: vec![0],
+                turns: 1,
             },
-        )
-        .unwrap_err(),
-        ErrorCode::PageChangeFailed
-    );
-    assert_eq!(page_count(e, doc), 3);
-    // The document is whole and the other tools work on it, and it saves.
-    changed(page_op(
-        e,
-        PagesRequest::Rotate {
-            doc,
-            pages: vec![0],
-            turns: 1,
-        },
-    ));
-    assert!(save_all(e, doc).starts_with(b"%PDF-"));
+        ));
+        assert!(save_all(e, doc).starts_with(b"%PDF-"), "{name}");
+    }
 }
 
 #[test]
