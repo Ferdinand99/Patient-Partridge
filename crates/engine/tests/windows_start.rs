@@ -34,6 +34,7 @@ fn start_once(label: &str) -> u64 {
         "job",
         "mitigations",
         "appcontainer",
+        "no-privileges",
         "own-desktop",
     ] {
         assert!(info.sandbox.contains(layer), "{label}: {info:?}");

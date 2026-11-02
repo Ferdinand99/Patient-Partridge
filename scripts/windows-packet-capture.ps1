@@ -18,7 +18,7 @@ $log = Join-Path $PWD 'logs/capture.txt'
 function Say($text) { $text | Tee-Object -FilePath $log -Append }
 
 $counts = [ordered]@{}
-function Capture([string]$phase, [string]$keepPrivilege) {
+function Capture([string]$phase, [bool]$keepPrivilege) {
   Say "=== $phase ==="
   pktmon stop 2>&1 | Out-Null
   pktmon filter remove 2>&1 | Out-Null
@@ -38,17 +38,22 @@ function Capture([string]$phase, [string]$keepPrivilege) {
   $txt = Join-Path $PWD "logs/$phase.txt"
   Say (pktmon etl2txt $etl -o $txt 2>&1 | Out-String)
   $echo = 0
-  $any = 0
+  $dropped = 0
   if (Test-Path $txt) {
+    # pktmon writes UTF-16 text. A packet that the stack dropped is shown as a "Drop:" event with
+    # the reason; a packet that went on is shown at each component it passed.
     $all = Get-Content -LiteralPath $txt
-    $any = @($all | Where-Object { $_ -match [regex]::Escape($target) }).Count
-    $echo = @($all | Where-Object { $_ -match [regex]::Escape($target) -and $_ -match 'ICMP' }).Count
-    Say "lines with the address: $any, of which ICMP: $echo"
-    $all | Where-Object { $_ -match [regex]::Escape($target) } | Select-Object -First 6 | ForEach-Object { Say "  $_" }
+    $requests = @($all | Where-Object { $_ -match [regex]::Escape($target) -and $_ -match 'ICMP echo request' })
+    $dropped = @($requests | Where-Object { $_ -match '^\s*Drop:' }).Count
+    $echo = $requests.Count - $dropped
+    $reasons = @($all | Where-Object { $_ -match 'Drop: PktGroupId' } | ForEach-Object { if ($_ -match 'DropReason ([^,]+),') { $Matches[1] } } | Sort-Object -Unique)
+    Say "echo requests to $target in the capture: $($requests.Count), dropped in the stack: $dropped ($($reasons -join '; ')), passed on: $echo"
+    $requests | Select-Object -First 6 | ForEach-Object { Say "  $_" }
   } else {
     Say 'no text file was made from the capture'
   }
   $script:counts[$phase] = $echo
+  $script:counts["$phase-dropped"] = $dropped
   $sent = ([regex]::Matches($test, 'raw_echo_sent_\d: ALLOWED')).Count
   $refused = ([regex]::Matches($test, 'raw_echo_sent_\d: denied')).Count
   Say "echo requests the program says it sent: $sent; refused: $refused"
@@ -59,15 +64,15 @@ Capture 'control' $false
 Capture 'sandbox' $false
 Capture 'sandbox-with-privilege' $true
 
-$summary = @("### Raw echo requests to $target seen by pktmon", '', '| Run | Packets seen | Program says sent |', '|---|---|---|')
+$summary = @("### Raw echo requests to $target seen by pktmon", '', '| Run | Program says sent | Passed on in the stack | Dropped in the stack |', '|---|---|---|---|')
 foreach ($phase in 'control', 'sandbox', 'sandbox-with-privilege') {
-  $summary += "| $phase | $($counts[$phase]) | $($counts["$phase-sent"]) |"
+  $summary += "| $phase | $($counts["$phase-sent"]) | $($counts[$phase]) | $($counts["$phase-dropped"]) |"
 }
 $summary | ForEach-Object { Say $_ }
 if ($env:GITHUB_STEP_SUMMARY) { $summary | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY }
 
 if ($counts['control-sent'] -lt 1) { throw 'The control could not send an echo request: the capture proves nothing.' }
-if ($counts['control'] -lt 1) { throw 'pktmon did not see the control''s echo requests: the capture proves nothing about the sandbox.' }
+if (($counts['control'] + $counts['control-dropped']) -lt 1) { throw 'pktmon did not see the control''s echo requests: the capture proves nothing about the sandbox.' }
 if ($counts['sandbox-sent'] -ne 0) { throw 'The sandbox sent an echo request.' }
-if ($counts['sandbox'] -ne 0) { throw 'pktmon saw packets to the documentation address from the sandbox run.' }
+if (($counts['sandbox'] + $counts['sandbox-dropped']) -ne 0) { throw 'pktmon saw echo requests to the documentation address from the sandbox run.' }
 Say 'The sandbox sent nothing, and the capture sees what the control sends.'

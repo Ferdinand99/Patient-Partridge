@@ -13,7 +13,7 @@
 
 #![cfg(windows)]
 
-use partridge_engine_client::{EngineClient, EngineConfig, SandboxPolicy};
+use partridge_engine_client::{EngineClient, EngineConfig, EnginePool, SandboxPolicy};
 use partridge_testkit as kit;
 
 fn config() -> EngineConfig {
@@ -36,15 +36,30 @@ fn the_engine_in_this_firewall_state() {
     let opened = EngineClient::new(config()).open(&file.path_str(), None);
     println!("document: {opened:?}");
 
+    // The pool, which the app uses, learns from the greeting whether the block was proved.
+    let pool = EnginePool::new(config(), 1);
+    let pooled = pool.open(&file.path_str(), None);
+    println!(
+        "pool: opened {:?}, network_not_proved {}",
+        pooled.as_ref().map(|(handle, _)| handle),
+        pool.network_not_proved()
+    );
+
     if expect == "record" {
         return;
     }
+    pooled.unwrap_or_else(|e| panic!("the pool did not open the document: {e:?}"));
     let info = started.unwrap_or_else(|e| panic!("the engine did not start: {e:?}"));
     opened.unwrap_or_else(|e| panic!("the document was not opened: {e:?}"));
     assert!(info.sandbox.contains("appcontainer"), "{info:?}");
     let proved = info.sandbox.split('+').any(|l| l == "no-network");
     let unproved = info.sandbox.contains("network-not-proved");
     assert!(proved != unproved, "exactly one of the two: {info:?}");
+    assert_eq!(
+        pool.network_not_proved(),
+        unproved,
+        "the pool and the greeting disagree: {info:?}"
+    );
     match expect.as_str() {
         "proved" => {
             assert!(proved, "{info:?}");
