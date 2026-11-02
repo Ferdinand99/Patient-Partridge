@@ -314,6 +314,151 @@ pub fn signed_without_field_pdf() -> Vec<u8> {
     build(&specs, "/Perms << /DocMDP 6 0 R >>", "", extras)
 }
 
+/// The text of the page of `annotated_pdf`: "Hello Partridge" as a title at (72, 740) and three
+/// lines from (72, 400) going down by 16 points.
+pub const ANNOTATED_PAGE_TEXT: &str = "Hello Partridge";
+
+/// A hex string of the UTF-16 text of a PDF text string (with the byte order mark).
+fn pdf_text(text: &str) -> String {
+    let mut out = String::from("<FEFF");
+    for unit in text.encode_utf16() {
+        let _ = write!(out, "{unit:04X}");
+    }
+    out.push('>');
+    out
+}
+
+/// A document whose first page holds annotations made by "another program", none of them with an
+/// appearance stream of its own: a yellow-red highlight over the title with a comment, a sticky
+/// note, a drawing, a stamp, a text box, and a link. The second page is plain.
+///
+/// The author names, the comments and the places are for the tests to check; the engine has to
+/// show these, let them be changed or removed, and write nothing of its own over them.
+pub fn annotated_pdf() -> Vec<u8> {
+    let page1 = "BT /F1 24 Tf 72 740 Td (Hello Partridge) Tj ET\n\
+BT /F1 12 Tf 72 400 Td 16 TL (A needle in a haystack.) Tj T* (Another NEEDLE here and quick) Tj T* (brown fox) Tj ET\n"
+        .to_string();
+    let specs = [
+        PageSpec {
+            width: 612,
+            height: 792,
+            content: Some(page1),
+            extra: "/Annots [8 0 R 9 0 R 10 0 R 11 0 R 12 0 R 13 0 R]".into(),
+        },
+        PageSpec {
+            width: 612,
+            height: 792,
+            content: Some(demo_content(2, 612, 792)),
+            extra: String::new(),
+        },
+    ];
+    let extras: Vec<Vec<u8>> = vec![
+        // 8: a highlight over the title, red
+        format!(
+            "<< /Type /Annot /Subtype /Highlight /Rect [72 735 200 765] /QuadPoints [72 765 200 765 72 735 200 735] /C [1 0 0] /Contents {} /T {} /F 4 >>",
+            pdf_text("Check this title"),
+            pdf_text("Alice")
+        )
+        .into_bytes(),
+        // 9: a sticky note
+        format!(
+            "<< /Type /Annot /Subtype /Text /Rect [300 700 320 720] /C [1 1 0] /Name /Comment /Contents {} /T {} /F 4 >>",
+            pdf_text("A note from the file \u{2713}"),
+            pdf_text("Bob")
+        )
+        .into_bytes(),
+        // 10: a drawing
+        b"<< /Type /Annot /Subtype /Ink /Rect [100 300 200 350] /InkList [[100 300 150 350 200 300]] /C [0 0 1] /BS << /W 3 >> /Contents (Ink) /F 4 >>".to_vec(),
+        // 11: a stamp
+        b"<< /Type /Annot /Subtype /Stamp /Rect [400 600 500 650] /Name /Approved /Contents (Stamp) /F 4 >>".to_vec(),
+        // 12: a text box
+        b"<< /Type /Annot /Subtype /FreeText /Rect [72 500 300 540] /Contents (A text box) /DA (/Helv 12 Tf 0 g) /F 4 >>".to_vec(),
+        // 13: a link, which the annotation list leaves out
+        b"<< /Type /Annot /Subtype /Link /Rect [72 650 172 670] /Border [0 0 0] /A << /S /URI /URI (https://example.com/page) >> >>".to_vec(),
+    ];
+    build(&specs, "", "", extras)
+}
+
+/// A document with annotations that try to make a reader misbehave: a comment and an author far
+/// longer than any limit, control characters and direction marks in the text, text that looks like
+/// markup, and a box that is a million points wide. The first page has them; the engine has to
+/// cut, clean and bound all of it, and show it only as text.
+pub fn hostile_annots_pdf() -> Vec<u8> {
+    let specs = [PageSpec {
+        width: 612,
+        height: 792,
+        content: Some(demo_content(1, 612, 792)),
+        extra: "/Annots [6 0 R 7 0 R 8 0 R]".into(),
+    }];
+    let long = "x".repeat(60_000);
+    let extras: Vec<Vec<u8>> = vec![
+        format!(
+            "<< /Type /Annot /Subtype /Text /Rect [100 100 120 120] /Contents {} /T {} /F 4 >>",
+            pdf_text(&long),
+            pdf_text(&"A".repeat(10_000))
+        )
+        .into_bytes(),
+        format!(
+            "<< /Type /Annot /Subtype /Text /Rect [200 100 220 120] /Contents {} /T {} /F 4 >>",
+            pdf_text("<img src=x onerror=alert(1)>\u{7}bell\u{202E}evil\u{200B}\r\nsecond line"),
+            pdf_text("<b>author</b>")
+        )
+        .into_bytes(),
+        b"<< /Type /Annot /Subtype /Square /Rect [-1000000 -1000000 1000000 1000000] /C [0 1 0] /Contents (huge) /F 4 >>".to_vec(),
+    ];
+    build(&specs, "", "", extras)
+}
+
+/// A one page document with `count` sticky notes in a grid, numbered in their text.
+pub fn many_annots_pdf(count: usize) -> Vec<u8> {
+    let first = 6;
+    let refs: String = (0..count).map(|i| format!("{} 0 R ", first + i)).collect();
+    let specs = [PageSpec {
+        width: 612,
+        height: 792,
+        content: Some(demo_content(1, 612, 792)),
+        extra: format!("/Annots [{refs}]"),
+    }];
+    let extras: Vec<Vec<u8>> = (0..count)
+        .map(|i| {
+            let x = 10 + (i % 25) * 22;
+            let y = 10 + (i / 25) * 22;
+            format!(
+                "<< /Type /Annot /Subtype /Text /Rect [{x} {y} {} {}] /Contents (Note {i}) /F 4 >>",
+                x + 20,
+                y + 20
+            )
+            .into_bytes()
+        })
+        .collect();
+    build(&specs, "", "", extras)
+}
+
+/// Five pages with the same text, turned in every way a page can be: not turned, a quarter turn,
+/// a half turn, three quarters, and a quarter turn with a crop box that does not start at zero.
+/// Every page says "Line 0 of page N: the quick brown fox jumps over the lazy dog." on its first
+/// line of text.
+pub fn turned_pdf() -> Vec<u8> {
+    let turns = ["/Rotate 0", "/Rotate 90", "/Rotate 180", "/Rotate 270"];
+    let mut specs: Vec<PageSpec> = turns
+        .iter()
+        .enumerate()
+        .map(|(i, extra)| PageSpec {
+            width: 612,
+            height: 792,
+            content: Some(demo_content(i + 1, 612, 792)),
+            extra: extra.to_string(),
+        })
+        .collect();
+    specs.push(PageSpec {
+        width: 612,
+        height: 792,
+        content: Some(demo_content(5, 612, 792)),
+        extra: "/Rotate 90 /CropBox [50 60 500 700]".to_string(),
+    });
+    build(&specs, "", "", Vec::new())
+}
+
 /// Letters of the right-to-left test page, in reading order: the first ten letters of the Hebrew
 /// alphabet (U+05D0 to U+05D9).
 pub const RTL_LINE: &str = "\u{5d0}\u{5d1}\u{5d2}\u{5d3}\u{5d4}\u{5d5}\u{5d6}\u{5d7}\u{5d8}\u{5d9}";
