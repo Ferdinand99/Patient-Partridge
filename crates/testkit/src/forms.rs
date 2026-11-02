@@ -27,8 +27,8 @@ use super::{build, stream_object, PageSpec};
 pub struct FormOptions {
     /// Turn the page this many degrees (0, 90, 180 or 270).
     pub rotate: u32,
-    /// Scripts and actions that the reader does not run: a format and a calculation on fields,
-    /// and an action on the push button.
+    /// Scripts, which never run, and an action: a format and a calculation on fields, and an
+    /// action on the push button.
     pub scripts: bool,
     /// The form carries XFA data. With `xfa_full` the page is the stub of a form that only XFA can
     /// show.
@@ -388,7 +388,7 @@ fn demo_footer() -> String {
     "0.1 0.3 0.8 rg 36 12 540 8 re f\n".to_string()
 }
 
-/// A form with scripts and actions the reader does not run.
+/// A form with scripts, which never run, and an action on a push button.
 pub fn forms_script_pdf() -> Vec<u8> {
     forms_with(&FormOptions {
         scripts: true,

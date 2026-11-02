@@ -88,6 +88,17 @@ button.form-field {
   outline-offset: 0;
 }
 
+/* Text the document did not accept stays visible and outlined until it is changed or put back. */
+.form-field.form-refused,
+.form-field.form-refused:hover:not(.form-readonly),
+.form-field.form-refused:focus {
+  background: #ffffff;
+  color: #111111;
+  -webkit-text-fill-color: #111111;
+  outline: 2px solid var(--bad-text, #d70015);
+  outline-offset: 0;
+}
+
 /* Check boxes and radio buttons have no text: they show their picture, and a mark while changing. */
 button.form-field,
 button.form-field:focus,

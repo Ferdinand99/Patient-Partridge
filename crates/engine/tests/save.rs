@@ -404,7 +404,7 @@ fn open_flaky(
 }
 
 #[test]
-fn c2_a_read_that_fails_before_a_save_makes_the_save_refuse() {
+fn a_read_that_fails_before_a_save_makes_the_save_refuse() {
     let mut guard = engine();
     let e = &mut guard.0;
     let (doc, broken, _file) = open_flaky(e, &kit::simple_pdf(4), usize::MAX);
@@ -429,7 +429,7 @@ fn c2_a_read_that_fails_before_a_save_makes_the_save_refuse() {
 }
 
 #[test]
-fn c2_a_read_that_fails_in_the_middle_of_a_save_makes_the_save_refuse() {
+fn a_read_that_fails_in_the_middle_of_a_save_makes_the_save_refuse() {
     let mut guard = engine();
     let e = &mut guard.0;
     // Opening reads a few blocks; the file fails a little after that, while the pages are read.
@@ -460,7 +460,7 @@ fn c2_a_read_that_fails_in_the_middle_of_a_save_makes_the_save_refuse() {
 }
 
 #[test]
-fn c1_a_file_changed_in_place_gives_source_changed_for_every_description_and_save() {
+fn a_file_changed_in_place_gives_source_changed_for_every_description_and_save() {
     let mut guard = engine();
     let e = &mut guard.0;
     let original = kit::simple_pdf(3);
@@ -485,7 +485,7 @@ fn c1_a_file_changed_in_place_gives_source_changed_for_every_description_and_sav
 }
 
 #[test]
-fn i3_a_save_of_a_bigger_document_reports_its_progress() {
+fn a_save_of_a_bigger_document_reports_its_progress() {
     let mut guard = engine();
     let e = &mut guard.0;
     let doc = open(e, &kit::simple_pdf(6000), None).unwrap();
@@ -510,7 +510,7 @@ fn i3_a_save_of_a_bigger_document_reports_its_progress() {
 }
 
 #[test]
-fn n1_the_reads_of_the_guard_report_progress_too() {
+fn the_reads_of_the_guard_report_progress_too() {
     let mut guard = engine();
     let e = &mut guard.0;
     // One page and 6 MiB of padding: the page loops report nothing, so every sign of life below
@@ -544,7 +544,7 @@ fn print_of(engine: &mut Engine, doc: u32) -> (u32, u32, u64) {
 }
 
 #[test]
-fn c2_the_fingerprint_of_a_document_is_the_one_of_the_file_it_is_saved_to() {
+fn the_fingerprint_of_a_document_is_the_one_of_the_file_it_is_saved_to() {
     let mut guard = engine();
     let e = &mut guard.0;
     for (name, bytes) in [
@@ -574,7 +574,7 @@ fn c2_the_fingerprint_of_a_document_is_the_one_of_the_file_it_is_saved_to() {
 }
 
 #[test]
-fn c2_the_fingerprint_sees_a_page_that_lost_its_text_or_its_size() {
+fn the_fingerprint_sees_a_page_that_lost_its_text_or_its_size() {
     let mut guard = engine();
     let e = &mut guard.0;
     let original = kit::simple_pdf(3);
@@ -594,7 +594,7 @@ fn c2_the_fingerprint_sees_a_page_that_lost_its_text_or_its_size() {
 }
 
 #[test]
-fn i5_a_signature_field_under_a_grouping_field_is_found_two_ways() {
+fn a_signature_field_under_a_grouping_field_is_found_two_ways() {
     let mut guard = engine();
     let e = &mut guard.0;
     let doc = open(e, &kit::signed_nested_pdf(), None).unwrap();

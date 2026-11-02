@@ -339,8 +339,8 @@ pub enum RequestBody {
     /// the number of objects and annotations. The app asks it of the engine that holds the
     /// document and of the engine that reads the saved file, and the two must agree.
     Fingerprint { doc: u32 },
-    /// What kind of form the document has, and whether it has actions that the reader does not run
-    /// (scripts, and actions on fields).
+    /// What kind of form the document has, and whether it has scripts, which never run, or actions
+    /// on fields.
     FormInfo { doc: u32 },
     /// The fields of one page that the reader fills in, with their values.
     ListFormFields { doc: u32, page: u32 },

@@ -782,6 +782,80 @@ describe("pages that come and go", () => {
   });
 });
 
+describe("what the notice about scripts and actions says", () => {
+  it("says that scripts are not run and that the PDF library can run other actions", () => {
+    expect(ACTIONS_NOTICE).toContain("does not run scripts");
+    expect(ACTIONS_NOTICE).toContain("The PDF library can run some other actions itself");
+    expect(ACTIONS_NOTICE).toContain("clear or hide other fields");
+    // Actions are not said to be left unrun as a whole.
+    expect(ACTIONS_NOTICE).not.toContain("actions that Patient Partridge does not run");
+  });
+});
+
+describe("going to a field", () => {
+  beforeEach(() => {
+    HTMLElement.prototype.scrollIntoView = vi.fn();
+  });
+  afterEach(() => {
+    delete (HTMLElement.prototype as { scrollIntoView?: unknown }).scrollIntoView;
+  });
+
+  it("focuses a field that is on screen", async () => {
+    const r = await rig([[field({ index: 0, name: "a" }), field({ index: 1, name: "b" })]]);
+    r.layer.reveal(0, 1);
+    expect(document.activeElement).toBe(r.control(1));
+    expect(HTMLElement.prototype.scrollIntoView).toHaveBeenCalledTimes(1);
+  });
+
+  it("waits for a page that is not there yet, and focuses the field when its box is built", async () => {
+    const r = await rig([[field({ index: 0, name: "a" })], [field({ index: 0, name: "b" })]], undefined, [0]);
+    r.layer.reveal(1, 0);
+    expect(document.activeElement).not.toBeNull();
+    const second = r.host.appendChild(document.createElement("div"));
+    r.layer.mount(1, second);
+    r.layer.pageDrawn(1);
+    await flush();
+    expect(document.activeElement).toBe(second.querySelector('.form-field[data-form-index="0"]'));
+  });
+
+  it("gives up on a page that never shows the field", async () => {
+    const r = await rig([[field({ index: 0, name: "a" })], [field({ index: 0, name: "b" })]], undefined, [0]);
+    vi.useFakeTimers();
+    try {
+      r.layer.reveal(1, 0);
+      await vi.advanceTimersByTimeAsync(6000);
+      const second = r.host.appendChild(document.createElement("div"));
+      r.layer.mount(1, second);
+      r.layer.pageDrawn(1);
+      await vi.advanceTimersByTimeAsync(50);
+      expect(document.activeElement).not.toBe(second.querySelector(".form-field"));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("lists the fields with refused text by page, with their labels", async () => {
+    const r = await rig([[field({ index: 0, name: "notes", tooltip: "Notes" })], [field({ index: 0, name: "more" })]]);
+    r.api.setFormField.mockRejectedValue({ code: "invalid_request", message: "too long" });
+    for (const [index, el] of [
+      [1, r.host.querySelector<HTMLInputElement>('.form-layer[data-page="1"] .form-field')],
+      [0, r.control(0) as HTMLInputElement],
+    ] as const) {
+      expect(el).not.toBeNull();
+      const input = el as HTMLInputElement;
+      input.focus();
+      input.value = `text ${index}`;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.blur();
+      await flush();
+    }
+    expect(r.layer.refusedFields).toEqual([
+      { page: 0, index: 0, label: "Notes" },
+      { page: 1, index: 0, label: "more" },
+    ]);
+  });
+});
+
 describe("the view of a document with a form", () => {
   function open(pageCount: number, render: ViewerApi["render"], forms: ReturnType<typeof fake>["api"]) {
     const events = { onPageChange: vi.fn(), onZoomChange: vi.fn(), onFatal: vi.fn(), onFirstPaint: vi.fn() };

@@ -115,6 +115,8 @@ interface Tab {
   dirtyTold: boolean;
   /** Set while the document is being saved; resolves with the answer of that save. */
   saving: Promise<boolean> | null;
+  /** The revision of the document when the running save began. */
+  savingFrom: number;
   view: DocumentView;
   /** The annotations of the document, or null when the app process offers none. */
   annotator: Annotator | null;
@@ -189,6 +191,9 @@ const SAVE_SHEET_DELAY_MS = 500;
 const SAVE_SLOW_DETAIL =
   "A large file or a slow drive can take a while. You can wait, or give up the changes you made: the file on the disk stays as it is. Cancel keeps the program open and lets the save carry on.";
 
+/** Said when a form field holds text that the engine did not take (it is too long, for one). */
+const REFUSED_FIELD_DETAIL = "A form field holds text that the document did not accept, so that text is not in it.";
+
 function byId<T extends HTMLElement>(root: Document, id: string): T {
   const el = root.getElementById(id);
   if (!el) throw new Error(`missing element #${id}`);
@@ -246,6 +251,12 @@ export class App {
   private readonly printRoot: HTMLElement;
   private printJob: PrintJob | null = null;
   private printing = false;
+  /**
+   * The saves the reader asked for that are under way, per tab (a press on another tab is its own
+   * save). A second press on the same tab is ignored, unless it is a Save and the document changed
+   * since the running save began.
+   */
+  private readonly savingByUser = new Map<Tab, { asCopy: boolean; count: number }>();
   private readonly positionDelay: number;
 
   constructor(
@@ -307,6 +318,22 @@ export class App {
   init(): void {
     byId(this.root, "open-button").addEventListener("click", () => void this.openDialog());
     byId(this.root, "print-button").addEventListener("click", () => void this.printActive());
+    for (const [id, asCopy] of [
+      ["save-button", false],
+      ["save-copy-button", true],
+    ] as const) {
+      const button = byId(this.root, id);
+      button.addEventListener("click", () => {
+        void this.saveFromUser(asCopy).then((ran) => {
+          // The focus goes back to the document, unless a question is open or the save sent the
+          // reader somewhere (to a field, say).
+          const at = this.root.activeElement;
+          if (ran && this.noticeLayer.childElementCount === 0 && (at === button || at === null || at === this.root.body)) {
+            this.active?.view.element.focus({ preventScroll: true });
+          }
+        });
+      });
+    }
     byId(this.root, "empty-open").addEventListener("click", () => void this.openDialog());
     this.zoomIn.addEventListener("click", () => this.active?.view.stepZoom(1));
     this.zoomOut.addEventListener("click", () => this.active?.view.stepZoom(-1));
@@ -702,6 +729,7 @@ export class App {
       history: new EditHistory(),
       dirtyTold: false,
       saving: null,
+      savingFrom: 0,
       view: undefined as unknown as DocumentView,
       annotator: null,
       sidebarDoc: undefined as unknown as SidebarDocument,
@@ -906,7 +934,7 @@ export class App {
     }
     const answer = await showNotice(this.noticeLayer, {
       title: `Save changes to "${tab.name}"?`,
-      detail: "If you close it without saving, the changes you made are lost.",
+      detail: `${tab.view.hasRefusedFormInput ? `${REFUSED_FIELD_DETAIL} ` : ""}If you close it without saving, the changes you made are lost.`,
       buttons: [
         { id: "cancel", label: "Cancel", safe: true },
         { id: "discard", label: "Don't save" },
@@ -1177,7 +1205,35 @@ export class App {
     const tab = this.active;
     if (!tab || tab.view.pageCount === 0) return false;
     if (tab.view.hasPendingFormInput) await this.flushForms([tab]);
+    if (!this.tabs.includes(tab)) return false;
     return this.saveTab(tab, true);
+  }
+
+  /**
+   * A save the reader asked for with a button or a key. A second press on the same tab while the
+   * first is still being answered (a dialog open, a question on the screen) does nothing: it would
+   * ask again, and would open a second dialog after the first was cancelled. The exception is a
+   * Save pressed after the document changed since the running save began: it is let through and
+   * waits for the running save. A press on another tab is a save of its own. Resolves with false
+   * when ignored.
+   */
+  private async saveFromUser(asCopy: boolean): Promise<boolean> {
+    const tab = this.active;
+    const running = tab ? this.savingByUser.get(tab) : undefined;
+    if (tab && running) {
+      const changed = tab.saving !== null && (tab.history.revision !== tab.savingFrom || tab.view.hasPendingFormInput);
+      if (asCopy || running.asCopy || !changed) return false;
+    }
+    const entry = running ?? { asCopy, count: 0 };
+    entry.count++;
+    if (tab) this.savingByUser.set(tab, entry);
+    try {
+      await (asCopy ? this.saveActiveAs() : this.saveActive());
+    } finally {
+      entry.count--;
+      if (tab && entry.count === 0 && this.savingByUser.get(tab) === entry) this.savingByUser.delete(tab);
+    }
+    return true;
   }
 
   /** Saves every document that has changes. Resolves with true when all were saved. */
@@ -1197,6 +1253,12 @@ export class App {
    * (a save breaks a signature). A failure is told to the user. Resolves with true when saved.
    */
   private async saveTab(tab: Tab, asCopy: boolean): Promise<boolean> {
+    // Text a field refused is not in the document: a file written now would leave it out and the tab
+    // would look saved. Nothing is written until the reader has dealt with the text.
+    if (tab.view.hasRefusedFormInput) {
+      await this.tellRefusedField(tab);
+      return false;
+    }
     // What is under way is done first (an open box of a note is saved, running changes finish),
     // so that the file holds what the window shows.
     await tab.annotator?.flush();
@@ -1206,6 +1268,7 @@ export class App {
       await tab.saving.catch(() => false);
       if (!asCopy && !this.isDirty(tab)) return true;
     }
+    tab.savingFrom = tab.history.revision;
     const running = this.writeTab(tab, asCopy);
     tab.saving = running;
     try {
@@ -1239,6 +1302,28 @@ export class App {
       this.syncChrome();
     }
     return !this.isDirty(tab);
+  }
+
+  private async tellRefusedField(tab: Tab): Promise<void> {
+    const [first, ...others] = tab.view.refusedFormFields;
+    const where = first ? `The field "${first.label}" on page ${first.page + 1}` : "A field";
+    const more =
+      others.length === 0
+        ? ""
+        : ` ${others.length === 1 ? "One other field has" : `${others.length} other fields have`} the same problem.`;
+    const answer = await showNotice(this.noticeLayer, {
+      title: "A field has text that could not be added",
+      detail: `"${tab.name}" was not saved. ${where} holds text that is too long for the document, so that text is not in it.${more} Shorten the text, or press Escape in the field to put back what the document has, then save again.`,
+      buttons: first
+        ? [
+            { id: "ok", label: "OK" },
+            { id: "go", label: "Go to the field", primary: true },
+          ]
+        : [{ id: "ok", label: "OK", primary: true }],
+    });
+    if (answer.button !== "go" || !first || !this.tabs.includes(tab)) return;
+    if (this.active !== tab) this.activate(tab.id);
+    tab.view.revealFormField(first.page, first.index);
   }
 
   private async runSave(tab: Tab): Promise<SavedFile | null> {
@@ -1382,10 +1467,11 @@ export class App {
       const answer = await showNotice(this.noticeLayer, {
         title:
           dirty.length === 1 ? `Save changes to "${dirty[0].name}"?` : `Save changes to ${dirty.length} documents?`,
-        detail:
+        detail: `${dirty.some((t) => t.view.hasRefusedFormInput) ? `${REFUSED_FIELD_DETAIL} ` : ""}${
           dirty.length === 1
             ? "If you quit without saving, the changes you made are lost."
-            : `${names.join(", ")} have changes that are not saved. If you quit without saving, they are lost.`,
+            : `${names.join(", ")} have changes that are not saved. If you quit without saving, they are lost.`
+        }`,
         buttons: [
           { id: "cancel", label: "Cancel", safe: true },
           { id: "discard", label: "Quit without saving" },
@@ -1620,12 +1706,20 @@ export class App {
   }
 
   private drawTitle(): void {
+    this.syncSaveButtons();
     const active = this.active;
     if (!active) {
       this.deps.setWindowTitle(this.appName);
       return;
     }
     this.deps.setWindowTitle(`${this.isDirty(active) ? "\u2022 " : ""}${active.name} - ${this.appName}`);
+  }
+
+  /** Save is there when the document in front has changes; Save a copy whenever a document is open. */
+  private syncSaveButtons(): void {
+    const active = this.active;
+    byId<HTMLButtonElement>(this.root, "save-button").disabled = !active || !this.isDirty(active);
+    byId<HTMLButtonElement>(this.root, "save-copy-button").disabled = !active || active.view.pageCount === 0;
   }
 
   private setControlsEnabled(on: boolean): void {
@@ -1761,10 +1855,10 @@ export class App {
       if (this.activeId !== null) void this.requestClose(this.activeId);
     } else if (action.type === "save") {
       e.preventDefault();
-      void this.saveActive();
+      void this.saveFromUser(false);
     } else if (action.type === "save-as") {
       e.preventDefault();
-      void this.saveActiveAs();
+      void this.saveFromUser(true);
     } else if (action.type === "undo" || action.type === "redo") {
       // In a text box, undo and redo belong to the box. A drop-down list has no undo of its own,
       // and the focus stays in it after a choice.
@@ -1814,9 +1908,11 @@ export class App {
     const tab = this.active;
     if (!tab || this.printing || tab.view.pageCount === 0) return;
     this.printing = true;
-    // The pages are drawn from the document, so what was typed must be in it.
-    if (tab.view.hasPendingFormInput) await this.flushForms([tab]);
     try {
+      // The pages are drawn from the document, so what was typed must be in it. The flush can end
+      // the tab (a lost engine); then there is nothing to print.
+      if (tab.view.hasPendingFormInput) await this.flushForms([tab]);
+      if (!this.tabs.includes(tab)) return;
       const choice = await showPrintDialog(this.noticeLayer, {
         name: tab.name,
         pageCount: tab.view.pageCount,
