@@ -287,6 +287,34 @@ fn stopping_the_transfer_of_pages_leaves_the_document_alone() {
 }
 
 #[test]
+fn a_stop_that_comes_with_the_last_piece_still_ends_the_insert_before_the_change() {
+    // The document is not touched until the last step, so a stop up to then must prevent it.
+    let pool = Arc::new(pool("good"));
+    let (handle, _) = pool.open(&doc_path(), None).unwrap();
+    let stopper = pool.clone();
+    let progress = move |done: u64, total: u64| {
+        if done == total {
+            assert_eq!(stopper.cancel_pages(handle), Cancelled::Handover);
+        }
+    };
+    let result = pool.insert_pdf(
+        handle,
+        0,
+        &doc_path(),
+        None,
+        InsertOptions::default(),
+        &progress,
+    );
+    match result {
+        Err(ClientError::Save(SaveError::Cancelled)) => {}
+        other => panic!("{other:?}"),
+    }
+    // The stand-in adds its two pages only when the change is asked for: it was not.
+    assert_eq!(pool.pages_rotate(handle, &[0], 1).unwrap().pages.len(), 3);
+    assert_eq!(pool.cancel_pages(handle), Cancelled::Idle);
+}
+
+#[test]
 fn a_stop_in_the_middle_of_a_change_does_not_end_the_engine() {
     // A change cannot be interrupted, and ending the engine would lose every change of the
     // document that is not saved. So a stop says that it is too late and does nothing; an engine

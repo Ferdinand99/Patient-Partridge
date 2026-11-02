@@ -2,8 +2,10 @@
 import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenedDocument, SavedFile, SavedPosition } from "../lib/api";
+import type { PageToolsApi, PagesChanged } from "../lib/pagesapi";
 import { THEME_KEY } from "../lib/theme";
 import { App } from "./app";
+import type { PageOps } from "./pageops";
 
 const putImageData = vi.fn();
 
@@ -110,6 +112,8 @@ function make(
     reopenTabs?: boolean;
     /** How long a tab of the last session may take to open at the start. */
     sessionOpenLimitMs?: number;
+    /** The page tools (the page panel and the tools are not there without them). */
+    pages?: PageToolsApi;
   } = {},
 ) {
   let nextDoc = 1;
@@ -177,6 +181,8 @@ function make(
     linkAnswerDelayMs: options.realLinkDelay ? undefined : 0,
     sessionOpenLimitMs: options.sessionOpenLimitMs,
     viewLimits: options.viewLimits,
+    pages: options.pages,
+    pageBusyDelayMs: 1000,
     print: {
       encode: vi.fn(() => Promise.resolve(new Blob(["jpeg"]))),
       createUrl: vi.fn(() => `blob:test/${++urlCounter}`),
@@ -2843,5 +2849,162 @@ describe("App: a save that cannot replace the file", () => {
     await flush();
     expect(m.api.saveAs).not.toHaveBeenCalled();
     expect(m.app.unsavedCount).toBe(1);
+  });
+});
+
+describe("App: page tools", () => {
+  const changed = (pages: number, snapshot = 0, count = 1): PagesChanged => ({
+    pages: Array.from({ length: pages }, () => letter),
+    snapshot,
+    count,
+    formFields: 0,
+  });
+
+  function fakePages() {
+    return {
+      pagesDelete: vi.fn((_d: number, pages: number[]) => Promise.resolve(changed(3 - pages.length, 7, pages.length))),
+      pagesReorder: vi.fn(() => Promise.resolve(changed(3, 8))),
+      pagesRotate: vi.fn((_d: number, pages: number[], _t: number) => Promise.resolve(changed(3, 0, pages.length))),
+      pagesCrop: vi.fn(() => Promise.resolve({ pages: [letter, letter, letter], before: [], after: [] })),
+      pagesSetBoxes: vi.fn(() => Promise.resolve(changed(3))),
+      pagesInsertBlank: vi.fn(() => Promise.resolve(changed(4, 9))),
+      pagesRestore: vi.fn((_d: number, snapshot: number) => Promise.resolve(changed(3, snapshot + 100, 0))),
+      pagesInsertPdf: vi.fn(() => Promise.resolve({ changed: changed(5, 11, 2), inserted: 2 })),
+      pagesExtract: vi.fn(() => Promise.resolve(null)),
+      pagesCancel: vi.fn(() => Promise.resolve("idle" as const)),
+    };
+  }
+
+  const opsOf = (app: App) => (app as unknown as { pageOps: PageOps }).pageOps;
+
+  /** A document that has been turned once, so that it has unsaved changes. */
+  async function changedDocument() {
+    const pages = fakePages();
+    const made = make({ pages: pages as unknown as PageToolsApi });
+    await made.app.openPath("/a.pdf");
+    await flush();
+    await opsOf(made.app).rotate([0], 1);
+    return { ...made, pages, ops: opsOf(made.app) };
+  }
+
+  it("a save waits for a tool that is working, so that it writes the pages as they are then", async () => {
+    const { app, api, pages, ops } = await changedDocument();
+    let finish!: (c: PagesChanged) => void;
+    pages.pagesRotate.mockImplementationOnce(() => new Promise((r) => (finish = r)));
+    const second = ops.rotate([1], 1);
+    await flush();
+    const saved = app.saveActive();
+    await flush();
+    expect(api.save).not.toHaveBeenCalled();
+    finish(changed(3, 0, 1));
+    await second;
+    await saved;
+    expect(api.save).toHaveBeenCalledOnce();
+  });
+
+  it("taking a change back does not start while a tool works, and says nothing about it", async () => {
+    const { pages, ops } = await changedDocument();
+    let finish!: (c: PagesChanged) => void;
+    pages.pagesRotate.mockImplementationOnce(() => new Promise((r) => (finish = r)));
+    const second = ops.rotate([1], 1);
+    await flush();
+    const calls = pages.pagesRotate.mock.calls.length;
+    key("z", { ctrlKey: true });
+    await flush();
+    // Nothing was asked of the engine, and no box says that something failed.
+    expect(pages.pagesRotate.mock.calls.length).toBe(calls);
+    expect(notice()).toBeNull();
+    finish(changed(3, 0, 1));
+    await second;
+  });
+
+  it("a second tool that is asked for while one works is not started and shows nothing", async () => {
+    const { pages, ops } = await changedDocument();
+    let finish!: (c: PagesChanged) => void;
+    pages.pagesRotate.mockImplementationOnce(() => new Promise((r) => (finish = r)));
+    const first = ops.rotate([1], 1);
+    await flush();
+    // Deleting every page would be refused with a box, if it were looked at at all.
+    expect(await ops.remove([0, 1, 2])).toBeNull();
+    expect(notice()).toBeNull();
+    expect(pages.pagesDelete).not.toHaveBeenCalled();
+    finish(changed(3, 0, 1));
+    await first;
+  });
+
+  it("the result of a search is dropped when the pages change, because page numbers mean other pages", async () => {
+    const { app, ops } = await changedDocument();
+    key("f", { ctrlKey: true });
+    const input = q<HTMLInputElement>("#find-input");
+    input.value = "hello";
+    input.dispatchEvent(new Event("input"));
+    await new Promise((r) => setTimeout(r, 120));
+    await flush();
+    expect(q("#find-status").textContent).toBe("1 of 1");
+    await ops.rotate([2], 1);
+    await flush();
+    expect(q("#find-status").textContent).not.toBe("1 of 1");
+    expect(document.querySelectorAll(".hl-find")).toHaveLength(0);
+    expect(app.currentView).not.toBeNull();
+  });
+
+  it("a search that was kept for a document behind another is dropped when its pages change", async () => {
+    const pages = fakePages();
+    const { app } = make({ pages: pages as unknown as PageToolsApi });
+    await app.openPath("/a.pdf");
+    await flush();
+    key("f", { ctrlKey: true });
+    const input = q<HTMLInputElement>("#find-input");
+    input.value = "hello";
+    input.dispatchEvent(new Event("input"));
+    await new Promise((r) => setTimeout(r, 120));
+    await flush();
+    expect(q("#find-status").textContent).toBe("1 of 1");
+    // Another document comes to the front; the pages of the first change while it is behind.
+    await app.openPath("/b.pdf");
+    await flush();
+    (app as unknown as { applyPages(doc: number, pages: unknown[]): void }).applyPages(1, [letter, letter]);
+    click(tab("a.pdf"));
+    await flush();
+    expect(q("#find-status").textContent).not.toBe("1 of 1");
+  });
+
+  it("the contents of the side panel are read again after the pages change", async () => {
+    const { api, ops } = await changedDocument();
+    click(q("#sidebar-toggle"));
+    click(q("#side-tab-contents"));
+    await flush();
+    const before = api.getOutline.mock.calls.length;
+    expect(before).toBeGreaterThan(0);
+    await ops.rotate([1], 1);
+    await flush();
+    // The bookmarks point at page numbers, which now mean other pages: they are asked for again.
+    expect(api.getOutline.mock.calls.length).toBeGreaterThan(before);
+  });
+
+  it("an undo that fails because the engine let go of the copy says so, and does not claim that nothing was lost", async () => {
+    const { pages, ops } = await changedDocument();
+    await ops.remove([1]);
+    // The first delete of a document says what a delete leaves; that is answered first.
+    click(button("OK"));
+    await flush();
+    pages.pagesRestore.mockRejectedValueOnce({ code: "snapshot_gone", message: "" });
+    key("z", { ctrlKey: true });
+    await flush();
+    expect(notice()?.textContent).toMatch(/cannot be taken back any more/);
+    expect(notice()?.textContent).not.toMatch(/Nothing was lost/);
+  });
+
+  it("an undo whose engine died says no second thing: the tab is closed with its own message", async () => {
+    const { pages, ops } = await changedDocument();
+    await ops.remove([1]);
+    click(button("OK"));
+    await flush();
+    pages.pagesRestore.mockRejectedValueOnce({ code: "engine_stopped", message: "gone" });
+    key("z", { ctrlKey: true });
+    await flush();
+    const text = [...document.querySelectorAll(".notice")].map((n) => n.textContent).join(" | ");
+    expect(text).not.toMatch(/Nothing was lost/);
+    expect(text).not.toMatch(/could not be taken back/);
   });
 });

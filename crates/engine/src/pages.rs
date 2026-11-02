@@ -82,6 +82,12 @@ pub struct PageTools {
     /// Test builds only: the step of the next change at which PDFium is made to fail.
     #[cfg(debug_assertions)]
     fail_at: Option<usize>,
+    /// Test builds only: how many pages more than there are the checks after a change see.
+    #[cfg(debug_assertions)]
+    miscount: isize,
+    /// Test builds only: the pages seem to be one place off when a move is checked.
+    #[cfg(debug_assertions)]
+    scramble: bool,
 }
 
 /// Test builds only: true at the step a test chose, to see what a change that fails half way
@@ -106,6 +112,10 @@ impl Default for PageTools {
             max_undo_steps: MAX_UNDO_STEPS,
             #[cfg(debug_assertions)]
             fail_at: None,
+            #[cfg(debug_assertions)]
+            miscount: 0,
+            #[cfg(debug_assertions)]
+            scramble: false,
         }
     }
 }
@@ -154,6 +164,46 @@ impl PageTools {
     pub fn failing_at(mut self, step: usize) -> PageTools {
         self.fail_at = Some(step);
         self
+    }
+
+    /// Makes the checks of the number of pages after a change see `extra` pages more than there
+    /// are (for tests: PDFium itself always counts right, so without this the checks are never put
+    /// to the test).
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn miscounting(mut self, extra: isize) -> PageTools {
+        self.miscount = extra;
+        self
+    }
+
+    /// Makes the check of the order after a move see the pages one place off (for tests).
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn scrambling(mut self) -> PageTools {
+        self.scramble = true;
+        self
+    }
+
+    fn scrambled(&self) -> bool {
+        #[cfg(debug_assertions)]
+        {
+            self.scramble
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            false
+        }
+    }
+
+    fn miscount(&self) -> isize {
+        #[cfg(debug_assertions)]
+        {
+            self.miscount
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            0
+        }
     }
 
     /// The step a test chose for the change that is starting, once.
@@ -854,6 +904,7 @@ fn delete(
     }
     let token = take_snapshot(engine, doc, progress)?;
     let fail_at = tools(engine, doc).fail_at();
+    let miscount = tools(engine, doc).miscount();
     let mut form_fields = 0;
     let result = (|| {
         let document = engine.docs.get_mut(&doc).ok_or_else(gone)?;
@@ -874,7 +925,7 @@ fn delete(
                 progress(i as u32 + 1);
             }
         }
-        if document.pages().len() as usize != count - sorted.len() {
+        if document.pages().len() as isize + miscount != (count - sorted.len()) as isize {
             return Err(failed(
                 "the document has the wrong number of pages after the delete",
             ));
@@ -930,6 +981,8 @@ fn reorder(
     };
     let stable = stable_places(order);
     let fail_at = tools(engine, doc).fail_at();
+    let miscount = tools(engine, doc).miscount();
+    let scramble = tools(engine, doc).scrambled();
     let password = password_of(engine, doc);
     let moved = stable.iter().filter(|s| !**s).count();
     let before = page_sizes(engine.document(doc)?);
@@ -981,14 +1034,17 @@ fn reorder(
             progress(end as u32);
             place = end;
         }
-        if document.pages().len() as usize != count {
+        if document.pages().len() as isize + miscount != count as isize {
             return Err(failed(
                 "the document has the wrong number of pages after the move",
             ));
         }
         // Every place must hold the page that was asked for. A page cannot be told from another
         // by its size alone, but a move that went wrong shows up there first.
-        let now = page_sizes(document);
+        let mut now = page_sizes(document);
+        if scramble {
+            now.rotate_left(1);
+        }
         if now
             .iter()
             .zip(order)
@@ -1188,6 +1244,7 @@ fn insert_blank(
     }
     let token = take_snapshot(engine, doc, progress)?;
     let fail_at = tools(engine, doc).fail_at();
+    let miscount = tools(engine, doc).miscount();
     let result = (|| {
         let document = engine.docs.get_mut(&doc).ok_or_else(gone)?;
         if injected(fail_at, 0) {
@@ -1204,7 +1261,7 @@ fn insert_blank(
                 at as PdfPageIndex,
             )
             .map_err(|_| failed("PDFium could not add a page"))?;
-        if document.pages().len() as usize != count + 1 {
+        if document.pages().len() as isize + miscount != count as isize + 1 {
             return Err(failed(
                 "the document has the wrong number of pages after the insert",
             ));
@@ -1359,6 +1416,7 @@ fn import_end(
         );
     };
     let password = password_of(engine, doc);
+    let miscount = tools(engine, doc).miscount();
     let result = (|| {
         let document = engine.docs.get_mut(&doc).ok_or_else(gone)?;
         document
@@ -1369,7 +1427,7 @@ fn import_end(
                 at as PdfPageIndex,
             )
             .map_err(|_| failed("PDFium could not insert the pages"))?;
-        if document.pages().len() as usize != count + added {
+        if document.pages().len() as isize + miscount != (count + added) as isize {
             return Err(failed(
                 "the document has the wrong number of pages after the insert",
             ));

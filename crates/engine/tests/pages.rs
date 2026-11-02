@@ -2560,3 +2560,247 @@ fn a_document_that_forbids_changes_can_still_be_read_and_a_change_cannot_be_undo
     );
     assert!(save_all(e, doc).starts_with(b"%PDF-"));
 }
+
+// ---- checks the page tools rely on, each put to the test -----------------------------------------
+
+#[test]
+fn a_file_that_changed_in_place_stops_every_tool_that_reads_the_document_again() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    for tool in [
+        "delete",
+        "move",
+        "blank page",
+        "restore",
+        "insert",
+        "copy out",
+    ] {
+        // The engine watches the file of the document opened last: the other document of an insert
+        // is opened and copied first.
+        let bytes_to_insert = (tool == "insert").then(|| {
+            let (other, _f) = open_doc(e, &kit::simple_pdf(1));
+            export(e, other, vec![0]).0
+        });
+        let original = kit::simple_pdf(3);
+        let file = kit::TempFile::new("inplace.pdf", &original);
+        e.set_document(File::open(file.path()).unwrap());
+        let ResponseBody::Opened { doc, .. } = ask(e, RequestBody::Open { password: None }) else {
+            panic!("no document");
+        };
+        // Every part of the file the tools will use has been read.
+        assert!(text(e, doc, 0).contains("Page 1"));
+        let mut token = 0;
+        match tool {
+            "restore" => {
+                token = changed(page_op(
+                    e,
+                    PagesRequest::Delete {
+                        doc,
+                        pages: vec![2],
+                    },
+                ))
+                .1;
+            }
+            "insert" => {
+                let bytes = bytes_to_insert.clone().unwrap();
+                page_op(
+                    e,
+                    PagesRequest::ImportBegin {
+                        doc,
+                        size: bytes.len() as u32,
+                    },
+                )
+                .unwrap();
+                page_op(
+                    e,
+                    PagesRequest::ImportChunk {
+                        doc,
+                        offset: 0,
+                        data: bytes,
+                    },
+                )
+                .unwrap();
+            }
+            _ => {}
+        }
+        // Another program rewrites the file in place, with the same size.
+        let mut theirs = original.clone();
+        let at = theirs.windows(6).position(|w| w == b"Page 1").unwrap();
+        theirs[at..at + 6].copy_from_slice(b"Page X");
+        std::fs::write(file.path(), &theirs).unwrap();
+        let op = match tool {
+            "delete" => PagesRequest::Delete {
+                doc,
+                pages: vec![0],
+            },
+            "move" => PagesRequest::Reorder {
+                doc,
+                order: vec![2, 1, 0],
+            },
+            "blank page" => PagesRequest::InsertBlank {
+                doc,
+                at: 0,
+                width: 100.0,
+                height: 100.0,
+            },
+            "restore" => PagesRequest::Restore {
+                doc,
+                snapshot: token,
+            },
+            "insert" => PagesRequest::ImportEnd { doc, at: 1 },
+            _ => PagesRequest::ExportBegin {
+                doc,
+                pages: vec![0],
+            },
+        };
+        assert_eq!(
+            page_op(e, op).unwrap_err(),
+            ErrorCode::SourceChanged,
+            "{tool}"
+        );
+        ask(e, RequestBody::Close { doc });
+    }
+}
+
+#[test]
+fn the_number_of_pages_is_checked_after_every_change_and_a_wrong_one_puts_the_document_back() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let (other, _f) = open_doc(e, &kit::simple_pdf(2));
+    let (copy, _) = export(e, other, vec![0, 1]);
+    for tool in ["delete", "move", "blank page", "insert"] {
+        let (doc, _f) = open_doc(e, &kit::marked_pdf(5));
+        let start = fingerprint(e, doc);
+        // PDFium counts right. The check is made to see one page too many.
+        e.set_page_tools_for_tests(doc, PageTools::default().miscounting(1));
+        let answer = match tool {
+            "delete" => page_op(
+                e,
+                PagesRequest::Delete {
+                    doc,
+                    pages: vec![1, 2],
+                },
+            )
+            .map(|_| ()),
+            "move" => page_op(
+                e,
+                PagesRequest::Reorder {
+                    doc,
+                    order: vec![4, 3, 2, 1, 0],
+                },
+            )
+            .map(|_| ()),
+            "blank page" => page_op(
+                e,
+                PagesRequest::InsertBlank {
+                    doc,
+                    at: 2,
+                    width: 100.0,
+                    height: 100.0,
+                },
+            )
+            .map(|_| ()),
+            _ => insert_document(e, doc, &copy, 1, 700).map(|_| ()),
+        };
+        assert_eq!(answer.unwrap_err(), ErrorCode::PageChangeFailed, "{tool}");
+        // The document is exactly what it was, in the file too.
+        assert_eq!(page_count(e, doc), 5, "{tool}");
+        assert_eq!(fingerprint(e, doc), start, "{tool}");
+        assert_eq!(order_of(e, doc, 5), vec![0, 1, 2, 3, 4], "{tool}");
+        let saved = save_all(e, doc);
+        for page in 0..5 {
+            assert_has(&saved, page);
+        }
+        ask(e, RequestBody::Close { doc });
+    }
+}
+
+#[test]
+fn every_tool_that_changes_or_goes_back_waits_for_a_save_or_a_copy_to_end() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let (doc, _f) = open_doc(e, &kit::marked_pdf(3));
+    let (_, token, _) = changed(page_op(
+        e,
+        PagesRequest::Delete {
+            doc,
+            pages: vec![0],
+        },
+    ));
+    let ResponseBody::SaveReady { .. } = ask(e, RequestBody::SaveBegin { doc }) else {
+        panic!("no SaveReady");
+    };
+    for (name, op) in [
+        (
+            "going back",
+            PagesRequest::Restore {
+                doc,
+                snapshot: token,
+            },
+        ),
+        (
+            "crop",
+            PagesRequest::Crop {
+                doc,
+                pages: vec![0],
+                margins: [1.0, 1.0, 1.0, 1.0],
+            },
+        ),
+        (
+            "boxes",
+            PagesRequest::SetBoxes {
+                doc,
+                pages: vec![0],
+                boxes: vec![[1.0, 1.0, 100.0, 100.0]],
+            },
+        ),
+        (
+            "begin an insert",
+            PagesRequest::ImportBegin { doc, size: 10 },
+        ),
+    ] {
+        assert_eq!(page_op(e, op).unwrap_err(), ErrorCode::Busy, "{name}");
+    }
+    ask(e, RequestBody::SaveEnd { doc });
+    // After the save the copy is still there to go back to.
+    changed(page_op(
+        e,
+        PagesRequest::Restore {
+            doc,
+            snapshot: token,
+        },
+    ));
+}
+
+#[test]
+fn a_move_that_leaves_the_pages_in_another_order_than_asked_is_taken_back() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    // Pages of different sizes, so that the order can be told from their sizes.
+    let (doc, _f) = open_doc(e, &kit::mixed_size_pdf());
+    let start = fingerprint(e, doc);
+    e.set_page_tools_for_tests(doc, PageTools::default().scrambling());
+    assert_eq!(
+        page_op(
+            e,
+            PagesRequest::Reorder {
+                doc,
+                order: vec![3, 2, 1, 0],
+            },
+        )
+        .unwrap_err(),
+        ErrorCode::PageChangeFailed
+    );
+    assert_eq!(fingerprint(e, doc), start);
+    // Without the injected fault the same move works, and puts the sizes where they were asked.
+    e.set_page_tools_for_tests(doc, PageTools::default());
+    let (sizes, _, _) = changed(page_op(
+        e,
+        PagesRequest::Reorder {
+            doc,
+            order: vec![3, 2, 1, 0],
+        },
+    ));
+    assert_eq!((sizes[0].width, sizes[0].height), (200.0, 1000.0));
+    assert_eq!((sizes[3].width, sizes[3].height), (612.0, 792.0));
+}
