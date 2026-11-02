@@ -1446,7 +1446,7 @@ export class App {
       this.deps.setWindowTitle(this.appName);
       return;
     }
-    this.deps.setWindowTitle(`${this.tabDirty(active) ? "u2022 " : ""}${active.name} - ${this.appName}`);
+    this.deps.setWindowTitle(`${this.tabDirty(active) ? "• " : ""}${active.name} - ${this.appName}`);
   }
 
   private setControlsEnabled(on: boolean): void {
