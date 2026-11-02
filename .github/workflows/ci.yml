@@ -542,7 +542,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: The sandbox proof in this state
         if: matrix.state != 'simulated-answer'
-        env:
         run: |
           cargo test -p partridge-engine --locked --test sandbox -- --nocapture --test-threads 1 2>&1 | Tee-Object -FilePath logs/sandbox.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
