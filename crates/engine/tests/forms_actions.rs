@@ -1381,6 +1381,145 @@ fn a_widget_that_is_none_in_pdfium_cannot_stand_in_for_the_real_one() {
     }
 }
 
+/// `date`, an ordinary text field with an action of its own, can be filled in and nothing is
+/// reset or hidden by it; no field of the form is left alone.
+fn assert_date_is_filled_in(engine: &mut Engine, doc: u32, what: &str) {
+    let _ = ask(engine, RequestBody::FormInfo { doc });
+    let list = fields(engine, doc, 0);
+    let mut sorted = names(&list);
+    sorted.sort_unstable();
+    assert!(
+        sorted.starts_with(&["date", "keep", "plain"]),
+        "{what}: {sorted:?}"
+    );
+    for field in &list {
+        assert!(
+            !field.has(field_flag::ACTION_BLOCKED)
+                && !field.has(field_flag::FORM_BLOCKED)
+                && !field.has(field_flag::READ_ONLY),
+            "{what}: {}: {:#x}",
+            field.name,
+            field.flags
+        );
+    }
+    let date = one(&list, "date");
+    assert!(date.has(field_flag::ACTION), "{what}: {:#x}", date.flags);
+    match set(engine, doc, 0, &date, FormValue::Text("typed".into())) {
+        ResponseBody::FormFields { fields: now } => {
+            assert_eq!(one(&now, "keep").value, "kept", "{what}");
+            assert_eq!(one(&now, "date").value, "typed", "{what}");
+            assert_eq!(names(&now).len(), list.len(), "{what} hid a field");
+        }
+        other => panic!("{what}: {other:?}"),
+    }
+}
+
+const DATE_SCRIPT: &str =
+    r#"/AA << /F << /S /JavaScript /JS (AFDate_FormatEx\("dd.mm.yyyy"\);) >> >>"#;
+const LINK: &str = "/A << /S /URI /URI (https://example.com/) >>";
+
+#[test]
+fn a_reset_or_a_hide_on_a_dictionary_with_no_box_does_not_block_a_field_with_the_same_keys() {
+    // PDFium never runs these from this engine: the events of a page and a document are not
+    // called, a bookmark is not followed, and `Fo` and `Bl` are not read from a parent. A field with
+    // a format script (or a link) is an ordinary field and is filled in.
+    let cases: [(&str, kit::Unplaced); 6] = [
+        (
+            "page open, hide",
+            kit::Unplaced {
+                page: "/AA << /O << /S /Hide /T (keep) /H true >> >>",
+                date: DATE_SCRIPT,
+                clear: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "page open, reset, no Clear button",
+            kit::Unplaced {
+                page: "/AA << /O << /S /ResetForm >> >>",
+                date: DATE_SCRIPT,
+                ..Default::default()
+            },
+        ),
+        (
+            "catalog, reset on close",
+            kit::Unplaced {
+                catalog: "/AA << /WC << /S /ResetForm >> >>",
+                date: DATE_SCRIPT,
+                clear: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "field above the widget, reset on focus",
+            kit::Unplaced {
+                parent: Some("/AA << /Fo << /S /ResetForm >> >>"),
+                date: DATE_SCRIPT,
+                clear: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "bookmark, reset",
+            kit::Unplaced {
+                objects: &[
+                    "<< /Type /Outlines /First 7 0 R /Last 7 0 R /Count 1 >>",
+                    "<< /Title (b) /Parent 6 0 R /A << /S /ResetForm >> >>",
+                ],
+                catalog: "/Outlines 6 0 R",
+                date: LINK,
+                clear: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "field above the widget, reset on release",
+            kit::Unplaced {
+                parent: Some("/A << /S /ResetForm >>"),
+                date: LINK,
+                clear: true,
+                ..Default::default()
+            },
+        ),
+    ];
+    for (what, spec) in &cases {
+        let mut guard = engine();
+        let engine = &mut guard.0;
+        let (doc, _file) = open(engine, &kit::forms_unplaced_pdf(spec));
+        assert_date_is_filled_in(engine, doc, what);
+        ask(engine, RequestBody::Close { doc });
+    }
+}
+
+#[test]
+fn a_box_written_with_references_is_still_the_box_of_the_widget() {
+    // PDFium reads the box through references. With a Clear button in the file, the field is
+    // matched to its own record by its box, so the box has to be read the same way here.
+    let cases: [(&str, &[&str], &str); 3] = [
+        ("the box is a reference", &["[100 660 300 680]"], "6 0 R"),
+        (
+            "every number is a reference",
+            &["100", "660", "300", "680"],
+            "[6 0 R 7 0 R 8 0 R 9 0 R]",
+        ),
+        ("one number is a reference", &["680"], "[100 660 300 6 0 R]"),
+    ];
+    for (what, objects, rect) in cases {
+        let mut guard = engine();
+        let engine = &mut guard.0;
+        let spec = kit::Unplaced {
+            objects,
+            date: DATE_SCRIPT,
+            rect: Some(rect),
+            clear: true,
+            ..Default::default()
+        };
+        let (doc, _file) = open(engine, &kit::forms_unplaced_pdf(&spec));
+        assert_date_is_filled_in(engine, doc, what);
+        ask(engine, RequestBody::Close { doc });
+    }
+}
+
 #[test]
 fn a_second_trailer_in_a_stream_and_a_trailer_that_cannot_be_read_steer_nothing() {
     // A metadata stream holds the text of another trailer and of a document whose widget at the

@@ -627,11 +627,15 @@ describe("what the form bar says", () => {
     expect(BLOCKED_NOTICE).toContain("cannot be filled in here");
     expect(BLOCKED_NOTICE).toContain("Some fields");
     expect(BLOCKED_NOTICE).toContain("may have an action that could clear or hide fields");
+    expect(BLOCKED_NOTICE).toContain("leaves these fields as they are");
+    expect(BLOCKED_NOTICE).not.toContain("does not run");
     expect(BLOCKED_NOTICE).not.toContain("button");
     expect(BLOCKED_NOTICE).toContain("another PDF reader");
     // The field says it too.
     expect(r.control(0).title).toContain("Name - This field cannot be filled in here");
     expect(r.control(0).title).toContain("it may have an action that could clear or hide fields");
+    expect(r.control(0).title).toContain("leaves it as it is");
+    expect(r.control(0).title).not.toContain("does not run");
     expect(r.control(1).title).toBe("");
     // The reader puts the message away, then tries the field: it comes back, once.
     r.host.querySelector<HTMLButtonElement>(".form-bar-close")?.click();
