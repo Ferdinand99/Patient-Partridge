@@ -194,6 +194,7 @@ export class App {
   /** Paths that are being opened right now, so that one file is not opened twice at once. */
   private readonly opening = new Set<string>();
   private measuring = false;
+  private appName = APP_NAME;
   private reported = false;
   /** Whether the tabs are remembered for the next start (the setting "Reopen tabs at start"). */
   private reopenTabs = true;
@@ -1428,13 +1429,24 @@ export class App {
     );
   }
 
+  /**
+   * The name of the app in the window title: the product name the build was made with, so that a
+   * build with another product name (the beta) says so. Without it the title says "Patient Partridge".
+   */
+  setAppName(name: string | null | undefined): void {
+    const next = name?.trim() || APP_NAME;
+    if (next === this.appName) return;
+    this.appName = next;
+    this.drawTitle();
+  }
+
   private drawTitle(): void {
     const active = this.active;
     if (!active) {
-      this.deps.setWindowTitle(APP_NAME);
+      this.deps.setWindowTitle(this.appName);
       return;
     }
-    this.deps.setWindowTitle(`${this.tabDirty(active) ? "\u2022 " : ""}${active.name} - ${APP_NAME}`);
+    this.deps.setWindowTitle(`${this.tabDirty(active) ? "u2022 " : ""}${active.name} - ${this.appName}`);
   }
 
   private setControlsEnabled(on: boolean): void {
