@@ -7,7 +7,7 @@
 #   C:\Apps\pp-nsis   the NSIS installer, run by the administrator with the folder given
 #   C:\Apps\pp-bare   a copy of the MSI folder without the entry for the engine's package (control)
 #
-# Before those, each installer is run once into a folder of its own and removed again, to show what
+# Each installer is also run once into a folder of its own and removed again, to show what
 # the installers leave: an entry for the engine's package on the folder, the engine program and the
 # PDFium library, without inheritance and on nothing else, and no entry on the folder after the
 # uninstall. A file of the user in the folder, made after the install, never gets an entry.
@@ -98,22 +98,6 @@ if (-not (Test-Path 'C:\Apps\pp-msi-gone\user-file-beside-the-install.txt')) { t
 Show-Access 'C:\Apps\pp-msi-gone'
 Assert-PackageAccess 'C:\Apps\pp-msi-gone' $false
 
-# The NSIS installer the same way. The uninstaller runs from the folder and waits (_?=).
-$install = Start-Process -FilePath $setup.FullName -Wait -PassThru -ArgumentList @('/S', '/D=C:\Apps\pp-nsis-gone')
-Log "NSIS installer exit code (folder to be removed again): $($install.ExitCode)"
-$deadline = (Get-Date).AddSeconds(60)
-while ((Get-Date) -lt $deadline -and -not (Test-Path 'C:\Apps\pp-nsis-gone\pdfium.dll')) { Start-Sleep -Seconds 2 }
-if (-not (Test-Path 'C:\Apps\pp-nsis-gone\pdfium.dll')) { throw 'The NSIS installer did not install into C:\Apps\pp-nsis-gone.' }
-Show-Access 'C:\Apps\pp-nsis-gone'
-Assert-PackageAccess 'C:\Apps\pp-nsis-gone' $true
-$uninstaller = Get-ChildItem 'C:\Apps\pp-nsis-gone' -Filter 'uninstall*.exe' | Select-Object -First 1
-if (-not $uninstaller) { throw 'The NSIS installer left no uninstaller.' }
-$remove = Start-Process -FilePath $uninstaller.FullName -Wait -PassThru -ArgumentList @('/S', '_?=C:\Apps\pp-nsis-gone')
-Log "NSIS uninstall exit code: $($remove.ExitCode)"
-if (-not (Test-Path 'C:\Apps\pp-nsis-gone\user-file-beside-the-install.txt')) { throw 'The uninstall removed the file of the user.' }
-Show-Access 'C:\Apps\pp-nsis-gone'
-Assert-PackageAccess 'C:\Apps\pp-nsis-gone' $false
-
 # ---- MSI -----------------------------------------------------------------------------------------
 $msiLog = 'C:\pp\out\msi-install.log'
 $install = Start-Process -FilePath msiexec.exe -Wait -PassThru -ArgumentList @(
@@ -129,6 +113,24 @@ if (-not (Test-Path 'C:\Apps\pp-msi\patient-partridge.exe')) {
   throw 'The MSI did not install into C:\Apps\pp-msi.'
 }
 Show-Access 'C:\Apps\pp-msi'
+
+# The NSIS installer the same way. The uninstaller runs from the folder and waits (_?=). This comes
+# after the MSI is installed in its folder: the NSIS installer leaves the folder it was given in the
+# registry of the user, and an MSI installed after that would go to that folder, not to INSTALLDIR.
+$install = Start-Process -FilePath $setup.FullName -Wait -PassThru -ArgumentList @('/S', '/D=C:\Apps\pp-nsis-gone')
+Log "NSIS installer exit code (folder to be removed again): $($install.ExitCode)"
+$deadline = (Get-Date).AddSeconds(60)
+while ((Get-Date) -lt $deadline -and -not (Test-Path 'C:\Apps\pp-nsis-gone\pdfium.dll')) { Start-Sleep -Seconds 2 }
+if (-not (Test-Path 'C:\Apps\pp-nsis-gone\pdfium.dll')) { throw 'The NSIS installer did not install into C:\Apps\pp-nsis-gone.' }
+Show-Access 'C:\Apps\pp-nsis-gone'
+Assert-PackageAccess 'C:\Apps\pp-nsis-gone' $true
+$uninstaller = Get-ChildItem 'C:\Apps\pp-nsis-gone' -Filter 'uninstall*.exe' | Select-Object -First 1
+if (-not $uninstaller) { throw 'The NSIS installer left no uninstaller.' }
+$remove = Start-Process -FilePath $uninstaller.FullName -Wait -PassThru -ArgumentList @('/S', '_?=C:\Apps\pp-nsis-gone')
+Log "NSIS uninstall exit code: $($remove.ExitCode)"
+if (-not (Test-Path 'C:\Apps\pp-nsis-gone\user-file-beside-the-install.txt')) { throw 'The uninstall removed the file of the user.' }
+Show-Access 'C:\Apps\pp-nsis-gone'
+Assert-PackageAccess 'C:\Apps\pp-nsis-gone' $false
 
 # ---- NSIS ----------------------------------------------------------------------------------------
 # The folder goes last and without quotes, as the installer wants it.
