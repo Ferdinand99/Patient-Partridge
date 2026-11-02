@@ -84,6 +84,7 @@ function textField(index: number, name: string, value = ""): FormFieldInfo {
     comb: false,
     action: false,
     actionBlocked: false,
+    formBlocked: false,
     turns: 0,
     rect: [100, 100, 300, 124],
     fontSize: 12,
@@ -484,4 +485,37 @@ describe("a form that is filled in and annotated", () => {
     // The form and the annotation boxes are both still on the page.
     expect(document.querySelectorAll(".form-field")).toHaveLength(2);
   });
+});
+
+describe("Undo of a form change that cannot be taken back", () => {
+  const radio = (index: number): FormFieldInfo => ({ ...textField(index, "pick"), kind: "radio", rect: [100, 100 + 30 * index, 120, 120 + 30 * index] });
+
+  for (const withAnnotations of [false, true]) {
+    it(`says the document is as it was, and leaves it saved (${withAnnotations ? "with" : "without"} the annotator)`, async () => {
+      const { app, api } = make({ fields: [radio(0), radio(1)], withAnnotations });
+      await app.openPath("/docs/form.pdf");
+      await flush();
+      // The first choice of a group: nothing was chosen before, and a radio button cannot be turned
+      // off, so the change cannot be taken back.
+      const first = field(0);
+      first.focus();
+      first.click();
+      await flush();
+      expect(app.unsavedCount).toBe(1);
+      expect(await app.saveActive()).toBe(true);
+      expect(app.unsavedCount).toBe(0);
+      api.setFormField.mockClear();
+
+      keyOn(document.body, "z", { ctrlKey: true });
+      await flush();
+      // The engine was not asked, and nothing about the document changed.
+      expect(api.setFormField).not.toHaveBeenCalled();
+      expect(app.unsavedCount).toBe(0);
+      expect(api.setDirty).toHaveBeenLastCalledWith(1, false);
+      const text = document.body.textContent ?? "";
+      expect(text).toContain("The change could not be taken back");
+      expect(text).toContain("The document is as it was before. Nothing was lost.");
+      expect(text).not.toContain("Part of the change may have been made");
+    });
+  }
 });

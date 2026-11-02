@@ -1425,7 +1425,12 @@ export class App {
   private async stepHistory(direction: "undo" | "redo"): Promise<void> {
     const tab = this.active;
     if (!tab || tab.saving) return;
-    const run = () => (direction === "undo" ? tab.history.undo() : tab.history.redo());
+    const run = async (): Promise<void> => {
+      // A form change that is on its way is part of the history first: Undo takes back that one,
+      // not the one before it.
+      await tab.view.flushForms().catch(() => undefined);
+      await (direction === "undo" ? tab.history.undo() : tab.history.redo());
+    };
     try {
       // After the changes asked for before it, and before the ones asked for later.
       await (tab.annotator ? tab.annotator.sequenced(run) : run());
