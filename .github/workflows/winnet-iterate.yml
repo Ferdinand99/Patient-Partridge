@@ -29,6 +29,18 @@ jobs:
       - run: |
           mkdir -p dist
           echo '<!doctype html><title>stub</title>' > dist/index.html
+      - name: Build
+        run: cargo test -p partridge-engine --locked --no-run
+      - name: Imports of the engine
+        shell: pwsh
+        run: |
+          $dumpbin = Get-ChildItem 'C:\Program Files\Microsoft Visual Studio' -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'Hostx64\x64' } | Select-Object -First 1
+          & $dumpbin.FullName /dependents target\debug\partridge-engine.exe
+          & $dumpbin.FullName /dependents target\debug\examples\engine_selftest.exe
+          $pdfium = Get-ChildItem vendor/pdfium -Recurse -Filter pdfium.dll | Select-Object -First 1
+          & $dumpbin.FullName /dependents $pdfium.FullName
+          icacls C:\Windows\System32\vcruntime140.dll
+          icacls C:\Windows\System32\bcryptprimitives.dll
       - name: Sandbox proof
         run: cargo test -p partridge-engine --locked --test sandbox -- --nocapture --test-threads 1
       - name: The other engine tests
