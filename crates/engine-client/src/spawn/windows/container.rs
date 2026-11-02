@@ -48,7 +48,9 @@ use windows_sys::Win32::Security::{
     AclSizeInformation, EqualSid, FreeSid, GetAce, GetAclInformation, GetLengthSid,
     ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
 };
-use windows_sys::Win32::Storage::FileSystem::{FILE_GENERIC_EXECUTE, FILE_GENERIC_READ};
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+};
 
 use super::{wide, Owned};
 
@@ -379,4 +381,11 @@ pub(super) fn allow_files(program: &Path, args: &[std::ffi::OsString]) -> io::Re
         }
     }
     Ok(())
+}
+
+/// For tests of the client that run stand-ins for the engine, which are in the same AppContainer
+/// but do not lock themselves in: lets the package read and write one file the test made.
+#[cfg(debug_assertions)]
+pub(super) fn allow_read_write(path: &Path) -> io::Result<()> {
+    on_path(path, package_sid()?, FILE_GENERIC_READ | FILE_GENERIC_WRITE)
 }

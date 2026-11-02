@@ -36,6 +36,8 @@ use partridge_protocol::{
     MAX_STRING_LEN, PROTOCOL_VERSION, SAVE_DATA_HEADER_LEN,
 };
 
+#[cfg(all(windows, debug_assertions))]
+pub use spawn::allow_stand_in_to_use;
 pub use spawn::{spawn_engine, EngineProcess, SandboxPolicy, SpawnRequest, SpawnedEngine};
 
 pub use partridge_protocol::{

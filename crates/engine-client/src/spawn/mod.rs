@@ -148,3 +148,11 @@ pub(crate) fn engine_environment() -> Vec<(OsString, OsString)> {
         })
         .collect()
 }
+
+/// Tests only (debug builds, Windows): lets the AppContainer the engines run in read and write one
+/// file. Stand-ins for the engine in the tests of the client do not lock themselves in, and
+/// without this a stand-in could not write the marker file some of the tests use.
+#[cfg(all(windows, debug_assertions))]
+pub fn allow_stand_in_to_use(path: &Path) -> io::Result<()> {
+    windows::allow_read_write(path)
+}
