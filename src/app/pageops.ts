@@ -43,8 +43,8 @@ export interface PageHost {
   pickFiles(): Promise<string[]>;
   /** Says something to a screen reader. */
   announce(text: string): void;
-  /** Where the box with the progress bar goes. */
-  layer: HTMLElement;
+  /** Where the box with the progress bar goes: a strip that covers nothing, apart from the message boxes. */
+  busyLayer: HTMLElement;
 }
 
 export interface PageOpsHooks {
@@ -68,6 +68,8 @@ interface RunOptions {
   stoppable?: boolean;
   /** The box is held back until `release()` (a dialog of the system is open). */
   held?: boolean;
+  /** The tool only reads the document (copying pages out): nothing in it is changed. */
+  copies?: boolean;
 }
 
 /** What failed, besides the error: the other file of an insert, and what had been added before. */
@@ -82,11 +84,13 @@ export class PageOps {
   private working = false;
   /** The document the running tool (or a step back or forward) is changing. */
   private workingDoc: number | null = null;
+  /** The running tool only copies pages out of the document. */
+  private copying = false;
   private readonly idleWaiters: (() => void)[] = [];
   private box: BusyBox | null = null;
   private readonly delay: number;
   /** What the running tool shows in its box, and whether the delay has run out. */
-  private running: { title: string; stoppable: boolean; doc: number } | null = null;
+  private running: { title: string; stoppable: boolean; doc: number; name: string } | null = null;
   private due = false;
   /** A Stop was asked for during this run, whether or not it could end the step in hand. */
   private stopAsked = false;
@@ -110,6 +114,11 @@ export class PageOps {
   /** True while a tool is changing the document `doc`. A tool on another document is not in the way. */
   busyOn(doc: number): boolean {
     return this.working && this.workingDoc === doc;
+  }
+
+  /** True while pages are being copied out of the document `doc`, which changes nothing in it. */
+  copyingOn(doc: number): boolean {
+    return this.busyOn(doc) && this.copying;
   }
 
   /** True while a tool (or taking one back) is working. Only one works at a time. */
@@ -326,7 +335,7 @@ export class PageOps {
           }
         }
       },
-      { stoppable: true, held: true },
+      { stoppable: true, held: true, copies: true },
     );
     if (saved) {
       this.host.announce(`Saved ${pagesWord(sorted.length)} to ${saved.name}.`);
@@ -474,7 +483,8 @@ export class PageOps {
     // Something else started while a dialog was open (the file dialog of an insert, say).
     if (this.working) return null;
     this.setWorking(true, t.doc);
-    this.running = { title, stoppable: options.stoppable === true, doc: t.doc };
+    this.copying = options.copies === true;
+    this.running = { title, stoppable: options.stoppable === true, doc: t.doc, name: t.name };
     this.due = false;
     this.stopAsked = false;
     this.holds = options.held ? 1 : 0;
@@ -503,17 +513,17 @@ export class PageOps {
     const run = this.running;
     if (!run || !this.due || this.holds > 0 || this.box) return;
     this.box = showBusyBox(
-      this.host.layer,
+      this.host.busyLayer,
       run.stoppable
         ? {
             title: run.title,
-            detail: "Patient Partridge is working on the pages.",
+            detail: `Patient Partridge is working on the pages of "${run.name}".`,
             cancelLabel: "Stop",
             onCancel: () => void this.stop(run.doc),
           }
         : {
             title: run.title,
-            detail: `Patient Partridge is working on the pages. ${TOOL_NOTES.working}`,
+            detail: `Patient Partridge is working on the pages of "${run.name}". ${TOOL_NOTES.working}`,
           },
     );
   }
@@ -570,6 +580,7 @@ export class PageOps {
     if (this.working === on) return;
     this.working = on;
     this.workingDoc = on ? doc : null;
+    if (!on) this.copying = false;
     this.hooks.busyChanged?.(on);
     if (!on) for (const resolve of this.idleWaiters.splice(0)) resolve();
   }

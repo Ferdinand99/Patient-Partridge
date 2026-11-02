@@ -70,7 +70,7 @@ function setup(over: { target?: Partial<PageTarget> | null; picked?: string[]; b
     },
     pickFiles: () => Promise.resolve(over.picked ?? ["/in/a.pdf"]),
     announce: (text) => announced.push(text),
-    layer,
+    busyLayer: layer,
   };
   const busy: boolean[] = [];
   const ops = new PageOps(api as unknown as PageToolsApi, host, {

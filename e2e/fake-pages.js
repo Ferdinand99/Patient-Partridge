@@ -49,6 +49,8 @@
     failNext: null,
     // How long the commands take, in milliseconds.
     delay: 0,
+    // When set, only the commands of this document take that long.
+    delayOnly: null,
     // True while a command of the page tools is in the middle of its work (a stop is too late).
     working: false,
     labels: (doc) => models.get(doc)?.pages.map((p) => p.id) ?? [],
@@ -175,7 +177,7 @@
       pg.failNext = null;
       throw error;
     }
-    if (pg.delay && cmd !== "pages_insert_pdf") {
+    if (pg.delay && (pg.delayOnly === null || args.doc === pg.delayOnly) && cmd !== "pages_insert_pdf") {
       pg.working = cmd.startsWith("pages_");
       try {
         await delay(pg.delay);

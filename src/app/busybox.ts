@@ -1,6 +1,8 @@
 // The box that shows while a page tool works and takes a moment: what it is doing, how far it has
 // come when that is known, and, when the work can be stopped without a cost, a button that stops it.
-// It sits in the layer of the message boxes.
+// It sits in a strip of its own at the foot of the window, not in the layer of the message boxes:
+// it does not cover the tabs or the buttons and takes no keys, so the rest of the window stays in
+// use while a change runs (the other documents can be saved, printed and closed).
 //
 // A change to the pages cannot be stopped half way: the only way would be to end the engine of the
 // document, and every change that is not saved goes with it. Such a box has no button, and Escape
@@ -30,11 +32,10 @@ export interface BusyBox {
 }
 
 export function showBusyBox(layer: HTMLElement, options: BusyBoxOptions): BusyBox {
-  const previousFocus = document.activeElement as HTMLElement | null;
   const box = document.createElement("form");
   box.className = "sheet notice busy-box";
-  box.setAttribute("role", "alertdialog");
-  box.setAttribute("aria-modal", "true");
+  box.setAttribute("role", "group");
+  box.setAttribute("aria-label", options.title);
   box.setAttribute("aria-busy", "true");
   box.tabIndex = -1;
   const title = document.createElement("h2");
@@ -80,7 +81,6 @@ export function showBusyBox(layer: HTMLElement, options: BusyBoxOptions): BusyBo
     shown = true;
     layer.append(box);
     layer.hidden = false;
-    (cancel ?? box).focus();
   };
   put();
 
@@ -103,7 +103,6 @@ export function showBusyBox(layer: HTMLElement, options: BusyBoxOptions): BusyBo
       if (cancel) cancel.disabled = true;
       note = why;
       text();
-      box.focus();
     },
     canStop() {
       stoppable = options.cancelLabel !== undefined && options.onCancel !== undefined;
@@ -122,7 +121,6 @@ export function showBusyBox(layer: HTMLElement, options: BusyBoxOptions): BusyBo
       shown = false;
       box.remove();
       layer.hidden = layer.childElementCount === 0;
-      if (previousFocus?.isConnected) previousFocus.focus?.();
     },
   };
 }

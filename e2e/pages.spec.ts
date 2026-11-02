@@ -22,6 +22,7 @@ type Stand = {
     lastDoc: number;
     failNext: { cmd: string; error: { code: string; message: string } } | null;
     delay: number;
+    delayOnly: number | null;
     working: boolean;
     labels(doc: number): number[];
     sizes(doc: number): number[][];
@@ -498,6 +499,57 @@ test.describe("pages from other files", () => {
     await expect(dirty(page)).toBeVisible();
   });
 
+  test("while a change runs, the other tabs, the keys and the menu answer, and the other document is saved and closed", async ({
+    page,
+  }) => {
+    const ten = await openDoc(page, "/docs/ten.pdf");
+    const second = await openDoc(page, "/docs/mixed.pdf");
+    // Another document with a change that is not saved.
+    await press(page, 0);
+    await page.keyboard.press("Delete");
+    await expect.poll(async () => (await labels(page, second)).length).toBe(4);
+    await answerNote(page, /What a delete leaves/);
+    await expect(dirty(page)).toBeVisible();
+
+    await page.locator(".tab-title", { hasText: "ten.pdf" }).click();
+    await expect(page.locator('.tab-title[aria-selected="true"]')).toHaveText("ten.pdf");
+    await press(page, 4);
+    await page.evaluate((d) => {
+      const stand = (window as unknown as { __E2E__: Stand }).__E2E__.pages;
+      stand.delayOnly = d;
+      stand.delay = 5000;
+    }, ten);
+    await page.keyboard.press("Delete");
+    const box = page.locator(".busy-box");
+    await expect(box).toBeVisible();
+    await expect(box).toContainText("ten.pdf");
+    await expect(page.locator("#notice-layer")).toBeHidden();
+
+    // A real click on the other tab goes through, and so does the menu.
+    await page.locator(".tab-title", { hasText: "mixed.pdf" }).click();
+    await expect(page.locator('.tab-title[aria-selected="true"]')).toHaveText("mixed.pdf");
+    await page.locator("#menu-button").click();
+    await expect(page.locator("#menu")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.locator("#menu")).toBeHidden();
+    await expect(box).toBeVisible();
+
+    // The keys act on the document in front: it is saved, and then closed.
+    await page.keyboard.press("Control+s");
+    await expect.poll(async () => (await saves(page)).map((s) => s.doc)).toEqual([second]);
+    await expect(dirty(page)).toHaveCount(0);
+    await expect(box).toBeVisible();
+    await page.keyboard.press("Control+w");
+    await expect(page.locator(".tab-title")).toHaveCount(1);
+    await expect(page.locator('.tab-title[aria-selected="true"]')).toHaveText("ten.pdf");
+    await expect(page.locator(".sheet:not(.busy-box)")).toHaveCount(0);
+
+    // The change itself went on through all of it and ends.
+    await expect.poll(async () => (await labels(page, ten)).length, { timeout: 15000 }).toBe(9);
+    await expect(box).toHaveCount(0);
+    await answerNote(page, /What a delete leaves/);
+  });
+
   test("a slow file shows progress and a Stop button that really stops, and the document is as it was", async ({
     page,
   }) => {
@@ -508,7 +560,9 @@ test.describe("pages from other files", () => {
     await expect(box).toBeVisible();
     await expect(box).toContainText("Adding pages");
     await expect(box.locator("progress")).toBeVisible();
-    // The window is not stuck: the tools of the bar wait, the rest of the window answers.
+    // The window is not held: the box sits at the foot of it, outside the layer of the message boxes, and the
+    // tools of the bar wait.
+    await expect(page.locator("#notice-layer")).toBeHidden();
     await expect(tool(page, "pt-delete")).toBeDisabled();
     await expect.poll(() => box.locator("progress").evaluate((p: HTMLProgressElement) => p.value)).toBeGreaterThan(0);
     await box.getByRole("button", { name: "Stop" }).click();

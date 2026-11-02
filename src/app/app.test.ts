@@ -3215,6 +3215,37 @@ describe("App: page tools", () => {
       finish();
       await turning;
     });
+
+    it("pages being copied out are not called a change, to the user who closes or prints", async () => {
+      const pages = fakePages();
+      const { app } = make({ pages: pages as unknown as PageToolsApi, changeGraceMs: 20 });
+      await app.openPath("/a.pdf");
+      await flush();
+      const [first] = tabsOf(app);
+      let finish!: (v: null) => void;
+      pages.pagesExtract.mockImplementationOnce(() => new Promise<null>((r) => (finish = r)));
+      const copying = opsOf(app).extract([0]);
+      await flush();
+
+      const printing = app.printActive();
+      await later(80);
+      await flush();
+      expect(notice()?.textContent).toContain('Pages are being copied out of "a.pdf"');
+      expect(notice()?.textContent).not.toContain("changed");
+      click(button("OK"));
+      await printing;
+
+      const closing = app.requestClose(first.id);
+      await later(80);
+      await flush();
+      expect(notice()?.textContent).toContain('Pages are being copied out of "a.pdf"');
+      expect(notice()?.textContent).toContain("the copy is given up and the changes to this document that you have not saved are lost");
+      expect(notice()?.textContent).not.toContain("that change");
+      click(button("Wait"));
+      expect(await closing).toBe(false);
+      finish(null);
+      await copying;
+    });
   });
   describe("on a signed document", () => {
     const item: SignatureItem = {

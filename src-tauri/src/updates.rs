@@ -679,6 +679,16 @@ impl UpdateState {
         self.unsaved.forget(doc);
     }
 
+    /// Counts a document as having unsaved changes, if it is still open. A change whose answer comes
+    /// in the moment the document is closed must not leave a mark for a document that is gone: it
+    /// would hold back an update until the program is restarted.
+    pub fn mark_unsaved(&self, doc: u64) {
+        let open = self.open_docs.lock().unwrap_or_else(|e| e.into_inner());
+        if open.iter().any(|(d, _)| *d == doc) {
+            self.unsaved.set(doc, true);
+        }
+    }
+
     /// A document now belongs to another file (it was saved under a new name), so that is the
     /// one to open again after an update.
     pub fn move_doc(&self, doc: u64, path: &str) {

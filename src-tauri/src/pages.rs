@@ -74,9 +74,9 @@ type Progress = Channel<[u64; 2]>;
 /// A change that was made counts as an unsaved change at once, in the app process, before the answer
 /// is on its way to the window: an update that waits for the commands in flight and then looks again
 /// at the documents with unsaved changes (it does, see `install_with_engines_stopped`) must not miss
-/// the one that has just been made.
+/// the one that has just been made. A document that was closed in the meantime gets no mark.
 fn unsaved(update_state: &UpdateState, doc: u64) {
-    update_state.unsaved().set(doc, true);
+    update_state.mark_unsaved(doc);
 }
 
 /// Held while a page tool changes a document: the document counts as having unsaved changes from
@@ -356,6 +356,8 @@ mod tests {
     #[test]
     fn a_change_that_was_made_counts_as_unsaved_before_the_window_has_the_answer() {
         let state = UpdateState::new(None, InstallMethod::Automatic);
+        state.record_open(7, "/a.pdf");
+        state.record_open(3, "/b.pdf");
         assert!(!state.unsaved().any());
         unsaved(&state, 7);
         // An update that waits for the commands in flight and then asks must find it.
@@ -369,8 +371,25 @@ mod tests {
     }
 
     #[test]
+    fn a_change_that_ends_after_its_document_was_closed_leaves_no_mark() {
+        let state = UpdateState::new(None, InstallMethod::Automatic);
+        state.record_open(7, "/a.pdf");
+        let changing = Changing::begin(&state, 7);
+        // The window closes the document; the answer of the change comes after.
+        state.forget_doc(7);
+        unsaved(&state, 7);
+        drop(changing);
+        assert!(
+            !state.unsaved().any(),
+            "a closed document is not held back for"
+        );
+        assert!(!state.unsaved().holds_exit());
+    }
+
+    #[test]
     fn a_document_counts_as_unsaved_while_a_page_tool_works_on_it_and_not_after_a_failure() {
         let state = UpdateState::new(None, InstallMethod::Automatic);
+        state.record_open(5, "/a.pdf");
         {
             let _changing = Changing::begin(&state, 5);
             // The window has not been told of any change, and the tool has not answered.

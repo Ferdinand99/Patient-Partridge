@@ -333,6 +333,7 @@ export class App {
         pickFiles: () => deps.pickFiles(),
         announce: (text) => this.announcePages(text),
         layer: this.noticeLayer,
+        busyLayer: byId(root, "busy-strip"),
         currentPage: () => this.active?.view.currentPageIndex ?? 0,
         goToPage: (index) => this.active?.view.goToPage(index),
         render: (doc, page, width, height) => deps.api.render(doc, page, width, height),
@@ -1072,9 +1073,13 @@ export class App {
    */
   private async askAboutChange(tab: Tab, what: "close" | "quit"): Promise<"wait" | "leave"> {
     const leave = what === "close" ? "close the document" : "quit";
+    // Copying pages out changes nothing in the document: only what is not saved is at stake.
+    const copying = this.pageOps?.copyingOn(tab.doc) === true;
     const answer = await showNotice(this.noticeLayer, {
-      title: `"${tab.name}" is still being changed`,
-      detail: `A change to its pages is under way. If you ${leave} now, that change and the changes to this document that you have not saved are lost. To keep them, wait until the change has finished, then ${leave}.`,
+      title: copying ? `Pages are being copied out of "${tab.name}"` : `"${tab.name}" is still being changed`,
+      detail: copying
+        ? `If you ${leave} now, the copy is given up and the changes to this document that you have not saved are lost. To keep them, wait until the copy has finished, then ${leave}.`
+        : `A change to its pages is under way. If you ${leave} now, that change and the changes to this document that you have not saved are lost. To keep them, wait until the change has finished, then ${leave}.`,
       buttons: [
         { id: "wait", label: "Wait", safe: true },
         { id: "leave", label: what === "close" ? "Close now" : "Quit now" },
@@ -1192,9 +1197,12 @@ export class App {
     // tool that works on another document does not matter: each document has an engine of its own.
     if (this.pageOps?.busyOn(tab.doc) && !(await this.changeEnded(tab.doc))) {
       if (this.pageOps.busyOn(tab.doc)) {
+        const copying = this.pageOps.copyingOn(tab.doc);
         await showNotice(this.noticeLayer, {
-          title: `"${tab.name}" is being changed`,
-          detail: "A change to its pages is under way, and a save would not write the document as it will be. Save again when the change has finished.",
+          title: copying ? `Pages are being copied out of "${tab.name}"` : `"${tab.name}" is being changed`,
+          detail: copying
+            ? "The document cannot be saved while its pages are being copied out. Save again when the copy has finished."
+            : "A change to its pages is under way, and a save would not write the document as it will be. Save again when the change has finished.",
           buttons: [{ id: "ok", label: "OK", primary: true }],
         });
         return false;
@@ -1788,9 +1796,12 @@ export class App {
     const working = this.active;
     if (working && this.pageOps?.busyOn(working.doc) && !(await this.changeEnded(working.doc))) {
       if (this.pageOps.busyOn(working.doc)) {
+        const copying = this.pageOps.copyingOn(working.doc);
         await showNotice(this.noticeLayer, {
-          title: `"${working.name}" is being changed`,
-          detail: "A change to its pages is under way, and the print would show the pages as they were. Print again when the change has finished.",
+          title: copying ? `Pages are being copied out of "${working.name}"` : `"${working.name}" is being changed`,
+          detail: copying
+            ? "The document cannot be printed while its pages are being copied out. Print again when the copy has finished."
+            : "A change to its pages is under way, and the print would show the pages as they were. Print again when the change has finished.",
           buttons: [{ id: "ok", label: "OK", primary: true }],
         });
         return;

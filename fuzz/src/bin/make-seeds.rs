@@ -895,6 +895,7 @@ fn main() {
             kit::dangling_resources_pdf("/Resources 900 0 R"),
         ),
         ("null_resources", kit::dangling_resources_pdf("/Resources null")),
+        ("outside_parent", kit::outside_parent_pdf(true, true)),
         ("turned_root", kit::turned_root_pdf()),
         ("listed_many_times", kit::listed_many_times_pdf(200, 300, 0)),
         ("indirect_kids", kit::indirect_kids_pdf()),

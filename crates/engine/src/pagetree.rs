@@ -30,7 +30,7 @@
 //! a reference.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -748,6 +748,51 @@ fn info_of(table: &Table<'_>, number: u32) -> Found<Info> {
     })
 }
 
+/// Whether the chain of parents that starts at object `start` holds an entry that its pages
+/// inherit, as far as the chain is outside the tree of pages. PDFium follows `/Parent` from the
+/// page up, not the lists of kids from the root down, so a page that names a node that no list
+/// names inherits from it. The chain stops at a node the walk visited (it counted what that holds),
+/// at an object that is not a dictionary, and at a node it has been to. `memo` keeps the answer
+/// for each node of such a chain, so pages that share a parent read it once.
+fn outside_holds(
+    table: &Table<'_>,
+    start: u32,
+    visited: &HashSet<u32>,
+    memo: &mut HashMap<u32, bool>,
+) -> Found<bool> {
+    let mut chain: Vec<(u32, bool)> = Vec::new();
+    let mut on_chain: HashSet<u32> = HashSet::new();
+    let mut tail = false;
+    let mut at = Some(start);
+    while let Some(number) = at {
+        if visited.contains(&number) || !on_chain.insert(number) {
+            break;
+        }
+        if let Some(&known) = memo.get(&number) {
+            tail = known;
+            break;
+        }
+        if chain.len() >= MAX_LEVELS {
+            return Err(TreeError::Unreadable("a chain of parents is too long"));
+        }
+        match info_of(table, number) {
+            Ok(info) => {
+                chain.push((number, info.holds_a_value()));
+                at = info.parent;
+            }
+            // Nothing there, or not a dictionary: the chain ends, as it does for PDFium.
+            Err(TreeError::Damaged(_)) => break,
+            Err(other) => return Err(other),
+        }
+    }
+    let mut held = tail;
+    for (number, here) in chain.into_iter().rev() {
+        held |= here;
+        memo.insert(number, held);
+    }
+    Ok(held)
+}
+
 /// A node, ready to be walked: its kids are listed and its count is read.
 fn open(table: &Table<'_>, info: Rc<Info>) -> Found<Frame> {
     let b = table.bytes;
@@ -857,6 +902,8 @@ pub fn read_within(
     // two together make a tree that a move cannot be trusted with.
     let mut any_holds = false;
     let mut strays = false;
+    // The nodes that pages and nodes name as their parent, to look at once the walk is done.
+    let mut parents_named: BTreeSet<u32> = BTreeSet::new();
     // The pages to look at again once everything is known: the node chain is only on the stack now.
     struct Leaf {
         info: Rc<Info>,
@@ -866,6 +913,7 @@ pub fn read_within(
 
     visited.insert(root_number);
     let root_info = Rc::new(info_of(&table, root_number)?);
+    parents_named.extend(root_info.parent);
     if root_info.kids.is_none() {
         return Err(TreeError::Damaged("the list of pages has no list of kids"));
     }
@@ -909,6 +957,7 @@ pub fn read_within(
             None => {
                 let info = Rc::new(info_of(&table, number)?);
                 known.insert(number, info.clone());
+                parents_named.extend(info.parent);
                 (info, true)
             }
         };
@@ -969,6 +1018,18 @@ pub fn read_within(
         return Err(TreeError::Damaged(
             "a page or a node does not name the node that lists it as its parent, and what a page inherits follows its parent",
         ));
+    }
+    if parents && strays {
+        // A parent that is in no list of kids gives what it holds to the pages that name it, and a
+        // move would take that away. Where it holds nothing, the move is as safe as any.
+        let mut memo: HashMap<u32, bool> = HashMap::new();
+        for named in parents_named {
+            if !visited.contains(&named) && outside_holds(&table, named, &visited, &mut memo)? {
+                return Err(TreeError::Damaged(
+                    "a page or a node names a parent that no list of pages lists, and that parent holds entries that its pages inherit",
+                ));
+            }
+        }
     }
 
     for (i, key) in INHERITED.iter().enumerate() {
@@ -1745,5 +1806,60 @@ mod tests {
         assert!(matches!(read(&bytes, 1, true), Err(TreeError::Damaged(_))));
         // And that does not apply to the tools that do not move pages.
         assert!(read(&bytes, 1, false).is_ok());
+    }
+
+    /// A flat tree with nothing on any node of it (the pages have their sizes), and a page that names `parent` as its parent.
+    /// Objects 4 and 5 are in no list of kids, and hold `near` and `far`.
+    fn outside(near: &str, far: &str, parent: &str) -> Vec<u8> {
+        let node = |extra: &str| format!("<< /Type /Pages /Kids [] /Count 0 {extra} >>");
+        document(
+            &[
+                "<< /Type /Catalog /Pages 2 0 R >>",
+                "<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>",
+                &format!(
+                    "<< /Type /Page /Parent {parent} /MediaBox [0 0 100 100] /Contents 7 0 R >>"
+                ),
+                &node(near),
+                &node(far),
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 7 0 R >>",
+                "<< /Length 0 >>\nstream\n\nendstream",
+            ],
+            "",
+        )
+    }
+
+    #[test]
+    fn a_parent_in_no_list_of_kids_matters_where_it_gives_its_pages_an_entry() {
+        let held = "/Resources << /Font << >> >>";
+        // The parent holds an entry, directly or further up its own chain: a move is refused.
+        for (near, far, parent) in [
+            (held, "", "4 0 R"),
+            ("/Parent 5 0 R", held, "4 0 R"),
+            ("/Rotate 90", "", "4 0 R"),
+            ("/MediaBox [0 0 5 5]", "", "4 0 R"),
+        ] {
+            let bytes = outside(near, far, parent);
+            assert!(
+                matches!(read(&bytes, 2, true), Err(TreeError::Damaged(_))),
+                "{near} {far}"
+            );
+            // Not for the tools that do not move pages.
+            assert!(read(&bytes, 2, false).is_ok(), "{near} {far}");
+        }
+        // The parent holds nothing, or leads to nothing, or its chain ends in nothing: the move is as safe as any.
+        for (near, far, parent) in [
+            ("", "", "4 0 R"),
+            ("/Parent 5 0 R", "", "4 0 R"),
+            ("/Resources 900 0 R", "/Rotate null", "4 0 R"),
+            ("", held, "900 0 R"),
+            // A chain that loops, with nothing on it.
+            ("/Parent 5 0 R", "/Parent 4 0 R", "4 0 R"),
+        ] {
+            let bytes = outside(near, far, parent);
+            assert!(read(&bytes, 2, true).is_ok(), "{near} {far} {parent}");
+        }
+        // A chain that loops and holds an entry is still seen.
+        let bytes = outside("/Parent 5 0 R", &format!("/Parent 4 0 R {held}"), "4 0 R");
+        assert!(matches!(read(&bytes, 2, true), Err(TreeError::Damaged(_))));
     }
 }

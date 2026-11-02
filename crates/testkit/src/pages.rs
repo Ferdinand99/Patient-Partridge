@@ -928,6 +928,58 @@ pub fn dangling_resources_pdf(own: &str) -> Vec<u8> {
     assemble(&objects, "")
 }
 
+/// Four pages (A to D) under a root that holds nothing a page inherits; every page has its own
+/// `/MediaBox`. A and B have their own `/Resources` (a font, a graphics state and a colour space). C and D name a parent
+/// that is in no list of kids. With `holds` that node (or, with `chain`, the node above it, which
+/// the first names as its own parent) has `/Resources` with a font, a faint graphics state and a red
+/// colour space, and C and D have none of their own, so a reader that goes from the page up finds
+/// them there. Without `holds` no node holds anything, and C and D have resources of their own.
+///
+/// Object numbers: 2 root, 3 the font, 4 the parent of C and D, 5 the node above it, 6 to 9 the
+/// pages.
+pub fn outside_parent_pdf(chain: bool, holds: bool) -> Vec<u8> {
+    let faint = "/Resources << /Font << /F1 3 0 R >> /ExtGState << /G0 << /ca 0.2 >> >> /ColorSpace << /C0 [/Separation /Spot /DeviceRGB << /FunctionType 2 /Domain [0 1] /N 1 /C0 [1 1 1] /C1 [1 0 0] >>] >> >>";
+    let own = "/Resources << /Font << /F1 3 0 R >> /ExtGState << /G0 << /ca 1 >> >> /ColorSpace << /C0 [/Separation /Spot2 /DeviceRGB << /FunctionType 2 /Domain [0 1] /N 1 /C0 [1 1 1] /C1 [0 0 1] >>] >> >>";
+    let given = if holds { faint } else { "" };
+    let (near, far) = if chain {
+        ("/Parent 5 0 R", given)
+    } else {
+        (given, "")
+    };
+    let mut objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [6 0 R 7 0 R 8 0 R 9 0 R] /Count 4 >>".to_vec(),
+        BLIND_FONT.as_bytes().to_vec(),
+        format!("<< /Type /Pages /Kids [] /Count 0 {near} >>").into_bytes(),
+        format!("<< /Type /Pages /Kids [] /Count 0 {far} >>").into_bytes(),
+    ];
+    for i in 0..4usize {
+        let (parent, resources) = match (i < 2, holds) {
+            (true, _) => (2, own),
+            (false, true) => (4, ""),
+            (false, false) => (4, own),
+        };
+        objects.push(
+            format!(
+                "<< /Type /Page /Parent {parent} 0 R /MediaBox [0 0 300 300] {resources} /Contents {} 0 R >>",
+                10 + i
+            )
+            .into_bytes(),
+        );
+    }
+    for i in 0..4u8 {
+        objects.push(stream_object(
+            "",
+            &format!(
+                "/G0 gs /C0 cs 1 scn {} 20 200 200 re f 0 g BT /F1 24 Tf 40 150 Td (PAGE-{}) Tj ET",
+                20 + 15 * u32::from(i),
+                (b'A' + i) as char
+            ),
+        ));
+    }
+    assemble(&objects, "")
+}
+
 /// `pages` pages in two nodes. The first node gives its pages `/Resources` that are written in
 /// place and take about `bytes` bytes (a long list of fonts); the second gives a short one. All
 /// pages draw the same text, from one content stream.

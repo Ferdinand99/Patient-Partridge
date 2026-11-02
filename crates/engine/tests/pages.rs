@@ -3364,6 +3364,64 @@ fn pages_whose_resources_are_a_reference_to_nothing_are_drawn_after_a_move_as_th
 }
 
 #[test]
+fn pages_that_name_a_parent_no_list_names_are_moved_when_it_holds_nothing() {
+    // The pages follow /Parent to a node that is in no list of kids; it holds nothing, so a move
+    // takes nothing from them.
+    for chain in [false, true] {
+        assert_moves_keep_every_picture(
+            &format!("a parent outside the tree, chain {chain}"),
+            &kit::outside_parent_pdf(chain, false),
+        );
+    }
+}
+
+#[test]
+fn pages_that_inherit_from_a_parent_no_list_names_are_not_moved_and_nothing_changes() {
+    // C and D get their font, graphics state and colour space from a node that no list of kids
+    // names. A move would put them under a node that gives them none of it, and the graphics state
+    // and the colour space are not in the print of a page: only the pixels show it. So the move is
+    // refused, and the document, and what is saved of it, draws as it did.
+    for chain in [false, true] {
+        let name = format!("chain {chain}");
+        let mut guard = engine();
+        let e = &mut guard.0;
+        let (doc, _f) = open_doc(e, &kit::outside_parent_pdf(chain, true));
+        let original = pictures(e, doc);
+        assert!(
+            original.iter().all(|p| inked(p) > 200),
+            "{name}: every page draws something"
+        );
+        for order in [vec![2, 3, 0, 1], vec![3, 2, 1, 0], vec![1, 0, 2, 3]] {
+            let (code, message) = page_error(e, PagesRequest::Reorder { doc, order });
+            assert_eq!(code, ErrorCode::PageChangeFailed, "{name}");
+            assert!(
+                message.contains("does not follow the format")
+                    && message.contains("no list of pages lists"),
+                "{name}: {message}"
+            );
+            assert!(
+                original == pictures(e, doc),
+                "{name}: the document is as it was after the refusal"
+            );
+        }
+        // A delete does not move the pages that stay, and what is saved draws them as they were.
+        changed(page_op(
+            e,
+            PagesRequest::Delete {
+                doc,
+                pages: vec![3],
+            },
+        ));
+        let saved = save_all(e, doc);
+        let reopened = open(e, &saved, None).unwrap();
+        assert!(
+            original[..3] == pictures(e, reopened)[..],
+            "{name}: the saved file"
+        );
+    }
+}
+
+#[test]
 fn pages_whose_resources_are_null_are_drawn_after_a_move_as_pages_with_no_key() {
     // The format says that a key with the value `null` is the same as no key. A page with it is
     // drawn with what its node gives, before and after a move, whatever the library does with it.
