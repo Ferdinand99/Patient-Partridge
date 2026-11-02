@@ -19,7 +19,7 @@ A restricted token does not stop the network on Windows: a process with such a t
 The options that were looked at:
 
 - **AppContainer with no capabilities, on top of the restricted token** (what is built). Both access checks apply: an object has to be open to the restricting SID *and* to the package. The restricted token keeps its job: after the engine has locked itself in it cannot open any file, not even its own program, which the package is allowed to read.
-- **Less privileged AppContainer.** Takes "all application packages" out of the token, so the engine could reach even less. Not used: the restricted token already keeps the engine away from files, and the extra step was not needed to block the network.
+- **Less privileged AppContainer.** Takes "all application packages" out of the token, so the engine could reach even less. Not built and not tried: the plain AppContainer already blocks the network, and the restricted token already keeps the engine away from files, so it would add reach-reduction for objects that only "all application packages" can open, at the price of a second round of work on every start-up problem above.
 - **A firewall rule** is out, as said above.
 
 ## What it does to the other layers
