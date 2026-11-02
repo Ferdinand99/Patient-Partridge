@@ -25,6 +25,7 @@ use source::{GuardedReader, SourceFile, SourceGuard};
 #[cfg(unix)]
 pub mod fds;
 pub mod fonts;
+pub mod forms;
 pub mod limits;
 pub mod sandbox;
 pub mod save;
@@ -138,6 +139,9 @@ fn fail<T>(code: ErrorCode, message: impl Into<String>) -> Result<T, Failure> {
 pub struct Engine {
     pdfium: Result<&'static Pdfium, String>,
     pdfium_version: String,
+    /// The form environment of a document, made when the first form request for it comes. It is
+    /// listed before `docs` because it must be closed before the document it belongs to.
+    forms: HashMap<u32, forms::FormEnv>,
     docs: HashMap<u32, PdfDocument<'static>>,
     /// The serialised form of a document between `SaveBegin` and `SaveEnd`.
     saves: HashMap<u32, Vec<u8>>,
@@ -191,6 +195,7 @@ impl Engine {
             missed_fonts: missed,
             pdfium,
             pdfium_version: version,
+            forms: HashMap::new(),
             docs: HashMap::new(),
             saves: HashMap::new(),
             next_doc: 1,
@@ -290,6 +295,7 @@ impl Engine {
             } => self.render(doc, page, width, height),
             RequestBody::Close { doc } => {
                 // Closing an unknown id is not an error: the end state is the same.
+                self.forms.remove(&doc);
                 self.docs.remove(&doc);
                 self.saves.remove(&doc);
                 Ok(ResponseBody::Closed)
@@ -383,6 +389,27 @@ impl Engine {
                     data: bytes[start..end].to_vec(),
                 })
             }
+            RequestBody::FormInfo { doc } => {
+                let document = self.document(doc)?;
+                Ok(forms::info(pdfium, document, self.source.as_deref()))
+            }
+            RequestBody::ListFormFields { doc, page } => self.with_form(pdfium, doc, |env| {
+                Ok(ResponseBody::FormFields {
+                    fields: env.list(page)?,
+                })
+            }),
+            RequestBody::SetFormField {
+                doc,
+                page,
+                index,
+                name,
+                value,
+            } => self.with_form(pdfium, doc, |env| {
+                env.set(page, index, &name, &value)?;
+                Ok(ResponseBody::FormFields {
+                    fields: env.list(page)?,
+                })
+            }),
             RequestBody::SaveEnd { doc } => {
                 self.saves.remove(&doc);
                 Ok(ResponseBody::SaveEnded)
@@ -400,6 +427,26 @@ impl Engine {
         edit: impl FnOnce(&mut PdfDocument<'static>) -> T,
     ) -> Option<T> {
         self.docs.get_mut(&doc).map(edit)
+    }
+
+    /// Runs `f` on the form environment of a document, making the environment first if it is not
+    /// there yet.
+    fn with_form<T>(
+        &mut self,
+        pdfium: &'static Pdfium,
+        doc: u32,
+        f: impl FnOnce(&forms::FormEnv) -> Result<T, Failure>,
+    ) -> Result<T, Failure> {
+        if !self.forms.contains_key(&doc) {
+            let document = self.document(doc)?;
+            let env = forms::FormEnv::create(pdfium, document)?;
+            self.forms.insert(doc, env);
+        }
+        let env = self
+            .forms
+            .get(&doc)
+            .ok_or((ErrorCode::UnknownDocument, "no such document".to_string()))?;
+        f(env)
     }
 
     /// Fails when the file the document is read from changed, or a read of it failed.

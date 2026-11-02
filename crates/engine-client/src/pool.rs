@@ -14,8 +14,8 @@ use partridge_protocol::{ErrorCode, PageSize};
 
 use crate::save::{save_document, verify_written, FileStamp};
 use crate::{
-    Bitmap, ClientError, EngineClient, EngineConfig, EngineInfo, FontScript, OutlineItem, PageLink,
-    PageText, SaveError, SaveOptions, SaveOutcome, TextMatch,
+    Bitmap, ClientError, EngineClient, EngineConfig, EngineInfo, FontScript, FormField, FormKind,
+    FormValue, OutlineItem, PageLink, PageText, SaveError, SaveOptions, SaveOutcome, TextMatch,
 };
 
 /// The file a document belongs to, and how it looked when the document was opened (or last saved).
@@ -303,6 +303,31 @@ impl EnginePool {
     pub fn page_links(&self, handle: u64, page: u32) -> Result<Vec<PageLink>, ClientError> {
         let (client, doc) = self.entry(handle)?;
         client.page_links(doc, page)
+    }
+
+    /// What kind of form a document has, and whether it has actions that are never run.
+    pub fn form_info(&self, handle: u64) -> Result<(FormKind, bool), ClientError> {
+        let (client, doc) = self.entry(handle)?;
+        client.form_info(doc)
+    }
+
+    /// The fields of one page that the reader fills in.
+    pub fn form_fields(&self, handle: u64, page: u32) -> Result<Vec<FormField>, ClientError> {
+        let (client, doc) = self.entry(handle)?;
+        client.form_fields(doc, page)
+    }
+
+    /// Sets one field; returns the fields of the page as they are then.
+    pub fn set_form_field(
+        &self,
+        handle: u64,
+        page: u32,
+        index: u32,
+        name: &str,
+        value: &FormValue,
+    ) -> Result<Vec<FormField>, ClientError> {
+        let (client, doc) = self.entry(handle)?;
+        client.set_form_field(doc, page, index, name, value)
     }
 
     pub fn search_page(

@@ -22,6 +22,7 @@ import {
   visibleRange,
   type Range,
 } from "./layout";
+import { FormLayer, type FormEdit, type FormsApi } from "./forms";
 import { PageOverlays, type CopyResult, type OverlayApi, type OverlayLimits, type PageLinkInfo } from "./overlays";
 import { RenderScheduler, type RenderJob } from "./scheduler";
 import type { SearchMatch } from "./search";
@@ -68,6 +69,11 @@ export interface ViewerOptions {
   start?: ViewPosition | null;
   /** Limits on the text kept for the document. For tests; the defaults are meant for the app. */
   limits?: Partial<OverlayLimits>;
+  /**
+   * Lets the reader fill in the form of the document, if it has one. `record` is given every change,
+   * for undo and redo and for the mark that the document has changes that are not saved.
+   */
+  forms?: { api: FormsApi; record(edit: FormEdit): void };
 }
 
 export interface DocumentInfo {
@@ -83,6 +89,8 @@ interface Mounted {
   /** The bitmap size on the canvas, or null while the canvas is empty. */
   drawnKey: string | null;
   failedKey: string | null;
+  /** Counts the times the picture of the page was called out of date (see `redrawPage`). */
+  version: number;
 }
 
 const WHEEL_ZOOM_THRESHOLD = 40;
@@ -101,6 +109,7 @@ export class DocumentView {
   private readonly mounted = new Map<number, Mounted>();
   private readonly scheduler: RenderScheduler;
   private readonly overlays: PageOverlays;
+  private readonly forms: FormLayer | null;
   private readonly resizeObserver?: ResizeObserver;
   private layout: Layout;
   private zoom = 1;
@@ -157,6 +166,14 @@ export class DocumentView {
       },
       options.limits,
     );
+
+    this.forms = options.forms
+      ? new FormLayer(info.doc, info.pages, options.forms.api, this.element, {
+          onEdit: (edit) => options.forms?.record(edit),
+          onRedraw: (page) => this.redrawPage(page),
+        })
+      : null;
+    this.forms?.start();
 
     this.element.addEventListener("scroll", this.onScroll, { passive: true });
     this.element.addEventListener("wheel", this.onWheel, { passive: false });
@@ -267,6 +284,7 @@ export class DocumentView {
     cancelAnimationFrame(this.frame);
     this.resizeObserver?.disconnect();
     window.removeEventListener("resize", this.onWindowResize);
+    this.forms?.destroy();
     for (const index of [...this.mounted.keys()]) this.unmount(index);
     this.overlays.destroy();
     this.element.remove();
@@ -540,11 +558,16 @@ export class DocumentView {
     const canvas = document.createElement("canvas");
     canvas.className = "viewer-canvas";
     el.append(canvas);
-    this.sizer.append(el);
-    const m: Mounted = { el, canvas, wantKey: "", drawnKey: null, failedKey: null };
+    // In page order, so that the Tab key walks the fields of the pages in reading order.
+    const after = [...this.mounted.keys()].filter((i) => i > index).sort((a, b) => a - b)[0];
+    const next = after === undefined ? null : (this.mounted.get(after)?.el ?? null);
+    if (next) this.sizer.insertBefore(el, next);
+    else this.sizer.append(el);
+    const m: Mounted = { el, canvas, wantKey: "", drawnKey: null, failedKey: null, version: 0 };
     this.mounted.set(index, m);
     this.placePage(index, m);
     this.overlays.mount(index, el);
+    this.forms?.mount(index, el);
     return m;
   }
 
@@ -554,13 +577,28 @@ export class DocumentView {
     // Shrinking the canvas frees its bitmap right away instead of when the garbage collector runs.
     m.canvas.width = 0;
     m.canvas.height = 0;
+    this.forms?.unmount(index);
     this.overlays.unmount(index);
     m.el.remove();
     this.mounted.delete(index);
   }
 
+  /**
+   * Calls the picture of a page out of date (the form in it was changed): it is drawn again, also
+   * when it is being drawn right now.
+   */
+  redrawPage(page: number): void {
+    const m = this.mounted.get(page);
+    if (!m) return;
+    m.version += 1;
+    m.drawnKey = null;
+    m.failedKey = null;
+    this.refresh();
+  }
+
   private async renderJob(job: RenderJob): Promise<void> {
     if (this.destroyed) return;
+    const startVersion = this.mounted.get(job.page)?.version ?? 0;
     const buffer = await this.api.render(this.info.doc, job.page, job.width, job.height);
     const m = this.mounted.get(job.page);
     // The page scrolled away or changed size while the engine was drawing: drop the result.
@@ -573,15 +611,21 @@ export class DocumentView {
     m.canvas.width = job.width;
     m.canvas.height = job.height;
     ctx.putImageData(new ImageData(new Uint8ClampedArray(buffer), job.width, job.height), 0, 0);
-    m.drawnKey = job.key;
+    // The page was called out of date while the engine drew it: this picture is shown, but not
+    // counted as drawn, so the page is drawn once more.
+    const stale = m.version !== startVersion;
+    m.drawnKey = stale ? null : job.key;
     m.el.classList.remove("viewer-page-failed");
     // Text and links come after the picture, so they never delay the page the reader waits for.
     this.overlays.pageDrawn(job.page);
+    if (!stale) this.forms?.pageDrawn(job.page);
     this.events.onPageDrawn?.(job.page);
     if (!this.painted) {
       this.painted = true;
       this.events.onFirstPaint();
     }
+    // After the job is over: a job that is still counted as running is not queued again.
+    if (stale) this.scheduleRefresh();
   }
 
   private renderFailed(job: RenderJob, error: unknown): void {

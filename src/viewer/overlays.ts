@@ -609,7 +609,7 @@ export class PageOverlays {
     const p = e as PointerEvent;
     if (p.button !== 0 || this.destroyed) return;
     const target = p.target;
-    if (target instanceof Element && target.closest(".page-link")) return;
+    if (target instanceof Element && target.closest(".page-link, .form-field, .form-bar")) return;
     const last = this.lastPress;
     const count =
       last &&

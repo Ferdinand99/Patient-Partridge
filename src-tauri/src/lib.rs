@@ -9,6 +9,7 @@
 //! engine closes only its own tab. The documents belong to the page in the window: when the page
 //! starts again (a reload, whatever the cause), every engine is ended and the window starts clean.
 
+mod forms;
 mod links;
 mod locate;
 mod positions;
@@ -893,6 +894,9 @@ pub fn run() {
             get_outline,
             get_page_text,
             get_page_links,
+            forms::form_info,
+            forms::get_form_fields,
+            forms::set_form_field,
             missed_fonts,
             open_link,
             print_webview,

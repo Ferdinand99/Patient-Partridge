@@ -41,6 +41,9 @@ pub fn demo_content(number: usize, width: u32, height: u32) -> String {
     s
 }
 
+mod forms;
+pub use forms::*;
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

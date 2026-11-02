@@ -16,6 +16,7 @@ import {
   saveTheme,
   type StorageLike,
 } from "../lib/theme";
+import type { FormEdit, FormFieldInfo, FormInfo, FormValueIn, FormsApi } from "../viewer/forms";
 import { actionForKey } from "../viewer/keys";
 import type { CopyResult, PageLinkInfo } from "../viewer/overlays";
 import { DocumentView, type ViewPosition, type ViewerOptions } from "../viewer/viewer";
@@ -48,6 +49,16 @@ export interface AppDeps {
     getPageText(doc: number, page: number): Promise<{ text: string; rects: number[] }>;
     getPageLinks(doc: number, page: number): Promise<PageLinkInfo[]>;
     searchPage(doc: number, page: number, query: string): Promise<[number, number][]>;
+    /** The form of a document, if the app can fill in forms (the three go together). */
+    formInfo?(doc: number): Promise<FormInfo>;
+    getFormFields?(doc: number, page: number): Promise<FormFieldInfo[]>;
+    setFormField?(
+      doc: number,
+      page: number,
+      index: number,
+      name: string,
+      value: FormValueIn,
+    ): Promise<FormFieldInfo[]>;
     openLink(doc: number, url: string): Promise<void>;
     /** The scripts the engine of a document had no font for when PDFium asked. */
     missedFonts?(doc: number): Promise<string[]>;
@@ -640,7 +651,7 @@ export class App {
         },
         onPageDrawn: () => void this.fontsMissed(tab),
       },
-      { start: opened.position ?? null, limits: this.deps.viewLimits },
+      { start: opened.position ?? null, limits: this.deps.viewLimits, forms: this.formsFor(tab) },
     );
     tab.history.onChange(() => this.historyChanged(tab));
     tab.sidebarDoc = {
@@ -670,6 +681,36 @@ export class App {
         detail: `"${opened.name}" opened, but it does not contain any pages to show.`,
         buttons: [{ id: "ok", label: "OK", primary: true }],
       });
+    }
+  }
+
+  /**
+   * What the view of a tab needs to let the reader fill in a form: the three commands, and a place to
+   * record each change, so that it can be taken back and the document counts as changed.
+   */
+  private formsFor(tab: Tab): ViewerOptions["forms"] {
+    const api = this.deps.api;
+    if (!api.formInfo || !api.getFormFields || !api.setFormField) return undefined;
+    const forms: FormsApi = {
+      formInfo: (doc) => (api.formInfo as NonNullable<typeof api.formInfo>)(doc),
+      getFormFields: (doc, page) => (api.getFormFields as NonNullable<typeof api.getFormFields>)(doc, page),
+      setFormField: (doc, page, index, name, value) =>
+        (api.setFormField as NonNullable<typeof api.setFormField>)(doc, page, index, name, value),
+    };
+    return { api: forms, record: (edit) => this.recordFormEdit(tab, edit, 0) };
+  }
+
+  /**
+   * Puts a change of a form in the history of its tab. While an undo or a redo is still running the
+   * history refuses it, so the change waits for the end of that (a moment) and is not lost.
+   */
+  private recordFormEdit(tab: Tab, edit: FormEdit, attempt: number): void {
+    try {
+      tab.history.push(edit);
+    } catch {
+      if (attempt < 100 && this.tabs.includes(tab)) {
+        setTimeout(() => this.recordFormEdit(tab, edit, attempt + 1), 20);
+      }
     }
   }
 

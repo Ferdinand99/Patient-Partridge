@@ -32,13 +32,17 @@ use std::time::Duration;
 
 use partridge_protocol::{
     read_frame_limited, write_request, ErrorCode, PageSize, Request, RequestBody, Response,
-    ResponseBody, MAX_QUERY_LEN, MAX_SAVE_BYTES, MAX_SAVE_CHUNK, MAX_STRING_LEN, PROTOCOL_VERSION,
+    ResponseBody, MAX_FORM_ANSWER_BYTES, MAX_FORM_NAME, MAX_FORM_OPTIONS, MAX_FORM_VALUE,
+    MAX_QUERY_LEN, MAX_SAVE_BYTES, MAX_SAVE_CHUNK, MAX_STRING_LEN, PROTOCOL_VERSION,
     SAVE_DATA_HEADER_LEN,
 };
 
 pub use spawn::{spawn_engine, EngineProcess, SandboxPolicy, SpawnRequest, SpawnedEngine};
 
-pub use partridge_protocol::{FontScript, LinkTarget, OutlineItem, PageLink, TextMatch};
+pub use partridge_protocol::{
+    field_flag, FontScript, FormField, FormFieldKind, FormKind, FormOption, FormValue, LinkTarget,
+    OutlineItem, PageLink, TextMatch,
+};
 
 mod pool;
 pub use pool::EnginePool;
@@ -60,6 +64,9 @@ const MAX_OUTLINE_ANSWER: usize = 3 * 1024 * 1024;
 const MAX_TEXT_ANSWER: usize = 2_200_000;
 /// Largest links answer: 500 links with an address of at most 2 048 bytes.
 const MAX_LINKS_ANSWER: usize = 1_300_000;
+/// Largest answer about the fields of a page. The engine keeps to `MAX_FORM_ANSWER_BYTES`; the rest is
+/// the room for the header.
+const MAX_FORMS_ANSWER: usize = MAX_FORM_ANSWER_BYTES + 64;
 
 /// How to start and supervise the engine.
 #[derive(Debug, Clone)]
@@ -395,6 +402,71 @@ impl EngineClient {
         )
     }
 
+    /// What kind of form the document has, and whether it has scripts or actions that are never run.
+    pub fn form_info(&self, doc: u64) -> Result<(FormKind, bool), ClientError> {
+        self.call(
+            doc,
+            "form info",
+            |doc| RequestBody::FormInfo { doc },
+            |body| match body {
+                ResponseBody::FormInfo { kind, has_actions } => Ok((kind, has_actions)),
+                other => Err(other),
+            },
+        )
+    }
+
+    /// The fields of one page that the reader fills in.
+    pub fn form_fields(&self, doc: u64, page: u32) -> Result<Vec<FormField>, ClientError> {
+        self.call(
+            doc,
+            "form fields",
+            |doc| RequestBody::ListFormFields { doc, page },
+            |body| match body {
+                ResponseBody::FormFields { fields } => Ok(fields),
+                other => Err(other),
+            },
+        )
+    }
+
+    /// Sets one field and returns the fields of the page as they are then. A name or a value over
+    /// the caps is refused here, before it is sent.
+    pub fn set_form_field(
+        &self,
+        doc: u64,
+        page: u32,
+        index: u32,
+        name: &str,
+        value: &FormValue,
+    ) -> Result<Vec<FormField>, ClientError> {
+        let too_long = name.len() > MAX_FORM_NAME
+            || match value {
+                FormValue::Text(text) => text.len() > MAX_FORM_VALUE,
+                FormValue::Choice(picked) => picked.len() > MAX_FORM_OPTIONS,
+                FormValue::Checked(_) => false,
+            };
+        if too_long {
+            return Err(ClientError::Engine {
+                code: ErrorCode::InvalidRequest,
+                message: "the name or the value is too long".into(),
+            });
+        }
+        self.call(
+            doc,
+            "set form field",
+            |doc| RequestBody::SetFormField {
+                doc,
+                page,
+                index,
+                name: name.to_string(),
+                value: value.clone(),
+            },
+            |body| match body {
+                ResponseBody::FormFields { fields } => Ok(fields),
+                other => Err(other),
+            },
+        )
+    }
+
     /// Finds `query` on one page. A search text that is too long is refused here.
     pub fn search_page(
         &self,
@@ -595,6 +667,9 @@ impl EngineClient {
             RequestBody::Outline { .. } => MAX_OUTLINE_ANSWER,
             RequestBody::PageText { .. } => MAX_TEXT_ANSWER,
             RequestBody::PageLinks { .. } => MAX_LINKS_ANSWER,
+            RequestBody::ListFormFields { .. } | RequestBody::SetFormField { .. } => {
+                MAX_FORMS_ANSWER
+            }
             RequestBody::SaveChunk { len, .. } => {
                 (SAVE_DATA_HEADER_LEN + (*len as usize).min(MAX_SAVE_CHUNK)).max(IDLE_LIMIT)
             }
