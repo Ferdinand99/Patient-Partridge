@@ -905,7 +905,9 @@ fn assert_whole_form_left_alone(engine: &mut Engine, doc: u32, what: &str) {
 fn assert_only_the_target_left_alone(engine: &mut Engine, doc: u32, what: &str) {
     let _ = ask(engine, RequestBody::FormInfo { doc });
     let list = fields(engine, doc, 0);
-    assert_eq!(names(&list), ["keep", "plain", "target"], "{what}");
+    let mut sorted = names(&list);
+    sorted.sort_unstable();
+    assert_eq!(sorted, ["keep", "plain", "target"], "{what}");
     let target = one(&list, "target");
     assert!(
         target.has(field_flag::ACTION_BLOCKED)
@@ -1292,6 +1294,276 @@ fn ordinary_forms_with_a_clear_button_stay_fillable() {
             .iter()
             .filter(|f| f.name == "born")
             .all(|f| f.value == "typed"));
+        ask(engine, RequestBody::Close { doc });
+    }
+}
+
+// ---- widgets that the file and PDFium count differently ----------------------------------------------
+
+#[test]
+fn an_aa_given_as_a_reference_to_a_reference_is_read() {
+    // PDFium follows a reference to a reference when it looks up `/AA`. Objects are numbered from 6.
+    let reset = "<< /Fo << /S /ResetForm >> >>";
+    let target_cases: [(&str, &[&str], &str); 3] = [
+        ("a reset on focus", &["7 0 R", reset], "/AA 6 0 R"),
+        (
+            "a hide on blur",
+            &["7 0 R", "<< /Bl << /S /Hide /T (keep) /H true >> >>"],
+            "/AA 6 0 R",
+        ),
+        (
+            "three references deep",
+            &["7 0 R", "8 0 R", reset],
+            "/AA 6 0 R",
+        ),
+    ];
+    let whole_cases: [(&str, &[&str], &str); 3] = [
+        (
+            "a reset on the keystroke",
+            &["7 0 R", "<< /K << /S /ResetForm >> >>"],
+            "/AA 6 0 R",
+        ),
+        (
+            "a reset on the validate event",
+            &["7 0 R", "<< /V << /S /ResetForm >> >>"],
+            "/AA 6 0 R",
+        ),
+        (
+            "a hide on the validate event",
+            &["7 0 R", "<< /V << /S /Hide /T (keep) /H true >> >>"],
+            "/AA 6 0 R",
+        ),
+    ];
+    for packed in [false, true] {
+        for (what, actions, extra) in target_cases {
+            let mut guard = engine();
+            let engine = &mut guard.0;
+            let (doc, _file) = open(engine, &kit::forms_action_pdf(actions, extra, packed));
+            assert_only_the_target_left_alone(engine, doc, &format!("{what} (packed {packed})"));
+            ask(engine, RequestBody::Close { doc });
+        }
+        for (what, actions, extra) in whole_cases {
+            let mut guard = engine();
+            let engine = &mut guard.0;
+            let (doc, _file) = open(engine, &kit::forms_action_pdf(actions, extra, packed));
+            assert_whole_form_left_alone(engine, doc, &format!("{what} (packed {packed})"));
+            ask(engine, RequestBody::Close { doc });
+        }
+    }
+}
+
+#[test]
+fn a_widget_that_is_none_in_pdfium_cannot_stand_in_for_the_real_one() {
+    // The decoy comes first in the page's list and has the box and the keys of `target`, but it is
+    // an annotation of no kind for PDFium. The widgets after it must not be taken for the wrong ones.
+    let link = "/AA << /Fo << /S /URI /URI (https://example.com/) >> >>";
+    let reset = "/AA << /Fo << /S /ResetForm >> >>";
+    let hide = "/AA << /Bl << /S /Hide /T (keep) /H true >> >>";
+    for as_stream in [false, true] {
+        for (what, decoy, target) in [
+            ("a reset on focus", link, reset),
+            (
+                "a hide on blur",
+                "/AA << /Bl << /S /URI /URI (https://example.com/) >> >>",
+                hide,
+            ),
+        ] {
+            let mut guard = engine();
+            let engine = &mut guard.0;
+            let (doc, _file) = open(engine, &kit::forms_decoy_pdf(as_stream, decoy, target));
+            assert_only_the_target_left_alone(
+                engine,
+                doc,
+                &format!("{what} (decoy is a stream: {as_stream})"),
+            );
+            ask(engine, RequestBody::Close { doc });
+        }
+    }
+}
+
+#[test]
+fn a_second_trailer_in_a_stream_and_a_trailer_that_cannot_be_read_steer_nothing() {
+    // A metadata stream holds the text of another trailer and of a document whose widget at the
+    // place of `target` is harmless. The real trailer can be read, or it holds a value nested too
+    // deep for the search.
+    let deep = format!("/Z {}1{}", "[".repeat(55), "]".repeat(55));
+    for (what, trailer) in [
+        ("a readable trailer", ""),
+        ("a trailer nested too deep", deep.as_str()),
+    ] {
+        let mut guard = engine();
+        let engine = &mut guard.0;
+        let (doc, _file) = open(engine, &kit::forms_trailer_pdf(trailer, ""));
+        assert_only_the_target_left_alone(engine, doc, what);
+        ask(engine, RequestBody::Close { doc });
+    }
+}
+
+#[test]
+fn a_page_tree_with_holes_does_not_move_a_widget_away_from_its_action() {
+    // Kids that name objects that are not there make PDFium number the pages as it meets them, so the
+    // same request can be answered from another page later. `target` is left alone every time it is
+    // listed, whatever pages were asked for before.
+    let mut guard = engine();
+    let engine = &mut guard.0;
+    let (doc, _file) = open(engine, &kit::forms_holes_pdf());
+    let _ = ask(engine, RequestBody::FormInfo { doc });
+    let mut listed = 0;
+    for page in [0u32, 1, 2, 3, 0, 2, 1, 3, 1, 3] {
+        let ResponseBody::FormFields { fields: list } =
+            ask(engine, RequestBody::ListFormFields { doc, page })
+        else {
+            continue;
+        };
+        for field in &list {
+            if field.name == "target" {
+                listed += 1;
+                assert!(
+                    field.has(field_flag::ACTION_BLOCKED) && field.has(field_flag::READ_ONLY),
+                    "page {page}: {:#x}",
+                    field.flags
+                );
+                assert!(
+                    matches!(
+                        set(engine, doc, page, field, value_for(field)),
+                        ResponseBody::Error {
+                            code: ErrorCode::FormFieldRefused,
+                            ..
+                        }
+                    ),
+                    "page {page}"
+                );
+            }
+            if field.name == "keep" || field.name == "other" {
+                assert!(
+                    !field.has(field_flag::ACTION_BLOCKED),
+                    "page {page}: {}",
+                    field.name
+                );
+            }
+        }
+        if let Some(keep) = list.iter().find(|f| f.name == "keep") {
+            assert_eq!(keep.value, "kept", "page {page}");
+        }
+    }
+    assert!(listed >= 2, "target was listed {listed} times");
+}
+
+#[test]
+fn a_stream_of_trailer_words_does_not_hold_the_search_up() {
+    // The same form with 1 MiB of repeats of the word that used to start a search of its own, in
+    // the stream. The form is still read, and still quickly.
+    let bytes = kit::forms_trailer_pdf("", &"trailer(".repeat(1 << 17));
+    let started = std::time::Instant::now();
+    let mut guard = engine();
+    let engine = &mut guard.0;
+    let (doc, _file) = open(engine, &bytes);
+    let _ = ask(engine, RequestBody::FormInfo { doc });
+    let list = fields(engine, doc, 0);
+    assert!(one(&list, "target").has(field_flag::ACTION_BLOCKED));
+    assert!(!one(&list, "plain").has(field_flag::ACTION_BLOCKED));
+    assert!(started.elapsed().as_secs() < 30, "{:?}", started.elapsed());
+    ask(engine, RequestBody::Close { doc });
+}
+
+// ---- the same forms, rewritten by another program ---------------------------------------------------
+
+fn required() -> bool {
+    std::env::var_os("PARTRIDGE_REQUIRE_READERS").is_some()
+}
+
+fn have_qpdf() -> bool {
+    let found = std::process::Command::new("qpdf")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !found {
+        assert!(!required(), "qpdf is required and is not installed");
+        eprintln!("qpdf is not installed: its checks are skipped");
+    }
+    found
+}
+
+/// The file written again by qpdf in four ways: object streams, linearized, RC4 128 and AES 256 (the
+/// last two with an empty user password).
+fn qpdf_variants(bytes: &[u8]) -> Vec<(&'static str, Vec<u8>)> {
+    let dir = std::env::temp_dir().join(format!("partridge-forms-qpdf-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("in.pdf");
+    std::fs::write(&input, bytes).unwrap();
+    let ways: [(&str, &[&str]); 4] = [
+        ("object streams", &["--object-streams=generate"]),
+        ("linearized", &["--linearize"]),
+        (
+            "RC4 128",
+            &["--allow-weak-crypto", "--encrypt", "", "owner", "128", "--"],
+        ),
+        ("AES 256", &["--encrypt", "", "owner", "256", "--"]),
+    ];
+    let mut out = Vec::new();
+    for (what, args) in ways {
+        let output = dir.join(format!("{}.pdf", what.replace(' ', "-")));
+        let status = std::process::Command::new("qpdf")
+            .args(args)
+            .arg(&input)
+            .arg(&output)
+            .output()
+            .unwrap();
+        // 3 is a warning that still wrote the file.
+        assert!(
+            status.status.success() || status.status.code() == Some(3),
+            "qpdf {what}: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        out.push((what, std::fs::read(&output).unwrap()));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    out
+}
+
+#[test]
+fn forms_rewritten_by_qpdf_are_judged_as_the_plain_files_are() {
+    if !have_qpdf() {
+        return;
+    }
+    // Ordinary forms stay fillable.
+    for two_widgets in [false, true] {
+        for (what, bytes) in qpdf_variants(&kit::forms_clear_pdf(two_widgets)) {
+            let what = format!("{what}, two widgets {two_widgets}");
+            let mut guard = engine();
+            let engine = &mut guard.0;
+            let (doc, _file) = open(engine, &bytes);
+            let _ = ask(engine, RequestBody::FormInfo { doc });
+            let list = fields(engine, doc, 0);
+            assert_eq!(list.len(), if two_widgets { 9 } else { 7 }, "{what}");
+            for field in &list {
+                assert!(
+                    !field.has(field_flag::ACTION_BLOCKED)
+                        && !field.has(field_flag::FORM_BLOCKED)
+                        && !field.has(field_flag::READ_ONLY),
+                    "{what}: {}: {:#x}",
+                    field.name,
+                    field.flags
+                );
+            }
+            let field = list.iter().find(|f| f.name == "born").unwrap().clone();
+            match set(engine, doc, 0, &field, value_for(&field)) {
+                ResponseBody::FormFields { fields: after } => {
+                    assert_eq!(one(&after, "keep").value, "kept", "{what}");
+                }
+                other => panic!("{what}: {other:?}"),
+            }
+            ask(engine, RequestBody::Close { doc });
+        }
+    }
+    // A field with a reset of its own is still left alone, and only that one.
+    let plain = kit::forms_action_pdf(&[], "/AA << /Fo << /S /ResetForm >> >>", false);
+    for (what, bytes) in qpdf_variants(&plain) {
+        let mut guard = engine();
+        let engine = &mut guard.0;
+        let (doc, _file) = open(engine, &bytes);
+        assert_only_the_target_left_alone(engine, doc, what);
         ask(engine, RequestBody::Close { doc });
     }
 }

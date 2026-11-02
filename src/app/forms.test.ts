@@ -487,6 +487,39 @@ describe("a form that is filled in and annotated", () => {
   });
 });
 
+describe("Undo while a form change is on its way", () => {
+  it("waits for that change and then takes it back, not the one before it", async () => {
+    const { app, api } = make();
+    await app.openPath("/docs/form.pdf");
+    await flush();
+    // The engine is slow to answer the change.
+    const answer = api.setFormField.getMockImplementation() as (...args: Parameters<typeof api.setFormField>) => Promise<FormFieldInfo[]>;
+    let release = () => {};
+    const held = new Promise<void>((resolve) => (release = resolve));
+    api.setFormField.mockImplementationOnce(async (...args) => {
+      await held;
+      return answer(...args);
+    });
+    const input = field(0) as HTMLInputElement;
+    input.value = "Ada";
+    change(input);
+    await flush();
+    expect(api.setFormField).toHaveBeenCalledTimes(1);
+
+    // Undo is pressed before the answer: it does not run ahead of the change.
+    keyOn(document.body, "z", { ctrlKey: true });
+    await flush();
+    expect(api.setFormField).toHaveBeenCalledTimes(1);
+
+    release();
+    await flush();
+    // The change was made and then taken back: the field is as it was, and nothing is left to save.
+    expect(api.setFormField).toHaveBeenCalledTimes(2);
+    expect(api.setFormField).toHaveBeenLastCalledWith(1, 0, 0, "name", { kind: "text", text: "" });
+    expect(app.unsavedCount).toBe(0);
+  });
+});
+
 describe("Undo of a form change that cannot be taken back", () => {
   const radio = (index: number): FormFieldInfo => ({ ...textField(index, "pick"), kind: "radio", rect: [100, 100 + 30 * index, 120, 120 + 30 * index] });
 

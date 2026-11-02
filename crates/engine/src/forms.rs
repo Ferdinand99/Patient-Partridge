@@ -16,8 +16,9 @@
 //! other fields. The rest (a link, a jump, a launch, a submit, a named action) end in a callback
 //! that this module does not give, so they do nothing.
 //!
-//! So the module makes sure that no action that changes the document can fire. What it does is
-//! described in `form_actions`; in short:
+//! So the module reads the actions of a form before it lets the form be filled in, and leaves alone
+//! every field that could set one of them off. What it does is described in `form_actions`; in
+//! short:
 //!
 //! - When the environment is made (while the window asks what kind of form the document has, which
 //!   is a request that may take long), the document is written out once, so that every object is
@@ -30,8 +31,13 @@
 //!   keystroke, validate, format or calculate event of any dictionary does (PDFium reads those from
 //!   a field other than the widget, and the file does not say which), or when the search cannot be
 //!   settled, every widget is left alone: listed read only, marked, and a request for it refused.
-//! - A widget whose own `/A` or `/AA` reaches one is left alone, and only that widget. A reset
-//!   button, and widgets with scripts that reach neither, do not stop anything else.
+//! - A widget that PDFium lists with an `/A` or an `/AA` is left alone when a dictionary of the
+//!   written document with the same keys and the same box has actions that reach one, and when no
+//!   dictionary has them. A reset button, and widgets with scripts that reach neither, do not stop
+//!   anything else.
+//! - This is a reading of the file, and a file made to get round it could still clear or hide a
+//!   field in the open document. Nothing leaves the engine, and the file on disk changes only when
+//!   it is saved.
 //! - The widget that is named is the one that gets the focus and the key, never the widget found at
 //!   a point, so a button that lies over a field is never pressed.
 //! - No push button is listed, and nothing calls the functions that run the actions of a document
@@ -644,11 +650,7 @@ impl<'e> LoadedPage<'e> {
                 rect[0].max(rect[2]),
                 rect[1].max(rect[3]),
             ];
-            if self
-                .env
-                .scan
-                .blocks_widget(self.index, ordinal, has_a, has_aa, rect)
-            {
+            if self.env.scan.blocks_widget(has_a, has_aa, rect) {
                 flags |= field_flag::ACTION_BLOCKED | field_flag::READ_ONLY;
             }
         }

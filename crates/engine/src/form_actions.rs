@@ -33,15 +33,19 @@
 //!
 //! Every object of the written document is read, with all the dictionaries inside it, and for each
 //! dictionary its `/A` and `/AA` are followed through indirect references and `/Next` chains (a
-//! single action or an array) to see whether the chain reaches a `ResetForm` or a `Hide`.
+//! single action or an array) to see whether the chain reaches a `ResetForm` or a `Hide`. A
+//! reference is followed as far as the limits below allow, which is further than PDFium follows
+//! one.
 //!
 //! - If the `K`, `V`, `F` or `C` entry of any `/AA`, in any dictionary at all, reaches one, the whole
 //!   form is left alone.
-//! - If the own `/A` or `/AA` of a widget reaches one, that widget is left alone. The widget is
-//!   found by page and place in the page's list of annotations, the way the window numbers it, and
-//!   the match is checked against what PDFium says about the same widget (whether it has `/A` and
-//!   `/AA`, and its box). A widget that cannot be tied that way, or any widget when the page tree
-//!   cannot be followed, is left alone when it has an action.
+//! - For every dictionary that has an `/A` or an `/AA`, the search records which of the two it has,
+//!   its box (`/Rect`) and whether its own actions reach one. A widget that PDFium lists with an
+//!   action is left alone when a record with the same keys and the same box reaches one, when no
+//!   record has them (the file and PDFium do not agree about the widget), and when a record that
+//!   reaches one has no box that can be read and has the same keys. A harmless widget with the box
+//!   and keys of a harmful one is left alone too. Nothing depends on where a widget sits in a page,
+//!   on the page tree or on the trailer, so none of them can be made to point at another widget.
 //! - A reset button that reaches a reset itself blocks nothing else, and a script that does not
 //!   reach a reset or a hide through `/Next` blocks nothing, because scripts never run.
 //! - A missing or unreadable target, a loop, a chain or nesting that is too deep, more work than the
@@ -52,7 +56,7 @@
 //! one step of a budget that grows with the size of the document, and the search reports progress
 //! while it runs.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// Most steps (tokens read and objects looked up) for a document of no size, and the steps allowed
 /// for each byte of the document on top of that.
@@ -68,10 +72,8 @@ const MAX_NEST: usize = 48;
 /// Longest chain of actions (`/Next`, arrays of them) that is followed.
 const MAX_CHAIN: usize = 32;
 
-/// Deepest page tree that is followed, most pages and most widgets that are tied to a place.
-const MAX_TREE: usize = 48;
-const MAX_PAGES: usize = 1 << 20;
-const MAX_WIDGETS: usize = 2_000_000;
+/// Most dictionaries with an action that are recorded.
+const MAX_RECORDS: usize = 2_000_000;
 
 /// The names of the two actions that change a document when they fire.
 const STATE_ACTIONS: [&[u8]; 2] = [b"ResetForm", b"Hide"];
@@ -84,29 +86,77 @@ const FIELD_EVENTS: [&[u8]; 4] = [b"K", b"V", b"F", b"C"];
 pub struct Scan {
     /// No widget of the form is filled in.
     pub whole_form: bool,
-    /// Widgets whose own actions reach a reset or a hide, when some widget has such actions.
-    own: Own,
+    /// The dictionaries that have actions, when some of them reach a reset or a hide.
+    own: Option<Records>,
 }
 
-#[derive(Debug)]
-enum Own {
-    /// No widget has an action of its own that reaches a reset or a hide.
-    Nothing,
-    /// Some do, and the widgets could not be told apart: a widget with an action is left alone.
-    Unmapped,
-    /// Some do, per page and place in the list of annotations of the page.
-    Mapped(Vec<Vec<Widget>>),
+/// The dictionaries with an `/A` or an `/AA`, by which of the two they have and their box.
+#[derive(Debug, Default)]
+struct Records {
+    /// For each pair of keys and box (in steps of [`CELL`]): whether one of them reaches a reset or
+    /// a hide.
+    boxes: HashMap<(bool, bool, [i64; 4]), bool>,
+    /// For each pair of keys: a dictionary that reaches one has no box that can be read.
+    unplaced: [bool; 4],
+    count: usize,
 }
 
-/// What the file says about one widget.
-#[derive(Debug)]
-struct Widget {
-    /// Its own `/A` or `/AA` reaches a reset or a hide.
-    reaches: bool,
-    has_a: bool,
-    has_aa: bool,
-    /// `[left, bottom, right, top]`, if the file gives a box of four numbers.
-    rect: Option<[f64; 4]>,
+/// The size of a step in the box of a widget, in points, and how far PDFium's box may be from the
+/// file's. A box is looked for in every step that is within the tolerance.
+const CELL: f64 = 0.01;
+const TOLERANCE: f64 = 0.01;
+
+fn cell(v: f64) -> i64 {
+    (v / CELL).floor() as i64
+}
+
+fn key_slot(has_a: bool, has_aa: bool) -> usize {
+    usize::from(has_a) * 2 + usize::from(has_aa)
+}
+
+impl Records {
+    fn add(&mut self, has_a: bool, has_aa: bool, rect: Option<[f64; 4]>, reaches: bool) -> R<()> {
+        self.count += 1;
+        if self.count > MAX_RECORDS {
+            return Err(Stop::Whole);
+        }
+        match rect {
+            None => self.unplaced[key_slot(has_a, has_aa)] |= reaches,
+            Some(r) => {
+                *self
+                    .boxes
+                    .entry((has_a, has_aa, r.map(cell)))
+                    .or_insert(false) |= reaches;
+            }
+        }
+        Ok(())
+    }
+
+    fn blocks(&self, has_a: bool, has_aa: bool, rect: [f32; 4]) -> bool {
+        if self.unplaced[key_slot(has_a, has_aa)] || !rect.iter().all(|v| v.is_finite()) {
+            return true;
+        }
+        let steps = |v: f32| {
+            let v = f64::from(v);
+            cell(v - TOLERANCE)..=cell(v + TOLERANCE)
+        };
+        let mut found = false;
+        for left in steps(rect[0]) {
+            for bottom in steps(rect[1]) {
+                for right in steps(rect[2]) {
+                    for top in steps(rect[3]) {
+                        match self.boxes.get(&(has_a, has_aa, [left, bottom, right, top])) {
+                            Some(true) => return true,
+                            Some(false) => found = true,
+                            None => {}
+                        }
+                    }
+                }
+            }
+        }
+        // A widget with an action that no record has: the file and PDFium do not agree about it.
+        !found
+    }
 }
 
 impl Scan {
@@ -114,7 +164,7 @@ impl Scan {
     pub fn nothing() -> Scan {
         Scan {
             whole_form: false,
-            own: Own::Nothing,
+            own: None,
         }
     }
 
@@ -122,47 +172,18 @@ impl Scan {
     pub fn everything() -> Scan {
         Scan {
             whole_form: true,
-            own: Own::Nothing,
+            own: None,
         }
     }
 
-    /// Whether the widget at `ordinal` among the widgets of page `page` is left alone for what its own
-    /// actions do. `has_a`, `has_aa` and `rect` (`[left, bottom, right, top]`) are what PDFium says
-    /// about the widget; they must agree with the file's widget at that place.
-    pub fn blocks_widget(
-        &self,
-        page: u32,
-        ordinal: u32,
-        has_a: bool,
-        has_aa: bool,
-        rect: [f32; 4],
-    ) -> bool {
-        match &self.own {
-            Own::Nothing => false,
-            Own::Unmapped => has_a || has_aa,
-            Own::Mapped(pages) => {
-                let found = pages
-                    .get(page as usize)
-                    .and_then(|widgets| widgets.get(ordinal as usize));
-                match found {
-                    Some(w) if w.has_a == has_a && w.has_aa == has_aa && w.matches(rect) => {
-                        w.reaches
-                    }
-                    _ => has_a || has_aa,
-                }
-            }
-        }
-    }
-}
-
-impl Widget {
-    fn matches(&self, rect: [f32; 4]) -> bool {
-        let Some(mine) = self.rect else {
-            return false;
-        };
-        mine.iter()
-            .zip(rect)
-            .all(|(a, b)| b.is_finite() && (*a - b as f64).abs() <= 0.01)
+    /// Whether a widget is left alone for what its own actions do. `has_a`, `has_aa` and `rect`
+    /// (`[left, bottom, right, top]`) are what PDFium says about the widget.
+    pub fn blocks_widget(&self, has_a: bool, has_aa: bool, rect: [f32; 4]) -> bool {
+        (has_a || has_aa)
+            && self
+                .own
+                .as_ref()
+                .is_some_and(|records| records.blocks(has_a, has_aa, rect))
     }
 }
 
@@ -173,8 +194,6 @@ impl Widget {
 enum Stop {
     /// Every widget of the form is left alone.
     Whole,
-    /// The widgets cannot be told apart.
-    Unmapped,
 }
 
 type R<T> = Result<T, Stop>;
@@ -381,16 +400,15 @@ impl Iterator for WrittenObjects<'_> {
     }
 }
 
-/// Whether the bytes of an object name something this search looks at: an action (`/A`, `/AA`), a
-/// compressed object stream, or the dictionary of a cross-reference stream (which holds `/Root`).
-/// A name with a `#` escape in it is looked at as well.
+/// Whether the bytes of an object name something this search looks at: an action (`/A`, `/AA`) or a
+/// compressed object stream. A name with a `#` escape in it is looked at as well.
 fn mentions_actions(body: &[u8]) -> bool {
     let mut at = 0;
     while let Some(p) = body[at..].iter().position(|b| *b == b'/') {
         let start = at + p + 1;
         let len = body[start..].iter().take_while(|b| is_regular(**b)).count();
         let name = &body[start..start + len];
-        if matches!(name, b"A" | b"AA" | b"ObjStm" | b"XRef") || name.contains(&b'#') {
+        if matches!(name, b"A" | b"AA" | b"ObjStm") || name.contains(&b'#') {
             return true;
         }
         at = start;
@@ -522,6 +540,13 @@ fn parse_value(bytes: &[u8], at: &mut usize, depth: usize, budget: &mut Budget<'
                     Ok(Val::Null)
                 }
                 _ => {
+                    // Only what a PDF number is made of: `inf`, `nan` and `1e3` are not numbers.
+                    if !token
+                        .iter()
+                        .all(|b| b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.'))
+                    {
+                        return Err(Stop::Whole);
+                    }
                     let text = std::str::from_utf8(token).map_err(|_| Stop::Whole)?;
                     let number: f64 = text.parse().map_err(|_| Stop::Whole)?;
                     // `12 0 R`: a reference.
@@ -559,6 +584,8 @@ struct Scanner<'a, 'p> {
     index: Vec<(u64, u32, u32)>,
     budget: Budget<'p>,
     memo: HashMap<u64, Memo>,
+    /// The dictionaries that have actions.
+    records: Records,
 }
 
 /// Searches a written document. Everything that cannot be settled counts against the form.
@@ -573,6 +600,7 @@ pub fn scan(bytes: &[u8], progress: &mut dyn FnMut(u32)) -> Scan {
             progress,
         },
         memo: HashMap::new(),
+        records: Records::default(),
     };
     match scanner.run() {
         Ok(scan) => scan,
@@ -596,10 +624,9 @@ impl Scanner<'_, '_> {
         }
         self.index.sort_by_key(|(number, _, _)| *number);
 
-        // Pass one: every object that has an action, a compressed stream or the cross-reference
-        // dictionary, with every dictionary inside it.
+        // Every object that has an action or is a compressed stream, with every dictionary inside
+        // it.
         let mut any_own = false;
-        let mut roots: Vec<u64> = Vec::new();
         for i in 0..self.index.len() {
             let (_, start, end) = self.index[i];
             let body = &self.bytes[start as usize..end as usize];
@@ -612,27 +639,15 @@ impl Scanner<'_, '_> {
                     // Its content is compressed and is not read: it may hold anything.
                     return Err(Stop::Whole);
                 }
-                if value.get(b"Type").is_some_and(|t| t.is_name(b"XRef")) {
-                    if let Some(Val::Ref(root)) = value.get(b"Root") {
-                        roots.push(*root);
-                    }
-                }
             }
             any_own |= self.walk(&value)?;
         }
         if !any_own {
             return Ok(Scan::nothing());
         }
-
-        // Pass two: which widgets those are.
-        let own = match self.map_widgets(roots) {
-            Ok(pages) => Own::Mapped(pages),
-            Err(Stop::Unmapped) => Own::Unmapped,
-            Err(Stop::Whole) => return Err(Stop::Whole),
-        };
         Ok(Scan {
             whole_form: false,
-            own,
+            own: Some(std::mem::take(&mut self.records)),
         })
     }
 
@@ -680,7 +695,12 @@ impl Scanner<'_, '_> {
             self.budget.tick()?;
             match v {
                 Val::Dict(pairs) => {
-                    own |= self.own_actions(v)?;
+                    let (has_a, has_aa) = (v.get(b"A").is_some(), v.get(b"AA").is_some());
+                    if has_a || has_aa {
+                        let reaches = self.own_actions(v)?;
+                        own |= reaches;
+                        self.records.add(has_a, has_aa, rect_of(v), reaches)?;
+                    }
                     stack.extend(pairs.iter().map(|(_, v)| v));
                 }
                 Val::Array(items) => stack.extend(items.iter()),
@@ -697,21 +717,28 @@ impl Scanner<'_, '_> {
         if let Some(a) = dict.get(b"A") {
             own |= self.reaches(a, 0)?;
         }
-        match dict.get(b"AA") {
-            Some(Val::Ref(number)) => {
-                for target in self.load_ref(*number)? {
-                    own |= self.events(&target)?;
-                }
-            }
-            Some(aa) => own |= self.events(aa)?,
-            None => {}
+        if let Some(aa) = dict.get(b"AA") {
+            own |= self.events(aa, 0)?;
         }
         Ok(own)
     }
 
-    fn events(&mut self, aa: &Val) -> R<bool> {
-        let Val::Dict(pairs) = aa else {
-            return Ok(false);
+    /// The events of an `/AA`, which is a dictionary or a reference to one, as many references deep
+    /// as [`MAX_CHAIN`] allows.
+    fn events(&mut self, aa: &Val, depth: usize) -> R<bool> {
+        let pairs = match aa {
+            Val::Dict(pairs) => pairs,
+            Val::Ref(number) => {
+                if depth > MAX_CHAIN {
+                    return Err(Stop::Whole);
+                }
+                let mut own = false;
+                for target in self.load_ref(*number)? {
+                    own |= self.events(&target, depth + 1)?;
+                }
+                return Ok(own);
+            }
+            _ => return Ok(false),
         };
         let mut own = false;
         for (key, action) in pairs {
@@ -785,179 +812,6 @@ impl Scanner<'_, '_> {
             _ => Ok(false),
         }
     }
-
-    // ---- which widget is which -------------------------------------------------------------
-
-    /// The widgets of every page, in the order of the page tree and of each page's annotations.
-    fn map_widgets(&mut self, mut roots: Vec<u64>) -> R<Vec<Vec<Widget>>> {
-        // The trailer of a written document, or the dictionary of its cross-reference stream.
-        let bytes = self.bytes;
-        let mut from = 0;
-        while let Some(at) = bytes[from..]
-            .windows(7)
-            .position(|window| window == b"trailer")
-        {
-            let mut p = from + at + 7;
-            from += at + 7;
-            if let Ok(trailer) = parse_value(bytes, &mut p, 0, &mut self.budget) {
-                if let Some(Val::Ref(root)) = trailer.get(b"Root") {
-                    roots.push(*root);
-                }
-            }
-            self.budget.tick()?;
-        }
-        roots.sort_unstable();
-        roots.dedup();
-        let [root] = roots.as_slice() else {
-            return Err(Stop::Unmapped);
-        };
-        let catalog = self.single(*root)?;
-        let mut pages: Vec<Vec<Widget>> = Vec::new();
-        let mut tree = Tree {
-            seen: HashSet::new(),
-            widgets: 0,
-        };
-        match catalog.get(b"Pages") {
-            Some(Val::Ref(number)) => {
-                let node = self.single(*number)?;
-                tree.seen.insert(*number);
-                self.page_node(&node, 0, &mut pages, &mut tree)?;
-            }
-            Some(node @ Val::Dict(_)) => self.page_node(node, 0, &mut pages, &mut tree)?,
-            _ => return Err(Stop::Unmapped),
-        }
-        Ok(pages)
-    }
-
-    /// The value of an object that is defined once. Anything else cannot be followed.
-    fn single(&mut self, number: u64) -> R<Val> {
-        let defs = self.defs(number);
-        let [(start, end)] = defs[..] else {
-            return Err(Stop::Unmapped);
-        };
-        self.load(start, end)
-    }
-
-    /// Follows a page tree the way PDFium numbers pages: depth first, a kid without `/Kids` is a
-    /// page, a kid that is not a dictionary takes the place of a page and has no widgets, and
-    /// `/Count` is not read.
-    fn page_node(
-        &mut self,
-        node: &Val,
-        level: usize,
-        pages: &mut Vec<Vec<Widget>>,
-        tree: &mut Tree,
-    ) -> R<()> {
-        if level > MAX_TREE || pages.len() > MAX_PAGES {
-            return Err(Stop::Unmapped);
-        }
-        self.budget.tick()?;
-        let Some(kids) = node.get(b"Kids") else {
-            let widgets = self.page_widgets(node, tree)?;
-            pages.push(widgets);
-            return Ok(());
-        };
-        let held;
-        let kids: &[Val] = match kids {
-            Val::Array(items) => items,
-            Val::Ref(number) => {
-                held = self.single(*number)?;
-                match &held {
-                    Val::Array(items) => items,
-                    _ => return Err(Stop::Unmapped),
-                }
-            }
-            _ => return Err(Stop::Unmapped),
-        };
-        for kid in kids {
-            match kid {
-                Val::Ref(number) => {
-                    if self.defs(*number).is_empty() {
-                        // PDFium finds nothing there and keeps the place.
-                        pages.push(Vec::new());
-                        continue;
-                    }
-                    let target = self.single(*number)?;
-                    if !matches!(target, Val::Dict(_)) {
-                        pages.push(Vec::new());
-                        continue;
-                    }
-                    if !tree.seen.insert(*number) {
-                        return Err(Stop::Unmapped);
-                    }
-                    self.page_node(&target, level + 1, pages, tree)?;
-                }
-                node @ Val::Dict(_) => self.page_node(node, level + 1, pages, tree)?,
-                _ => pages.push(Vec::new()),
-            }
-        }
-        Ok(())
-    }
-
-    /// The widgets of a page, in the order of its annotations.
-    fn page_widgets(&mut self, page: &Val, tree: &mut Tree) -> R<Vec<Widget>> {
-        let held;
-        let list: &[Val] = match page.get(b"Annots") {
-            Some(Val::Array(items)) => items,
-            Some(Val::Ref(number)) => {
-                if self.defs(*number).is_empty() {
-                    return Ok(Vec::new());
-                }
-                held = self.single(*number)?;
-                match &held {
-                    Val::Array(items) => items,
-                    _ => return Ok(Vec::new()),
-                }
-            }
-            _ => return Ok(Vec::new()),
-        };
-        let mut widgets = Vec::new();
-        for item in list {
-            self.budget.tick()?;
-            let loaded;
-            let annot: &Val = match item {
-                Val::Dict(_) => item,
-                Val::Ref(number) => {
-                    if self.defs(*number).is_empty() {
-                        // PDFium skips what it cannot find.
-                        continue;
-                    }
-                    loaded = self.single(*number)?;
-                    &loaded
-                }
-                _ => continue,
-            };
-            if !matches!(annot, Val::Dict(_)) {
-                continue;
-            }
-            match annot.get(b"Subtype") {
-                Some(Val::Ref(_)) => return Err(Stop::Unmapped),
-                Some(s) if s.is_name(b"Popup") => continue,
-                Some(s) if s.is_name(b"Widget") => {}
-                _ => continue,
-            }
-            tree.widgets += 1;
-            if tree.widgets > MAX_WIDGETS {
-                return Err(Stop::Unmapped);
-            }
-            let reaches = self.own_actions(annot)?;
-            widgets.push(Widget {
-                reaches,
-                has_a: annot.get(b"A").is_some(),
-                has_aa: annot.get(b"AA").is_some(),
-                rect: rect_of(annot),
-            });
-        }
-        Ok(widgets)
-    }
-}
-
-/// What a walk through the page tree has seen.
-struct Tree {
-    /// The page tree nodes that were entered: one reached twice is not followed.
-    seen: HashSet<u64>,
-    /// The widgets found so far.
-    widgets: usize,
 }
 
 /// `[left, bottom, right, top]` of a `/Rect` of four numbers.
@@ -987,20 +841,13 @@ fn rect_of(annot: &Val) -> Option<[f64; 4]> {
 mod tests {
     use super::*;
 
-    /// A written document of the given object bodies (object `i + 1` is `bodies[i]`), with a
-    /// trailer that names object 1 as the root.
+    /// A written document of the given object bodies (object `i + 1` is `bodies[i]`).
     fn doc(bodies: &[&str]) -> Vec<u8> {
-        doc_with(bodies, "<< /Root 1 0 R >>")
-    }
-
-    fn doc_with(bodies: &[&str], trailer: &str) -> Vec<u8> {
         let mut out = String::from("%PDF-1.5\r\n");
         for (i, body) in bodies.iter().enumerate() {
             out.push_str(&format!("{} 0 obj\r\n{body}\r\nendobj\r\n", i + 1));
         }
-        out.push_str(&format!(
-            "trailer\r\n{trailer}\r\nstartxref\r\n0\r\n%%EOF\r\n"
-        ));
+        out.push_str("trailer\r\n<< /Root 1 0 R >>\r\nstartxref\r\n0\r\n%%EOF\r\n");
         out.into_bytes()
     }
 
@@ -1035,9 +882,9 @@ mod tests {
         ]);
         let scan = run(&bytes);
         assert!(!scan.whole_form);
-        assert!(scan.blocks_widget(0, 0, true, false, RECT));
-        assert!(!scan.blocks_widget(0, 1, false, true, RECT));
-        assert!(!scan.blocks_widget(0, 2, false, false, RECT));
+        assert!(scan.blocks_widget(true, false, RECT));
+        assert!(!scan.blocks_widget(false, true, RECT));
+        assert!(!scan.blocks_widget(false, false, RECT));
     }
 
     #[test]
@@ -1047,7 +894,7 @@ mod tests {
         )]);
         let scan = run(&bytes);
         assert!(!scan.whole_form);
-        assert!(!scan.blocks_widget(0, 0, false, true, RECT));
+        assert!(!scan.blocks_widget(false, true, RECT));
     }
 
     #[test]
@@ -1152,66 +999,135 @@ mod tests {
     }
 
     #[test]
-    fn widgets_are_found_by_page_and_place_the_way_pdfium_counts_them() {
-        // The tree: a kid that is no dictionary takes the place of a page, a pop-up and a
-        // dictionary that is no annotation are not counted, and the widget with the action is the
-        // second one of its page.
+    fn a_widget_is_matched_by_its_keys_and_its_box_and_nothing_else() {
+        // Nothing here says which page a widget is on or where in a list: an entry that is no
+        // widget, a decoy with the same box, and a hole in the page tree change nothing.
         let bytes = doc(&[
             "<< /Type /Catalog /Pages 2 0 R >>",
-            "<< /Type /Pages /Kids [7 0 R 3 0 R 99 0 R] >>",
-            "<< /Type /Page /Annots [4 0 R 5 0 R 6 0 R << /Subtype /Widget /Rect [10 10 110 30] /A << /S /Hide >> >> << /Subtype /Widget /Rect [10 10 110 30] /A << /S /URI >> >>] >>",
-            "<< /Subtype /Popup /Rect [0 0 1 1] >>",
-            "<< /Note (not an annotation) >>",
-            &format!("<< {WIDGET} >>"),
-            "5",
+            "<< /Type /Pages /Kids [99 0 R 3 0 R 98 0 R] /Count 3 >>",
+            "<< /Type /Page /Annots [4 0 R 5 0 R 6 0 R] >>",
+            // A decoy with the box and keys of the harmful widget, and a string for a subtype.
+            "<< /Type /Annot /Subtype (Widget) /Rect [10 10 110 30] /A << /S /URI >> >>",
+            "<< /Type /Annot /Subtype /Widget /Rect [10 10 110 30] /A << /S /Hide >> >>",
+            "<< /Type /Annot /Subtype /Widget /Rect [10 40 110 60] /A << /S /URI >> >>",
+            "<< /Type /Annot /Subtype /Widget /Rect [0 0 0 0] /A << /S /URI >> >>",
         ]);
         let scan = run(&bytes);
-        // Page 0 is object 7 (no dictionary), page 1 is object 3.
-        assert!(!scan.blocks_widget(1, 0, false, false, RECT));
-        assert!(scan.blocks_widget(1, 1, true, false, RECT));
-        // What PDFium says about a widget has to agree with the file, or the widget is left alone
-        // when it has an action.
-        assert!(scan.blocks_widget(1, 0, false, true, RECT));
-        assert!(scan.blocks_widget(1, 1, false, true, RECT));
-        assert!(scan.blocks_widget(1, 1, true, false, [0.0, 0.0, 5.0, 5.0]));
-        assert!(!scan.blocks_widget(1, 0, false, false, [0.0, 0.0, 5.0, 5.0]));
-        // A widget with a link at its place is free, but not when its box is not the one in the file.
-        assert!(!scan.blocks_widget(1, 2, true, false, RECT));
-        assert!(scan.blocks_widget(1, 2, true, false, [0.0, 0.0, 5.0, 5.0]));
+        assert!(!scan.whole_form);
+        // The harmful one, and the decoy that looks like it.
+        assert!(scan.blocks_widget(true, false, RECT));
+        // Another box, with an action that does not reach one: free.
+        assert!(!scan.blocks_widget(true, false, [10.0, 40.0, 110.0, 60.0]));
+        // A box within a hundredth of a point is the same box, for either of them.
+        assert!(scan.blocks_widget(true, false, [10.004, 9.996, 110.0, 30.0]));
+        assert!(!scan.blocks_widget(true, false, [10.004, 40.004, 109.996, 60.0]));
+        // What PDFium says has to agree with the file: another box, another set of keys, or a box
+        // that is not a number is a widget no record has, and it is left alone.
+        assert!(scan.blocks_widget(true, false, [0.0, 0.0, 5.0, 5.0]));
+        assert!(scan.blocks_widget(false, true, [10.0, 40.0, 110.0, 60.0]));
+        assert!(scan.blocks_widget(true, false, [f32::NAN, 0.0, 5.0, 5.0]));
+        assert!(scan.blocks_widget(true, false, [f32::NAN; 4]));
+        // No action, nothing to settle.
+        assert!(!scan.blocks_widget(false, false, [0.0, 0.0, 5.0, 5.0]));
     }
 
     #[test]
-    fn widgets_that_cannot_be_told_apart_are_left_alone_when_they_have_an_action() {
-        let page = format!(
-            "<< /Type /Page /Annots [<< {WIDGET} /A << /S /ResetForm >> >> << {WIDGET} /AA << /Fo << /S /URI >> >> >> << {WIDGET} >>] >>"
-        );
-        let bodies = [
-            "<< /Type /Catalog /Pages 2 0 R >>",
-            "<< /Type /Pages /Kids [3 0 R] >>",
-            page.as_str(),
-        ];
-        // Two trailers that name two roots: no way to say which page tree PDFium numbers.
-        let mut two = doc(&bodies);
-        two.extend_from_slice(b"trailer\r\n<< /Root 2 0 R >>\r\n");
-        let scan = run(&two);
-        assert!(!scan.whole_form);
-        assert!(scan.blocks_widget(0, 0, true, false, RECT));
-        assert!(scan.blocks_widget(0, 1, false, true, RECT));
-        assert!(!scan.blocks_widget(0, 2, false, false, RECT));
-        // The same document with one root is mapped: the widget with a link is free.
-        let scan = run(&doc(&bodies));
-        assert!(scan.blocks_widget(0, 0, true, false, RECT));
-        assert!(!scan.blocks_widget(0, 1, false, true, RECT));
-        // A page tree that comes back to itself.
-        let looped = doc(&[
-            "<< /Type /Catalog /Pages 2 0 R >>",
-            "<< /Type /Pages /Kids [2 0 R 3 0 R] >>",
-            page.as_str(),
+    fn a_harmful_dictionary_with_no_box_that_can_be_read_blocks_every_widget_with_its_keys() {
+        for rect in [
+            "",
+            "/Rect [10 10 110]",
+            "/Rect [10 10 110 (x)]",
+            "/Rect 7 0 R",
+        ] {
+            let bytes = one_page(&[
+                &format!(
+                    "<< /Type /Annot /Subtype /Widget {rect} /AA << /Fo << /S /ResetForm >> >> >>"
+                ),
+                &format!("<< {WIDGET} /AA << /Fo << /S /URI >> >> >>"),
+                &format!("<< {WIDGET} /A << /S /URI >> >>"),
+            ]);
+            let scan = run(&bytes);
+            assert!(!scan.whole_form, "{rect}");
+            assert!(scan.blocks_widget(false, true, RECT), "{rect}");
+            // The same box, the other key: no harmful dictionary is without a box there.
+            assert!(!scan.blocks_widget(true, false, RECT), "{rect}");
+        }
+    }
+
+    #[test]
+    fn a_number_that_is_not_a_pdf_number_cannot_be_settled() {
+        for number in ["inf", "nan", "1e3", "--", "1.2.3"] {
+            let bytes = one_page(&[&format!(
+                "<< /Type /Annot /Subtype /Widget /Rect [10 10 110 {number}] /A << /S /ResetForm >> >>"
+            )]);
+            assert!(run(&bytes).whole_form, "{number}");
+        }
+    }
+
+    #[test]
+    fn too_many_records_cannot_be_settled() {
+        let mut records = Records {
+            count: MAX_RECORDS,
+            ..Records::default()
+        };
+        assert!(records.add(true, false, None, false).is_err());
+    }
+
+    #[test]
+    fn an_aa_given_as_a_reference_to_a_reference_is_read() {
+        let bytes = doc(&[
+            "<< /Type /Annot /Subtype /Widget /Rect [10 10 110 30] /AA 2 0 R >>",
+            "3 0 R",
+            "<< /Fo << /S /ResetForm >> >>",
         ]);
-        let scan = run(&looped);
+        let scan = run(&bytes);
         assert!(!scan.whole_form);
-        assert!(scan.blocks_widget(0, 1, false, true, RECT));
-        assert!(!scan.blocks_widget(0, 2, false, false, RECT));
+        assert!(scan.blocks_widget(false, true, RECT));
+        // The events that PDFium reads from the field above a widget are found the same way.
+        for event in ["K", "V"] {
+            let bytes = doc(&[
+                "<< /Type /Annot /Subtype /Widget /Rect [10 10 110 30] /AA 2 0 R >>",
+                "3 0 R",
+                &format!("<< /{event} << /S /Hide >> >>"),
+            ]);
+            assert!(run(&bytes).whole_form, "{event}");
+        }
+        // A reference that comes back to itself cannot be settled.
+        let bytes = doc(&["<< /AA 2 0 R >>", "3 0 R", "2 0 R"]);
+        assert!(run(&bytes).whole_form);
+    }
+
+    #[test]
+    fn a_trailer_that_is_not_read_makes_no_difference() {
+        // The trailer of a written document plays no part: a fake one inside a stream, a real one
+        // that cannot be read and no trailer at all give the same answer.
+        let deep = format!("{}1{}", "[".repeat(MAX_NEST + 7), "]".repeat(MAX_NEST + 7));
+        let objects =
+            "1 0 obj\r\n<< /Type /Annot /Subtype /Widget /Rect [10 10 110 30] /A << /S /ResetForm >> >>\r\nendobj\r\n\
+             2 0 obj\r\n<< /Type /Metadata /Length 40 >>\r\nstream\r\ntrailer << /Root 900 0 R >>\r\n\
+             900 0 obj\r\n<< /Type /Catalog >>\r\nendobj\r\nendstream\r\nendobj\r\n"
+            ;
+        for trailer in [
+            format!("trailer\r\n<< /Root 1 0 R /Z {deep} >>\r\n"),
+            "trailer\r\n<< /Root".to_string(),
+            String::new(),
+        ] {
+            let bytes = format!("{objects}{trailer}");
+            let scan = run(bytes.as_bytes());
+            assert!(!scan.whole_form);
+            assert!(scan.blocks_widget(true, false, RECT));
+        }
+    }
+
+    #[test]
+    fn a_stream_full_of_the_word_trailer_costs_no_more_than_any_other_bytes() {
+        // A reset is there so that the search runs; the bytes that follow are a stream.
+        let mut bytes = doc(&["<< /Type /Annot /Rect [1 1 2 2] /A << /S /ResetForm >> >>"]);
+        bytes.extend_from_slice(&b"trailer(".repeat(1 << 20));
+        let started = std::time::Instant::now();
+        let scan = run(&bytes);
+        assert!(!scan.whole_form);
+        assert!(started.elapsed().as_secs() < 5, "{:?}", started.elapsed());
     }
 
     #[test]
@@ -1222,7 +1138,7 @@ mod tests {
         )]);
         let scan = run(&bytes);
         assert!(!scan.whole_form);
-        assert!(!scan.blocks_widget(0, 0, true, false, RECT));
+        assert!(!scan.blocks_widget(true, false, RECT));
     }
 
     #[test]

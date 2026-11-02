@@ -858,3 +858,128 @@ pub fn forms_clear_pdf(two_widgets: bool) -> Vec<u8> {
     };
     build(&[spec], &catalog(&fields), "", objs.bodies)
 }
+
+/// A form with a widget `decoy` ahead of the real ones, to try what a list of widgets counts that
+/// PDFium does not. The decoy has the box of `target`, `decoy_extra` among its entries, and either a
+/// subtype that is a string (PDFium does not read it as a subtype) or, with `as_stream`, the
+/// dictionary of a stream (PDFium takes no annotation from a stream). The page lists `decoy`,
+/// `target`, `keep`, `plain` and the push button `clear`. `target` has `target_extra`, and `keep`
+/// holds "kept".
+pub fn forms_decoy_pdf(as_stream: bool, decoy_extra: &str, target_extra: &str) -> Vec<u8> {
+    let mut objs = Objects::new(6);
+    let page = 4;
+    let entries = format!("/Type /Annot /Rect [100 660 300 680] /F 4 /P {page} 0 R {decoy_extra}");
+    let decoy = if as_stream {
+        objs.add(stream_object(&format!("/Subtype /Widget {entries}"), ""))
+    } else {
+        objs.add(format!("<< /Subtype (Widget) {entries} >>"))
+    };
+    let target = text(&mut objs, page, "target", 660, "", target_extra);
+    let keep = text(&mut objs, page, "keep", 740, "kept", "");
+    let plain = text(&mut objs, page, "plain", 700, "", "");
+    let clear = clear_button(&mut objs, page, 620);
+    let annots = [decoy, target, keep, plain, clear];
+    let annot_list: String = annots.iter().fold(String::new(), |mut s, f| {
+        let _ = write!(s, "{f} 0 R ");
+        s
+    });
+    let spec = PageSpec {
+        width: 612,
+        height: 792,
+        content: Some("0 g 10 10 1 1 re f\n".to_string()),
+        extra: format!("/Annots [{annot_list}]"),
+    };
+    build(
+        &[spec],
+        &catalog(&[target, keep, plain, clear]),
+        "",
+        objs.bodies,
+    )
+}
+
+/// A form whose file holds, in a metadata stream that a writer leaves as it is, a second trailer
+/// and the objects of a second document (a page with three widgets, the last of them harmless and
+/// with the box of `target`). `real_trailer_extra` goes into the real trailer, to make it one that
+/// a reader with limits cannot read (`/Z` with deep nesting), and `padding` is more text for the end
+/// of the stream. The page lists `keep`, `plain`, `target` (it has a reset on focus) and the push
+/// button `clear`.
+pub fn forms_trailer_pdf(real_trailer_extra: &str, padding: &str) -> Vec<u8> {
+    let fake = "trailer << /Root 900 0 R >>\r\n\
+         900 0 obj\r\n<< /Type /Catalog /Pages 901 0 R >>\r\nendobj\r\n\
+         901 0 obj\r\n<< /Type /Pages /Kids [902 0 R] /Count 1 >>\r\nendobj\r\n\
+         902 0 obj\r\n<< /Type /Page /Parent 901 0 R /Annots [903 0 R 904 0 R 905 0 R] >>\r\nendobj\r\n\
+         903 0 obj\r\n<< /Type /Annot /Subtype /Widget /Rect [1 1 2 2] >>\r\nendobj\r\n\
+         904 0 obj\r\n<< /Type /Annot /Subtype /Widget /Rect [3 3 4 4] >>\r\nendobj\r\n\
+         905 0 obj\r\n<< /Type /Annot /Subtype /Widget /Rect [100 660 300 680] \
+         /AA << /Fo << /S /URI /URI (https://example.com/) >> >> >>\r\nendobj\r\n";
+    let fake = format!("{fake}{padding}");
+    let mut objs = Objects::new(6);
+    let page = 4;
+    let metadata = objs.add(stream_object("/Type /Metadata /Subtype /XML", &fake));
+    let keep = text(&mut objs, page, "keep", 740, "kept", "");
+    let plain = text(&mut objs, page, "plain", 700, "", "");
+    let target = text(
+        &mut objs,
+        page,
+        "target",
+        660,
+        "",
+        "/AA << /Fo << /S /ResetForm >> >>",
+    );
+    let clear = clear_button(&mut objs, page, 620);
+    let fields = [keep, plain, target, clear];
+    let annot_list: String = fields.iter().fold(String::new(), |mut s, f| {
+        let _ = write!(s, "{f} 0 R ");
+        s
+    });
+    let spec = PageSpec {
+        width: 612,
+        height: 792,
+        content: Some("0 g 10 10 1 1 re f\n".to_string()),
+        extra: format!("/Annots [{annot_list}]"),
+    };
+    let catalog = format!("{} /Metadata {metadata} 0 R", catalog(&fields));
+    let objects = build_objects(&[spec], &catalog, objs.bodies);
+    assemble(&objects, real_trailer_extra)
+}
+
+/// A form whose page tree has holes: kids that name objects that do not exist, so that PDFium
+/// numbers the pages as it meets them. Page 1 holds `keep` and `benign`, page 3 holds `other` and
+/// `target`, with the boxes of `keep` and `benign`, so that the widgets of the two pages stand in
+/// the same places. `benign` has a link on focus, `target` a reset on focus, and the two have the
+/// same box.
+pub fn forms_holes_pdf() -> Vec<u8> {
+    let mut objs = Objects::new(8);
+    let (first, second) = (4, 6);
+    let keep = text(&mut objs, first, "keep", 740, "kept", "");
+    let benign = text(
+        &mut objs,
+        first,
+        "benign",
+        660,
+        "",
+        "/AA << /Fo << /S /URI /URI (https://example.com/) >> >>",
+    );
+    let other = text(&mut objs, second, "other", 740, "", "");
+    let target = text(
+        &mut objs,
+        second,
+        "target",
+        660,
+        "",
+        "/AA << /Fo << /S /ResetForm >> >>",
+    );
+    let page = |list: [usize; 2]| PageSpec {
+        width: 612,
+        height: 792,
+        content: Some("0 g 10 10 1 1 re f\n".to_string()),
+        extra: format!("/Annots [{} 0 R {} 0 R]", list[0], list[1]),
+    };
+    let mut objects = build_objects(
+        &[page([keep, benign]), page([other, target])],
+        &catalog(&[keep, benign, other, target]),
+        objs.bodies,
+    );
+    objects[1] = b"<< /Type /Pages /Kids [99 0 R 4 0 R 98 0 R 6 0 R] /Count 4 >>".to_vec();
+    assemble(&objects, "")
+}
