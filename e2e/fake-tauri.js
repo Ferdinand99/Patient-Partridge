@@ -225,8 +225,8 @@
       const list = [];
       if (path === "/docs/annotated.pdf" && page === 0) {
         list.push(
-          { id: nextAnnot++, kind: "highlight", can: { ...ABILITIES.highlight }, rect: [72, 100, 200, 110], color: [230, 40, 40, 255], text: "Check this title", author: "Alice", boxes: [[72, 100, 200, 110]] },
-          { id: nextAnnot++, kind: "note", can: { ...ABILITIES.note }, rect: [300, 50, 320, 70], color: YELLOW, text: "<img src=x onerror=alert(1)> a note from the file", author: "<b>Bob</b>" },
+          { id: nextAnnot++, kind: "highlight", can: { ...ABILITIES.highlight, restore: false }, rect: [72, 100, 200, 110], color: [230, 40, 40, 255], text: "Check this title", author: "Alice", boxes: [[72, 100, 200, 110]] },
+          { id: nextAnnot++, kind: "note", can: { ...ABILITIES.note, restore: false }, rect: [300, 50, 320, 70], color: YELLOW, text: "<img src=x onerror=alert(1)> a note from the file", author: "<b>Bob</b>" },
           { id: nextAnnot++, kind: "ink", can: { ...ABILITIES.ink }, rect: [100, 300, 200, 350], color: [0, 0, 255, 255], text: "", author: "", strokes: [[[100, 300], [150, 350], [200, 300]]], width: 3 },
           { id: nextAnnot++, kind: "other", can: { ...ABILITIES.other }, rect: [72, 500, 300, 540], color: YELLOW, text: "A text box", author: "" },
         );
@@ -385,7 +385,13 @@
         }
         if (args.text !== null) item.text = args.text;
         if (args.color !== null) item.color = args.color;
-        if (args.dx || args.dy) item.rect = [item.rect[0] + args.dx, item.rect[1] + args.dy, item.rect[2] + args.dx, item.rect[3] + args.dy];
+        if (args.dx || args.dy) {
+          // The engine keeps a note on its page.
+          const size = dims(docs.get(args.doc).path);
+          const dx = Math.min(Math.max(args.dx, -item.rect[0]), size.w - item.rect[2]);
+          const dy = Math.min(Math.max(args.dy, -item.rect[1]), size.h - item.rect[3]);
+          item.rect = [item.rect[0] + dx, item.rect[1] + dy, item.rect[2] + dx, item.rect[3] + dy];
+        }
         return view(item);
       }
       case "remove_annotation": {

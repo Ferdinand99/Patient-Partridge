@@ -1370,6 +1370,12 @@ export class App {
       // After the changes asked for before it, and before the ones asked for later.
       await (tab.annotator ? tab.annotator.sequenced(run) : run());
     } catch (error) {
+      // An engine that was lost ends the tab, as it does for any other change.
+      const lost = toAppError(error);
+      if (isEngineLost(lost)) {
+        await this.documentLost(tab, lost);
+        return;
+      }
       await showNotice(this.noticeLayer, {
         title: direction === "undo" ? "The change could not be taken back" : "The change could not be made again",
         detail: CLEAN_REFUSALS.has(toAppError(error).code)
@@ -1721,6 +1727,8 @@ export class App {
   private annotationKey(e: KeyboardEvent): boolean {
     const annotator = this.active?.annotator;
     if (!annotator || e.ctrlKey || e.metaKey || e.altKey) return false;
+    // With the bar closed the keys belong to the page: the arrows scroll it, and nothing is picked.
+    if (!this.annotOpen) return false;
     const target = e.target as HTMLElement | null;
     const typing =
       target instanceof HTMLInputElement ||

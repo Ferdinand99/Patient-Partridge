@@ -304,7 +304,7 @@ fn deleted_comments_leave_nothing_of_their_text_in_the_saved_file() {
     let (doc, items) = open_foreign(e);
     let before = annotation_count(e, doc);
     let erin = by_author(&items, "Erin");
-    // As in the report: recolour, then delete.
+    // Recolour, then delete.
     annot(update(e, doc, 0, erin.id, None, Some(GREEN), 0.0, 0.0));
     assert!(matches!(
         remove(e, doc, erin.id),
@@ -472,5 +472,140 @@ fn a_note_cannot_be_pushed_off_its_page() {
         near.rect[0] >= -0.5 && near.rect[1] >= -0.5,
         "{:?}",
         near.rect
+    );
+}
+
+// ---- taking a change back writes the file's own data again ---------------------------------------------
+
+#[test]
+fn taking_back_a_text_change_writes_the_files_own_rich_text_and_date_again() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let (doc, items) = open_foreign(e);
+    let erin = by_author(&items, "Erin");
+    assert!(erin.abilities & ability::EDIT_TEXT != 0);
+    let rich = "<body xmlns=\"http://www.w3.org/1999/xhtml\"><p>RCSALARY</p></body>";
+
+    // While the text is changed the rich text says the new words, so the search can tell the two apart.
+    annot(update(e, doc, 0, erin.id, Some("changed"), None, 0.0, 0.0));
+    let middle = save_all(e, doc);
+    assert!(!kit::text_in_file(&middle, "RCSALARY"));
+    assert!(kit::text_in_file(&middle, "changed"));
+
+    // Taking the change back (what Undo asks for) puts the file's rich text and date back as well,
+    // and the document then reads as it did.
+    annot(update(
+        e,
+        doc,
+        0,
+        erin.id,
+        Some("salary 90k"),
+        None,
+        0.0,
+        0.0,
+    ));
+    let saved = save_all(e, doc);
+    assert!(
+        kit::text_in_file(&saved, rich),
+        "the rich text is not as it was"
+    );
+    assert!(kit::text_in_file(&saved, "D:20240303040506Z"));
+    assert!(!kit::text_in_file(&saved, "changed"));
+    let again = open(e, &saved, None).unwrap();
+    assert_eq!(contents_by(e, again, "Erin"), "salary 90k");
+}
+
+#[test]
+fn a_highlight_drawn_through_a_form_keeps_its_colour_when_a_recolour_is_taken_back() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let doc = open(e, &kit::nested_appearance_pdf(), None).unwrap();
+    let items = list(e, doc, 0);
+    let one = by_text(&items, "NESTEDONE");
+    // The red is read from the form inside the appearance, not guessed.
+    assert!(
+        one.color[0] > 200 && one.color[1] < 60 && one.color[2] < 60,
+        "{:?}",
+        one.color
+    );
+    assert!(one.abilities & ability::RECOLOUR != 0);
+    let green = annot(update(e, doc, 0, one.id, None, Some(GREEN), 0.0, 0.0));
+    assert!(
+        green.color[1] > 150 && green.color[0] < 80,
+        "{:?}",
+        green.color
+    );
+    // What Undo asks for: the colour the list gave.
+    let back = annot(update(e, doc, 0, one.id, None, Some(one.color), 0.0, 0.0));
+    assert!(
+        back.color[0] > 200 && back.color[1] < 60 && back.color[2] < 60,
+        "{:?}",
+        back.color
+    );
+}
+
+#[test]
+fn a_highlight_whose_colour_cannot_be_read_is_not_recoloured() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let doc = open(e, &kit::nested_appearance_pdf(), None).unwrap();
+    let two = by_text(&list(e, doc, 0), "NESTEDTWO");
+    assert_eq!(two.abilities & ability::RECOLOUR, 0);
+    assert!(two.abilities & ability::REMOVE != 0);
+    assert_eq!(
+        error_code(update(e, doc, 0, two.id, None, Some(GREEN), 0.0, 0.0)),
+        ErrorCode::AnnotationRefused
+    );
+    // Its own appearance is still the file's.
+    let saved = save_all(e, doc);
+    assert!(kit::text_in_file(&saved, "NOCOLOURAP"));
+}
+
+// ---- the owner of a document -----------------------------------------------------------------------------
+
+#[test]
+fn the_owner_password_allows_what_the_user_password_does_not() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    // Bit 6 of the permissions (value 32) is the one for annotating; it is clear for the user.
+    let file = kit::encrypted_pdf_with_owner("user", "owner", 1, -4 & !32);
+    let note = |doc| RequestBody::AddNote {
+        doc,
+        page: 0,
+        x: 50.0,
+        y: 50.0,
+        color: YELLOW,
+        text: "hello".into(),
+    };
+    let as_user = open(e, &file, Some("user")).unwrap();
+    assert_eq!(
+        error_code(ask(e, note(as_user))),
+        ErrorCode::AnnotationsNotAllowed
+    );
+    let as_owner = open(e, &file, Some("owner")).unwrap();
+    annot(ask(e, note(as_owner)));
+}
+
+// ---- a limit that is known -------------------------------------------------------------------------------
+
+#[test]
+fn a_free_text_box_without_an_appearance_keeps_its_words_in_the_saved_file_after_a_delete() {
+    // PDFium makes the appearance of such a box, with its words, when the page is drawn, and a
+    // save writes what it made even when nothing refers to it any more. No call overwrites it.
+    // The README says so. If this test fails because the words are gone, PDFium changed: take the
+    // exception out of the README and out of the question that is asked before a delete.
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let doc = open(e, &kit::free_text_without_appearance_pdf(), None).unwrap();
+    let free = by_text(&list(e, doc, 0), "BAREFREEWORDS");
+    assert!(matches!(
+        remove(e, doc, free.id),
+        ResponseBody::AnnotRemoved
+    ));
+    assert_eq!(annotation_count(e, doc), 0);
+    let saved = save_all(e, doc);
+    assert!(
+        kit::text_in_file(&saved, "BAREFREEWORDS"),
+        "the words are gone from the saved file: the README no longer needs its exception"
     );
 }

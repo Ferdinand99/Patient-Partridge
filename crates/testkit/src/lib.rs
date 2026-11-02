@@ -551,7 +551,7 @@ pub fn foreign_annots_pdf() -> Vec<u8> {
         .into_bytes(),
         // 18
         format!(
-            "<< /Type /Annot /Subtype /Highlight {} /C [0 0 1] /Contents {} /RC {} /Subj {} /T {} /Popup 19 0 R /F 4 >>",
+            "<< /Type /Annot /Subtype /Highlight {} /C [0 0 1] /Contents {} /RC {} /Subj {} /T {} /Popup 19 0 R /M (D:20240303040506Z) /F 4 >>",
             quad(72, 600),
             pdf_text("salary 90k"),
             pdf_text("<body xmlns=\"http://www.w3.org/1999/xhtml\"><p>RCSALARY</p></body>"),
@@ -565,6 +565,65 @@ pub fn foreign_annots_pdf() -> Vec<u8> {
             pdf_text("POPUPSECRET")
         )
         .into_bytes(),
+    ];
+    build(&specs, "", "", extras)
+}
+
+/// A one page document with two highlights from a file whose appearance is drawn through a form
+/// inside the form, as some programs write it (objects 6 and 9 are the annotations):
+/// - 6: a red highlight (`NESTEDONE`); the red is in the form that the appearance draws.
+/// - 9: a highlight (`NESTEDTWO`) with a blue `/C` whose appearance draws nothing a colour can be
+///   read from (it holds the comment `NOCOLOURAP`).
+pub fn nested_appearance_pdf() -> Vec<u8> {
+    let specs = [PageSpec {
+        width: 612,
+        height: 792,
+        content: Some(demo_content(1, 612, 792)),
+        extra: "/Annots [6 0 R 9 0 R]".into(),
+    }];
+    let quad = "/Rect [72 700 200 720] /QuadPoints [72 720 200 720 72 700 200 700]";
+    let extras: Vec<Vec<u8>> = vec![
+        // 6
+        format!(
+            "<< /Type /Annot /Subtype /Highlight {quad} /C [1 0 0] /Contents (NESTEDONE) /F 4 /AP << /N 7 0 R >> >>"
+        )
+        .into_bytes(),
+        // 7: draws the form 8
+        binary_stream(
+            "/Type /XObject /Subtype /Form /BBox [72 700 200 720] /Resources << /XObject << /Fm0 8 0 R >> >>",
+            b"/Fm0 Do",
+        ),
+        // 8
+        binary_stream(
+            "/Type /XObject /Subtype /Form /BBox [72 700 200 720]",
+            b"1 0 0 rg 72 700 128 20 re f",
+        ),
+        // 9
+        format!(
+            "<< /Type /Annot /Subtype /Highlight {quad} /C [0 0 1] /Contents (NESTEDTWO) /F 4 /AP << /N 10 0 R >> >>"
+        )
+        .into_bytes(),
+        // 10
+        binary_stream(
+            "/Type /XObject /Subtype /Form /BBox [72 700 200 720]",
+            b"% NOCOLOURAP\nq Q",
+        ),
+    ];
+    build(&specs, "", "", extras)
+}
+
+/// A one page document with a free text box that has no appearance stream (the entry is optional):
+/// PDFium makes the appearance, with the words in it, when the page is drawn.
+pub fn free_text_without_appearance_pdf() -> Vec<u8> {
+    let specs = [PageSpec {
+        width: 612,
+        height: 792,
+        content: Some(demo_content(1, 612, 792)),
+        extra: "/Annots [6 0 R]".into(),
+    }];
+    let extras: Vec<Vec<u8>> = vec![
+        b"<< /Type /Annot /Subtype /FreeText /Rect [72 500 300 540] /Contents (BAREFREEWORDS) /DA (/Helv 12 Tf 0 g) /F 4 >>"
+            .to_vec(),
     ];
     build(&specs, "", "", extras)
 }
@@ -1134,16 +1193,49 @@ pub fn encrypted_pdf_with_permissions(
     pages: usize,
     permissions: i32,
 ) -> Vec<u8> {
+    encrypted_pdf_impl(user_password, None, pages, permissions)
+}
+
+/// As `encrypted_pdf_with_permissions`, with an owner password that opens the document with every
+/// permission whatever the file grants the user.
+pub fn encrypted_pdf_with_owner(
+    user_password: &str,
+    owner_password: &str,
+    pages: usize,
+    permissions: i32,
+) -> Vec<u8> {
+    encrypted_pdf_impl(user_password, Some(owner_password), pages, permissions)
+}
+
+fn encrypted_pdf_impl(
+    user_password: &str,
+    owner_password: Option<&str>,
+    pages: usize,
+    permissions: i32,
+) -> Vec<u8> {
     let mut padded = [0u8; 32];
     let pw = user_password.as_bytes();
     let n = pw.len().min(32);
     padded[..n].copy_from_slice(&pw[..n]);
     padded[n..].copy_from_slice(&PADDING[..32 - n]);
 
-    // The owner entry only matters for the owner password, which these files do not use.
-    let owner: Vec<u8> = (0u8..32)
-        .map(|i| i.wrapping_mul(7).wrapping_add(3))
-        .collect();
+    // The owner entry (algorithm 3, revision 2): the padded user password, encrypted with a key
+    // made from the owner password. Without an owner password it is filler nobody can open with.
+    let owner: Vec<u8> = match owner_password {
+        Some(owner_password) => {
+            let mut padded_owner = [0u8; 32];
+            let ow = owner_password.as_bytes();
+            let m = ow.len().min(32);
+            padded_owner[..m].copy_from_slice(&ow[..m]);
+            padded_owner[m..].copy_from_slice(&PADDING[..32 - m]);
+            let mut md5 = Md5::new();
+            md5.update(padded_owner);
+            rc4(&md5.finalize()[..5], &padded)
+        }
+        None => (0u8..32)
+            .map(|i| i.wrapping_mul(7).wrapping_add(3))
+            .collect(),
+    };
     let id: [u8; 16] = *b"partridge-test-1";
 
     // Algorithm 2 for revision 2: the file key.

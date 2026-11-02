@@ -32,6 +32,7 @@ function fakeView(initial: Annotation[] = []) {
     setSelected: vi.fn(),
     abort: vi.fn(() => false),
     endStroke: vi.fn(),
+    setReading: vi.fn(),
     find: (page: number, id: number) => list.get(`${page}:${id}`),
     boxElement: () => null,
   };
@@ -85,7 +86,13 @@ function setup(initial: Annotation[] = []) {
     }),
     updateAnnotation: vi.fn((_d, page, id, change) => {
       calls.push(`update ${page} ${id} ${JSON.stringify(change)}`);
-      return Promise.resolve(annotation({ id }));
+      // A move shows in the box the layer holds, as it does once the page is listed again.
+      const old = v.list.get(`${page}:${id}`);
+      const [dx, dy] = [change.dx ?? 0, change.dy ?? 0];
+      const rect: Annotation["rect"] = old ? [old.rect[0] + dx, old.rect[1] + dy, old.rect[2] + dx, old.rect[3] + dy] : [10, 20, 30, 40];
+      const next = annotation({ ...(old ?? {}), id, rect });
+      v.list.set(`${page}:${id}`, next);
+      return Promise.resolve(next);
     }),
     removeAnnotation: vi.fn((_d, page, id) => {
       calls.push(`remove ${page} ${id}`);
@@ -632,5 +639,216 @@ describe("a save", () => {
     await t.annotator.flush();
     expect(t.calls).toEqual(["addInk 0 3 1"]);
     expect(t.annotator.unsaved).toBe(false);
+  });
+});
+
+describe("the bar is closed", () => {
+  const key = (k: string) => new KeyboardEvent("keydown", { key: k });
+  const noteBox = () =>
+    annotation({
+      id: 5,
+      kind: "note",
+      text: "x",
+      can: { editText: true, recolour: false, move: true, remove: true, restore: true, locked: false },
+    });
+
+  it("lets go of what is picked and takes none of the keys", async () => {
+    const t = setup([noteBox()]);
+    t.annotator.select(0, 5);
+    expect(t.annotator.selected).not.toBeNull();
+    t.annotator.setReading(true);
+    expect(t.annotator.selected).toBeNull();
+    for (const k of ["ArrowDown", "ArrowRight", "Delete", "Backspace", "Enter", "Escape"]) {
+      expect(t.annotator.handleKey(key(k))).toBe(false);
+    }
+    // Nothing can be picked behind a closed bar either.
+    t.annotator.select(0, 5);
+    expect(t.annotator.selected).toBeNull();
+    await t.annotator.idle();
+    expect(t.calls).toEqual([]);
+    expect(t.history.dirty).toBe(false);
+    // Opened again, the keys work on what is picked then.
+    t.annotator.setReading(false);
+    t.annotator.select(0, 5);
+    expect(t.annotator.handleKey(key("ArrowDown"))).toBe(true);
+  });
+
+  it("does not pick the note that a box places after the bar was closed", async () => {
+    const t = setup();
+    t.annotator.setTool("note");
+    t.annotator.onPlace(0, 100, 100, { x: 0, y: 0 });
+    const area = t.host.popovers.querySelector("textarea") as HTMLTextAreaElement;
+    area.value = "late";
+    t.annotator.setReading(true);
+    await t.annotator.flush();
+    expect(t.calls).toEqual(["addNote 0 90,90 late"]);
+    expect(t.annotator.selected).toBeNull();
+    expect(t.annotator.tool).toBe("select");
+  });
+});
+
+describe("what the engine refuses or holds back", () => {
+  const movable = () =>
+    annotation({
+      id: 5,
+      kind: "note",
+      can: { editText: true, recolour: false, move: true, remove: true, restore: true, locked: false },
+    });
+
+  it("undoes a move by the distance the engine really moved the note", async () => {
+    const note = movable();
+    const t = setup([note]);
+    t.annotator.select(0, 5);
+    // The engine keeps the note on its page: asked for 12, it moves 2.
+    vi.mocked(t.api.updateAnnotation).mockImplementationOnce((_d, page, id, change) => {
+      t.calls.push(`update ${page} ${id} ${JSON.stringify(change)}`);
+      const next = annotation({ ...note, rect: [12, 20, 32, 40] });
+      t.list.set(`${page}:${id}`, next);
+      return Promise.resolve(next);
+    });
+    await t.annotator.moveBy(0, 5, 12, 0);
+    await t.history.undo();
+    expect(t.calls[1]).toBe('update 0 5 {"dx":-2,"dy":0}');
+    await t.history.redo();
+    expect(t.calls[2]).toBe('update 0 5 {"dx":2,"dy":0}');
+  });
+
+  it("makes no edit for a move that did not move anything", async () => {
+    const note = movable();
+    const t = setup([note]);
+    vi.mocked(t.api.updateAnnotation).mockImplementationOnce(() => Promise.resolve(annotation({ ...note })));
+    await t.annotator.moveBy(0, 5, 12, 0);
+    expect(t.history.canUndo).toBe(false);
+    expect(t.history.dirty).toBe(false);
+  });
+
+  it("opens the box again with the typed text when the engine refuses the note", async () => {
+    const t = setup();
+    t.annotator.setTool("note");
+    t.annotator.onPlace(0, 100, 100, { x: 0, y: 0 });
+    const area = t.host.popovers.querySelector("textarea") as HTMLTextAreaElement;
+    area.value = "precious words";
+    vi.mocked(t.api.addNote).mockRejectedValueOnce({ code: "annotations_not_allowed", message: "no" });
+    (t.host.popovers.querySelector("form") as HTMLFormElement).dispatchEvent(new Event("submit", { cancelable: true }));
+    await vi.waitFor(() => expect(t.host.failures).toHaveLength(1));
+    await vi.waitFor(() => expect(t.host.popovers.querySelector("textarea")).not.toBeNull());
+    const again = t.host.popovers.querySelector("textarea") as HTMLTextAreaElement;
+    expect(again.value).toBe("precious words");
+    // The text in the box still counts as unsaved.
+    expect(t.annotator.unsaved).toBe(true);
+  });
+
+  it("opens the box of a comment again, with the draft, when the engine refuses the change", async () => {
+    const t = setup([annotation({ id: 3, text: "old" })]);
+    const done = t.annotator.editText(0, 3);
+    const area = t.host.popovers.querySelector("textarea") as HTMLTextAreaElement;
+    area.value = "new words";
+    vi.mocked(t.api.updateAnnotation).mockRejectedValueOnce({ code: "annotation_refused", message: "no" });
+    (t.host.popovers.querySelector("form") as HTMLFormElement).dispatchEvent(new Event("submit", { cancelable: true }));
+    await done;
+    await vi.waitFor(() => expect(t.host.popovers.querySelector("textarea")).not.toBeNull());
+    expect((t.host.popovers.querySelector("textarea") as HTMLTextAreaElement).value).toBe("new words");
+    expect(t.annotator.unsaved).toBe(true);
+  });
+
+  it("does not open the box again after a failure that is not a refusal", async () => {
+    const t = setup();
+    t.annotator.setTool("note");
+    t.annotator.onPlace(0, 100, 100, { x: 0, y: 0 });
+    const area = t.host.popovers.querySelector("textarea") as HTMLTextAreaElement;
+    area.value = "text";
+    vi.mocked(t.api.addNote).mockRejectedValueOnce({ code: "engine_stopped", message: "gone" });
+    (t.host.popovers.querySelector("form") as HTMLFormElement).dispatchEvent(new Event("submit", { cancelable: true }));
+    await vi.waitFor(() => expect(t.host.failures).toHaveLength(1));
+    await t.annotator.idle();
+    expect(t.host.popovers.querySelector("textarea")).toBeNull();
+  });
+
+  it("says that some pages are marked when a later page is refused", async () => {
+    const t = setup();
+    t.setRanges([
+      { page: 0, start: 0, end: 4 },
+      { page: 1, start: 0, end: 4 },
+    ]);
+    vi.mocked(t.api.addMarkup).mockImplementationOnce(() => Promise.resolve(annotation({ id: 50 })));
+    vi.mocked(t.api.addMarkup).mockRejectedValueOnce({ code: "annotation_refused", message: "no" });
+    await t.annotator.markSelection("strikeout");
+    expect((t.host.failures[0] as { code: string }).code).toBe("annotation_partial");
+  });
+
+  it("deleting what came with the file leaves earlier changes undoable and the document changed", async () => {
+    const drawing = annotation({
+      id: 8,
+      kind: "ink",
+      can: { editText: true, recolour: false, move: false, remove: true, restore: false, locked: false },
+    });
+    const t = setup([drawing]);
+    const undone = vi.fn();
+    t.history.push({ label: "Earlier", undo: undone, redo: vi.fn() });
+    t.history.markSaved();
+    expect(t.history.dirty).toBe(false);
+    t.annotator.select(0, 8);
+    await t.annotator.removeSelected();
+    expect(t.calls).toEqual(["remove 0 8"]);
+    expect(t.history.dirty).toBe(true);
+    expect(t.history.undoLabel).toBe("Earlier");
+    await t.history.undo();
+    expect(undone).toHaveBeenCalled();
+    expect(t.history.dirty).toBe(true);
+  });
+
+  it("the warning before such a delete does not promise redaction, and a text box says its words can stay", async () => {
+    const asked: string[] = [];
+    for (const kind of ["highlight", "other"] as const) {
+      const a = annotation({
+        id: 4,
+        kind,
+        can: { editText: false, recolour: false, move: false, remove: true, restore: false, locked: false },
+      });
+      const t = setup([a]);
+      t.host.ask = (options) => {
+        asked.push(options.detail ?? "");
+        return Promise.resolve({ button: "cancel" });
+      };
+      t.annotator.select(0, 4);
+      await t.annotator.removeSelected();
+    }
+    expect(asked[0]).toContain("not redaction");
+    expect(asked[0]).not.toContain("gone from the file");
+    expect(asked[0]).not.toContain("words of a text box");
+    expect(asked[1]).toContain("words of a text box can stay");
+  });
+
+  it("a flush also waits for work that was asked for while it waited", async () => {
+    const t = setup();
+    let finish: (a: Annotation) => void = () => undefined;
+    vi.mocked(t.api.addInk).mockImplementationOnce(
+      () =>
+        new Promise<Annotation>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    t.annotator.onStroke(0, [[1, 1]]);
+    const done = t.annotator.flush();
+    await vi.waitFor(() => expect(t.api.addInk).toHaveBeenCalled());
+    // A second change arrives while the flush waits.
+    t.annotator.onStroke(0, [[2, 2]]);
+    finish(annotation({ id: 600, kind: "ink" }));
+    await done;
+    expect(t.api.addInk).toHaveBeenCalledTimes(2);
+    expect(t.annotator.unsaved).toBe(false);
+  });
+
+  it("says why the colour of a highlight cannot be changed when its picture has no plain colour", () => {
+    const stuck = annotation({
+      id: 6,
+      can: { editText: true, recolour: false, move: false, remove: true, restore: false, locked: false },
+    });
+    const t = setup([stuck]);
+    t.annotator.select(0, 6);
+    expect(t.annotator.pickedReason).toContain("colour");
+    t.annotator.setColor([126, 217, 87, 255]);
+    expect(t.host.told.at(-1)).toContain("colour");
+    expect(t.calls).toEqual([]);
   });
 });

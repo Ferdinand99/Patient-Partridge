@@ -41,6 +41,9 @@ const FLAG_READ_ONLY: i32 = 1 << 6;
 const FLAG_LOCKED: i32 = 1 << 7;
 const FLAG_LOCKED_CONTENTS: i32 = 1 << 9;
 
+/// The number PDFium gives the popup subtype (`FPDF_ANNOT_POPUP`).
+const SUBTYPE_POPUP: u32 = 16;
+
 /// Colour of a highlight, an underline or a strike-out that came without one.
 const DEFAULT_COLOR: [u8; 4] = [255, 235, 59, 255];
 
@@ -74,6 +77,17 @@ enum Recipe {
     },
 }
 
+/// The text of an annotation as the file has it.
+#[derive(Clone, Debug)]
+struct Original {
+    /// The comment (`/Contents`).
+    text: String,
+    /// The rich text (`/RC`), when the annotation has any.
+    rich: Option<String>,
+    /// The date of the last change (`/M`), when the annotation has one.
+    modified: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 struct Snapshot {
     recipe: Recipe,
@@ -93,9 +107,10 @@ pub struct DocAnnots {
     made: HashMap<u32, Recipe>,
     /// Pages whose annotations have been drawn once, so that each has an appearance stream.
     settled: HashSet<u32>,
-    /// The text of an annotation as the file has it, kept when it differs from the text shown
-    /// (line ends written as CR), so that a change that is taken back writes the original.
-    texts: HashMap<u32, String>,
+    /// The comment and the rich text of an annotation as the file has them, kept before the first
+    /// change of its text, so that a change that is taken back writes the file's own data again
+    /// (line ends written as CR, formatting in the rich text).
+    originals: HashMap<u32, Original>,
     /// Annotations that were removed, oldest first: `(page, id, what it was)`.
     removed: VecDeque<(u32, u32, Snapshot)>,
 }
@@ -199,24 +214,58 @@ fn quads_of(annotation: &PdfPageAnnotation) -> Vec<[f32; 8]> {
     out
 }
 
-/// The colour an annotation is drawn in, read from its appearance. The colour entry of the
-/// annotation itself is not used: PDFium refuses to read it once an appearance stream exists, and
-/// the call that stands in for it in `pdfium-render` would then read a page object where there is
-/// an annotation. The fill of a highlight and the stroke of an underline or a strike-out come
-/// from the first path of the appearance.
-fn color_of(annotation: &PdfPageAnnotation, kind: AnnotKind) -> [u8; 4] {
-    for object in annotation.objects().iter().take(16) {
-        if let Some(path) = object.as_path_object() {
-            let color = match kind {
-                AnnotKind::Highlight => path.fill_color(),
-                _ => path.stroke_color(),
-            };
-            if let Ok(c) = color {
-                return [c.red(), c.green(), c.blue(), 255];
+/// Most objects of an appearance that are looked at to find its colour, and the deepest level of
+/// forms inside forms that is followed.
+const COLOR_OBJECTS: usize = 64;
+const COLOR_DEPTH: usize = 4;
+
+/// The colour of the first path in `object`, or in the form it is (an appearance often draws
+/// through a form inside the form): the fill of a highlight, the stroke of the other kinds.
+fn path_color(
+    object: &PdfPageObject,
+    kind: AnnotKind,
+    depth: usize,
+    budget: &mut usize,
+) -> Option<[u8; 4]> {
+    if *budget == 0 {
+        return None;
+    }
+    *budget -= 1;
+    if let Some(path) = object.as_path_object() {
+        let color = match kind {
+            AnnotKind::Highlight => path.fill_color(),
+            _ => path.stroke_color(),
+        };
+        return color.ok().map(|c| [c.red(), c.green(), c.blue(), 255]);
+    }
+    if depth < COLOR_DEPTH {
+        if let Some(form) = object.as_x_object_form_object() {
+            for index in 0..form.len().min(16) {
+                if let Ok(inner) = form.get(index) {
+                    if let Some(color) = path_color(&inner, kind, depth + 1, budget) {
+                        return Some(color);
+                    }
+                }
             }
         }
     }
-    DEFAULT_COLOR
+    None
+}
+
+/// The colour an annotation is drawn in, read from its appearance, or `None` when the appearance
+/// has no path to read it from. The colour entry of the annotation itself is not used: PDFium
+/// refuses to read it once an appearance stream exists, and the call that stands in for it in
+/// `pdfium-render` would then read a page object where there is an annotation. The fill of a
+/// highlight and the stroke of an underline or a strike-out come from the first path of the
+/// appearance, also when it is drawn through forms.
+fn color_of(annotation: &PdfPageAnnotation, kind: AnnotKind) -> Option<[u8; 4]> {
+    let mut budget = COLOR_OBJECTS;
+    for object in annotation.objects().iter().take(16) {
+        if let Some(color) = path_color(&object, kind, 0, &mut budget) {
+            return Some(color);
+        }
+    }
+    None
 }
 
 fn bounds_of(annotation: &PdfPageAnnotation) -> Option<[f32; 4]> {
@@ -298,10 +347,14 @@ impl DocAnnots {
         let restore = if made { ability::RESTORE } else { 0 };
         let has_quads = !annotation.attachment_points().is_empty();
         let raw = annotation.contents().unwrap_or_default();
+        let found = color_of(annotation, kind);
         let mut abilities = match kind {
             AnnotKind::Highlight | AnnotKind::Underline | AnnotKind::Strikeout => {
                 let mut a = ability::EDIT_TEXT | ability::REMOVE | restore;
-                if has_quads {
+                // A colour is changed by making a plain picture in the new colour, and taken back
+                // by making one in the old colour. That is only possible when the old colour is
+                // known: an appearance that has no path to read it from is left as it is.
+                if has_quads && found.is_some() {
                     a |= ability::RECOLOUR;
                 }
                 a
@@ -336,7 +389,7 @@ impl DocAnnots {
             cut(rect[2], width),
             cut(rect[3], height),
         ];
-        let color = color_of(annotation, kind);
+        let color = found.unwrap_or(DEFAULT_COLOR);
         Some(AnnotInfo {
             id,
             kind,
@@ -679,26 +732,32 @@ impl DocAnnots {
             );
         }
         let mapper = Mapper::new(&page);
-        let mut rich = None;
+        // What the file holds of the text is kept before the first change of it.
+        if text.is_some() && !self.originals.contains_key(&id) {
+            let original = read_original(document, page_index, position)?;
+            self.originals.insert(id, original);
+        }
+        // The text and the date that go with it, and the rich text to write next to the new text.
+        let mut written: Option<(Option<String>, Option<String>)> = None;
         {
             let mut annotation = page.annotations().get(position).map_err(|_| no_such())?;
             if let Some(text) = text {
-                // The text goes into the one key the person edits. Line ends the file writes as CR
-                // are shown as line feeds, so the text of the file is kept and written back when
-                // a change is taken back to the text that was shown.
-                let raw = annotation.contents().unwrap_or_default();
-                if !self.texts.contains_key(&id) && clean_text(&raw, MAX_ANNOT_TEXT) != raw {
-                    self.texts.insert(id, raw);
-                }
+                // The text goes into the one key the person edits. When a change is taken back to
+                // the text that was shown, the text of the file is written back as it was (line
+                // ends written as CR, formatting in the rich text, the date of the last change).
                 let wanted = clean_text(text, MAX_ANNOT_TEXT);
-                let value = match self.texts.get(&id) {
-                    Some(original) if clean_text(original, MAX_ANNOT_TEXT) == wanted => {
-                        original.clone()
-                    }
-                    _ => wanted,
-                };
+                let back = self
+                    .originals
+                    .get(&id)
+                    .filter(|o| clean_text(&o.text, MAX_ANNOT_TEXT) == wanted)
+                    .cloned();
+                let value = back.as_ref().map_or(wanted, |o| o.text.clone());
                 annotation.set_contents(&value).map_err(refused)?;
-                rich = Some(value);
+                written = Some(match back {
+                    Some(o) => (o.rich, o.modified),
+                    // A comment with rich text (`/RC`) is kept in step with its plain text.
+                    None => (Some(rich_text(&value)), None),
+                });
             }
             if wants_move {
                 let from = mapper.to_page(&page, 0.0, 0.0);
@@ -723,9 +782,14 @@ impl DocAnnots {
                 annotation.set_bounds(rect_of(moved)).map_err(refused)?;
             }
         }
-        if let Some(value) = rich {
-            // A comment with rich text (`/RC`) is kept in step with its plain text.
-            set_rich_text(document, page_index, position, &value)?;
+        if let Some((rich, modified)) = written {
+            write_text_keys(
+                document,
+                page_index,
+                position,
+                rich.as_deref(),
+                modified.as_deref(),
+            )?;
         }
         if let Some(color) = color {
             // PDFium cannot change the colour of an annotation that has its appearance stream. The
@@ -813,7 +877,7 @@ impl DocAnnots {
                 ids.remove(*place);
             }
         }
-        self.texts.remove(&id);
+        self.originals.remove(&id);
         if let Some(snapshot) = snapshot {
             self.remember(page_index, id, snapshot);
         } else {
@@ -853,7 +917,7 @@ impl DocAnnots {
         self.made.clear();
         self.removed.clear();
         self.settled.clear();
-        self.texts.clear();
+        self.originals.clear();
     }
 }
 
@@ -879,8 +943,9 @@ fn changes_allowed(document: &PdfDocument<'_>) -> bool {
     let Some(handle) = raw_document(document) else {
         return false;
     };
-    // SAFETY: the handle is the live document's.
-    let bits = unsafe { document.bindings().FPDF_GetDocUserPermissions(handle) };
+    // SAFETY: the handle is the live document's. The call that answers for the owner is used, so
+    // that a document opened with its owner password allows what the owner may do.
+    let bits = unsafe { document.bindings().FPDF_GetDocPermissions(handle) };
     bits & 0x20 != 0
 }
 
@@ -945,6 +1010,9 @@ unsafe fn with_annot<R>(
 /// annotation counts as locked.
 fn flags_of(document: &PdfDocument<'static>, page_index: u32, count: usize) -> Vec<i32> {
     let n = count.min(MAX_SCANNED);
+    if n == 0 {
+        return Vec::new();
+    }
     with_raw_page(document, page_index, |bindings, page| {
         (0..n)
             .map(|i| {
@@ -1029,28 +1097,104 @@ fn rich_text(text: &str) -> String {
     out
 }
 
-/// Writes `text` as the rich text of the annotation if it has any, so that the two do not tell
-/// different things.
-fn set_rich_text(
+/// Most bytes of a text kept to be written back (the rich text of an annotation).
+const MAX_KEPT_TEXT: usize = 1 << 20;
+
+/// The text under `key`, as PDFium reads it: `Ok(None)` when the annotation has no such key, and an
+/// error when the text is longer than `MAX_KEPT_TEXT`.
+///
+/// # Safety
+/// `annotation` must be a live annotation handle of `bindings`.
+unsafe fn read_key(
+    bindings: &dyn PdfiumLibraryBindings,
+    annotation: FPDF_ANNOTATION,
+    key: &str,
+) -> Result<Option<String>, ()> {
+    if bindings.FPDFAnnot_HasKey(annotation, key) == 0 {
+        return Ok(None);
+    }
+    let bytes =
+        bindings.FPDFAnnot_GetStringValue(annotation, key, std::ptr::null_mut(), 0) as usize;
+    if bytes > MAX_KEPT_TEXT {
+        return Err(());
+    }
+    if bytes <= 2 {
+        return Ok(Some(String::new()));
+    }
+    let mut units = vec![0u16; bytes / 2 + 1];
+    let got = bindings.FPDFAnnot_GetStringValue(
+        annotation,
+        key,
+        units.as_mut_ptr(),
+        bytes as std::os::raw::c_ulong,
+    ) as usize;
+    // The text ends with a terminating zero.
+    let count = (got.min(bytes) / 2).saturating_sub(1);
+    Ok(Some(String::from_utf16_lossy(&units[..count])))
+}
+
+/// What the annotation at `position` holds of its text now: the comment, the rich text and the
+/// date of the last change. Refused when the rich text is too long to be kept.
+fn read_original(
     document: &PdfDocument<'static>,
     page_index: u32,
     position: usize,
-    text: &str,
-) -> Result<(), Failure> {
-    let rich = rich_text(text);
-    with_raw_page(document, page_index, |bindings, page| {
+) -> Result<Original, Failure> {
+    let read = with_raw_page(document, page_index, |bindings, page| {
         // SAFETY: `page` is live, and so is the annotation inside the closure.
         unsafe {
             with_annot(bindings, page, position, |a| {
-                if bindings.FPDFAnnot_HasKey(a, "RC") != 0 {
-                    bindings.FPDFAnnot_SetStringValue_str(a, "RC", &rich) != 0
-                } else {
-                    true
-                }
+                Some(Original {
+                    text: read_key(bindings, a, "Contents").ok()?.unwrap_or_default(),
+                    rich: read_key(bindings, a, "RC").ok()?,
+                    modified: read_key(bindings, a, "M").ok()?,
+                })
             })
         }
+    })?;
+    read.flatten().ok_or_else(|| {
+        (
+            ErrorCode::AnnotationRefused,
+            "the text of this annotation is too long to be changed here".to_string(),
+        )
     })
-    .map(|_| ())
+}
+
+/// Writes the rich text of the annotation, if it has any, so that the two texts do not tell
+/// different things, and the date of the last change when one is given (a text that is taken back
+/// has the date it had).
+fn write_text_keys(
+    document: &PdfDocument<'static>,
+    page_index: u32,
+    position: usize,
+    rich: Option<&str>,
+    modified: Option<&str>,
+) -> Result<(), Failure> {
+    let done = with_raw_page(document, page_index, |bindings, page| {
+        // SAFETY: `page` is live, and so is the annotation inside the closure.
+        unsafe {
+            with_annot(bindings, page, position, |a| {
+                let mut ok = true;
+                if let Some(rich) = rich {
+                    if bindings.FPDFAnnot_HasKey(a, "RC") != 0 {
+                        ok &= bindings.FPDFAnnot_SetStringValue_str(a, "RC", rich) != 0;
+                    }
+                }
+                if let Some(modified) = modified {
+                    ok &= bindings.FPDFAnnot_SetStringValue_str(a, "M", modified) != 0;
+                }
+                ok
+            })
+        }
+    })?;
+    if done == Some(true) {
+        Ok(())
+    } else {
+        fail(
+            ErrorCode::AnnotationRefused,
+            "the text could not be written",
+        )
+    }
 }
 
 /// Overwrites the text an annotation holds: comment, author, rich text, subject.
@@ -1084,12 +1228,15 @@ fn remove_raw(
             let mut places = vec![position];
             let popup = bindings.FPDFAnnot_GetLinkedAnnot(annotation, "Popup");
             if !popup.is_null() {
-                let at = bindings.FPDFPage_GetAnnotIndex(page, popup);
-                blank(bindings, popup);
-                bindings.FPDFPage_CloseAnnot(popup);
-                if at >= 0 && at as usize != position {
-                    places.push(at as usize);
+                // Only a popup goes with its owner: a file can name any annotation there.
+                if bindings.FPDFAnnot_GetSubtype(popup) as u32 == SUBTYPE_POPUP {
+                    let at = bindings.FPDFPage_GetAnnotIndex(page, popup);
+                    blank(bindings, popup);
+                    if at >= 0 && at as usize != position {
+                        places.push(at as usize);
+                    }
                 }
+                bindings.FPDFPage_CloseAnnot(popup);
             }
             blank(bindings, annotation);
             bindings.FPDFAnnot_SetAP(annotation, 0 as FPDF_ANNOT_APPEARANCEMODE, std::ptr::null());

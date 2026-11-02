@@ -37,3 +37,12 @@ The workflow has read-only rights. Only its last job, which opens or updates the
 ## What the V8 check does
 
 `scripts/check-pdfium-v8.mjs` searches each PDFium library for the symbol names that only a V8 build has (`_ZN2v8`, `@v8@`, `v8::`, `V8Flags`). A plain build has none of them, and the V8 build of every platform has hundreds. It runs when the library is fetched, and again on the library inside each installer built by CI. It fails when it finds no library at all, so it can not pass by looking in the wrong folder.
+
+## What the annotation tests rely on
+
+Some of what the README promises about annotations is a fact about PDFium, and the engine tests (`crates/engine/tests/annots_review.rs`, `annots_readers.rs`) would show a change in it:
+
+- A save writes the objects that a loaded file no longer refers to as nothing, and the objects made during the session as they are. That is why the text of a deleted comment is not in the saved file, and why the text of an annotation made in the session is overwritten before it is removed.
+- A free text box that came without an appearance stream gets one, with its words, when the page is first drawn, and no call can overwrite it. The test `a_free_text_box_without_an_appearance_keeps_its_words_in_the_saved_file_after_a_delete` states that; if it fails after an update, PDFium stopped doing it, and the exception in the README and in the question before a delete can go.
+- A closed popup gets no appearance (`CPDF_Annot::ShouldGenerateAP`). Older builds drew the comment into one for every draw, which would leave every old version of a comment in the saved file. If an update changes that, `deleted_comments_leave_nothing_of_their_text_in_the_saved_file` should fail; check it before relying on the README.
+- `FPDF_GetDocPermissions` answers for the owner, `FPDF_GetDocUserPermissions` for the user; the engine uses the first one for annotating.

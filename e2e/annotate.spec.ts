@@ -367,13 +367,15 @@ test("annotations a file already has are shown, can be changed, and removed with
   await page.getByRole("alertdialog").getByRole("button", { name: "Delete" }).click();
   await expect.poll(() => calls(page, "remove_annotation").then((c) => c.length)).toBe(1);
   await expect(page.locator(".annot")).toHaveCount(3);
-  // Undo says plainly that it cannot, and the document stays as it is.
+  // The deletion is not in the history, because it cannot be taken back: Undo takes back the earlier
+  // change of the comment, the drawing stays gone, and the document stays changed.
   await page.locator(".viewer").focus();
   await page.keyboard.press("Control+z");
-  await expect(page.getByRole("alertdialog")).toContainText("The change could not be taken back");
-  await page.getByRole("button", { name: "OK" }).click();
+  await expect.poll(() => calls(page, "update_annotation").then((c) => c.length)).toBe(2);
+  expect((await calls(page, "update_annotation"))[1].args).toMatchObject({ page: 0, text: "Check this title" });
   await expect(page.locator(".annot")).toHaveCount(3);
   await expect(page.locator(".tab-dirty")).toHaveCount(1);
+  await expect((await calls(page, "restore_annotation")).length).toBe(0);
 });
 
 test("a note can be moved with the arrow keys and with the pointer, and put back with undo", async ({ page }) => {
@@ -554,9 +556,65 @@ test("Ctrl+S with an open note box saves the text as a note first", async ({ pag
   await page.mouse.click(at.x, at.y);
   const editor = page.getByRole("dialog", { name: "New note" });
   await editor.getByRole("textbox", { name: "Text of the note" }).fill("kept by the save");
-  await page.locator(".viewer").evaluate((el) => (el as HTMLElement).focus());
-  await page.evaluate(() => document.dispatchEvent(new KeyboardEvent("keydown", { key: "s", ctrlKey: true, bubbles: true })));
+  // Ctrl+S with the focus still in the box.
+  await expect(editor.getByRole("textbox", { name: "Text of the note" })).toBeFocused();
+  await page.keyboard.press("Control+s");
   await expect.poll(() => page.evaluate(() => (window as unknown as { __E2E__: Stand }).__E2E__.saves.length)).toBe(1);
   expect((await calls(page, "add_note")).length).toBe(1);
   await expect(page.locator(".tab-dirty")).toHaveCount(0);
+});
+
+test("with the bar closed nothing stays picked: the arrow keys scroll, and Delete and Enter do nothing", async ({ page }) => {
+  await openFile(page, "/docs/annotated.pdf", "annotated.pdf");
+  await openBar(page);
+  const note = page.locator(".annot[data-kind='note']");
+  await note.focus();
+  await expect(note).toHaveAttribute("aria-pressed", "true");
+
+  // Close the bar with the picked note in place.
+  await page.locator("#annotate-button").click();
+  await expect(page.locator("#annotbar")).toBeHidden();
+  await expect(note).toHaveAttribute("aria-pressed", "false");
+
+  const viewer = page.locator(".viewer:not([hidden])");
+  await viewer.focus();
+  const before = await viewer.evaluate((el) => el.scrollTop);
+  await page.keyboard.press("ArrowDown");
+  await page.keyboard.press("ArrowDown");
+  await expect.poll(() => viewer.evaluate((el) => el.scrollTop)).toBeGreaterThan(before);
+  await page.keyboard.press("ArrowRight");
+  await page.keyboard.press("Enter");
+  await page.keyboard.press("Delete");
+  await page.keyboard.press("Backspace");
+  expect((await calls(page, "update_annotation")).length).toBe(0);
+  expect((await calls(page, "remove_annotation")).length).toBe(0);
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(page.locator(".tab-dirty")).toHaveCount(0);
+
+  // Opened again, nothing is picked until the person picks it.
+  await openBar(page);
+  await expect(note).toHaveAttribute("aria-pressed", "false");
+});
+
+test("a note that was just placed is let go when the bar closes, and Delete and Enter leave it alone", async ({ page }) => {
+  await openBook(page);
+  await openBar(page);
+  await page.locator(".viewer").focus();
+  await page.keyboard.press("n");
+  const at = await onPage(page, 0, 300, 200);
+  await page.mouse.click(at.x, at.y);
+  const editor = page.getByRole("dialog", { name: "New note" });
+  await editor.getByRole("textbox", { name: "Text of the note" }).fill("a note");
+  await page.keyboard.press("Control+Enter");
+  await expect.poll(() => calls(page, "add_note").then((c) => c.length)).toBe(1);
+  await expect(page.locator(".annot")).toHaveCount(1);
+  // The new note is picked now. Closing the bar lets go of it.
+  await expect(page.locator(".annot")).toHaveAttribute("aria-pressed", "true");
+  await page.locator("#annotate-button").click();
+  await expect(page.locator("#annotbar")).toBeHidden();
+  await page.locator(".viewer:not([hidden])").focus();
+  await page.keyboard.press("Delete");
+  await page.keyboard.press("Enter");
+  expect((await calls(page, "remove_annotation")).length).toBe(0);
+  await expect(page.getByRole("dialog")).toHaveCount(0);
 });

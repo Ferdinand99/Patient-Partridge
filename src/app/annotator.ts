@@ -71,8 +71,14 @@ export interface AnnotatorHost {
 /** Answers of the engine that say it changed nothing. */
 export const CLEAN_REFUSALS = new Set(["annotation_refused", "no_such_annotation", "annotations_not_allowed"]);
 
+/** Refusals after which the text typed in a box is shown again. */
+const REFUSALS_THAT_KEEP_TEXT = new Set(["annotation_refused", "annotations_not_allowed"]);
+
 /** The colour of the icon of a note: the engine draws every note the same, whatever its colour. */
 const NOTE_COLOR: Rgba = PALETTE[0].rgba;
+
+/** Said when the colour of a picked markup annotation cannot be changed. */
+const RECOLOUR_REASON = "The colour of this annotation cannot be changed here: its picture has no plain colour to take back.";
 
 /** Distance, in points, an arrow key moves a picked note; with Shift it moves further. */
 const NUDGE = 4;
@@ -93,6 +99,8 @@ export class Annotator implements AnnotLayerEvents {
   private flow: Promise<void> | null = null;
   private destroyed = false;
   private blocked = false;
+  /** The bar is closed: the pages read as they do without annotations, and no key is taken. */
+  private reading = false;
   /** Changes wait for this before they start (a save is being written). */
   private gate: Promise<unknown> = Promise.resolve();
 
@@ -145,7 +153,10 @@ export class Annotator implements AnnotLayerEvents {
       else editor.close();
     }
     await this.flow;
-    await this.idle();
+    // Work asked for while this waited (a key pressed meanwhile) is waited for too.
+    do {
+      await this.idle();
+    } while (this.inflight > 0);
   }
 
   /** Why the annotations cannot be changed, if the document says so; otherwise null. */
@@ -161,12 +172,22 @@ export class Annotator implements AnnotLayerEvents {
     if (!a.can.editText && a.text !== "" && a.can.remove && a.kind !== "stamp") {
       return "The text of this annotation is too long or is locked in the file, so it cannot be edited here.";
     }
+    if (this.recolourRefused(a)) return RECOLOUR_REASON;
     return null;
+  }
+
+  /** True for a markup annotation whose colour cannot be changed because its picture has no colour to read. */
+  private recolourRefused(a: Annotation): boolean {
+    return !a.can.locked && !a.can.recolour && (a.kind === "highlight" || a.kind === "underline" || a.kind === "strikeout");
   }
 
   /** Reading mode: the boxes over the pages take no clicks and no focus, so the pages read as before. */
   setReading(reading: boolean): void {
+    this.reading = reading;
     this.view.annotationLayer.setReading(reading);
+    // Nothing stays picked behind a closed bar: its outline would sit on a box that cannot be
+    // reached, and the keys of the page (the arrows, Delete, Enter) must not act on it.
+    if (reading) this.select(0, null);
   }
 
   /**
@@ -280,6 +301,7 @@ export class Annotator implements AnnotLayerEvents {
     // A picked annotation that has a colour takes the new one.
     const current = this.current;
     if (current?.can.recolour && this.selected) void this.recolour(this.selected.page, current, color);
+    else if (current && this.recolourRefused(current)) this.host.announce(RECOLOUR_REASON);
   }
 
   setPenWidth(width: number): void {
@@ -295,6 +317,7 @@ export class Annotator implements AnnotLayerEvents {
   }
 
   select(page: number, id: number | null): void {
+    if (this.reading && id !== null) return;
     const next = id === null ? null : { page, id };
     if (this.selected?.page === next?.page && this.selected?.id === next?.id) return;
     this.selected = next;
@@ -375,7 +398,13 @@ export class Annotator implements AnnotLayerEvents {
         this.record(kindName(kind), made, "remove");
         this.host.announce(`${kindName(kind)} added on ${pagesText(made.map((m) => m.page))}.`);
       }
-      if (failure) throw failure;
+      if (failure) {
+        // Some pages are marked and some are not: a clean refusal is no longer "as it was before".
+        if (made.length > 0 && CLEAN_REFUSALS.has(toAppError(failure).code)) {
+          throw Object.assign(new Error(toAppError(failure).message), { code: "annotation_partial" });
+        }
+        throw failure;
+      }
     });
   }
 
@@ -410,31 +439,42 @@ export class Annotator implements AnnotLayerEvents {
 
   // ---- notes, stamps, drawings ------------------------------------------------------------
 
-  private placeNote(page: number, x: number, y: number, client: { x: number; y: number }): Promise<void> {
+  /** `draft` is text typed in an earlier box that the engine refused: the box comes back with it. */
+  private placeNote(page: number, x: number, y: number, client: { x: number; y: number }, draft = ""): Promise<void> {
     if (this.editor) return Promise.resolve();
     // The note starts where it was clicked, its middle under the pointer.
     const at = { x: x - 10, y: y - 10 };
     const editor = openNoteEditor(this.host.popovers, {
       title: "New note",
-      text: "",
+      text: draft,
+      baseline: "",
       near: client,
       onChange: () => this.host.changed(),
     });
-    return this.holding(editor, async (text) => {
-      const a = await this.api.addNote(this.doc, page, at.x, at.y, NOTE_COLOR, clampToBytes(text));
-      this.refresh(page);
-      this.record("Note", [{ page, id: a.id }], "remove");
-      this.host.announce(`Note added on page ${page + 1}.`);
-      this.finishPlacing(page, a.id);
-    });
+    return this.holding(
+      editor,
+      async (text) => {
+        const a = await this.api.addNote(this.doc, page, at.x, at.y, NOTE_COLOR, clampToBytes(text));
+        this.refresh(page);
+        this.record("Note", [{ page, id: a.id }], "remove");
+        this.host.announce(`Note added on page ${page + 1}.`);
+        this.finishPlacing(page, a.id);
+      },
+      (text) => void this.placeNote(page, x, y, client, text),
+    );
   }
 
   /**
    * Keeps `editor` as the open box and waits for what the person does with it, outside the queue
    * (a box that stays open must not hold up the undo or the save). When the text is saved, `save`
-   * runs in the queue with it.
+   * runs in the queue with it. When the engine refuses cleanly, the box is opened again with the
+   * text (`again`), so that what was typed is not lost; the refusal itself is told as usual.
    */
-  private holding(editor: NoteEditor, save: (text: string) => Promise<void>): Promise<void> {
+  private holding(
+    editor: NoteEditor,
+    save: (text: string) => Promise<void>,
+    again: (text: string) => void,
+  ): Promise<void> {
     this.editor = editor;
     this.host.changed();
     const flow = (async () => {
@@ -442,7 +482,16 @@ export class Annotator implements AnnotLayerEvents {
       this.editor = null;
       this.host.changed();
       if (text === null || this.destroyed) return;
-      await this.queued(() => save(text));
+      let refused = false;
+      await this.queued(async () => {
+        try {
+          await save(text);
+        } catch (error) {
+          refused = REFUSALS_THAT_KEEP_TEXT.has(toAppError(error).code);
+          throw error;
+        }
+      });
+      if (refused && !this.destroyed && !this.editor) again(text);
     })();
     this.flow = flow;
     void flow.finally(() => {
@@ -469,8 +518,11 @@ export class Annotator implements AnnotLayerEvents {
   private finishPlacing(page: number, id: number): void {
     this.tool = "select";
     this.syncLayer();
-    this.selected = { page, id };
-    this.view.annotationLayer.setSelected(this.selected);
+    // With the bar closed meanwhile nothing is picked.
+    if (!this.reading) {
+      this.selected = { page, id };
+      this.view.annotationLayer.setSelected(this.selected);
+    }
     this.host.changed();
   }
 
@@ -508,16 +560,21 @@ export class Annotator implements AnnotLayerEvents {
     const a = this.view.annotationLayer.find(page, id);
     if (!a?.can.move || (dx === 0 && dy === 0)) return Promise.resolve();
     return this.queued(async () => {
-      await this.api.updateAnnotation(this.doc, page, id, { dx, dy });
+      const moved = await this.api.updateAnnotation(this.doc, page, id, { dx, dy });
       this.refresh(page);
+      // The engine keeps a note on its page, so it may move less than asked: undo and redo use
+      // the distance it really moved.
+      const [rx, ry] = [moved.rect[0] - a.rect[0], moved.rect[1] - a.rect[1]];
+      const [mx, my] = Number.isFinite(rx + ry) ? [rx, ry] : [dx, dy];
+      if (Math.abs(mx) < 0.005 && Math.abs(my) < 0.005) return;
       this.push({
         label: "Move",
         undo: async () => {
-          await this.api.updateAnnotation(this.doc, page, id, { dx: -dx, dy: -dy });
+          await this.api.updateAnnotation(this.doc, page, id, { dx: -mx, dy: -my });
           this.refresh(page);
         },
         redo: async () => {
-          await this.api.updateAnnotation(this.doc, page, id, { dx, dy });
+          await this.api.updateAnnotation(this.doc, page, id, { dx: mx, dy: my });
           this.refresh(page);
         },
       });
@@ -525,7 +582,7 @@ export class Annotator implements AnnotLayerEvents {
   }
 
   /** Opens the box for the text of an annotation and saves what the person writes. */
-  editText(page: number, id: number): Promise<void> {
+  editText(page: number, id: number, draft?: string): Promise<void> {
     const a = this.view.annotationLayer.find(page, id);
     if (a && !a.can.editText) {
       this.host.announce(
@@ -540,27 +597,32 @@ export class Annotator implements AnnotLayerEvents {
     const before = a.text;
     const editor = openNoteEditor(this.host.popovers, {
       title: a.kind === "note" ? "Note" : "Comment",
-      text: before,
+      text: draft ?? before,
+      baseline: before,
       near,
       onChange: () => this.host.changed(),
     });
-    return this.holding(editor, async (text) => {
-      if (text === before) return;
-      await this.api.updateAnnotation(this.doc, page, id, { text });
-      this.refresh(page);
-      this.push({
-        label: "Edit text",
-        undo: async () => {
-          await this.api.updateAnnotation(this.doc, page, id, { text: before });
-          this.refresh(page);
-        },
-        redo: async () => {
-          await this.api.updateAnnotation(this.doc, page, id, { text });
-          this.refresh(page);
-        },
-      });
-      this.host.announce("Text saved.");
-    });
+    return this.holding(
+      editor,
+      async (text) => {
+        if (text === before) return;
+        await this.api.updateAnnotation(this.doc, page, id, { text });
+        this.refresh(page);
+        this.push({
+          label: "Edit text",
+          undo: async () => {
+            await this.api.updateAnnotation(this.doc, page, id, { text: before });
+            this.refresh(page);
+          },
+          redo: async () => {
+            await this.api.updateAnnotation(this.doc, page, id, { text });
+            this.refresh(page);
+          },
+        });
+        this.host.announce("Text saved.");
+      },
+      (text) => void this.editText(page, id, text),
+    );
   }
 
   private recolour(page: number, a: Annotation, color: Rgba): Promise<void> {
@@ -601,8 +663,7 @@ export class Annotator implements AnnotLayerEvents {
     if (!a.can.restore) {
       const answer = await this.host.ask({
         title: "Delete this annotation?",
-        detail:
-          "This annotation came with the file, and Undo cannot bring it back. If you delete it and save, it is gone from the file.",
+        detail: deleteWarning(a.kind),
         buttons: [
           { id: "cancel", label: "Cancel", safe: true },
           { id: "delete", label: "Delete", primary: true },
@@ -615,7 +676,14 @@ export class Annotator implements AnnotLayerEvents {
       await this.api.removeAnnotation(this.doc, page, id);
       this.refresh(page);
       this.select(page, null);
-      this.record(`Delete ${kindName(a.kind).toLowerCase()}`, [{ page, id }], "restore");
+      if (a.can.restore) {
+        this.record(`Delete ${kindName(a.kind).toLowerCase()}`, [{ page, id }], "restore");
+      } else {
+        // Undo cannot bring this back, so there is no edit to take back: an entry whose undo is
+        // always refused would stop every earlier edit from being undone. The document counts as
+        // changed until it is saved.
+        this.history.markUnsaved();
+      }
       this.host.announce(`${kindName(a.kind)} deleted.`);
     });
   }
@@ -624,6 +692,8 @@ export class Annotator implements AnnotLayerEvents {
 
   /** Keys for the annotation that is picked. Returns true when the key was used. */
   handleKey(e: KeyboardEvent): boolean {
+    // The bar is closed: the keys belong to the page (the arrows scroll it).
+    if (this.reading) return false;
     if (e.key === "Escape") {
       if (this.view.annotationLayer.abort()) return true;
       if (this.editor) {
@@ -677,7 +747,20 @@ export class Annotator implements AnnotLayerEvents {
   }
 }
 
+/**
+ * What is said before an annotation that came with the file is deleted. Saving writes a new file in
+ * which the comment, the author, the rich text and the subject are not kept; it is not redaction,
+ * and the old file and its copies keep everything. A free text box may keep its words.
+ */
+function deleteWarning(kind: Annotation["kind"]): string {
+  const base =
+    "This annotation came with the file, and Undo cannot bring it back. If you delete it and save, the new file does not hold its comment or author. " +
+    "This is not redaction: the old file and any copy of it still hold the text.";
+  return kind === "other" ? `${base} The words of a text box can stay in the saved file.` : base;
+}
+
 function pagesText(pages: number[]): string {
+
   const unique = [...new Set(pages)].map((p) => p + 1);
   return unique.length === 1 ? `page ${unique[0]}` : `pages ${unique.join(", ")}`;
 }

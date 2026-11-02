@@ -9,6 +9,12 @@ export interface NoteEditorOptions {
   title: string;
   /** The text that is there now. */
   text: string;
+  /**
+   * The text the box counts as unchanged. It is the text the box starts with unless the box comes
+   * back with text that was typed before (and refused): then the start is the draft and this is
+   * the text the annotation holds.
+   */
+  baseline?: string;
   /** A place on the screen the box is put next to. */
   near: { x: number; y: number };
   saveLabel?: string;
@@ -74,7 +80,7 @@ export function openNoteEditor(host: HTMLElement, options: NoteEditorOptions): N
     finish(value);
     previous?.focus({ preventScroll: true });
   };
-  const started = area.value;
+  const started = options.baseline === undefined ? area.value : clampToBytes(options.baseline, MAX_NOTE_BYTES);
   area.addEventListener("input", () => {
     // The limit is in bytes, as the engine counts. A paste that is too long is cut, not refused.
     if (utf8Length(area.value) > MAX_NOTE_BYTES) area.value = clampToBytes(area.value, MAX_NOTE_BYTES);
@@ -94,6 +100,8 @@ export function openNoteEditor(host: HTMLElement, options: NoteEditorOptions): N
       e.preventDefault();
       e.stopPropagation();
       close(area.value);
+    } else if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === "s") {
+      // Save belongs to the window: it saves the text of this box first, then the document.
     } else {
       // Keys typed here are for the text: the shortcuts of the window must not see them.
       e.stopPropagation();

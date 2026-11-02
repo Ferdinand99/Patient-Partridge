@@ -357,3 +357,80 @@ fn poppler_opens_the_files_and_draws_the_annotations() {
         "Poppler does not draw the stamp"
     );
 }
+
+/// A file whose annotation dictionaries live in object streams (packed by `qpdf`) loses the text
+/// of what is deleted, as a plain file does: a save writes every live object again on its own and
+/// the packed container is not written.
+#[test]
+fn deleted_text_is_gone_when_the_file_keeps_its_objects_in_object_streams() {
+    if !have("qpdf") {
+        return;
+    }
+    let dir = Dir::new("packed");
+    let input = dir.write("plain.pdf", &kit::foreign_annots_pdf());
+    let output = dir.0.join("packed.pdf");
+    let (ok, text) = run(
+        "qpdf",
+        &[
+            "--object-streams=generate",
+            input.to_str().unwrap(),
+            output.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "qpdf could not pack the file: {text}");
+    let packed = std::fs::read(&output).unwrap();
+    assert!(
+        contains(&packed, b"/ObjStm"),
+        "the file has no object streams"
+    );
+    let markers = [
+        "salary 90k",
+        "RCSALARY",
+        "SUBJSALARY",
+        "POPUPSECRET",
+        "FREECONTENTSONE",
+        "FREESUBJONE",
+        "FREERCONE",
+        "FREECONTENTSTWO",
+        "APSECRETONE",
+        "APSECRETTWO",
+    ];
+    // The search sees the text in the packed file, so it can tell when it is gone.
+    for marker in markers {
+        assert!(
+            kit::text_in_file(&packed, marker),
+            "the search does not find {marker} in the packed file"
+        );
+    }
+
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let doc = open(e, &packed, None).unwrap();
+    let items = list(e, doc, 0);
+    for text in ["salary 90k", "FREECONTENTSONE", "FREECONTENTSTWO"] {
+        let item = items
+            .iter()
+            .find(|i| i.text == text)
+            .unwrap_or_else(|| panic!("no annotation with the text {text}"));
+        assert!(matches!(
+            ask(
+                e,
+                RequestBody::RemoveAnnot {
+                    doc,
+                    page: 0,
+                    id: item.id
+                }
+            ),
+            partridge_protocol::ResponseBody::AnnotRemoved
+        ));
+    }
+    let saved = save_all(e, doc);
+    for marker in markers {
+        assert!(
+            !kit::text_in_file(&saved, marker),
+            "{marker} is still in the saved file"
+        );
+    }
+    // What was not deleted is still there.
+    assert!(kit::text_in_file(&saved, "REPLYMARKER"));
+}
