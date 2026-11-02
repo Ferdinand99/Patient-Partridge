@@ -33,11 +33,12 @@
 //!   the end, or longer than a piece may be, is refused. The saved file opens again (with the
 //!   password, for the encrypted seed) with the same number of pages and the same kind of
 //!   protection. A document that PDFium cannot write fails only with `SaveFailed`.
-//! - The page tools, on the same document: a turn, a crop, a blank page, a delete and the copy it
-//!   leaves (restore), a move of every page and the insert of a copy (only with PARTRIDGE_FUZZ_STRUCTURE set), the
-//!   copy of the first page into a new document (which opens with one page and the digest the engine gave) and its insert. The number
-//!   of pages after each is the number it should be, a refusal is one of a short list of errors, and
-//!   the document, saved after all of it, opens again with the same pages and the same digest.
+//! - The page tools, on the document as it was opened and on the saved file opened again: a turn, a
+//!   crop, a blank page, a delete and the copy it leaves (restore), a move of every page and the
+//!   copy it leaves, the copy of the first page into a new document (which opens with one page and
+//!   the digest the engine gave) and its insert. The number of pages after each is the number it
+//!   should be, a refusal is one of a short list of errors, and the document, saved after all of
+//!   it, opens again with the same pages and the same digest.
 //! - Every answer can be encoded and decoded by the app, and the encoder cuts nothing.
 //! - A page that exists fails only with `Corrupt` or `RenderFailed`; a page past the end gives
 //!   `PageOutOfRange`.
@@ -224,8 +225,16 @@ impl State {
             height: 10,
         });
 
-        // The page tools work on the document as it was saved and opened again (see `save`).
+        // The page tools work on the document as it was saved and opened again (see `save`), which
+        // is how PDFium wrote it, and then on the document as it was opened, which is how a person
+        // meets them: a file that PDFium reads only after repairing it is changed and written out as
+        // it is.
         self.save(doc, count, data, 0);
+        self.lost = false;
+        let now = self.tools(doc, count, data);
+        if !self.lost && now > 0 {
+            self.save(doc, now, data, 1);
+        }
 
         match self.ask(RequestBody::Close { doc }) {
             ResponseBody::Closed => {}
@@ -399,14 +408,9 @@ impl State {
                 self.change(doc, PagesRequest::Restore { doc, snapshot }, None);
             }
         }
-        // A move, and pages put into this document, are tried only when asked for
-        // (PARTRIDGE_FUZZ_STRUCTURE): on a file damaged in the right way PDFium crashes in the work that
-        // follows (a SEGV inside the library, see docs/fuzzing.md), which the sandbox contains, and a
-        // target that stops on it every few minutes finds nothing else. They are tested on made-up
-        // documents in the engine tests.
-        let structure = std::env::var_os("PARTRIDGE_FUZZ_STRUCTURE").is_some();
+        // A move of every page, and its copy.
         let pages = self.pages_now(doc);
-        if (2..=40).contains(&pages) && structure {
+        if (2..=40).contains(&pages) {
             let moved = self.change(
                 doc,
                 PagesRequest::Reorder {
@@ -460,31 +464,29 @@ impl State {
                 }
                 self.ask(RequestBody::Close { doc: other });
             }
-            // And put it in the document, in pieces of an odd size.
-            let pages = self.pages_now(doc);
-            if !structure {
-                // Not into this document (see above); the bytes are handed over and dropped, to try the
-                // pieces and the end of an insert that is given up.
-                if let Some(PagesResponse::ImportReady) = self.tool(PagesRequest::ImportBegin {
+            // An insert that is given up, to try the pieces and the abort.
+            if let Some(PagesResponse::ImportReady) = self.tool(PagesRequest::ImportBegin {
+                doc,
+                size: bytes.len() as u32,
+            }) {
+                self.tool(PagesRequest::ImportChunk {
                     doc,
-                    size: bytes.len() as u32,
-                }) {
-                    self.tool(PagesRequest::ImportChunk {
+                    offset: 0,
+                    data: bytes[..bytes.len().min(3001)].to_vec(),
+                });
+                self.tool(PagesRequest::ImportAbort { doc });
+                // A piece after the abort has nothing to belong to.
+                assert!(self
+                    .tool(PagesRequest::ImportChunk {
                         doc,
                         offset: 0,
-                        data: bytes[..bytes.len().min(3001)].to_vec(),
-                    });
-                    self.tool(PagesRequest::ImportAbort { doc });
-                    // A piece after the abort has nothing to belong to.
-                    assert!(self
-                        .tool(PagesRequest::ImportChunk {
-                            doc,
-                            offset: 0,
-                            data: vec![1],
-                        })
-                        .is_none());
-                }
-            } else if let Some(PagesResponse::ImportReady) = self.tool(PagesRequest::ImportBegin {
+                        data: vec![1],
+                    })
+                    .is_none());
+            }
+            // And put it in the document, in pieces of an odd size.
+            let pages = self.pages_now(doc);
+            if let Some(PagesResponse::ImportReady) = self.tool(PagesRequest::ImportBegin {
                 doc,
                 size: bytes.len() as u32,
             }) {
@@ -513,10 +515,8 @@ impl State {
     /// The three requests of a save, and a look at the file that comes out.
     ///
     /// `level` 0 is the document as it was opened; the page tools are then tried on the saved file
-    /// opened again, which is how a document has been written out by PDFium (and so is in a form
-    /// PDFium can be expected to handle; a file as damaged as the fuzzer makes it can crash PDFium in
-    /// a change of the pages, which the engine's sandbox contains, but which is no finding of this
-    /// target). What the tools leave is saved and checked again, at `level` 1.
+    /// opened again, which is how a document has been written out by PDFium. What the tools leave
+    /// is saved and checked again, at `level` 1.
     fn save(&mut self, doc: u32, count: u32, data: &[u8], level: u8) {
         let (pages, security) = match self.ask(RequestBody::DocInfo { doc }) {
             ResponseBody::DocInfo {

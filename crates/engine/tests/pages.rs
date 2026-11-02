@@ -2804,3 +2804,90 @@ fn a_move_that_leaves_the_pages_in_another_order_than_asked_is_taken_back() {
     assert_eq!((sizes[0].width, sizes[0].height), (200.0, 1000.0));
     assert_eq!((sizes[3].width, sizes[3].height), (612.0, 792.0));
 }
+
+#[test]
+fn a_page_far_from_the_origin_is_refused_for_a_crop_and_no_answer_is_made_that_the_app_cannot_read()
+{
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let (doc, _f) = open_doc(e, &kit::far_box_pdf());
+    // The page is an ordinary size, but its boxes hold numbers above what the protocol carries; a
+    // crop would report them, and the app would refuse the answer and end the engine.
+    assert_eq!(
+        page_op(
+            e,
+            PagesRequest::Crop {
+                doc,
+                pages: vec![0],
+                margins: [10.0, 10.0, 10.0, 10.0],
+            },
+        )
+        .unwrap_err(),
+        ErrorCode::PageChangeFailed
+    );
+    assert_eq!(page_count(e, doc), 1);
+    // The other tools go on working on it.
+    changed(page_op(
+        e,
+        PagesRequest::Rotate {
+            doc,
+            pages: vec![0],
+            turns: 1,
+        },
+    ));
+}
+
+#[test]
+fn a_page_list_that_names_something_that_is_not_there_is_not_moved_but_everything_else_works() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let (doc, _f) = open_doc(e, &kit::trailing_null_kid_pdf());
+    assert_eq!(page_count(e, doc), 3);
+    // PDFium's move stops the process on this tree; the tools look at the tree first, and refuse.
+    assert_eq!(
+        page_op(
+            e,
+            PagesRequest::Reorder {
+                doc,
+                order: vec![2, 1, 0],
+            },
+        )
+        .unwrap_err(),
+        ErrorCode::PageChangeFailed
+    );
+    assert_eq!(page_count(e, doc), 3);
+    // The document is whole and the other tools work on it, and it saves.
+    changed(page_op(
+        e,
+        PagesRequest::Rotate {
+            doc,
+            pages: vec![0],
+            turns: 1,
+        },
+    ));
+    assert!(save_all(e, doc).starts_with(b"%PDF-"));
+}
+
+#[test]
+fn dictionaries_written_in_place_and_nested_nodes_do_not_make_a_page_tree_look_damaged() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let (doc, _f) = open_doc(e, &kit::inline_dictionaries_pdf());
+    assert_eq!(page_count(e, doc), 3);
+    let (sizes, _, _) = changed(page_op(
+        e,
+        PagesRequest::Reorder {
+            doc,
+            order: vec![2, 1, 0],
+        },
+    ));
+    assert_eq!(sizes.len(), 3);
+    changed(page_op(
+        e,
+        PagesRequest::Reorder {
+            doc,
+            order: vec![1, 2, 0],
+        },
+    ));
+    assert!(save_all(e, doc).starts_with(b"%PDF-"));
+}

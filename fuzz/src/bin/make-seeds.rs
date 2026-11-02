@@ -817,6 +817,18 @@ fn main() {
         ("odd_boxes", kit::odd_boxes_pdf()),
         ("many_blank_pages", kit::blank_pages_pdf(300)),
         ("signed", kit::signed_pdf()),
+        // What the page tools had to be made safe against: a copy of pages that points into the
+        // other document (a note with its pop-up, a field on two pages, an entry with /First), a
+        // text field with the look of its value, a tree whose list of kids ends with an entry that
+        // is not there, and a damaged protected file that reads back with no pages.
+        ("popup_note", kit::popup_note_pdf()),
+        ("shared_field", kit::shared_field_pdf()),
+        ("first_key", kit::first_key_pdf()),
+        ("form_leftovers", kit::form_leftovers_pdf()),
+        ("trailing_null_kid", kit::trailing_null_kid_pdf()),
+        ("inline_dictionaries", kit::inline_dictionaries_pdf()),
+        ("page_count_lost", kit::page_count_lost_pdf()),
+        ("mixed_sizes", kit::mixed_size_pdf()),
         ("truncated", kit::truncated_pdf()),
         ("corrupt", kit::corrupt_pdf()),
     ];

@@ -545,3 +545,42 @@ pub fn encrypted_with_permissions_pdf(user_password: &str, pages: usize, p: u32)
 pub fn encrypted_r3_with_permissions_pdf(user_password: &str, pages: usize, p: u32) -> Vec<u8> {
     super::encrypted_pdf_with(user_password, pages, p as i32, true)
 }
+
+/// Three pages in a page tree whose list of kids ends with an entry that is not there. PDFium finds
+/// the three pages and every one of them is sound, so a look at the pages does not show it; its
+/// move of pages stops the process on such a tree.
+pub fn trailing_null_kid_pdf() -> Vec<u8> {
+    let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec();
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 99 0 R] /Count 3 >>".to_vec(),
+        page.clone(),
+        page.clone(),
+        page,
+    ];
+    assemble(&objects, "")
+}
+
+/// Three pages whose resources hold dictionaries of their own with a `/Type` (a font and a graphics
+/// state written in place), and a page tree with two levels. Everything is as it should be: the
+/// check of the page tree must not take the `/Type` of an inner dictionary for the page's.
+pub fn inline_dictionaries_pdf() -> Vec<u8> {
+    let page = |parent: u32| {
+        format!(
+            "<< /Resources << /ExtGState << /G0 << /Type /ExtGState /CA 0.5 >> >> /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> /Parent {parent} 0 R /MediaBox [0 0 612 792] /Type /Page >>"
+        )
+        .into_bytes()
+    };
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Kids [3 0 R 6 0 R] /Count 3 /Type /Pages >>".to_vec(),
+        b"<< /Kids [4 0 R 5 0 R] /Count 2 /Type /Pages /Parent 2 0 R >>".to_vec(),
+        page(3),
+        page(3),
+        page(2),
+    ];
+    // Object 3 is the inner node; the pages are 4, 5 and 6.
+    let mut objects = objects;
+    objects.swap(2, 2);
+    assemble(&objects, "")
+}

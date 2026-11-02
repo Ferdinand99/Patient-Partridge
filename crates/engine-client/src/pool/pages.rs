@@ -321,8 +321,10 @@ impl EnginePool {
             }
         };
         Ok(InsertOutcome {
+            // The pages the engine says it added, which is what the window must pick; a document
+            // that gave another number than the other file has is told by it.
+            inserted: changed.count,
             changed,
-            inserted: all.len() as u32,
         })
     }
 

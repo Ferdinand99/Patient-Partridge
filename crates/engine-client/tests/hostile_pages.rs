@@ -173,6 +173,23 @@ fn lists_and_sizes_that_do_not_fit_are_refused_before_anything_is_sent() {
             .map(|_| ()),
         client.import_begin(doc, 0),
         client.import_begin(doc, u64::MAX),
+        // Numbers the engine or the protocol would refuse are refused before they are sent.
+        client
+            .pages_crop(doc, &[0], [-1.0, 0.0, 0.0, 0.0])
+            .map(|_| ()),
+        client
+            .pages_crop(doc, &[0], [1.0e9, 0.0, 0.0, 0.0])
+            .map(|_| ()),
+        client
+            .pages_set_boxes(doc, &[0], &[[0.0, 0.0, 2.0e7, 10.0]])
+            .map(|_| ()),
+        client.pages_insert_blank(doc, 0, 1.0, 100.0).map(|_| ()),
+        client
+            .pages_insert_blank(doc, 0, 100.0, f32::INFINITY)
+            .map(|_| ()),
+        client
+            .pages_insert_blank(doc, 0, 100.0, 20_000.0)
+            .map(|_| ()),
     ] {
         match result {
             Err(ClientError::Engine { code, .. }) => {
@@ -250,7 +267,8 @@ fn pages_are_inserted_from_another_file_and_progress_is_told() {
             &progress,
         )
         .unwrap();
-    assert_eq!(outcome.inserted, 3);
+    // The number of pages the engine says it added, not the number the other file was said to have.
+    assert_eq!(outcome.inserted, 2);
     assert_eq!(outcome.changed.count, 2);
     assert_eq!(last.load(Ordering::SeqCst), 2_500_000);
     assert!(calls.load(Ordering::SeqCst) >= 3, "pieces of at most a MiB");

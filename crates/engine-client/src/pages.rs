@@ -8,8 +8,9 @@
 use std::io;
 
 use partridge_protocol::{
-    ErrorCode, PageSize, PagesRequest, PagesResponse, RequestBody, ResponseBody, MAX_EDIT_PAGES,
-    MAX_IMPORT_BYTES, MAX_SAVE_BYTES, MAX_SAVE_CHUNK,
+    ErrorCode, PageSize, PagesRequest, PagesResponse, RequestBody, ResponseBody, MAX_BLANK_SIDE,
+    MAX_BOX_VALUE, MAX_EDIT_PAGES, MAX_IMPORT_BYTES, MAX_SAVE_BYTES, MAX_SAVE_CHUNK,
+    MIN_BLANK_SIDE,
 };
 
 use crate::{lock, stale_document, usable_page_side, ClientError, EngineClient};
@@ -156,8 +157,13 @@ impl EngineClient {
         margins: [f32; 4],
     ) -> Result<PagesCropped, ClientError> {
         list_ok(pages)?;
-        if margins.iter().any(|m| !m.is_finite()) {
-            return Err(refuse("the margins are not numbers"));
+        // The limits the engine and the protocol have: a number outside them would end the engine
+        // (the protocol refuses to carry it) instead of being refused.
+        if margins
+            .iter()
+            .any(|m| !m.is_finite() || *m < 0.0 || *m > MAX_BLANK_SIDE)
+        {
+            return Err(refuse("the margins are not usable"));
         }
         let wanted = pages.len();
         self.call(
@@ -202,6 +208,13 @@ impl EngineClient {
         if pages.len() != boxes.len() {
             return Err(refuse("every page needs a box"));
         }
+        if boxes
+            .iter()
+            .flatten()
+            .any(|v| !v.is_finite() || v.abs() > MAX_BOX_VALUE)
+        {
+            return Err(refuse("a box is not usable"));
+        }
         self.pages_changed(doc, "set boxes", |doc| PagesRequest::SetBoxes {
             doc,
             pages: pages.to_vec(),
@@ -217,6 +230,10 @@ impl EngineClient {
         width: f32,
         height: f32,
     ) -> Result<PagesChanged, ClientError> {
+        let side = |v: f32| v.is_finite() && (MIN_BLANK_SIDE..=MAX_BLANK_SIDE).contains(&v);
+        if !side(width) || !side(height) {
+            return Err(refuse("the size of the page is not usable"));
+        }
         self.pages_changed(doc, "insert a blank page", |doc| {
             PagesRequest::InsertBlank {
                 doc,

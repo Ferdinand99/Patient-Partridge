@@ -35,9 +35,9 @@ use std::collections::VecDeque;
 use std::os::raw::{c_int, c_ulong};
 
 use partridge_protocol::{
-    ErrorCode, PageSize, PagesRequest, PagesResponse, ResponseBody, MAX_BLANK_SIDE, MAX_EDIT_PAGES,
-    MAX_IMPORT_BYTES, MAX_SAVE_BYTES, MAX_SAVE_CHUNK, MAX_UNDO_BYTES, MAX_UNDO_STEPS,
-    MIN_BLANK_SIDE, MIN_CROP_SIDE,
+    ErrorCode, PageSize, PagesRequest, PagesResponse, ResponseBody, MAX_BLANK_SIDE, MAX_BOX_VALUE,
+    MAX_EDIT_PAGES, MAX_IMPORT_BYTES, MAX_SAVE_BYTES, MAX_SAVE_CHUNK, MAX_UNDO_BYTES,
+    MAX_UNDO_STEPS, MIN_BLANK_SIDE, MIN_CROP_SIDE,
 };
 use pdfium_render::prelude::*;
 
@@ -346,8 +346,10 @@ fn rect_of(r: &PdfRect) -> [f32; 4] {
     [l.min(rt), b.min(t), l.max(rt), b.max(t)]
 }
 
+/// A box the page tools work with: finite numbers that the protocol can carry (the answer of a crop
+/// holds the boxes, and the app refuses numbers above [`MAX_BOX_VALUE`]), and sides of a sane size.
 fn usable(b: &[f32; 4]) -> bool {
-    b.iter().all(|v| v.is_finite())
+    b.iter().all(|v| v.is_finite() && v.abs() <= MAX_BOX_VALUE)
         && b[2] - b[0] > 0.0
         && b[3] - b[1] > 0.0
         && b[2] - b[0] <= 14_400.0
@@ -607,8 +609,259 @@ fn page_is_sound(document: &PdfDocument<'_>, index: PdfPageIndex) -> bool {
     document.pages().page_size(index).is_ok()
 }
 
-fn password_of(engine: &Engine, doc: u32) -> Option<String> {
-    engine.passwords.get(&doc).map(|s| s.0.clone())
+/// Reads the page tree out of a document as PDFium writes it (a classic table of the places of the
+/// objects, the catalog, the nodes of the tree) and says whether it is as it should be: the root
+/// that the catalog names is a node (it has `/Kids`, and its `/Type`, if it has one, is `/Pages`),
+/// every kid of every node is an object that is there with a dictionary, and the pages at the
+/// leaves are as many as the document says it has. Bytes that cannot be read that way (a table of
+/// another kind) are taken as a sound tree: a document is not refused for how it is written.
+fn page_tree_is_sound(bytes: &[u8], count: usize) -> bool {
+    let Some(table) = XrefTable::read(bytes) else {
+        return true;
+    };
+    let Some(root) = table.catalog_pages() else {
+        return false;
+    };
+    let mut leaves = 0usize;
+    let mut visited = 0usize;
+    table.walk(root, 0, &mut leaves, &mut visited) && leaves == count
+}
+
+/// The places of the objects of a document written by PDFium, and the way to read their dictionaries.
+struct XrefTable<'a> {
+    bytes: &'a [u8],
+    /// Object number to the place of `N G obj`; None for a free entry.
+    places: Vec<Option<usize>>,
+    root: u32,
+}
+
+/// The words of `bytes`, separated by white space.
+fn words(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+    bytes
+        .split(|b| b.is_ascii_whitespace())
+        .filter(|w| !w.is_empty())
+}
+
+fn number_of(word: Option<&[u8]>) -> Option<usize> {
+    std::str::from_utf8(word?).ok()?.parse().ok()
+}
+
+impl<'a> XrefTable<'a> {
+    fn read(bytes: &'a [u8]) -> Option<XrefTable<'a>> {
+        let start = rfind(bytes, b"startxref")?;
+        let at = number_of(words(&bytes[start + 9..]).next())?;
+        let table = bytes.get(at..)?;
+        if !table.starts_with(b"xref") {
+            return None;
+        }
+        let mut rest = words(&table[4..]);
+        let mut places: Vec<Option<usize>> = Vec::new();
+        loop {
+            let first = rest.next()?;
+            if first == b"trailer" {
+                break;
+            }
+            let first = number_of(Some(first))?;
+            let entries = number_of(rest.next())?;
+            if entries > 1_000_000 || first > 1_000_000 {
+                return None;
+            }
+            if places.len() < first + entries {
+                places.resize(first + entries, None);
+            }
+            for i in 0..entries {
+                let offset = number_of(rest.next())?;
+                let _generation = number_of(rest.next())?;
+                let kind = rest.next()?;
+                places[first + i] = (kind == b"n").then_some(offset);
+            }
+        }
+        let trailer = &table[find(table, b"trailer")?..];
+        let root = reference_after(trailer, b"/Root")?;
+        Some(XrefTable {
+            bytes,
+            places,
+            root,
+        })
+    }
+
+    /// The dictionary of object `number`: the text from after `obj` up to the stream or the end.
+    fn dictionary(&self, number: u32) -> Option<&'a [u8]> {
+        let place = (*self.places.get(number as usize)?)?;
+        let rest = self.bytes.get(place..)?;
+        let header_end = find(rest, b"obj")? + 3;
+        let body = rest.get(header_end..)?;
+        // The nearest end first, so that the cost of a look at an object is that of the object.
+        let end = find(body, b"endobj").unwrap_or(body.len());
+        let end = find(&body[..end], b"stream").unwrap_or(end);
+        let text = &body[..end];
+        // Only white space may come before the dictionary.
+        let open = text.iter().take_while(|b| b.is_ascii_whitespace()).count();
+        text[open..].starts_with(b"<<").then_some(&text[open..])
+    }
+
+    fn catalog_pages(&self) -> Option<u32> {
+        reference_after(self.dictionary(self.root)?, b"/Pages")
+    }
+
+    /// True when the node is sound; adds the pages at its leaves to `leaves`.
+    fn walk(&self, number: u32, depth: usize, leaves: &mut usize, visited: &mut usize) -> bool {
+        *visited += 1;
+        if depth > 64 || *visited > 2_000_000 {
+            return false;
+        }
+        let Some(dict) = self.dictionary(number) else {
+            return false;
+        };
+        let kind = name_after(dict, b"/Type");
+        let Some(kids) = array_after(dict, b"/Kids") else {
+            // A leaf: a page. A dictionary that says it is something else is not one.
+            if kind.is_some_and(|k| k != b"/Page") {
+                return false;
+            }
+            *leaves += 1;
+            return true;
+        };
+        if kind.is_some_and(|k| k != b"/Pages") {
+            return false;
+        }
+        references_in(kids)
+            .into_iter()
+            .all(|kid| self.walk(kid, depth + 1, leaves, visited))
+    }
+}
+
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+fn rfind(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).rposition(|w| w == needle)
+}
+
+fn skip_white(bytes: &[u8]) -> &[u8] {
+    let n = bytes.iter().take_while(|b| b.is_ascii_whitespace()).count();
+    &bytes[n..]
+}
+
+/// What follows `key` among the keys of the dictionary itself (not those of a dictionary inside
+/// it, where the same name may mean something else).
+fn value_of<'a>(dict: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    let mut dicts = 0usize;
+    let mut arrays = 0usize;
+    let mut i = 0;
+    while i < dict.len() {
+        match dict[i] {
+            b'<' if dict.get(i + 1) == Some(&b'<') => {
+                dicts += 1;
+                i += 2;
+            }
+            b'>' if dict.get(i + 1) == Some(&b'>') => {
+                dicts = dicts.saturating_sub(1);
+                i += 2;
+                if dicts == 0 {
+                    break;
+                }
+            }
+            b'[' => {
+                arrays += 1;
+                i += 1;
+            }
+            b']' => {
+                arrays = arrays.saturating_sub(1);
+                i += 1;
+            }
+            b'(' => {
+                // A string: up to the closing bracket that matches, a backslash takes the next byte.
+                let mut open = 1usize;
+                i += 1;
+                while i < dict.len() && open > 0 {
+                    match dict[i] {
+                        b'\\' => i += 1,
+                        b'(' => open += 1,
+                        b')' => open -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+            b'<' => {
+                i += dict[i..]
+                    .iter()
+                    .position(|b| *b == b'>')
+                    .map_or(1, |p| p + 1);
+            }
+            b'/' => {
+                let end = dict[i + 1..]
+                    .iter()
+                    .position(|b| b.is_ascii_whitespace() || b"/<>[]()".contains(b))
+                    .map_or(dict.len(), |p| i + 1 + p);
+                if dicts == 1 && arrays == 0 && &dict[i..end] == key {
+                    return Some(&dict[end..]);
+                }
+                i = end.max(i + 1);
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// The name that follows `key` (`/Type` then `/Pages`).
+fn name_after<'a>(dict: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    let rest = skip_white(value_of(dict, key)?);
+    if !rest.starts_with(b"/") {
+        return None;
+    }
+    let end = rest[1..]
+        .iter()
+        .position(|b| b.is_ascii_whitespace() || b"/<>[]()".contains(b))
+        .map_or(rest.len(), |p| p + 1);
+    Some(&rest[..end])
+}
+
+/// The text between the brackets of the array that follows `key`.
+fn array_after<'a>(dict: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    let rest = skip_white(value_of(dict, key)?);
+    if !rest.starts_with(b"[") {
+        return None;
+    }
+    let end = rest.iter().position(|b| *b == b']')?;
+    Some(&rest[1..end])
+}
+
+/// The object number of the reference (`N G R`) that follows `key`.
+fn reference_after(dict: &[u8], key: &[u8]) -> Option<u32> {
+    references_in(value_of(dict, key)?).first().copied()
+}
+
+/// The object numbers of the references (`N G R`) at the start of `text`, one after another.
+fn references_in(text: &[u8]) -> Vec<u32> {
+    let all: Vec<&[u8]> = words(text).collect();
+    let mut out = Vec::new();
+    for chunk in all.chunks(3) {
+        if chunk.len() < 3 || chunk[2] != b"R" {
+            break;
+        }
+        let Some(n) = std::str::from_utf8(chunk[0])
+            .ok()
+            .and_then(|w| w.parse::<u32>().ok())
+        else {
+            break;
+        };
+        out.push(n);
+    }
+    out
+}
+
+/// The password the document was opened with, in a copy that is overwritten with zeros when it is
+/// let go of, like the one the engine keeps.
+fn password_of(engine: &Engine, doc: u32) -> Option<Secret> {
+    engine.passwords.get(&doc).map(|s| Secret(s.0.clone()))
+}
+
+fn password_str(password: &Option<Secret>) -> Option<&str> {
+    password.as_ref().map(|s| s.0.as_str())
 }
 
 /// The document written out as it is now (up to `limit` bytes), after making sure that the file it
@@ -704,10 +957,10 @@ fn put_back(
     doc: u32,
     bytes: Vec<u8>,
     pages: usize,
-    password: Option<String>,
+    password: Option<Secret>,
     original: Failure,
 ) -> Failure {
-    match load_copy(pdfium, bytes, password.as_deref(), pages) {
+    match load_copy(pdfium, bytes, password_str(&password), pages) {
         Ok(loaded) => {
             engine.docs.insert(doc, loaded);
             original
@@ -985,6 +1238,16 @@ fn reorder(
     let scramble = tools(engine, doc).scrambled();
     let password = password_of(engine, doc);
     let moved = stable.iter().filter(|s| !**s).count();
+    // PDFium's move stops the process on a page tree that lists something that is not there (a
+    // kid that is a null object after the last page that can be found, found by the fuzz target):
+    // the pages it can find are all sound, so the check of the list of pages did not see it. The
+    // document as PDFium writes it shows it, and such a document is not moved.
+    if !page_tree_is_sound(&bytes, count) {
+        return fail(
+            ErrorCode::PageChangeFailed,
+            "the list of pages of this document is damaged (it names something that is not there), so its pages cannot be moved",
+        );
+    }
     let before = page_sizes(engine.document(doc)?);
     let result = (|| {
         let document = engine.docs.get_mut(&doc).ok_or_else(gone)?;
@@ -1302,7 +1565,7 @@ fn restore(
     // the step can still be taken back, but not made again.
     let leaving = take_snapshot(engine, doc, progress)?;
     let password = password_of(engine, doc);
-    match load_copy(pdfium, target.bytes, password.as_deref(), target.pages) {
+    match load_copy(pdfium, target.bytes, password_str(&password), target.pages) {
         Ok(loaded) => {
             engine.docs.insert(doc, loaded);
             changed(engine, doc, leaving, 0)
@@ -1437,7 +1700,7 @@ fn import_end(
         // alive, the document is one that stands on its own. Dropping `source` before that left
         // the next save reading memory that was freed.
         let written = save::serialise(document)?;
-        load_copy(pdfium, written, password.as_deref(), count + added)
+        load_copy(pdfium, written, password_str(&password), count + added)
     })();
     match result {
         Ok(loaded) => {
