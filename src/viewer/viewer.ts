@@ -79,7 +79,13 @@ export interface ViewerOptions {
    * Lets the reader fill in the form of the document, if it has one. `record` is given every change,
    * for undo and redo and for the mark that the document has changes that are not saved.
    */
-  forms?: { api: FormsApi; record(edit: FormEdit): void; pending?(pending: boolean): void };
+  forms?: {
+    api: FormsApi;
+    record(edit: FormEdit): void;
+    pending?(pending: boolean): void;
+    /** The picture of a page is out of date after a change of a field (the side panel draws it again). */
+    redrawn?(page: number): void;
+  };
 }
 
 export interface DocumentInfo {
@@ -179,7 +185,10 @@ export class DocumentView {
     this.forms = options.forms
       ? new FormLayer(info.doc, info.pages, options.forms.api, this.element, {
           onEdit: (edit) => options.forms?.record(edit),
-          onRedraw: (page) => this.invalidatePage(page),
+          onRedraw: (page) => {
+            this.invalidatePage(page);
+            options.forms?.redrawn?.(page);
+          },
           onPending: (pending) => options.forms?.pending?.(pending),
         })
       : null;

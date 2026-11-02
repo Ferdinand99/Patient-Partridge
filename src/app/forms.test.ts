@@ -4,6 +4,7 @@
 import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenedDocument, SavedFile } from "../lib/api";
+import type { Annotation } from "../lib/annotations";
 import type { FormFieldInfo, FormInfo, FormValueIn } from "../viewer/forms";
 import { XFA_NOTICE } from "../viewer/forms";
 import { App } from "./app";
@@ -94,7 +95,7 @@ function textField(index: number, name: string, value = ""): FormFieldInfo {
   };
 }
 
-function make(options: { fields?: FormFieldInfo[]; info?: FormInfo; withForms?: boolean } = {}) {
+function make(options: { fields?: FormFieldInfo[]; info?: FormInfo; withForms?: boolean; withAnnotations?: boolean } = {}) {
   const state = structuredClone(options.fields ?? [textField(0, "name"), { ...textField(1, "agree"), kind: "checkbox" as const }]);
   const api = {
     open: vi.fn((path: string, _password?: string) =>
@@ -132,8 +133,31 @@ function make(options: { fields?: FormFieldInfo[]; info?: FormInfo; withForms?: 
       },
     ),
   };
+  let nextAnnotation = 50;
+  const annotation = (id: number): Annotation => ({
+    id,
+    kind: "ink",
+    can: { editText: false, recolour: false, move: false, remove: true, restore: true, locked: false },
+    rect: [10, 10, 40, 40],
+    color: [0, 0, 255, 255],
+    text: "",
+    author: "",
+  });
+  const annotationCalls = {
+    listAnnotations: vi.fn((_doc: number, _page: number) => Promise.resolve<Annotation[]>([])),
+    addMarkup: vi.fn(() => Promise.resolve(annotation(nextAnnotation++))),
+    addNote: vi.fn(() => Promise.resolve(annotation(nextAnnotation++))),
+    addInk: vi.fn(() => Promise.resolve(annotation(nextAnnotation++))),
+    addStamp: vi.fn(() => Promise.resolve(annotation(nextAnnotation++))),
+    updateAnnotation: vi.fn((_d: number, _p: number, id: number) => Promise.resolve(annotation(id))),
+    removeAnnotation: vi.fn(() => Promise.resolve()),
+    restoreAnnotation: vi.fn((_d: number, _p: number, id: number) => Promise.resolve(annotation(id))),
+  };
   const deps = {
-    api: options.withForms === false ? { ...api, formInfo: undefined, getFormFields: undefined, setFormField: undefined } : api,
+    api: {
+      ...(options.withForms === false ? { ...api, formInfo: undefined, getFormFields: undefined, setFormField: undefined } : api),
+      ...(options.withAnnotations ? annotationCalls : {}),
+    },
     pickFiles: vi.fn(() => Promise.resolve<string[]>([])),
     setWindowTitle: vi.fn(),
     now: vi.fn(() => 0),
@@ -145,7 +169,7 @@ function make(options: { fields?: FormFieldInfo[]; info?: FormInfo; withForms?: 
   };
   const app = new App(document, deps);
   app.init();
-  return { app, api, deps, state };
+  return { app, api, deps, state, annotationCalls };
 }
 
 const field = (index: number) => document.querySelector<HTMLElement>(`.form-field[data-form-index="${index}"]`) as HTMLElement;
@@ -172,6 +196,23 @@ describe("filling in a form in the window", () => {
     // The page is drawn again so that the new value shows.
     const drawn = api.render.mock.calls.filter((c) => c[1] === 0).length;
     expect(drawn).toBeGreaterThanOrEqual(2);
+  });
+
+  it("asks the side panel to draw the thumbnail of the page again after a change, and after Undo", async () => {
+    const { app } = make();
+    await app.openPath("/docs/form.pdf");
+    await flush();
+    const sidebar = (app as unknown as { sidebar: { pageChanged(doc: number, page: number): void } }).sidebar;
+    const changed = vi.spyOn(sidebar, "pageChanged");
+    const input = field(0) as HTMLInputElement;
+    input.value = "Ada";
+    change(input);
+    await flush();
+    expect(changed).toHaveBeenCalledWith(1, 0);
+    changed.mockClear();
+    keyOn(field(1), "z", { ctrlKey: true });
+    await flush();
+    expect(changed).toHaveBeenCalledWith(1, 0);
   });
 
   it("takes a change back with Ctrl+Z, makes it again with Ctrl+Y, also with a check box in focus", async () => {
@@ -382,5 +423,65 @@ describe("undo from a drop-down list", () => {
     keyOn(select, "z", { ctrlKey: true });
     await flush();
     expect(api.setFormField).toHaveBeenLastCalledWith(1, 0, 0, "country", { kind: "choice", picked: [0] });
+  });
+});
+
+describe("a form that is filled in and annotated", () => {
+  it("is saved with both kinds of change by one save, and Undo and Redo take them in the order they were made", async () => {
+    const { app, api, annotationCalls } = make({ withAnnotations: true });
+    await app.openPath("/docs/form.pdf");
+    await flush();
+    // A field first, then a drawing, then a check box.
+    const input = field(0) as HTMLInputElement;
+    input.value = "Ada";
+    change(input);
+    await flush();
+    const annotator = (app as unknown as { active: { annotator: { onStroke(page: number, points: [number, number][]): void; idle(): Promise<void> } } }).active
+      .annotator;
+    annotator.onStroke(0, [
+      [1, 1],
+      [30, 30],
+    ]);
+    await annotator.idle();
+    expect(annotationCalls.addInk).toHaveBeenCalledTimes(1);
+    const box = field(1);
+    box.focus();
+    box.click();
+    await flush();
+    expect(app.unsavedCount).toBe(1);
+
+    // One save writes the document with all three, and leaves nothing to save.
+    expect(await app.saveActive()).toBe(true);
+    expect(api.save).toHaveBeenCalledTimes(1);
+    expect(app.unsavedCount).toBe(0);
+    expect(api.setDirty).toHaveBeenLastCalledWith(1, false);
+
+    // Undo goes back over them, newest first, also after the save: the check box, the drawing, the
+    // field. Each makes the document differ from the saved file.
+    keyOn(document.body, "z", { ctrlKey: true });
+    await flush();
+    expect(api.setFormField).toHaveBeenLastCalledWith(1, 0, 1, "agree", { kind: "checked", on: false });
+    expect(app.unsavedCount).toBe(1);
+    keyOn(document.body, "z", { ctrlKey: true });
+    await flush();
+    expect(annotationCalls.removeAnnotation).toHaveBeenCalledTimes(1);
+    keyOn(document.body, "z", { ctrlKey: true });
+    await flush();
+    expect(api.setFormField).toHaveBeenLastCalledWith(1, 0, 0, "name", { kind: "text", text: "" });
+    // Redo puts them back in the order they were made.
+    keyOn(document.body, "y", { ctrlKey: true });
+    await flush();
+    expect(api.setFormField).toHaveBeenLastCalledWith(1, 0, 0, "name", { kind: "text", text: "Ada" });
+    keyOn(document.body, "y", { ctrlKey: true });
+    await flush();
+    expect(annotationCalls.restoreAnnotation).toHaveBeenCalledTimes(1);
+    keyOn(document.body, "y", { ctrlKey: true });
+    await flush();
+    expect(api.setFormField).toHaveBeenLastCalledWith(1, 0, 1, "agree", { kind: "checked", on: true });
+    // Back at the state of the save.
+    expect(app.unsavedCount).toBe(0);
+    expect(api.setDirty).toHaveBeenLastCalledWith(1, false);
+    // The form and the annotation boxes are both still on the page.
+    expect(document.querySelectorAll(".form-field")).toHaveLength(2);
   });
 });

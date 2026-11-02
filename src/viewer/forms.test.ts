@@ -623,7 +623,8 @@ describe("what the form bar says", () => {
     // Once, when the page is shown.
     expect(r.bar()).toBe(BLOCKED_NOTICE);
     expect(BLOCKED_NOTICE).toContain("cannot be filled in here");
-    expect(BLOCKED_NOTICE).toContain("clears or hides fields");
+    expect(BLOCKED_NOTICE).toContain("can clear or hide fields");
+    expect(BLOCKED_NOTICE).not.toContain("button");
     expect(BLOCKED_NOTICE).toContain("another PDF reader");
     // The field says it too.
     expect(r.control(0).title).toContain("Name - This field cannot be filled in here");
@@ -834,5 +835,70 @@ describe("the view of a document with a form", () => {
     view.start();
     await flush();
     expect(view.element.querySelector(".form-layer")).toBeNull();
+  });
+});
+
+describe("the view of a document with a form and annotations", () => {
+  const note = {
+    id: 4,
+    kind: "note" as const,
+    can: { editText: true, recolour: false, move: true, remove: true, restore: true, locked: false },
+    rect: [300, 300, 320, 320] as [number, number, number, number],
+    color: [255, 235, 59, 255] as [number, number, number, number],
+    text: "a note",
+    author: "",
+  };
+
+  function open(forms: ReturnType<typeof fake>["api"]) {
+    const render = vi.fn((_d: number, _p: number, w: number, h: number) => Promise.resolve(new ArrayBuffer(w * h * 4)));
+    const listAnnotations = vi.fn((_doc: number, _page: number) => Promise.resolve([note]));
+    const events = { onPageChange: vi.fn(), onZoomChange: vi.fn(), onFatal: vi.fn(), onFirstPaint: vi.fn() };
+    const recorded: FormEdit[] = [];
+    const view = new DocumentView({ doc: 7, pages: [letter] }, { render, listAnnotations }, events, {
+      forms: { api: forms, record: (e) => recorded.push(e) },
+    });
+    document.body.append(view.element);
+    view.start();
+    return { view, render, listAnnotations, recorded };
+  }
+
+  const layers = (view: DocumentView) =>
+    [...(view.element.querySelector(".viewer-page")?.children ?? [])].map((el) => el.className);
+
+  it("puts the fields under the boxes of the annotations and keeps both on the page through a redraw", async () => {
+    const { api } = fake([[field({ index: 0, name: "a" })]]);
+    const { view, render, listAnnotations } = open(api);
+    await flush();
+    expect(view.element.querySelectorAll(".form-field")).toHaveLength(1);
+    expect(view.element.querySelectorAll(".annot")).toHaveLength(1);
+    // The form is mounted first, so the annotation layer lies over it.
+    const order = layers(view);
+    expect(order.indexOf("form-layer")).toBeGreaterThan(-1);
+    expect(order.indexOf("annot-layer")).toBeGreaterThan(order.indexOf("form-layer"));
+    expect(render).toHaveBeenCalledTimes(1);
+    expect(listAnnotations).toHaveBeenCalledTimes(1);
+    const input = view.element.querySelector<HTMLInputElement>(".form-field") as HTMLInputElement;
+
+    // An annotation changed the page: it is drawn again, the annotations are listed again, and
+    // the field and the box are both still there afterwards.
+    view.invalidatePage(0);
+    await flush();
+    expect(render).toHaveBeenCalledTimes(2);
+    expect(listAnnotations).toHaveBeenCalledTimes(2);
+    expect(view.element.querySelectorAll(".form-field")).toHaveLength(1);
+    expect(view.element.querySelectorAll(".annot")).toHaveLength(1);
+    expect(layers(view)).toEqual(order);
+
+    // A field changed after that: the page is drawn again once more, and the box is still there.
+    input.value = "typed";
+    change(input);
+    await flush();
+    expect(render.mock.calls.length).toBeGreaterThanOrEqual(3);
+    expect(view.element.querySelectorAll(".annot")).toHaveLength(1);
+    expect(view.element.querySelectorAll(".form-field")).toHaveLength(1);
+    expect((view.element.querySelector(".form-field") as HTMLInputElement).value).toBe("typed");
+    view.destroy();
+    expect(document.querySelector(".form-layer")).toBeNull();
+    expect(document.querySelector(".annot-layer")).toBeNull();
   });
 });

@@ -108,7 +108,7 @@ export const ACTIONS_NOTICE =
 
 /** What the form bar says about fields that are left alone for the action they carry. */
 export const BLOCKED_NOTICE =
-  "Some fields in this form cannot be filled in here. The form has a button that clears or hides fields, and these fields have actions or scripts of their own that Patient Partridge does not run and cannot check. It leaves them as they are, so that nothing you have typed gets cleared. To fill them in, use another PDF reader.";
+  "Some fields in this form cannot be filled in here. This form can clear or hide fields, and Patient Partridge cannot check whether these fields would do that: they have actions or scripts of their own, or the fields above them do, and Patient Partridge does not run those. It leaves them as they are, so that nothing you have typed gets cleared. To fill them in, use another PDF reader.";
 
 /** What the form bar says when the form of a document cannot be read. */
 export const UNREADABLE_NOTICE = "The form of this document could not be read, so it cannot be filled in here.";

@@ -810,6 +810,7 @@ export class App {
       api: forms,
       record: (edit) => this.recordFormEdit(tab, edit),
       pending: () => this.historyChanged(tab),
+      redrawn: (page) => this.sidebar.pageChanged(tab.doc, page),
     };
   }
 

@@ -10,6 +10,7 @@ use partridge_engine_client::{field_flag, FormField, FormFieldKind, FormKind, Fo
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
+use crate::updates::{self, UpdateState};
 use crate::{blocking, round2, CommandError, Engine};
 
 /// What kind of form a document has, and whether it has actions that never run.
@@ -139,16 +140,23 @@ pub async fn get_form_fields(
     Ok(fields.into_iter().map(field_out).collect())
 }
 
-/// Sets one field and returns the fields of the page as they are then.
+/// Sets one field and returns the fields of the page as they are then. Like every change to a
+/// document it holds a permit of the update gate while it runs, so that an install cannot stop the
+/// engine in the middle of a change.
 #[tauri::command]
 pub async fn set_form_field(
     engine: State<'_, Engine>,
+    update_state: State<'_, UpdateState>,
     doc: u64,
     page: u32,
     index: u32,
     name: String,
     value: ValueIn,
 ) -> Result<Vec<FieldOut>, CommandError> {
+    let _permit = update_state
+        .gate()
+        .enter()
+        .map_err(|_| updates::updating_error())?;
     let pool = engine.0.clone();
     let value = match value {
         ValueIn::Text { text } => FormValue::Text(text),
