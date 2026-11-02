@@ -34,7 +34,11 @@ fn a_highlight_is_written_with_an_appearance_and_read_back() {
         },
     ));
     assert_eq!(item.kind, AnnotKind::Highlight);
-    assert!(close(item.rect, b, 2.0), "{:?} should match {b:?}", item.rect);
+    assert!(
+        close(item.rect, b, 2.0),
+        "{:?} should match {b:?}",
+        item.rect
+    );
     assert!(item.abilities & ability::REMOVE != 0);
     assert!(item.abilities & ability::EDIT_TEXT != 0);
 
@@ -141,7 +145,11 @@ fn a_note_keeps_its_text_and_its_place() {
     ));
     assert_eq!(item.kind, AnnotKind::Note);
     assert_eq!(item.text, text);
-    assert!(close(item.rect, [100.0, 150.0, 120.0, 170.0], 1.0), "{:?}", item.rect);
+    assert!(
+        close(item.rect, [100.0, 150.0, 120.0, 170.0], 1.0),
+        "{:?}",
+        item.rect
+    );
     assert!(item.abilities & ability::MOVE != 0);
     assert!(list(e, doc, 0).is_empty(), "the note is on the other page");
 
@@ -155,7 +163,10 @@ fn a_note_keeps_its_text_and_its_place() {
     let objects = appearance_objects(e, again, 1, PdfPageAnnotationType::Text);
     assert!(objects[0] > 0, "the note has no appearance stream");
     let shot = Shot::take(e, again, 1, 612, 792);
-    assert!(shot.inked([100.0, 150.0, 120.0, 170.0]) > 40, "no note icon");
+    assert!(
+        shot.inked([100.0, 150.0, 120.0, 170.0]) > 40,
+        "no note icon"
+    );
 }
 
 #[test]
@@ -172,14 +183,27 @@ fn a_drawing_is_written_as_an_ink_annotation_with_an_appearance() {
             color: blue,
             width: 4.0,
             strokes: vec![
-                vec![[100.0, 600.0], [150.0, 620.0], [200.0, 600.0], [250.0, 640.0]],
+                vec![
+                    [100.0, 600.0],
+                    [150.0, 620.0],
+                    [200.0, 600.0],
+                    [250.0, 640.0],
+                ],
                 vec![[100.0, 700.0]],
             ],
         },
     ));
     assert_eq!(item.kind, AnnotKind::Ink);
-    assert!(item.rect[0] <= 98.0 && item.rect[2] >= 252.0, "{:?}", item.rect);
-    assert!(item.rect[1] <= 598.0 && item.rect[3] >= 702.0, "{:?}", item.rect);
+    assert!(
+        item.rect[0] <= 98.0 && item.rect[2] >= 252.0,
+        "{:?}",
+        item.rect
+    );
+    assert!(
+        item.rect[1] <= 598.0 && item.rect[3] >= 702.0,
+        "{:?}",
+        item.rect
+    );
     let shot = Shot::take(e, doc, 0, 612, 792);
     assert!(shot.near([100.0, 600.0, 250.0, 640.0], [0, 0, 255], 40) > 100);
     // The single point is a dot.
@@ -223,9 +247,17 @@ fn every_stamp_is_drawn_and_written() {
     let again = open(e, &saved, None).unwrap();
     let read_back = Shot::take(e, again, 0, 612, 792);
     for (i, _) in StampKind::ALL.iter().enumerate() {
-        let b = [40.0, 20.0 + i as f32 * 60.0, 240.0, 20.0 + i as f32 * 60.0 + 44.0];
+        let b = [
+            40.0,
+            20.0 + i as f32 * 60.0,
+            240.0,
+            20.0 + i as f32 * 60.0 + 44.0,
+        ];
         assert!(shot.inked(b) > 200, "stamp {i} is not drawn");
-        assert!(read_back.inked(b) > 200, "stamp {i} is not drawn after a save");
+        assert!(
+            read_back.inked(b) > 200,
+            "stamp {i} is not drawn after a save"
+        );
     }
     let objects = appearance_objects(e, again, 0, PdfPageAnnotationType::Stamp);
     assert_eq!(objects.len(), 6);
@@ -264,7 +296,10 @@ fn a_drawing_has_a_list_of_strokes_as_other_readers_expect() {
             page: 0,
             color: [0, 0, 255, 255],
             width: 3.0,
-            strokes: vec![vec![[100.0, 100.0], [150.0, 120.0]], vec![[200.0, 100.0], [250.0, 130.0], [300.0, 100.0]]],
+            strokes: vec![
+                vec![[100.0, 100.0], [150.0, 120.0]],
+                vec![[200.0, 100.0], [250.0, 130.0], [300.0, 100.0]],
+            ],
         },
     ));
     let saved = save_all(e, doc);

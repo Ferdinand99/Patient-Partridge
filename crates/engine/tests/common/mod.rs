@@ -6,10 +6,7 @@ use std::fs::File;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use partridge_engine::Engine;
-use partridge_protocol::{
-    ability, AnnotInfo, AnnotKind, ErrorCode, Request, RequestBody, ResponseBody, StampKind,
-    MAX_ANNOTS_PER_PAGE, MAX_ANNOT_AUTHOR, MAX_ANNOT_TEXT,
-};
+use partridge_protocol::{AnnotInfo, ErrorCode, Request, RequestBody, ResponseBody};
 use partridge_testkit as kit;
 use pdfium_render::prelude::*;
 
@@ -213,7 +210,9 @@ impl Shot {
 }
 
 pub fn close(a: [f32; 4], b: [f32; 4], tolerance: f32) -> bool {
-    a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() <= tolerance)
+    a.iter()
+        .zip(b.iter())
+        .all(|(x, y)| (x - y).abs() <= tolerance)
 }
 
 /// Looks at the annotations of a page the way another program would: through PDFium, with the
@@ -244,4 +243,3 @@ pub fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 pub const YELLOW: [u8; 4] = [255, 235, 59, 255];
-

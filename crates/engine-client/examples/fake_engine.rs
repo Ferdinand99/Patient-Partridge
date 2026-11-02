@@ -314,7 +314,13 @@ fn main() {
                 } else {
                     kind
                 };
-                reply(&mut output, id, ResponseBody::Annot { item: made_up(2, kind, "") });
+                reply(
+                    &mut output,
+                    id,
+                    ResponseBody::Annot {
+                        item: made_up(2, kind, ""),
+                    },
+                );
             }
             RequestBody::AddNote { text, .. } => {
                 let kind = if mode == "annot-wrong-kind" {
@@ -322,7 +328,13 @@ fn main() {
                 } else {
                     AnnotKind::Note
                 };
-                reply(&mut output, id, ResponseBody::Annot { item: made_up(3, kind, &text) });
+                reply(
+                    &mut output,
+                    id,
+                    ResponseBody::Annot {
+                        item: made_up(3, kind, &text),
+                    },
+                );
             }
             RequestBody::AddInk { .. } => {
                 let kind = if mode == "annot-wrong-kind" {
@@ -330,7 +342,13 @@ fn main() {
                 } else {
                     AnnotKind::Ink
                 };
-                reply(&mut output, id, ResponseBody::Annot { item: made_up(4, kind, "") });
+                reply(
+                    &mut output,
+                    id,
+                    ResponseBody::Annot {
+                        item: made_up(4, kind, ""),
+                    },
+                );
             }
             RequestBody::AddStamp { .. } => {
                 let kind = if mode == "annot-wrong-kind" {
@@ -338,10 +356,22 @@ fn main() {
                 } else {
                     AnnotKind::Stamp
                 };
-                reply(&mut output, id, ResponseBody::Annot { item: made_up(5, kind, "") });
+                reply(
+                    &mut output,
+                    id,
+                    ResponseBody::Annot {
+                        item: made_up(5, kind, ""),
+                    },
+                );
             }
-            RequestBody::UpdateAnnot { id: annot, text, .. } => {
-                let annot = if mode == "annot-wrong-id" { annot + 1 } else { annot };
+            RequestBody::UpdateAnnot {
+                id: annot, text, ..
+            } => {
+                let annot = if mode == "annot-wrong-id" {
+                    annot + 1
+                } else {
+                    annot
+                };
                 reply(
                     &mut output,
                     id,
@@ -352,7 +382,11 @@ fn main() {
             }
             RequestBody::RemoveAnnot { .. } => reply(&mut output, id, ResponseBody::AnnotRemoved),
             RequestBody::RestoreAnnot { id: annot, .. } => {
-                let annot = if mode == "annot-wrong-id" { annot + 1 } else { annot };
+                let annot = if mode == "annot-wrong-id" {
+                    annot + 1
+                } else {
+                    annot
+                };
                 reply(
                     &mut output,
                     id,

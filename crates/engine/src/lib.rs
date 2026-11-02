@@ -22,9 +22,9 @@ use partridge_protocol::{
 use pdfium_render::prelude::*;
 use source::{GuardedReader, SourceFile, SourceGuard};
 
+pub mod annots;
 #[cfg(unix)]
 pub mod fds;
-pub mod annots;
 pub mod fonts;
 pub mod limits;
 pub mod sandbox;

@@ -98,6 +98,7 @@ pub async fn list_annotations(
 
 /// Marks the characters `start..end` of the page text.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn add_markup(
     engine: State<'_, Engine>,
     update_state: State<'_, UpdateState>,
@@ -120,6 +121,7 @@ pub async fn add_markup(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn add_note(
     engine: State<'_, Engine>,
     update_state: State<'_, UpdateState>,
@@ -181,6 +183,7 @@ pub async fn add_stamp(
 /// Changes the text, the colour or the place of an annotation. `dx` and `dy` are in points on the
 /// page as it is drawn.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn update_annotation(
     engine: State<'_, Engine>,
     update_state: State<'_, UpdateState>,
@@ -197,8 +200,8 @@ pub async fn update_annotation(
         .enter()
         .map_err(|_| updates::updating_error())?;
     let pool = engine.0.clone();
-    let item = blocking(move || pool.update_annot(doc, page, id, text.as_deref(), color, dx, dy))
-        .await?;
+    let item =
+        blocking(move || pool.update_annot(doc, page, id, text.as_deref(), color, dx, dy)).await?;
     Ok(item.into())
 }
 
@@ -245,7 +248,15 @@ mod tests {
         assert_eq!(markup_kind("highlight").unwrap(), AnnotKind::Highlight);
         assert_eq!(markup_kind("underline").unwrap(), AnnotKind::Underline);
         assert_eq!(markup_kind("strikeout").unwrap(), AnnotKind::Strikeout);
-        for name in ["note", "ink", "stamp", "other", "", "Highlight", "highlight "] {
+        for name in [
+            "note",
+            "ink",
+            "stamp",
+            "other",
+            "",
+            "Highlight",
+            "highlight ",
+        ] {
             assert!(markup_kind(name).is_err(), "{name:?}");
         }
         for stamp in StampKind::ALL {

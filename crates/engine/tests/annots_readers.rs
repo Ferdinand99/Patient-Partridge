@@ -83,7 +83,11 @@ fn everything() -> Vec<u8> {
                 doc,
                 page: 0,
                 kind,
-                color: if kind == AnnotKind::Highlight { YELLOW } else { [200, 0, 0, 255] },
+                color: if kind == AnnotKind::Highlight {
+                    YELLOW
+                } else {
+                    [200, 0, 0, 255]
+                },
                 start,
                 end: start + len,
             },
@@ -189,7 +193,10 @@ fn qpdf_accepts_the_files_and_shows_real_annotations_with_appearances() {
         args.push(path);
         let (ok, output) = run("qpdf", &args);
         assert!(ok, "qpdf --check {name} failed:\n{output}");
-        assert!(output.contains("No syntax or stream encoding errors"), "{name}: {output}");
+        assert!(
+            output.contains("No syntax or stream encoding errors"),
+            "{name}: {output}"
+        );
     }
     // Look inside the first one: unpacked, every annotation of ours is there with its stream.
     let path = dir.write("all.pdf", &everything());
@@ -205,15 +212,28 @@ fn qpdf_accepts_the_files_and_shows_real_annotations_with_appearances() {
     );
     assert!(ok, "{output}");
     let unpacked = String::from_utf8_lossy(&std::fs::read(&qdf).unwrap()).into_owned();
-    for subtype in ["/Highlight", "/Underline", "/StrikeOut", "/Text", "/Ink", "/Stamp"] {
+    for subtype in [
+        "/Highlight",
+        "/Underline",
+        "/StrikeOut",
+        "/Text",
+        "/Ink",
+        "/Stamp",
+    ] {
         assert!(
             unpacked.contains(&format!("/Subtype {subtype}")),
             "no {subtype} annotation in the file"
         );
     }
-    assert!(unpacked.matches("/AP <<").count() >= 6, "fewer than six appearance dictionaries");
+    assert!(
+        unpacked.matches("/AP <<").count() >= 6,
+        "fewer than six appearance dictionaries"
+    );
     assert!(unpacked.contains("/QuadPoints"));
-    assert!(unpacked.contains("/InkList"), "the drawing has no list of strokes");
+    assert!(
+        unpacked.contains("/InkList"),
+        "the drawing has no list of strokes"
+    );
     assert!(unpacked.contains("/Rect"));
 }
 
@@ -255,7 +275,14 @@ fn protected_with_note() -> Vec<u8> {
     let doc = open(e, &kit::encrypted_pdf("secret", 1), Some("secret")).unwrap();
     annot(ask(
         e,
-        RequestBody::AddNote { doc, page: 0, x: 60.0, y: 60.0, color: YELLOW, text: "n".into() },
+        RequestBody::AddNote {
+            doc,
+            page: 0,
+            x: 60.0,
+            y: 60.0,
+            color: YELLOW,
+            text: "n".into(),
+        },
     ));
     save_all(e, doc)
 }

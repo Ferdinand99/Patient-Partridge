@@ -13,7 +13,13 @@ use pdfium_render::prelude::*;
 
 const GREEN: [u8; 4] = [0, 200, 0, 255];
 
-fn highlight(e: &mut partridge_engine::Engine, doc: u32, page: u32, start: u32, end: u32) -> ResponseBody {
+fn highlight(
+    e: &mut partridge_engine::Engine,
+    doc: u32,
+    page: u32,
+    start: u32,
+    end: u32,
+) -> ResponseBody {
     ask(
         e,
         RequestBody::AddMarkup {
@@ -60,7 +66,11 @@ fn markup_lands_on_the_text_of_every_kind_of_page_before_and_after_a_save() {
         );
         let items = list(e, again, page);
         assert_eq!(items.len(), 1, "page {page}");
-        assert!(close(items[0].rect, b, 2.5), "page {page}: {:?} vs {b:?}", items[0].rect);
+        assert!(
+            close(items[0].rect, b, 2.5),
+            "page {page}: {:?} vs {b:?}",
+            items[0].rect
+        );
     }
 }
 
@@ -80,7 +90,10 @@ fn a_drawing_lands_where_it_was_drawn_on_every_kind_of_page() {
                 page,
                 color: red,
                 width: 3.0,
-                strokes: vec![vec![[60.0, 300.0], [200.0, 300.0]], vec![[300.0, 250.0], [300.0, 330.0]]],
+                strokes: vec![
+                    vec![[60.0, 300.0], [200.0, 300.0]],
+                    vec![[300.0, 250.0], [300.0, 330.0]],
+                ],
             },
         ));
     }
@@ -91,14 +104,27 @@ fn a_drawing_lands_where_it_was_drawn_on_every_kind_of_page() {
         let shot = Shot::take(e, again, page, w, h);
         let horizontal = shot.near([60.0, 298.0, 200.0, 302.0], [200, 0, 0], 50);
         let vertical = shot.near([298.0, 250.0, 302.0, 330.0], [200, 0, 0], 50);
-        assert!(horizontal > 220, "page {page}: horizontal stroke is {horizontal} pixels");
-        assert!(vertical > 140, "page {page}: vertical stroke is {vertical} pixels");
+        assert!(
+            horizontal > 220,
+            "page {page}: horizontal stroke is {horizontal} pixels"
+        );
+        assert!(
+            vertical > 140,
+            "page {page}: vertical stroke is {vertical} pixels"
+        );
         // It is where it was drawn and nowhere else: the corners are empty.
-        assert_eq!(shot.near([0.0, 0.0, 30.0, 30.0], [200, 0, 0], 50), 0, "page {page}");
+        assert_eq!(
+            shot.near([0.0, 0.0, 30.0, 30.0], [200, 0, 0], 50),
+            0,
+            "page {page}"
+        );
         let items = list(e, again, page);
         assert_eq!(items.len(), 1);
         let r = items[0].rect;
-        assert!(r[0] <= 60.0 && r[2] >= 300.0 && r[1] <= 250.0 && r[3] >= 330.0, "page {page}: {r:?}");
+        assert!(
+            r[0] <= 60.0 && r[2] >= 300.0 && r[1] <= 250.0 && r[3] >= 330.0,
+            "page {page}: {r:?}"
+        );
     }
 }
 
@@ -123,7 +149,11 @@ fn notes_and_stamps_keep_their_place_on_every_kind_of_page() {
                 text: format!("note {page}"),
             },
         ));
-        assert!(close(note.rect, [120.0, 200.0, 140.0, 220.0], 1.5), "page {page}: {:?}", note.rect);
+        assert!(
+            close(note.rect, [120.0, 200.0, 140.0, 220.0], 1.5),
+            "page {page}: {:?}",
+            note.rect
+        );
         let stamp = annot(ask(
             e,
             RequestBody::AddStamp {
@@ -140,7 +170,11 @@ fn notes_and_stamps_keep_their_place_on_every_kind_of_page() {
             stamp.rect
         );
         // The stamp is wider than tall on the page as it is seen, whatever the turn of the page.
-        assert!(stamp.rect[2] - stamp.rect[0] > 2.0 * (stamp.rect[3] - stamp.rect[1]), "page {page}: {:?}", stamp.rect);
+        assert!(
+            stamp.rect[2] - stamp.rect[0] > 2.0 * (stamp.rect[3] - stamp.rect[1]),
+            "page {page}: {:?}",
+            stamp.rect
+        );
     }
     let saved = save_all(e, doc);
     let (again, sizes) = open_sized(e, &saved, None).unwrap();
@@ -170,8 +204,14 @@ fn notes_and_stamps_keep_their_place_on_every_kind_of_page() {
                 }
             }
         }
-        assert!(changed > 300, "page {page}: the stamp and the note are not drawn ({changed})");
-        assert_eq!(outside, 0, "page {page}: something changed outside the two boxes");
+        assert!(
+            changed > 300,
+            "page {page}: the stamp and the note are not drawn ({changed})"
+        );
+        assert_eq!(
+            outside, 0,
+            "page {page}: something changed outside the two boxes"
+        );
     }
 }
 
@@ -192,10 +232,20 @@ fn a_selection_of_right_to_left_text_is_one_box_over_exactly_the_letters() {
     let first_line = text_box(e, doc, 0, 0, 10);
     let all = annot(highlight(e, doc, 0, 0, 10));
     assert!(close(all.rect, first_line, 2.0));
-    assert!(first_line[2] - first_line[0] > 80.0, "ten letters are wide: {first_line:?}");
-    let second_line_start = text.chars().position(|c| c == '\n').map(|n| n + 1).unwrap_or(11) as u32;
+    assert!(
+        first_line[2] - first_line[0] > 80.0,
+        "ten letters are wide: {first_line:?}"
+    );
+    let second_line_start = text
+        .chars()
+        .position(|c| c == '\n')
+        .map(|n| n + 1)
+        .unwrap_or(11) as u32;
     let two = annot(highlight(e, doc, 0, 0, second_line_start + 5));
-    assert!(two.rect[3] > first_line[3] + 10.0, "the second line is covered too");
+    assert!(
+        two.rect[3] > first_line[3] + 10.0,
+        "the second line is covered too"
+    );
     let _ = rects;
 
     // In the saved file the first two are one quadrilateral each, the third two.
@@ -231,6 +281,7 @@ fn a_selection_of_right_to_left_text_is_one_box_over_exactly_the_letters() {
 
 // ---- changing -----------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn update(
     e: &mut partridge_engine::Engine,
     doc: u32,
@@ -272,7 +323,16 @@ fn a_note_can_get_new_text_and_move_and_the_changes_are_saved() {
             text: "first".into(),
         },
     ));
-    let changed = annot(update(e, doc, 1, note.id, Some("second \u{2713}"), None, 30.0, 40.0));
+    let changed = annot(update(
+        e,
+        doc,
+        1,
+        note.id,
+        Some("second \u{2713}"),
+        None,
+        30.0,
+        40.0,
+    ));
     assert_eq!(changed.id, note.id);
     assert_eq!(changed.text, "second \u{2713}");
     assert!(
@@ -313,12 +373,27 @@ fn a_changed_colour_is_drawn_and_the_annotation_keeps_its_id() {
     assert_eq!(green.id, item.id);
     assert_eq!(&green.color[..3], &GREEN[..3]);
     let shot = Shot::take(e, doc, 0, 612, 792);
-    assert!(shot.near(b, [0, 200, 0], 60) > 30, "the new colour is not drawn");
-    assert_eq!(shot.near(b, [255, 235, 59], 20), 0, "the old colour is still drawn");
+    assert!(
+        shot.near(b, [0, 200, 0], 60) > 30,
+        "the new colour is not drawn"
+    );
+    assert_eq!(
+        shot.near(b, [255, 235, 59], 20),
+        0,
+        "the old colour is still drawn"
+    );
     // Still the only highlight, and the other annotation was not touched.
     let items = list(e, doc, 0);
-    assert_eq!(items.iter().filter(|i| i.kind == AnnotKind::Highlight).count(), 1);
-    assert!(items.iter().any(|i| i.id == other.id && i.text == "bystander"));
+    assert_eq!(
+        items
+            .iter()
+            .filter(|i| i.kind == AnnotKind::Highlight)
+            .count(),
+        1
+    );
+    assert!(items
+        .iter()
+        .any(|i| i.id == other.id && i.text == "bystander"));
     let saved = save_all(e, doc);
     let again = open(e, &saved, None).unwrap();
     let shot = Shot::take(e, again, 0, 612, 792);
@@ -332,15 +407,34 @@ fn changes_an_annotation_does_not_allow_are_refused() {
     let doc = open(e, &kit::simple_pdf(1), None).unwrap();
     let stamp = annot(ask(
         e,
-        RequestBody::AddStamp { doc, page: 0, x: 50.0, y: 50.0, stamp: StampKind::Draft },
+        RequestBody::AddStamp {
+            doc,
+            page: 0,
+            x: 50.0,
+            y: 50.0,
+            stamp: StampKind::Draft,
+        },
     ));
     let note = annot(ask(
         e,
-        RequestBody::AddNote { doc, page: 0, x: 300.0, y: 50.0, color: YELLOW, text: "n".into() },
+        RequestBody::AddNote {
+            doc,
+            page: 0,
+            x: 300.0,
+            y: 50.0,
+            color: YELLOW,
+            text: "n".into(),
+        },
     ));
     let ink = annot(ask(
         e,
-        RequestBody::AddInk { doc, page: 0, color: YELLOW, width: 2.0, strokes: vec![vec![[10.0, 10.0], [20.0, 20.0]]] },
+        RequestBody::AddInk {
+            doc,
+            page: 0,
+            color: YELLOW,
+            width: 2.0,
+            strokes: vec![vec![[10.0, 10.0], [20.0, 20.0]]],
+        },
     ));
     for (id, text, color, dx) in [
         (stamp.id, Some("x"), None, 0.0),
@@ -359,7 +453,10 @@ fn changes_an_annotation_does_not_allow_are_refused() {
     // Nothing changed.
     let items = list(e, doc, 0);
     assert_eq!(items.len(), 3);
-    assert_eq!(items.iter().find(|i| i.id == note.id).unwrap().rect, note.rect);
+    assert_eq!(
+        items.iter().find(|i| i.id == note.id).unwrap().rect,
+        note.rect
+    );
 }
 
 // ---- removing and putting back ---------------------------------------------------------
@@ -374,10 +471,24 @@ fn removing_and_putting_back_keep_the_id_and_the_drawing() {
     let item = annot(highlight(e, doc, 0, start, start + len));
     let other = annot(ask(
         e,
-        RequestBody::AddNote { doc, page: 0, x: 400.0, y: 300.0, color: YELLOW, text: "stays".into() },
+        RequestBody::AddNote {
+            doc,
+            page: 0,
+            x: 400.0,
+            y: 300.0,
+            color: YELLOW,
+            text: "stays".into(),
+        },
     ));
     assert!(matches!(
-        ask(e, RequestBody::RemoveAnnot { doc, page: 0, id: item.id }),
+        ask(
+            e,
+            RequestBody::RemoveAnnot {
+                doc,
+                page: 0,
+                id: item.id
+            }
+        ),
         ResponseBody::AnnotRemoved
     ));
     let items = list(e, doc, 0);
@@ -385,28 +496,62 @@ fn removing_and_putting_back_keep_the_id_and_the_drawing() {
     // The other annotation kept its id although it moved up in the page's list.
     assert!(items.iter().any(|i| i.id == other.id && i.text == "stays"));
     let shot = Shot::take(e, doc, 0, 612, 792);
-    assert_eq!(shot.near(b, [255, 235, 59], 40), 0, "the highlight is still drawn");
+    assert_eq!(
+        shot.near(b, [255, 235, 59], 40),
+        0,
+        "the highlight is still drawn"
+    );
     // Gone from the file too: the second remove says so.
     assert_eq!(
-        error_code(ask(e, RequestBody::RemoveAnnot { doc, page: 0, id: item.id })),
+        error_code(ask(
+            e,
+            RequestBody::RemoveAnnot {
+                doc,
+                page: 0,
+                id: item.id
+            }
+        )),
         ErrorCode::NoSuchAnnotation
     );
 
-    let back = annot(ask(e, RequestBody::RestoreAnnot { doc, page: 0, id: item.id }));
+    let back = annot(ask(
+        e,
+        RequestBody::RestoreAnnot {
+            doc,
+            page: 0,
+            id: item.id,
+        },
+    ));
     assert_eq!(back.id, item.id);
     assert!(close(back.rect, item.rect, 0.5));
     assert_eq!(&back.color[..3], &YELLOW[..3]);
     let shot = Shot::take(e, doc, 0, 612, 792);
-    assert!(shot.near(b, [255, 235, 59], 40) > 50, "the highlight is not back");
+    assert!(
+        shot.near(b, [255, 235, 59], 40) > 50,
+        "the highlight is not back"
+    );
     // A snapshot is used once.
     assert_eq!(
-        error_code(ask(e, RequestBody::RestoreAnnot { doc, page: 0, id: item.id })),
+        error_code(ask(
+            e,
+            RequestBody::RestoreAnnot {
+                doc,
+                page: 0,
+                id: item.id
+            }
+        )),
         ErrorCode::AnnotationRefused
     );
     // And the whole of it survives a save.
     let saved = save_all(e, doc);
     let again = open(e, &saved, None).unwrap();
-    assert_eq!(list(e, again, 0).iter().filter(|i| i.kind == AnnotKind::Highlight).count(), 1);
+    assert_eq!(
+        list(e, again, 0)
+            .iter()
+            .filter(|i| i.kind == AnnotKind::Highlight)
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -427,12 +572,25 @@ fn drawings_and_stamps_come_back_as_they_were() {
     ));
     let stamp = annot(ask(
         e,
-        RequestBody::AddStamp { doc, page: 0, x: 200.0, y: 400.0, stamp: StampKind::Final },
+        RequestBody::AddStamp {
+            doc,
+            page: 0,
+            x: 200.0,
+            y: 400.0,
+            stamp: StampKind::Final,
+        },
     ));
     let before = Shot::take(e, doc, 0, 612, 792);
     for item in [&ink, &stamp] {
         assert!(item.abilities & ability::RESTORE != 0);
-        ask(e, RequestBody::RemoveAnnot { doc, page: 0, id: item.id });
+        ask(
+            e,
+            RequestBody::RemoveAnnot {
+                doc,
+                page: 0,
+                id: item.id,
+            },
+        );
     }
     let gone = Shot::take(e, doc, 0, 612, 792);
     assert_eq!(gone.near([90.0, 90.0, 310.0, 230.0], [0, 0, 255], 40), 0);
@@ -442,12 +600,27 @@ fn drawings_and_stamps_come_back_as_they_were() {
         "the page does not look as it did before the drawing and the stamp"
     );
     for item in [&ink, &stamp] {
-        let back = annot(ask(e, RequestBody::RestoreAnnot { doc, page: 0, id: item.id }));
+        let back = annot(ask(
+            e,
+            RequestBody::RestoreAnnot {
+                doc,
+                page: 0,
+                id: item.id,
+            },
+        ));
         assert_eq!(back.id, item.id);
-        assert!(close(back.rect, item.rect, 0.5), "{:?} vs {:?}", back.rect, item.rect);
+        assert!(
+            close(back.rect, item.rect, 0.5),
+            "{:?} vs {:?}",
+            back.rect,
+            item.rect
+        );
     }
     let after = Shot::take(e, doc, 0, 612, 792);
-    assert_eq!(before.rgba, after.rgba, "the page does not look the same after remove and restore");
+    assert_eq!(
+        before.rgba, after.rgba,
+        "the page does not look the same after remove and restore"
+    );
 }
 
 #[test]
@@ -457,9 +630,23 @@ fn removed_text_is_not_left_in_the_saved_file() {
     let doc = open(e, &kit::simple_pdf(1), None).unwrap();
     let note = annot(ask(
         e,
-        RequestBody::AddNote { doc, page: 0, x: 50.0, y: 50.0, color: YELLOW, text: "ZZUNIQUEMARKERZZ".into() },
+        RequestBody::AddNote {
+            doc,
+            page: 0,
+            x: 50.0,
+            y: 50.0,
+            color: YELLOW,
+            text: "ZZUNIQUEMARKERZZ".into(),
+        },
     ));
-    ask(e, RequestBody::RemoveAnnot { doc, page: 0, id: note.id });
+    ask(
+        e,
+        RequestBody::RemoveAnnot {
+            doc,
+            page: 0,
+            id: note.id,
+        },
+    );
     let saved = save_all(e, doc);
     assert!(
         !contains(&saved, b"ZZUNIQUEMARKERZZ"),
@@ -490,38 +677,76 @@ fn annotations_a_file_already_has_are_listed_changed_and_removed() {
     let [h, n, ink, stamp, free] = [&items[0], &items[1], &items[2], &items[3], &items[4]];
     assert_eq!(h.text, "Check this title");
     assert_eq!(h.author, "Alice");
-    assert!(h.color[0] > 200 && h.color[1] < 60 && h.color[2] < 60, "{:?}", h.color);
+    assert!(
+        h.color[0] > 200 && h.color[1] < 60 && h.color[2] < 60,
+        "{:?}",
+        h.color
+    );
     assert_eq!(n.text, "A note from the file \u{2713}");
     assert_eq!(n.author, "Bob");
     assert_eq!(free.text, "A text box");
-    assert!(close(n.rect, [300.0, 72.0, 320.0, 92.0], 1.5), "{:?}", n.rect);
+    assert!(
+        close(n.rect, [300.0, 72.0, 320.0, 92.0], 1.5),
+        "{:?}",
+        n.rect
+    );
     // What can be done with each.
     assert!(h.abilities & ability::RESTORE != 0);
-    assert!(ink.abilities & ability::RESTORE == 0, "a drawing from a file cannot be put back");
+    assert!(
+        ink.abilities & ability::RESTORE == 0,
+        "a drawing from a file cannot be put back"
+    );
     assert!(stamp.abilities & ability::RESTORE == 0);
     assert_eq!(free.abilities, ability::REMOVE);
     // Ids are the same when asked again.
-    assert_eq!(list(e, doc, 0).iter().map(|i| i.id).collect::<Vec<_>>(), items.iter().map(|i| i.id).collect::<Vec<_>>());
+    assert_eq!(
+        list(e, doc, 0).iter().map(|i| i.id).collect::<Vec<_>>(),
+        items.iter().map(|i| i.id).collect::<Vec<_>>()
+    );
 
     // Change the note's text, remove the drawing and the text box, and save.
     update(e, doc, 0, n.id, Some("changed"), None, 0.0, 0.0);
     assert!(matches!(
-        ask(e, RequestBody::RemoveAnnot { doc, page: 0, id: ink.id }),
+        ask(
+            e,
+            RequestBody::RemoveAnnot {
+                doc,
+                page: 0,
+                id: ink.id
+            }
+        ),
         ResponseBody::AnnotRemoved
     ));
     assert!(matches!(
-        ask(e, RequestBody::RemoveAnnot { doc, page: 0, id: free.id }),
+        ask(
+            e,
+            RequestBody::RemoveAnnot {
+                doc,
+                page: 0,
+                id: free.id
+            }
+        ),
         ResponseBody::AnnotRemoved
     ));
     assert_eq!(
-        error_code(ask(e, RequestBody::RestoreAnnot { doc, page: 0, id: ink.id })),
+        error_code(ask(
+            e,
+            RequestBody::RestoreAnnot {
+                doc,
+                page: 0,
+                id: ink.id
+            }
+        )),
         ErrorCode::AnnotationRefused
     );
     let saved = save_all(e, doc);
     let again = open(e, &saved, None).unwrap();
     let items = list(e, again, 0);
     let kinds: Vec<AnnotKind> = items.iter().map(|i| i.kind).collect();
-    assert_eq!(kinds, vec![AnnotKind::Highlight, AnnotKind::Note, AnnotKind::Stamp]);
+    assert_eq!(
+        kinds,
+        vec![AnnotKind::Highlight, AnnotKind::Note, AnnotKind::Stamp]
+    );
     assert_eq!(items[1].text, "changed");
     assert_eq!(items[0].author, "Alice");
     assert_eq!(items[0].text, "Check this title");
@@ -534,15 +759,36 @@ fn a_foreign_highlight_comes_back_in_its_colour() {
     let mut guard = engine();
     let e = &mut guard.0;
     let doc = open(e, &kit::annotated_pdf(), None).unwrap();
-    let h = list(e, doc, 0).into_iter().find(|i| i.kind == AnnotKind::Highlight).unwrap();
+    let h = list(e, doc, 0)
+        .into_iter()
+        .find(|i| i.kind == AnnotKind::Highlight)
+        .unwrap();
     let b = h.rect;
     let before = Shot::take(e, doc, 0, 612, 792);
     assert!(before.near(b, [255, 0, 0], 70) > 100);
-    ask(e, RequestBody::RemoveAnnot { doc, page: 0, id: h.id });
+    ask(
+        e,
+        RequestBody::RemoveAnnot {
+            doc,
+            page: 0,
+            id: h.id,
+        },
+    );
     let gone = Shot::take(e, doc, 0, 612, 792);
     assert_eq!(gone.near(b, [255, 0, 0], 70), 0);
-    let back = annot(ask(e, RequestBody::RestoreAnnot { doc, page: 0, id: h.id }));
-    assert!(back.color[0] > 200 && back.color[1] < 60, "{:?}", back.color);
+    let back = annot(ask(
+        e,
+        RequestBody::RestoreAnnot {
+            doc,
+            page: 0,
+            id: h.id,
+        },
+    ));
+    assert!(
+        back.color[0] > 200 && back.color[1] < 60,
+        "{:?}",
+        back.color
+    );
     assert_eq!(back.text, "Check this title");
     assert_eq!(back.author, "Alice");
     let after = Shot::take(e, doc, 0, 612, 792);
@@ -560,18 +806,40 @@ fn text_and_boxes_from_a_hostile_file_are_cut_cleaned_and_only_text() {
     assert_eq!(items.len(), 3);
     for item in &items {
         assert!(item.text.len() <= MAX_ANNOT_TEXT, "{}", item.text.len());
-        assert!(item.author.len() <= MAX_ANNOT_AUTHOR, "{}", item.author.len());
-        assert!(item.rect.iter().all(|v| v.is_finite() && v.abs() <= 1.0e6), "{:?}", item.rect);
+        assert!(
+            item.author.len() <= MAX_ANNOT_AUTHOR,
+            "{}",
+            item.author.len()
+        );
+        assert!(
+            item.rect.iter().all(|v| v.is_finite() && v.abs() <= 1.0e6),
+            "{:?}",
+            item.rect
+        );
     }
     assert_eq!(items[0].text.len(), MAX_ANNOT_TEXT);
     let t = &items[1].text;
-    assert!(t.contains("<img src=x onerror=alert(1)>"), "markup stays as it is: text, {t:?}");
-    assert!(!t.chars().any(|c| matches!(c, '\u{7}' | '\u{202E}' | '\u{200B}' | '\r')), "{t:?}");
+    assert!(
+        t.contains("<img src=x onerror=alert(1)>"),
+        "markup stays as it is: text, {t:?}"
+    );
+    assert!(
+        !t.chars()
+            .any(|c| matches!(c, '\u{7}' | '\u{202E}' | '\u{200B}' | '\r')),
+        "{t:?}"
+    );
     assert!(t.contains("second line"));
     assert_eq!(items[1].author, "<b>author</b>");
     // The huge square can be removed, and the rest is not hurt by it.
     assert!(matches!(
-        ask(e, RequestBody::RemoveAnnot { doc, page: 0, id: items[2].id }),
+        ask(
+            e,
+            RequestBody::RemoveAnnot {
+                doc,
+                page: 0,
+                id: items[2].id
+            }
+        ),
         ResponseBody::AnnotRemoved
     ));
     assert_eq!(list(e, doc, 0).len(), 2);
@@ -590,7 +858,14 @@ fn a_page_with_too_many_annotations_lists_the_first_ones() {
     assert_eq!(ids.len(), MAX_ANNOTS_PER_PAGE, "ids are unique");
     assert_eq!(items[0].text, "Note 0");
     // One that is listed can be removed; the ids of the others stay.
-    ask(e, RequestBody::RemoveAnnot { doc, page: 0, id: items[3].id });
+    ask(
+        e,
+        RequestBody::RemoveAnnot {
+            doc,
+            page: 0,
+            id: items[3].id,
+        },
+    );
     let after = list(e, doc, 0);
     assert_eq!(after.len(), MAX_ANNOTS_PER_PAGE);
     assert_eq!(after[3].id, items[4].id);
@@ -605,12 +880,28 @@ fn a_protected_document_stays_protected_with_its_annotation() {
     let doc = open(e, &kit::encrypted_pdf("secret", 1), Some("secret")).unwrap();
     annot(ask(
         e,
-        RequestBody::AddNote { doc, page: 0, x: 60.0, y: 60.0, color: YELLOW, text: "ZZSECRETNOTEZZ".into() },
+        RequestBody::AddNote {
+            doc,
+            page: 0,
+            x: 60.0,
+            y: 60.0,
+            color: YELLOW,
+            text: "ZZSECRETNOTEZZ".into(),
+        },
     ));
     let saved = save_all(e, doc);
-    assert!(!contains(&saved, b"ZZSECRETNOTEZZ"), "the note is in the file in the clear");
-    assert_eq!(open(e, &saved, None).unwrap_err(), ErrorCode::PasswordRequired);
-    assert_eq!(open(e, &saved, Some("wrong")).unwrap_err(), ErrorCode::PasswordIncorrect);
+    assert!(
+        !contains(&saved, b"ZZSECRETNOTEZZ"),
+        "the note is in the file in the clear"
+    );
+    assert_eq!(
+        open(e, &saved, None).unwrap_err(),
+        ErrorCode::PasswordRequired
+    );
+    assert_eq!(
+        open(e, &saved, Some("wrong")).unwrap_err(),
+        ErrorCode::PasswordIncorrect
+    );
     let again = open(e, &saved, Some("secret")).unwrap();
     let items = list(e, again, 0);
     assert_eq!(items.len(), 1);
@@ -624,13 +915,24 @@ fn a_signed_document_is_still_reported_as_signed_after_an_annotation() {
     let doc = open(e, &kit::signed_pdf(), None).unwrap();
     annot(ask(
         e,
-        RequestBody::AddNote { doc, page: 0, x: 60.0, y: 60.0, color: YELLOW, text: "n".into() },
+        RequestBody::AddNote {
+            doc,
+            page: 0,
+            x: 60.0,
+            y: 60.0,
+            color: YELLOW,
+            text: "n".into(),
+        },
     ));
     // The signature field is a widget: it is not in the list, and cannot be changed.
     let items = list(e, doc, 0);
     assert_eq!(items.len(), 1);
     match ask(e, RequestBody::DocInfo { doc }) {
-        ResponseBody::DocInfo { signatures, maybe_signed, .. } => {
+        ResponseBody::DocInfo {
+            signatures,
+            maybe_signed,
+            ..
+        } => {
             assert!(signatures >= 1 && maybe_signed);
         }
         other => panic!("{other:?}"),
@@ -646,22 +948,58 @@ fn requests_that_cannot_be_done_say_why() {
     let mut guard = engine();
     let e = &mut guard.0;
     let doc = open(e, &kit::simple_pdf(1), None).unwrap();
-    assert_eq!(error_code(ask(e, RequestBody::ListAnnots { doc: 999, page: 0 })), ErrorCode::UnknownDocument);
-    assert_eq!(error_code(ask(e, RequestBody::ListAnnots { doc, page: 5 })), ErrorCode::PageOutOfRange);
     assert_eq!(
-        error_code(ask(e, RequestBody::AddNote { doc, page: 7, x: 1.0, y: 1.0, color: YELLOW, text: String::new() })),
+        error_code(ask(e, RequestBody::ListAnnots { doc: 999, page: 0 })),
+        ErrorCode::UnknownDocument
+    );
+    assert_eq!(
+        error_code(ask(e, RequestBody::ListAnnots { doc, page: 5 })),
         ErrorCode::PageOutOfRange
     );
-    assert_eq!(error_code(highlight(e, doc, 0, 100_000, 100_005)), ErrorCode::InvalidRequest);
     assert_eq!(
-        error_code(ask(e, RequestBody::RemoveAnnot { doc, page: 0, id: 12345 })),
+        error_code(ask(
+            e,
+            RequestBody::AddNote {
+                doc,
+                page: 7,
+                x: 1.0,
+                y: 1.0,
+                color: YELLOW,
+                text: String::new()
+            }
+        )),
+        ErrorCode::PageOutOfRange
+    );
+    assert_eq!(
+        error_code(highlight(e, doc, 0, 100_000, 100_005)),
+        ErrorCode::InvalidRequest
+    );
+    assert_eq!(
+        error_code(ask(
+            e,
+            RequestBody::RemoveAnnot {
+                doc,
+                page: 0,
+                id: 12345
+            }
+        )),
         ErrorCode::NoSuchAnnotation
     );
     assert_eq!(
-        error_code(ask(e, RequestBody::RestoreAnnot { doc, page: 0, id: 12345 })),
+        error_code(ask(
+            e,
+            RequestBody::RestoreAnnot {
+                doc,
+                page: 0,
+                id: 12345
+            }
+        )),
         ErrorCode::AnnotationRefused
     );
-    assert_eq!(error_code(update(e, doc, 0, 12345, Some("x"), None, 0.0, 0.0)), ErrorCode::NoSuchAnnotation);
+    assert_eq!(
+        error_code(update(e, doc, 0, 12345, Some("x"), None, 0.0, 0.0)),
+        ErrorCode::NoSuchAnnotation
+    );
     // A range that runs past the end of the text is cut to the text.
     let (text, _) = page_text(e, doc, 0);
     let n = text.chars().count() as u32;
@@ -669,14 +1007,35 @@ fn requests_that_cannot_be_done_say_why() {
     // Points outside the page are pulled onto it, and a note outside the page is put inside.
     let ink = annot(ask(
         e,
-        RequestBody::AddInk { doc, page: 0, color: YELLOW, width: 2.0, strokes: vec![vec![[-500.0, -500.0], [9000.0, 9000.0]]] },
+        RequestBody::AddInk {
+            doc,
+            page: 0,
+            color: YELLOW,
+            width: 2.0,
+            strokes: vec![vec![[-500.0, -500.0], [9000.0, 9000.0]]],
+        },
     ));
-    assert!(ink.rect[0] >= -4.0 && ink.rect[2] <= 616.0 && ink.rect[3] <= 796.0, "{:?}", ink.rect);
+    assert!(
+        ink.rect[0] >= -4.0 && ink.rect[2] <= 616.0 && ink.rect[3] <= 796.0,
+        "{:?}",
+        ink.rect
+    );
     let note = annot(ask(
         e,
-        RequestBody::AddNote { doc, page: 0, x: 5000.0, y: -50.0, color: YELLOW, text: String::new() },
+        RequestBody::AddNote {
+            doc,
+            page: 0,
+            x: 5000.0,
+            y: -50.0,
+            color: YELLOW,
+            text: String::new(),
+        },
     ));
-    assert!(note.rect[2] <= 612.5 && note.rect[1] >= -0.5, "{:?}", note.rect);
+    assert!(
+        note.rect[2] <= 612.5 && note.rect[1] >= -0.5,
+        "{:?}",
+        note.rect
+    );
 }
 
 #[test]
@@ -698,11 +1057,23 @@ fn the_content_of_the_page_is_not_rewritten_by_an_annotation() {
     annot(highlight(e, doc, 0, start, start + len));
     annot(ask(
         e,
-        RequestBody::AddInk { doc, page: 0, color: YELLOW, width: 2.0, strokes: vec![vec![[10.0, 10.0], [50.0, 50.0]]] },
+        RequestBody::AddInk {
+            doc,
+            page: 0,
+            color: YELLOW,
+            width: 2.0,
+            strokes: vec![vec![[10.0, 10.0], [50.0, 50.0]]],
+        },
     ));
     annot(ask(
         e,
-        RequestBody::AddStamp { doc, page: 0, x: 300.0, y: 300.0, stamp: StampKind::Draft },
+        RequestBody::AddStamp {
+            doc,
+            page: 0,
+            x: 300.0,
+            y: 300.0,
+            stamp: StampKind::Draft,
+        },
     ));
     assert_eq!(count(e, doc), before, "the objects of the page changed");
     let saved = save_all(e, doc);

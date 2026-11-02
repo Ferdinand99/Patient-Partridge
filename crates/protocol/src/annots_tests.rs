@@ -156,7 +156,12 @@ fn markup_is_held_to_its_range_and_its_kinds() {
     let cap = MAX_MARKUP_CHARS as u32;
     assert!(Request::decode(&encoded(markup(AnnotKind::Highlight, 0, cap + 1))).is_err());
     assert!(Request::decode(&encoded(markup(AnnotKind::Highlight, 0, cap))).is_ok());
-    assert!(Request::decode(&encoded(markup(AnnotKind::Highlight, u32::MAX - 5, u32::MAX))).is_ok());
+    assert!(Request::decode(&encoded(markup(
+        AnnotKind::Highlight,
+        u32::MAX - 5,
+        u32::MAX
+    )))
+    .is_ok());
     // Only three of the kinds are markup: the wire byte of the others is refused.
     for kind in [
         AnnotKind::Note,
@@ -191,7 +196,8 @@ fn note(x: f32, text: String) -> RequestBody {
 fn note_text_is_held_to_the_cap_and_places_to_finite_numbers() {
     // The encoder cuts the text, so what it writes always decodes ...
     let long = "a".repeat(MAX_ANNOT_TEXT + 100);
-    let RequestBody::AddNote { text, .. } = Request::decode(&encoded(note(1.0, long))).unwrap().body
+    let RequestBody::AddNote { text, .. } =
+        Request::decode(&encoded(note(1.0, long))).unwrap().body
     else {
         panic!("not a note");
     };
@@ -291,7 +297,13 @@ fn ink_is_held_to_its_caps() {
     empty.extend(1u32.to_le_bytes());
     empty.extend(0u32.to_le_bytes());
     assert!(Request::decode(&empty).is_err());
-    for width in [0.0, MIN_INK_WIDTH / 2.0, MAX_INK_WIDTH + 0.5, f32::NAN, -1.0] {
+    for width in [
+        0.0,
+        MIN_INK_WIDTH / 2.0,
+        MAX_INK_WIDTH + 0.5,
+        f32::NAN,
+        -1.0,
+    ] {
         assert!(
             Request::decode(&encoded(ink(width, vec![vec![[1.0, 1.0]]]))).is_err(),
             "{width}"

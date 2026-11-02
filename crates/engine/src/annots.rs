@@ -261,7 +261,7 @@ impl DocAnnots {
             return None;
         }
         let made = self.made.contains_key(&id);
-        let has_quads = annotation.attachment_points().len() > 0;
+        let has_quads = !annotation.attachment_points().is_empty();
         let abilities = match kind {
             AnnotKind::Highlight | AnnotKind::Underline | AnnotKind::Strikeout => {
                 let mut a = ability::EDIT_TEXT | ability::REMOVE;
@@ -309,6 +309,7 @@ impl DocAnnots {
         let count = page.annotations().len();
         let ids = self.ids(page_index, count).clone();
         let mut out = Vec::new();
+        #[allow(clippy::needless_range_loop)]
         for index in 0..count.min(MAX_SCANNED) {
             if out.len() >= MAX_ANNOTS_PER_PAGE {
                 break;
@@ -378,7 +379,11 @@ impl DocAnnots {
             let Ok(annotation) = page.annotations_mut().get(last) else {
                 break;
             };
-            if page.annotations_mut().delete_annotation(annotation).is_err() {
+            if page
+                .annotations_mut()
+                .delete_annotation(annotation)
+                .is_err()
+            {
                 break;
             }
         }
@@ -459,7 +464,10 @@ impl DocAnnots {
             mapper.to_page(&page, x + NOTE_SIDE, y + NOTE_SIDE),
         ];
         let (Some(a), Some(b)) = (corners[0], corners[1]) else {
-            return fail(ErrorCode::AnnotationRefused, "that place is not on the page");
+            return fail(
+                ErrorCode::AnnotationRefused,
+                "that place is not on the page",
+            );
         };
         let bounds = [a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1)];
         let snapshot = Snapshot {
@@ -561,11 +569,8 @@ impl DocAnnots {
         };
         // A drawing or a stamp can be put back only if the engine knows how it was made, and the
         // answer says so, so the recipe is kept before the answer is made.
-        let keeps = remember
-            && matches!(
-                snapshot.recipe,
-                Recipe::Ink { .. } | Recipe::Stamp { .. }
-            );
+        let keeps =
+            remember && matches!(snapshot.recipe, Recipe::Ink { .. } | Recipe::Stamp { .. });
         if keeps {
             self.made.insert(new_id, snapshot.recipe.clone());
         }
@@ -583,6 +588,7 @@ impl DocAnnots {
 
     // ---- changing ----------------------------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     pub fn update(
         &mut self,
         document: &mut PdfDocument<'static>,
@@ -618,7 +624,10 @@ impl DocAnnots {
                 let to = mapper.to_page(&page, dx, dy);
                 let (Some(from), Some(to), Some(bounds)) = (from, to, bounds_of(&annotation))
                 else {
-                    return fail(ErrorCode::AnnotationRefused, "that place is not on the page");
+                    return fail(
+                        ErrorCode::AnnotationRefused,
+                        "that place is not on the page",
+                    );
                 };
                 let moved = [
                     bounds[0] + to.0 - from.0,
@@ -798,7 +807,9 @@ fn write_annotation(
             macro_rules! markup {
                 ($create:ident) => {{
                     let mut annotation = page.annotations_mut().$create().map_err(refused)?;
-                    annotation.set_stroke_color(pdf_color(*color)).map_err(refused)?;
+                    annotation
+                        .set_stroke_color(pdf_color(*color))
+                        .map_err(refused)?;
                     annotation.set_bounds(rect_of(*bounds)).map_err(refused)?;
                     for q in quads {
                         annotation
@@ -829,7 +840,9 @@ fn write_annotation(
                 .annotations_mut()
                 .create_text_annotation(&snapshot.text)
                 .map_err(refused)?;
-            annotation.set_stroke_color(pdf_color(*color)).map_err(refused)?;
+            annotation
+                .set_stroke_color(pdf_color(*color))
+                .map_err(refused)?;
             annotation.set_bounds(rect_of(*bounds)).map_err(refused)?;
             if !snapshot.author.is_empty() {
                 annotation.set_creator(&snapshot.author).map_err(refused)?;
@@ -840,7 +853,9 @@ fn write_annotation(
             color,
             width,
             strokes,
-        } => write_ink(page, document, page_index, snapshot, *color, *width, strokes),
+        } => write_ink(
+            page, document, page_index, snapshot, *color, *width, strokes,
+        ),
         Recipe::Stamp { stamp, x, y } => write_stamp(page, document, snapshot, *stamp, *x, *y),
     }
 }
@@ -902,11 +917,19 @@ fn write_ink(
             top = top.max(*y);
         }
         if !points.is_empty() {
-            paths.push(points.into_iter().map(|(x, y)| FS_POINTF { x, y }).collect());
+            paths.push(
+                points
+                    .into_iter()
+                    .map(|(x, y)| FS_POINTF { x, y })
+                    .collect(),
+            );
         }
     }
     if paths.is_empty() {
-        return fail(ErrorCode::AnnotationRefused, "that place is not on the page");
+        return fail(
+            ErrorCode::AnnotationRefused,
+            "that place is not on the page",
+        );
     }
     let pad = width / 2.0 + 1.0;
     let rect = FS_RECTF {
@@ -916,7 +939,10 @@ fn write_ink(
         bottom: bottom - pad,
     };
     let Some(handle) = raw_document(document) else {
-        return fail(ErrorCode::AnnotationRefused, "the document cannot be changed");
+        return fail(
+            ErrorCode::AnnotationRefused,
+            "the document cannot be changed",
+        );
     };
     let bindings = document.bindings();
     let text = snapshot.text.as_str();
@@ -956,7 +982,10 @@ fn write_ink(
         if done {
             Ok(())
         } else {
-            fail(ErrorCode::AnnotationRefused, "the drawing could not be written")
+            fail(
+                ErrorCode::AnnotationRefused,
+                "the drawing could not be written",
+            )
         }
     }
 }
@@ -996,7 +1025,10 @@ fn write_stamp(
     // bottom left of the stamp as drawn, and goes to page space through three points.
     let corner = |dx: f32, dy: f32| mapper.to_page(page, x + dx, y + height - dy);
     let (Some(o), Some(u), Some(v)) = (corner(0.0, 0.0), corner(1.0, 0.0), corner(0.0, 1.0)) else {
-        return fail(ErrorCode::AnnotationRefused, "that place is not on the page");
+        return fail(
+            ErrorCode::AnnotationRefused,
+            "that place is not on the page",
+        );
     };
     let matrix = PdfMatrix::new(u.0 - o.0, u.1 - o.1, v.0 - o.0, v.1 - o.1, o.0, o.1);
     let corners: Vec<(f32, f32)> = [(0.0, 0.0), (width, 0.0), (0.0, height), (width, height)]
@@ -1004,7 +1036,10 @@ fn write_stamp(
         .filter_map(|(dx, dy)| corner(*dx, *dy))
         .collect();
     if corners.len() != 4 {
-        return fail(ErrorCode::AnnotationRefused, "that place is not on the page");
+        return fail(
+            ErrorCode::AnnotationRefused,
+            "that place is not on the page",
+        );
     }
     let bounds = [
         corners.iter().map(|c| c.0).fold(f32::MAX, f32::min),
@@ -1013,7 +1048,10 @@ fn write_stamp(
         corners.iter().map(|c| c.1).fold(f32::MIN, f32::max),
     ];
     let color = pdf_color(stamp_color(stamp));
-    let mut annotation = page.annotations_mut().create_stamp_annotation().map_err(refused)?;
+    let mut annotation = page
+        .annotations_mut()
+        .create_stamp_annotation()
+        .map_err(refused)?;
     annotation.set_bounds(rect_of(bounds)).map_err(refused)?;
 
     let border = 3.0;
@@ -1037,13 +1075,20 @@ fn write_stamp(
         .map_err(refused)?;
 
     let font = document.fonts_mut().helvetica_bold();
-    let mut label = PdfPageTextObject::new(document, stamp.label(), font, PdfPoints::new(STAMP_FONT))
-        .map_err(refused)?;
+    let mut label =
+        PdfPageTextObject::new(document, stamp.label(), font, PdfPoints::new(STAMP_FONT))
+            .map_err(refused)?;
     label.set_fill_color(color).map_err(refused)?;
-    label.apply_matrix(PdfMatrix::new(
-        1.0, 0.0, 0.0, 1.0, STAMP_PAD, STAMP_PAD + 0.2 * STAMP_FONT,
-    ))
-    .map_err(refused)?;
+    label
+        .apply_matrix(PdfMatrix::new(
+            1.0,
+            0.0,
+            0.0,
+            1.0,
+            STAMP_PAD,
+            STAMP_PAD + 0.2 * STAMP_FONT,
+        ))
+        .map_err(refused)?;
     label.apply_matrix(matrix).map_err(refused)?;
     annotation
         .objects_mut()
@@ -1164,7 +1209,12 @@ mod tests {
     #[test]
     fn a_line_left_to_right_is_one_box() {
         let chars: Vec<TextChar> = (0..5)
-            .map(|i| ch('a', [10.0 + i as f32 * 6.0, 100.0, 16.0 + i as f32 * 6.0, 112.0]))
+            .map(|i| {
+                ch(
+                    'a',
+                    [10.0 + i as f32 * 6.0, 100.0, 16.0 + i as f32 * 6.0, 112.0],
+                )
+            })
             .collect();
         assert_eq!(line_boxes(&chars), vec![[10.0, 100.0, 40.0, 112.0]]);
     }
@@ -1217,7 +1267,12 @@ mod tests {
     #[test]
     fn a_column_of_vertical_text_is_one_box() {
         let chars: Vec<TextChar> = (0..4)
-            .map(|i| ch('x', [50.0, 10.0 + i as f32 * 12.0, 62.0, 22.0 + i as f32 * 12.0]))
+            .map(|i| {
+                ch(
+                    'x',
+                    [50.0, 10.0 + i as f32 * 12.0, 62.0, 22.0 + i as f32 * 12.0],
+                )
+            })
             .collect();
         assert_eq!(line_boxes(&chars), vec![[50.0, 10.0, 62.0, 58.0]]);
     }

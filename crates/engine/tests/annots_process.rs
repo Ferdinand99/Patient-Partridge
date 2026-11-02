@@ -81,7 +81,13 @@ fn every_kind_of_annotation_is_made_saved_and_read_back_with_the_sandbox_on() {
         .add_note(handle, 0, 400.0, 100.0, YELLOW, "A note \u{2713}")
         .unwrap();
     let ink = pool
-        .add_ink(handle, 0, BLUE, 3.0, vec![vec![[300.0, 500.0], [400.0, 520.0], [450.0, 480.0]]])
+        .add_ink(
+            handle,
+            0,
+            BLUE,
+            3.0,
+            vec![vec![[300.0, 500.0], [400.0, 520.0], [450.0, 480.0]]],
+        )
         .unwrap();
     let stamp = pool
         .add_stamp(handle, 0, 100.0, 600.0, StampKind::Approved)
@@ -106,7 +112,10 @@ fn every_kind_of_annotation_is_made_saved_and_read_back_with_the_sandbox_on() {
         AnnotKind::Ink,
         AnnotKind::Stamp,
     ] {
-        assert!(kinds.contains(&kind), "{kind:?} is not in the saved file: {kinds:?}");
+        assert!(
+            kinds.contains(&kind),
+            "{kind:?} is not in the saved file: {kinds:?}"
+        );
     }
     let saved_note = items.iter().find(|i| i.kind == AnnotKind::Note).unwrap();
     assert_eq!(saved_note.text, "A changed note");
@@ -125,7 +134,10 @@ fn every_kind_of_annotation_is_made_saved_and_read_back_with_the_sandbox_on() {
             }
         }
     }
-    assert!(blue_near > 150, "the drawing is not in the file ({blue_near})");
+    assert!(
+        blue_near > 150,
+        "the drawing is not in the file ({blue_near})"
+    );
 }
 
 #[test]
@@ -134,7 +146,8 @@ fn a_protected_file_stays_protected_and_a_hostile_one_is_only_listed() {
     let path = dir.write("p.pdf", &kit::encrypted_pdf("secret", 1));
     let pool = EnginePool::new(config(), 4);
     let (handle, _) = pool.open(&text(&path), Some("secret")).unwrap();
-    pool.add_note(handle, 0, 50.0, 50.0, YELLOW, "ZZPROTECTEDZZ").unwrap();
+    pool.add_note(handle, 0, 50.0, 50.0, YELLOW, "ZZPROTECTEDZZ")
+        .unwrap();
     pool.save(handle, SaveOptions::default()).unwrap();
     let bytes = fs::read(&path).unwrap();
     assert!(!bytes.windows(13).any(|w| w == b"ZZPROTECTEDZZ"));
@@ -147,7 +160,10 @@ fn a_protected_file_stays_protected_and_a_hostile_one_is_only_listed() {
         other => panic!("{other:?}"),
     }
     let opened = client.open(&text(&path), Some("secret")).unwrap();
-    assert_eq!(client.list_annots(opened.doc, 0).unwrap()[0].text, "ZZPROTECTEDZZ");
+    assert_eq!(
+        client.list_annots(opened.doc, 0).unwrap()[0].text,
+        "ZZPROTECTEDZZ"
+    );
 
     let hostile = dir.write("h.pdf", &kit::hostile_annots_pdf());
     let client = EngineClient::new(config());

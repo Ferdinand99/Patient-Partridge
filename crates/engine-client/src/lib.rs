@@ -34,8 +34,8 @@ use partridge_protocol::{
     read_frame_limited, write_request, ErrorCode, PageSize, Request, RequestBody, Response,
     ResponseBody, ANNOT_INFO_MIN, MAX_ANNOTS_PER_PAGE, MAX_ANNOT_AUTHOR, MAX_ANNOT_TEXT,
     MAX_COORDINATE, MAX_INK_POINTS, MAX_INK_STROKES, MAX_INK_WIDTH, MAX_MARKUP_CHARS,
-    MAX_QUERY_LEN, MAX_SAVE_BYTES, MAX_SAVE_CHUNK, MAX_STRING_LEN, MIN_INK_WIDTH,
-    PROTOCOL_VERSION, SAVE_DATA_HEADER_LEN,
+    MAX_QUERY_LEN, MAX_SAVE_BYTES, MAX_SAVE_CHUNK, MAX_STRING_LEN, MIN_INK_WIDTH, PROTOCOL_VERSION,
+    SAVE_DATA_HEADER_LEN,
 };
 
 pub use spawn::{spawn_engine, EngineProcess, SandboxPolicy, SpawnRequest, SpawnedEngine};
@@ -74,7 +74,8 @@ const MAX_TEXT_ANSWER: usize = 2_200_000;
 /// Largest links answer: 500 links with an address of at most 2 048 bytes.
 const MAX_LINKS_ANSWER: usize = 1_300_000;
 /// Largest annotation list: 500 annotations with the longest text, author and framing they may have.
-const MAX_ANNOTS_ANSWER: usize = MAX_ANNOTS_PER_PAGE * (ANNOT_INFO_MIN + MAX_ANNOT_TEXT + MAX_ANNOT_AUTHOR) + 64;
+const MAX_ANNOTS_ANSWER: usize =
+    MAX_ANNOTS_PER_PAGE * (ANNOT_INFO_MIN + MAX_ANNOT_TEXT + MAX_ANNOT_AUTHOR) + 64;
 
 /// How to start and supervise the engine.
 #[derive(Debug, Clone)]
