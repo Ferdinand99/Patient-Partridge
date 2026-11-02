@@ -20,27 +20,29 @@ type Stand = {
   emit(name: string, payload: unknown): void;
 };
 
-declare global {
-  interface Window {
-    __E2E__: Stand;
-  }
-}
+const errors: string[] = [];
 
 test.beforeEach(async ({ page }) => {
+  errors.length = 0;
+  page.on("pageerror", (e) => errors.push(e.message));
+  page.on("console", (m) => {
+    if (m.type() === "error") errors.push(m.text());
+  });
   await page.addInitScript({ path: "e2e/fake-tauri.js" });
   await page.goto("/");
 });
 
 test.afterEach(async ({ page }) => {
-  const violations = await page.evaluate(() => window.__E2E__.violations);
+  const violations = await page.evaluate(() => (window as unknown as { __E2E__: Stand }).__E2E__.violations);
   expect(violations, "the content security policy blocked something").toEqual([]);
+  expect(errors, "the window reported an error").toEqual([]);
 });
 
 const calls = (page: Page, cmd: string) =>
-  page.evaluate((name) => window.__E2E__.calls.filter((c) => c.cmd === name), cmd);
+  page.evaluate((name) => (window as unknown as { __E2E__: Stand }).__E2E__.calls.filter((c) => c.cmd === name), cmd);
 
 async function openFile(page: Page, path: string, name: string) {
-  await page.evaluate((p) => (window.__E2E__.dialog = [p]), path);
+  await page.evaluate((p) => ((window as unknown as { __E2E__: Stand }).__E2E__.dialog = [p]), path);
   await page.locator("#open-button").click();
   await expect(page.locator('.tab-title[aria-selected="true"]')).toHaveText(name);
   // The first page is drawn and the list of its annotations has arrived.
@@ -153,12 +155,12 @@ test("selected text is highlighted, drawn, and taken back and made again with un
   expect(markup.args).toMatchObject({ page: 0, kind: "highlight", color: [255, 235, 59, 255], start: 18, end: 23 });
 
   // The page shows it (the top row of the characters' boxes is paper in the stand-in's picture).
-  await expect.poll(async () => isYellow(await pixelAt(page, 0, 100, 118.5))).toBe(true);
+  await expect.poll(() => pixelAt(page, 0, 100, 118.5)).toEqual([255, 235, 59]);
   // The text is not selected any more, and the document has a change that is not saved.
   await expect(page.locator(".hl-select")).toHaveCount(0);
   await expect(page.locator(".tab-dirty")).toHaveCount(1);
-  await expect.poll(() => page.evaluate(() => window.__E2E__.title)).toMatch(/^• book\.pdf/);
-  await expect.poll(() => page.evaluate(() => Object.values(window.__E2E__.dirty)[0])).toBe(true);
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __E2E__: Stand }).__E2E__.title)).toMatch(/^• book\.pdf/);
+  await expect.poll(() => page.evaluate(() => Object.values((window as unknown as { __E2E__: Stand }).__E2E__.dirty)[0])).toBe(true);
   // The annotation is on the page as a box a screen reader can reach.
   await expect(page.locator(".annot")).toHaveCount(1);
   await expect(page.locator(".annot")).toHaveAttribute("aria-label", "Highlight, page 1");
@@ -168,7 +170,7 @@ test("selected text is highlighted, drawn, and taken back and made again with un
   await expect.poll(async () => isWhite(await pixelAt(page, 0, 100, 118.5))).toBe(true);
   await expect(page.locator(".tab-dirty")).toHaveCount(0);
   await expect(page.locator(".annot")).toHaveCount(0);
-  await expect.poll(() => page.evaluate(() => Object.values(window.__E2E__.dirty)[0])).toBe(false);
+  await expect.poll(() => page.evaluate(() => Object.values((window as unknown as { __E2E__: Stand }).__E2E__.dirty)[0])).toBe(false);
   await page.keyboard.press("Control+y");
   await expect.poll(async () => isYellow(await pixelAt(page, 0, 100, 118.5))).toBe(true);
   await expect(page.locator(".tab-dirty")).toHaveCount(1);
@@ -201,12 +203,13 @@ test("right-to-left text is marked over exactly the letters that were selected",
   const [markup] = await calls(page, "add_markup");
   expect(markup.args).toMatchObject({ page: 0, start: 3, end: 7 });
   // One box over those letters: the engine's rule, as the stand-in copies it, found a single line.
+  await expect(page.locator(".annot")).toHaveCount(1);
   const [box] = await page.evaluate(() => {
     const el = document.querySelector<HTMLElement>(".annot");
     return el ? [{ left: el.style.left, width: el.style.width }] : [];
   });
-  expect(parseFloat(box.left)).toBeCloseTo((337 / 612) * 100, 0);
-  expect(parseFloat(box.width)).toBeCloseTo((50 / 612) * 100, 0);
+  expect(parseFloat(box?.left ?? "")).toBeCloseTo((337 / 612) * 100, 0);
+  expect(parseFloat(box?.width ?? "")).toBeCloseTo((50 / 612) * 100, 0);
   await expect.poll(async () => isYellow(await pixelAt(page, 0, 350, 75.5))).toBe(true);
   // The letter next to it, outside the selection, is not shaded.
   expect(isWhite(await pixelAt(page, 0, 395, 75.5))).toBe(true);
@@ -241,7 +244,7 @@ for (const zoom of ["0.5", "1", "2"]) {
     expect(ink.args.width).toBe(3);
     // The line is on the page, in the colour of the bar.
     await expect(page.locator(".annot")).toHaveAttribute("aria-label", "Drawing, page 1");
-    await expect.poll(async () => (await pixelAt(page, 0, 200, 150, 792)).reduce((a, b) => a + b, 0)).toBeLessThan(300);
+    await expect.poll(async () => isYellow(await pixelAt(page, 0, 200, 150, 792))).toBe(true);
   });
 }
 
@@ -252,7 +255,7 @@ test("a click with the note tool opens a box for the text, which stays text", as
   await page.locator(".viewer").focus();
   await page.keyboard.press("n");
   await expect(page.locator("#tool-note")).toHaveAttribute("aria-pressed", "true");
-  const at = await onPage(page, 0, 300, 400);
+  const at = await onPage(page, 0, 300, 200);
   await page.mouse.click(at.x, at.y);
   const editor = page.getByRole("dialog", { name: "New note" });
   await expect(editor).toBeVisible();
@@ -264,7 +267,7 @@ test("a click with the note tool opens a box for the text, which stays text", as
   const [note] = await calls(page, "add_note");
   expect(note.args).toMatchObject({ page: 0, text });
   expect(Math.abs((note.args.x as number) - 290)).toBeLessThan(3);
-  expect(Math.abs((note.args.y as number) - 390)).toBeLessThan(3);
+  expect(Math.abs((note.args.y as number) - 190)).toBeLessThan(3);
   // The note is picked, the pointer is back to picking, and the text is text everywhere.
   await expect(page.locator("#tool-select")).toHaveAttribute("aria-pressed", "true");
   const box = page.locator(".annot");
@@ -416,16 +419,16 @@ test("a change with unsaved annotations is asked about when the tab is closed, w
   await expect(page.locator(".tab-dirty")).toHaveCount(1);
 
   // The app asks the window before it quits (the close button of the window, Cmd+Q).
-  await page.evaluate(() => window.__E2E__.emit("quit-requested", null));
+  await page.evaluate(() => (window as unknown as { __E2E__: Stand }).__E2E__.emit("quit-requested", null));
   const quitting = page.getByRole("alertdialog");
   await expect(quitting).toContainText('Save changes to "book.pdf"?');
   await quitting.getByRole("button", { name: "Cancel" }).click();
-  await expect.poll(() => page.evaluate(() => window.__E2E__.stays)).toBe(1);
-  expect(await page.evaluate(() => window.__E2E__.quits)).toBe(0);
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __E2E__: Stand }).__E2E__.stays)).toBe(1);
+  expect(await page.evaluate(() => (window as unknown as { __E2E__: Stand }).__E2E__.quits)).toBe(0);
 
   // An update does not install over the change: it offers to save first, or to wait.
   await page.evaluate(() => {
-    window.__E2E__.update.found = { version: "0.2.0", currentVersion: "0.1.0", notes: "x", method: "automatic" };
+    (window as unknown as { __E2E__: Stand }).__E2E__.update.found = { version: "0.2.0", currentVersion: "0.1.0", notes: "x", method: "automatic" };
   });
   await page.locator("#menu-button").click();
   await page.getByRole("menuitem", { name: "Check for Updates…" }).click();
@@ -436,10 +439,10 @@ test("a change with unsaved annotations is asked about when the tab is closed, w
   expect((await calls(page, "install_update")).length).toBe(0);
 
   // Quit without saving ends the app; Save and quit saves first.
-  await page.evaluate(() => window.__E2E__.emit("quit-requested", null));
+  await page.evaluate(() => (window as unknown as { __E2E__: Stand }).__E2E__.emit("quit-requested", null));
   await page.getByRole("alertdialog").getByRole("button", { name: "Save and quit" }).click();
-  await expect.poll(() => page.evaluate(() => window.__E2E__.quits)).toBe(1);
-  expect(await page.evaluate(() => window.__E2E__.saves.length)).toBe(1);
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __E2E__: Stand }).__E2E__.quits)).toBe(1);
+  expect(await page.evaluate(() => (window as unknown as { __E2E__: Stand }).__E2E__.saves.length)).toBe(1);
   await expect(page.locator(".tab-dirty")).toHaveCount(0);
 });
 
@@ -450,9 +453,9 @@ test("Ctrl+S saves and clears the mark, and undo after a save brings the mark ba
   await drag(page, await onPage(page, 0, 84.5, 123), await onPage(page, 0, 113.5, 123));
   await expect(page.locator(".tab-dirty")).toHaveCount(1);
   await page.keyboard.press("Control+s");
-  await expect.poll(() => page.evaluate(() => window.__E2E__.saves.length)).toBe(1);
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __E2E__: Stand }).__E2E__.saves.length)).toBe(1);
   await expect(page.locator(".tab-dirty")).toHaveCount(0);
-  await expect.poll(() => page.evaluate(() => window.__E2E__.title)).toBe("book.pdf - Patient Partridge");
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __E2E__: Stand }).__E2E__.title)).toBe("book.pdf - Patient Partridge");
   await page.keyboard.press("Control+z");
   await expect(page.locator(".tab-dirty")).toHaveCount(1);
   await page.keyboard.press("Control+y");
@@ -463,7 +466,7 @@ test("a change that fails says so, makes no mark, and leaves the document as it 
   await openBook(page);
   await openBar(page);
   await page.evaluate(() => {
-    window.__E2E__.annotFailure = { cmd: "add_markup", error: { code: "annotation_refused", message: "no" }, once: true };
+    (window as unknown as { __E2E__: Stand }).__E2E__.annotFailure = { cmd: "add_markup", error: { code: "annotation_refused", message: "no" }, once: true };
   });
   await page.locator("#tool-highlight").click();
   await drag(page, await onPage(page, 0, 84.5, 123), await onPage(page, 0, 113.5, 123));
