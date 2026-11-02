@@ -42,6 +42,9 @@ jobs:
           & $dumpbin.FullName /dependents $pdfium.FullName
           icacls C:\Windows\System32\vcruntime140.dll
           icacls C:\Windows\System32\bcryptprimitives.dll
+      - name: How starts end with layers taken away
+        continue-on-error: true
+        run: cargo test -p partridge-engine --locked --test windows_start_variants -- --ignored --nocapture
       - name: Sandbox proof
         run: cargo test -p partridge-engine --locked --test sandbox -- --nocapture --test-threads 1
       - name: The other engine tests

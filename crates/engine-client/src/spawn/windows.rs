@@ -441,6 +441,21 @@ fn make_tokens() -> io::Result<(Owned, Owned)> {
         // The AppContainer: the same two tokens, as tokens of a package that has no capabilities.
         // The start identity has to be one of the same package, or the system lowers it to
         // "identification" and the loader fails.
+        if diag("nolowbox") {
+            let mut plain: HANDLE = null_mut();
+            check(
+                DuplicateTokenEx(
+                    start_token.raw(),
+                    TOKEN_ALL_ACCESS,
+                    null(),
+                    SecurityImpersonation,
+                    TokenImpersonation,
+                    &mut plain,
+                ),
+                "DuplicateTokenEx (plain)",
+            )?;
+            return Ok((lockdown, Owned::new(plain)?));
+        }
         let lockdown = container::lowbox(&lockdown)?;
         let start_box = container::lowbox(&start_token)?;
         let mut imp: HANDLE = null_mut();
@@ -656,7 +671,7 @@ pub(super) fn spawn(request: &SpawnRequest<'_>) -> io::Result<SpawnedEngine> {
     let program = wide(request.program.as_os_str());
 
     // The attribute list: handles to inherit, mitigation policies, no child processes.
-    let mut mitigations: u64 = MITIGATIONS;
+    let mut mitigations: u64 = if diag("nomit") { 0 } else { MITIGATIONS };
     let mut child_policy: u32 = PROCESS_CREATION_CHILD_PROCESS_RESTRICTED;
     let mut size = 0usize;
     // SAFETY: the first call only asks how large the list is.
@@ -720,7 +735,7 @@ pub(super) fn spawn(request: &SpawnRequest<'_>) -> io::Result<SpawnedEngine> {
             startup.lpAttributeList = list;
             // The engine shows nothing, so it gets a desktop of its own: it cannot see the windows
             // of the user, read the screen, or put a window of its own over theirs.
-            let mut desktop = engine_desktop().cloned();
+            let mut desktop = if diag("nodesk") { None } else { engine_desktop().cloned() };
             if let Some(name) = desktop.as_mut() {
                 startup.StartupInfo.lpDesktop = name.as_mut_ptr();
             }
@@ -756,10 +771,12 @@ pub(super) fn spawn(request: &SpawnRequest<'_>) -> io::Result<SpawnedEngine> {
                     SetThreadToken(&thread_handle, initial.raw()),
                     "SetThreadToken",
                 )?;
-                check(
-                    AssignProcessToJobObject(job.raw(), process.raw()),
-                    "AssignProcessToJobObject",
-                )?;
+                if !diag("nojob") {
+                    check(
+                        AssignProcessToJobObject(job.raw(), process.raw()),
+                        "AssignProcessToJobObject",
+                    )?;
+                }
                 if ResumeThread(thread.raw()) == u32::MAX {
                     return Err(io::Error::last_os_error());
                 }
@@ -846,4 +863,12 @@ pub(super) fn spawn_plain(request: &SpawnRequest<'_>) -> io::Result<SpawnedEngin
         stdin: Box::new(stdin),
         stdout: Box::new(stdout),
     })
+}
+
+/// Switches for taking layers away one at a time, to find which one breaks a start. Debug builds.
+fn diag(name: &str) -> bool {
+    cfg!(debug_assertions)
+        && std::env::var("PARTRIDGE_DIAG")
+            .map(|v| v.split(',').any(|x| x == name))
+            .unwrap_or(false)
 }
