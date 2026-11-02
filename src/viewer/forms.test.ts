@@ -624,7 +624,7 @@ describe("what the form bar says", () => {
     expect(r.bar()).toBe(BLOCKED_NOTICE);
     expect(BLOCKED_NOTICE).toContain("cannot be filled in here");
     expect(BLOCKED_NOTICE).toContain("clears or hides fields");
-    expect(BLOCKED_NOTICE).toContain("another reader");
+    expect(BLOCKED_NOTICE).toContain("another PDF reader");
     // The field says it too.
     expect(r.control(0).title).toContain("Name - This field cannot be filled in here");
     expect(r.control(1).title).toBe("");
