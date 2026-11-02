@@ -4,6 +4,8 @@ import { type Tool, toolForKey } from "../lib/annotations";
 
 export interface KeyInfo {
   key: string;
+  /** The physical key. Optional, so that callers that only have the character still work. */
+  code?: string;
   ctrlKey: boolean;
   metaKey: boolean;
   shiftKey: boolean;
@@ -42,6 +44,19 @@ export type Action =
 export const LINE_SCROLL = 48;
 
 /**
+ * The key a shortcut is matched on. A letter of the Latin alphabet is taken as it is, so Dvorak,
+ * AZERTY and the other Latin layouts keep the letter they print. On a layout without Latin letters
+ * (Russian, Greek, Hebrew, Arabic) the web view reports the letter of that layout, so the place of
+ * the key stands in: the key that prints S on a US keyboard counts as S.
+ */
+export function shortcutKey(e: KeyInfo): string {
+  if (/^[a-z]$/i.test(e.key)) return e.key.toLowerCase();
+  const place = /^Key([A-Z])$/.exec(e.code ?? "");
+  if (place && [...e.key].length === 1) return place[1].toLowerCase();
+  return e.key;
+}
+
+/**
  * What a key press means for the viewer, or null when the viewer does not use it.
  * Ctrl and Cmd are treated the same, so shortcuts work on Windows, Linux and macOS.
  */
@@ -50,7 +65,7 @@ export function actionForKey(e: KeyInfo): Action | null {
   if (e.altKey) return null;
 
   if (mod) {
-    switch (e.key) {
+    switch (shortcutKey(e)) {
       case "+":
       case "=":
         return { type: "zoom-in" };
@@ -62,34 +77,24 @@ export function actionForKey(e: KeyInfo): Action | null {
       case "1":
         return { type: "zoom-actual" };
       case "g":
-      case "G":
         return { type: "focus-page-box" };
       case "o":
-      case "O":
         return { type: "open-file" };
       case "w":
-      case "W":
         return { type: "close-tab" };
       case "b":
-      case "B":
         return { type: "toggle-sidebar" };
       case "f":
-      case "F":
         return { type: "find" };
       case "a":
-      case "A":
         return { type: e.shiftKey ? "toggle-annotations" : "select-all" };
       case "p":
-      case "P":
         return { type: "print" };
       case "s":
-      case "S":
         return { type: e.shiftKey ? "save-as" : "save" };
       case "z":
-      case "Z":
         return { type: e.shiftKey ? "redo" : "undo" };
       case "y":
-      case "Y":
         return { type: "redo" };
       case "Tab":
         return { type: e.shiftKey ? "previous-tab" : "next-tab" };

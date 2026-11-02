@@ -189,6 +189,9 @@ const SAVE_SHEET_DELAY_MS = 500;
 const SAVE_SLOW_DETAIL =
   "A large file or a slow drive can take a while. You can wait, or give up the changes you made: the file on the disk stays as it is. Cancel keeps the program open and lets the save carry on.";
 
+/** Said when a form field holds text that the engine did not take (it is too long, for one). */
+const REFUSED_FIELD_DETAIL = "A form field holds text that the document did not accept, so that text is not in it.";
+
 function byId<T extends HTMLElement>(root: Document, id: string): T {
   const el = root.getElementById(id);
   if (!el) throw new Error(`missing element #${id}`);
@@ -307,6 +310,12 @@ export class App {
   init(): void {
     byId(this.root, "open-button").addEventListener("click", () => void this.openDialog());
     byId(this.root, "print-button").addEventListener("click", () => void this.printActive());
+    byId(this.root, "save-button").addEventListener("click", () => {
+      void this.saveActive().then(() => this.active?.view.element.focus({ preventScroll: true }));
+    });
+    byId(this.root, "save-copy-button").addEventListener("click", () => {
+      void this.saveActiveAs().then(() => this.active?.view.element.focus({ preventScroll: true }));
+    });
     byId(this.root, "empty-open").addEventListener("click", () => void this.openDialog());
     this.zoomIn.addEventListener("click", () => this.active?.view.stepZoom(1));
     this.zoomOut.addEventListener("click", () => this.active?.view.stepZoom(-1));
@@ -906,7 +915,7 @@ export class App {
     }
     const answer = await showNotice(this.noticeLayer, {
       title: `Save changes to "${tab.name}"?`,
-      detail: "If you close it without saving, the changes you made are lost.",
+      detail: `${tab.view.hasRefusedFormInput ? `${REFUSED_FIELD_DETAIL} ` : ""}If you close it without saving, the changes you made are lost.`,
       buttons: [
         { id: "cancel", label: "Cancel", safe: true },
         { id: "discard", label: "Don't save" },
@@ -1197,6 +1206,12 @@ export class App {
    * (a save breaks a signature). A failure is told to the user. Resolves with true when saved.
    */
   private async saveTab(tab: Tab, asCopy: boolean): Promise<boolean> {
+    // Text a field refused is not in the document: a file written now would leave it out and the tab
+    // would look saved. Nothing is written until the reader has dealt with the text.
+    if (tab.view.hasRefusedFormInput) {
+      await this.tellRefusedField(tab);
+      return false;
+    }
     // What is under way is done first (an open box of a note is saved, running changes finish),
     // so that the file holds what the window shows.
     await tab.annotator?.flush();
@@ -1239,6 +1254,14 @@ export class App {
       this.syncChrome();
     }
     return !this.isDirty(tab);
+  }
+
+  private async tellRefusedField(tab: Tab): Promise<void> {
+    await showNotice(this.noticeLayer, {
+      title: "A field has text that could not be added",
+      detail: `"${tab.name}" was not saved. ${REFUSED_FIELD_DETAIL} Shorten the text or clear the field, then save again.`,
+      buttons: [{ id: "ok", label: "OK", primary: true }],
+    });
   }
 
   private async runSave(tab: Tab): Promise<SavedFile | null> {
@@ -1382,10 +1405,11 @@ export class App {
       const answer = await showNotice(this.noticeLayer, {
         title:
           dirty.length === 1 ? `Save changes to "${dirty[0].name}"?` : `Save changes to ${dirty.length} documents?`,
-        detail:
+        detail: `${dirty.some((t) => t.view.hasRefusedFormInput) ? `${REFUSED_FIELD_DETAIL} ` : ""}${
           dirty.length === 1
             ? "If you quit without saving, the changes you made are lost."
-            : `${names.join(", ")} have changes that are not saved. If you quit without saving, they are lost.`,
+            : `${names.join(", ")} have changes that are not saved. If you quit without saving, they are lost.`
+        }`,
         buttons: [
           { id: "cancel", label: "Cancel", safe: true },
           { id: "discard", label: "Quit without saving" },
@@ -1620,12 +1644,20 @@ export class App {
   }
 
   private drawTitle(): void {
+    this.syncSaveButtons();
     const active = this.active;
     if (!active) {
       this.deps.setWindowTitle(this.appName);
       return;
     }
     this.deps.setWindowTitle(`${this.isDirty(active) ? "\u2022 " : ""}${active.name} - ${this.appName}`);
+  }
+
+  /** Save is there when the document in front has changes; Save a copy whenever a document is open. */
+  private syncSaveButtons(): void {
+    const active = this.active;
+    byId<HTMLButtonElement>(this.root, "save-button").disabled = !active || !this.isDirty(active);
+    byId<HTMLButtonElement>(this.root, "save-copy-button").disabled = !active || active.view.pageCount === 0;
   }
 
   private setControlsEnabled(on: boolean): void {

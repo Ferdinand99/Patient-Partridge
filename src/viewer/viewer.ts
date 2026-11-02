@@ -190,6 +190,7 @@ export class DocumentView {
             options.forms?.redrawn?.(page);
           },
           onPending: (pending) => options.forms?.pending?.(pending),
+          onLost: (error) => this.engineLost(toAppError(error)),
         })
       : null;
     this.forms?.start();
@@ -748,15 +749,24 @@ export class DocumentView {
     }
   }
 
+  /** The engine of the document was lost: the window is told once, and the view stops drawing. */
+  private engineLost(error: AppErrorLike): void {
+    if (this.destroyed || this.fatal) return;
+    this.fatal = true;
+    this.scheduler.stop();
+    this.events.onFatal(error);
+  }
+
+  /** True while a field of the form holds text that the engine did not take. */
+  get hasRefusedFormInput(): boolean {
+    return this.forms?.hasRefusedInput ?? false;
+  }
+
   private renderFailed(job: RenderJob, error: unknown): void {
     if (this.destroyed) return;
     const appError = toAppError(error);
     if (isEngineLost(appError)) {
-      if (!this.fatal) {
-        this.fatal = true;
-        this.scheduler.stop();
-        this.events.onFatal(appError);
-      }
+      this.engineLost(appError);
       return;
     }
     // One page failed to draw. Say so on that page and carry on with the rest.

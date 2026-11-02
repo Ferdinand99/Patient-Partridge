@@ -16,6 +16,7 @@
 // Names, tooltips, values and the labels of choices come from the PDF: they are put in the controls
 // as text (`value`, `textContent`, attribute values) and never as markup.
 
+import { isEngineLost, toAppError } from "../lib/errors";
 import type { PageSizePt } from "./layout";
 
 export type FormKindName = "none" | "acro" | "xfa";
@@ -98,6 +99,8 @@ export interface FormsEvents {
    * change on its way. Told each time the answer changes.
    */
   onPending?(pending: boolean): void;
+  /** The engine of the document was lost while a field was changed: the document is gone. */
+  onLost?(error: unknown): void;
 }
 
 /** What the form bar says about a form that cannot be filled in. */
@@ -122,6 +125,8 @@ export const UNREADABLE_NOTICE = "The form of this document could not be read, s
 const CANNOT_CLEAR = "A drop-down list cannot be cleared once a choice is made. Pick another choice.";
 const CANNOT_UNCHECK = "A radio button cannot be turned off once it is on. Pick another one.";
 const CANNOT_CHANGE = "That field could not be changed.";
+const TEXT_REFUSED =
+  "That text is too long for the document, so it is not saved. It stays in the box. Shorten it or clear it before you save.";
 const CANNOT_UNDO_RADIO = "A radio button cannot be turned off, so this choice cannot be taken back. Pick another one.";
 const CANNOT_UNDO_LIST = "A drop-down list cannot be cleared, so this choice cannot be taken back. Pick another one.";
 
@@ -229,6 +234,12 @@ export class FormLayer {
   /** Changes that are sent or waiting to be sent. */
   private inFlight = 0;
   private pendingTold = false;
+  /**
+   * Text the engine did not take, by page and field. It stays in its box, and the document counts
+   * as changed, until the reader changes or clears it: it must not vanish at a save, a close or a
+   * quit. It is kept by place, not by box, so that it survives a page that is unmounted.
+   */
+  private readonly refused = new Map<string, string>();
 
   constructor(
     private readonly doc: number,
@@ -279,7 +290,16 @@ export class FormLayer {
 
   /** True while text that was typed is not in the document yet, or a change is on its way. */
   get hasPendingInput(): boolean {
-    return this.inFlight > 0 || this.typed.size > 0;
+    return this.inFlight > 0 || this.typed.size > 0 || this.refused.size > 0;
+  }
+
+  /** True while a field holds text that the engine did not take. The document cannot be saved so. */
+  get hasRefusedInput(): boolean {
+    return this.refused.size > 0;
+  }
+
+  private refusedKey(view: FieldView): string {
+    return `${view.page}:${view.field.index}`;
   }
 
   /**
@@ -467,6 +487,11 @@ export class FormLayer {
     for (const view of state.views.values()) {
       clearTimeout(view.pendingTimer);
       this.typed.delete(view);
+    }
+    // Text that was refused stays for a field that is still there, and goes with a field that is not.
+    for (const key of [...this.refused.keys()]) {
+      const [at, index] = key.split(":").map(Number);
+      if (at === page && !list.some((f) => f.index === index)) this.refused.delete(key);
     }
     state.layer.replaceChildren();
     state.views.clear();
@@ -667,9 +692,16 @@ export class FormLayer {
           const picked = selectedOf(field);
           el.value = picked.length > 0 ? String(picked[0]) : "-1";
           if (blank) blank.selected = picked.length === 0;
-        } else if ((force || !view.editing) && (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement)) {
-          el.value = field.value;
-          view.lastSent = null;
+        } else if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+          const kept = this.refused.get(this.refusedKey(view));
+          if (kept !== undefined) {
+            // The text the engine did not take stays where the reader put it.
+            el.value = kept;
+            view.lastSent = kept;
+          } else if (force || !view.editing) {
+            el.value = field.value;
+            view.lastSent = null;
+          }
         }
         break;
       }
@@ -762,6 +794,7 @@ export class FormLayer {
       });
       el.addEventListener("input", () => {
         view.lastSent = null;
+        this.refused.delete(this.refusedKey(view));
         const text = el.value.replace(/\r\n?/g, "\n");
         if (text !== view.field.value && !view.field.readOnly && !view.field.valueCut) this.typed.add(view);
         else this.typed.delete(view);
@@ -774,6 +807,7 @@ export class FormLayer {
           el.value = view.field.value;
           view.lastSent = null;
           this.typed.delete(view);
+          this.refused.delete(this.refusedKey(view));
           this.updatePending();
         } else if (e.key === "Enter" && el instanceof HTMLInputElement) {
           // Enter ends the entry and keeps the focus where it is.
@@ -846,6 +880,7 @@ export class FormLayer {
       view.pendingTimer = setTimeout(() => view.el.classList.remove("form-pending"), PENDING_MS);
       try {
         const list = await this.api.setFormField(this.doc, page, before.index, before.name, value);
+        this.refused.delete(`${page}:${before.index}`);
         this.accept(page, list);
         const after = list.find((f) => f.index === before.index && f.name === before.name) ?? before;
         // A box the reader is still in shows what the engine kept, which can be less than was typed.
@@ -859,13 +894,30 @@ export class FormLayer {
         await this.refreshGroup(page, before);
       } catch (error) {
         view.el.classList.remove("form-pending");
+        if (isEngineLost(toAppError(error))) {
+          // The document is gone with its engine: the window ends the tab.
+          this.events.onLost?.(error);
+          return;
+        }
+        // Text that is too long for the document is not given up: it stays in its box, and the
+        // document counts as changed, so that nothing is saved or closed over it unseen.
+        const refusedText =
+          value.kind === "text" && toAppError(error).code === "invalid_request" && this.stillInBox(view, value.text);
+        if (refusedText) this.refused.set(`${page}:${before.index}`, value.text);
         await this.resync(page);
-        this.tell(this.explain(before, error));
+        this.tell(refusedText ? TEXT_REFUSED : this.explain(before, error));
       } finally {
         this.inFlight -= 1;
         this.updatePending();
       }
     });
+  }
+
+  /** True when the box still holds the text that was sent (or is gone with its page). */
+  private stillInBox(view: FieldView, text: string): boolean {
+    const el = view.el;
+    if (!el.isConnected || !(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement)) return true;
+    return el.value.replace(/\r\n?/g, "\n") === text;
   }
 
   private enqueue<T>(job: () => Promise<T>): Promise<T> {

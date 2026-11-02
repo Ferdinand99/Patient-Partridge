@@ -519,3 +519,369 @@ describe("Undo of a form change that cannot be taken back", () => {
     });
   }
 });
+
+const noticeText = () => document.querySelector(".notice")?.textContent ?? "";
+const pressButton = (label: string) => {
+  const found = [...document.querySelectorAll<HTMLElement>(".notice button")].find((b) => b.textContent === label);
+  if (!found) throw new Error(`no button "${label}"`);
+  found.click();
+};
+
+describe("text that the engine refuses because it is too long", () => {
+  const LONG = "x".repeat(9000);
+
+  /** The reader pastes more than the document takes into the first field, as the client refuses it. */
+  async function pasted() {
+    const m = make();
+    const real = m.api.setFormField.getMockImplementation() as (...args: unknown[]) => Promise<FormFieldInfo[]>;
+    m.api.setFormField.mockImplementation((...args: Parameters<typeof m.api.setFormField>) => {
+      const value = args[4];
+      if (value.kind === "text" && new TextEncoder().encode(value.text).length > 8192) {
+        return Promise.reject({ code: "invalid_request", message: "the name or the value is too long" });
+      }
+      return real(...args);
+    });
+    await m.app.openPath("/docs/form.pdf");
+    await flush();
+    const input = field(0) as HTMLInputElement;
+    input.focus();
+    input.value = LONG;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    return { ...m, input };
+  }
+
+  it("keeps the text in the box and the tab marked as changed when the box is left", async () => {
+    const { app, api, input } = await pasted();
+    input.dispatchEvent(new Event("blur"));
+    await flush();
+    expect(input.value).toBe(LONG);
+    expect(app.unsavedCount).toBe(1);
+    expect(api.setDirty).toHaveBeenLastCalledWith(1, true);
+    expect(document.querySelector(".form-bar-text")?.textContent).toContain("too long");
+    expect(document.querySelectorAll(".tab-dirty")).toHaveLength(1);
+  });
+
+  it("asks at quit instead of quitting", async () => {
+    const { app, api, input } = await pasted();
+    void app.requestQuit();
+    await flush();
+    expect(api.quitApp).not.toHaveBeenCalled();
+    expect(noticeText()).toContain("Save changes to");
+    expect(noticeText()).toContain("did not accept");
+    expect(input.value).toBe(LONG);
+    expect(api.save).not.toHaveBeenCalled();
+  });
+
+  it("quits without saving only when the reader says so", async () => {
+    const { app, api } = await pasted();
+    void app.requestQuit();
+    await flush();
+    pressButton("Quit without saving");
+    await flush();
+    expect(api.quitApp).toHaveBeenCalledTimes(1);
+    expect(api.save).not.toHaveBeenCalled();
+  });
+
+  it("does not quit after Save and quit: the save says why it did not happen, and the program stays open", async () => {
+    const { app, api, input } = await pasted();
+    void app.requestQuit();
+    await flush();
+    pressButton("Save and quit");
+    await flush();
+    expect(noticeText()).toContain("was not saved");
+    pressButton("OK");
+    await flush();
+    expect(api.save).not.toHaveBeenCalled();
+    expect(api.quitApp).not.toHaveBeenCalled();
+    expect(api.stayOpen).toHaveBeenCalled();
+    expect(app.unsavedCount).toBe(1);
+    expect(input.value).toBe(LONG);
+  });
+
+  it("asks at Ctrl+W instead of closing the tab", async () => {
+    const { app, api, input } = await pasted();
+    keyOn(input, "w", { ctrlKey: true });
+    await flush();
+    expect(app.tabCount).toBe(1);
+    expect(noticeText()).toContain("Save changes to");
+    expect(noticeText()).toContain("did not accept");
+    expect(input.value).toBe(LONG);
+    expect(api.save).not.toHaveBeenCalled();
+    pressButton("Cancel");
+    await flush();
+    expect(app.tabCount).toBe(1);
+    expect(app.unsavedCount).toBe(1);
+  });
+
+  it("does not close the tab after Save in that question", async () => {
+    const { app, api } = await pasted();
+    keyOn(field(0), "w", { ctrlKey: true });
+    await flush();
+    pressButton("Save");
+    await flush();
+    expect(noticeText()).toContain("was not saved");
+    pressButton("OK");
+    await flush();
+    expect(app.tabCount).toBe(1);
+    expect(api.save).not.toHaveBeenCalled();
+  });
+
+  it("stops Ctrl+S: nothing is written, the dot stays, and the box keeps the text", async () => {
+    const { app, api, input } = await pasted();
+    // Another change is in the document too, so a save would have something to write.
+    field(1).click();
+    await flush();
+    keyOn(input, "s", { ctrlKey: true });
+    await flush();
+    expect(api.save).not.toHaveBeenCalled();
+    expect(noticeText()).toContain("was not saved");
+    expect(noticeText()).toContain("A field has text that could not be added");
+    expect(app.unsavedCount).toBe(1);
+    expect(input.value).toBe(LONG);
+    expect(document.querySelectorAll(".tab-dirty")).toHaveLength(1);
+  });
+
+  it("stops Save a copy as well", async () => {
+    const { app, api } = await pasted();
+    void app.saveActiveAs();
+    await flush();
+    expect(api.saveAs).not.toHaveBeenCalled();
+    expect(noticeText()).toContain("was not saved");
+  });
+
+  it("lets the reader save once the text is shortened", async () => {
+    const { app, api, input } = await pasted();
+    keyOn(input, "s", { ctrlKey: true });
+    await flush();
+    pressButton("OK");
+    input.value = "short";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    expect(app.unsavedCount).toBe(1);
+    expect(await app.saveActive()).toBe(true);
+    expect(api.save).toHaveBeenCalledTimes(1);
+    expect(app.unsavedCount).toBe(0);
+  });
+
+  it("is clean again when the reader clears the field", async () => {
+    const { app, api, input } = await pasted();
+    input.dispatchEvent(new Event("blur"));
+    await flush();
+    expect(app.unsavedCount).toBe(1);
+    input.value = "";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    expect(app.unsavedCount).toBe(0);
+    expect(api.setDirty).toHaveBeenLastCalledWith(1, false);
+  });
+
+  it("is clean again after Escape, which puts the old text back", async () => {
+    const { app, input } = await pasted();
+    input.dispatchEvent(new Event("blur"));
+    await flush();
+    keyOn(input, "Escape");
+    expect(input.value).toBe("");
+    expect(app.unsavedCount).toBe(0);
+  });
+
+  it("is still counted after the page scrolls out of the mounted range", async () => {
+    const { app, input } = await pasted();
+    input.dispatchEvent(new Event("blur"));
+    await flush();
+    await app.openPath("/docs/second.pdf");
+    await flush();
+    expect(input.isConnected).toBe(false);
+    expect(app.unsavedCount).toBe(1);
+  });
+});
+
+describe("a form change that loses the engine", () => {
+  it("ends the tab the way a lost engine does, and says that the changes are lost", async () => {
+    const { app, api } = make();
+    await app.openPath("/docs/form.pdf");
+    await flush();
+    api.setFormField.mockRejectedValueOnce({ code: "engine_stopped", message: "it exited" });
+    const input = field(0) as HTMLInputElement;
+    input.value = "Ada";
+    change(input);
+    await flush();
+    expect(app.tabCount).toBe(0);
+    expect(app.currentView).toBeNull();
+    expect(noticeText()).toContain("The PDF engine stopped");
+    expect(noticeText()).toContain("The changes that were not saved are lost.");
+    pressButton("Open the file again");
+    await flush();
+    expect(api.open).toHaveBeenCalledTimes(2);
+    expect(app.tabCount).toBe(1);
+  });
+
+  it("also ends the tab when a check box change loses the engine", async () => {
+    const { app, api } = make();
+    await app.openPath("/docs/form.pdf");
+    await flush();
+    api.setFormField.mockRejectedValueOnce({ code: "unknown_document", message: "gone" });
+    field(1).click();
+    await flush();
+    expect(app.tabCount).toBe(0);
+    expect(noticeText()).toContain("The PDF engine was restarted");
+  });
+
+  it("tells the reader only once when several changes are queued behind the lost one", async () => {
+    const { app, api } = make();
+    await app.openPath("/docs/form.pdf");
+    await flush();
+    api.setFormField.mockRejectedValue({ code: "engine_stopped", message: "it exited" });
+    field(1).click();
+    const input = field(0) as HTMLInputElement;
+    input.value = "Ada";
+    change(input);
+    await flush();
+    expect(app.tabCount).toBe(0);
+    expect(document.querySelectorAll(".notice")).toHaveLength(1);
+  });
+});
+
+describe("Save and Save a copy in the toolbar", () => {
+  const saveButton = () => document.getElementById("save-button") as HTMLButtonElement;
+  const copyButton = () => document.getElementById("save-copy-button") as HTMLButtonElement;
+
+  it("are both off with no document open", () => {
+    make();
+    expect(saveButton().disabled).toBe(true);
+    expect(copyButton().disabled).toBe(true);
+  });
+
+  it("offers Save a copy for a document without changes, and Save only once it has some", async () => {
+    const { app } = make();
+    await app.openPath("/docs/form.pdf");
+    await flush();
+    expect(saveButton().disabled).toBe(true);
+    expect(copyButton().disabled).toBe(false);
+    const input = field(0) as HTMLInputElement;
+    input.value = "Ada";
+    change(input);
+    await flush();
+    expect(saveButton().disabled).toBe(false);
+  });
+
+  it("turns Save on from the first key typed in a field", async () => {
+    const { app } = make();
+    await app.openPath("/docs/form.pdf");
+    await flush();
+    const input = field(0) as HTMLInputElement;
+    input.focus();
+    input.value = "A";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    expect(saveButton().disabled).toBe(false);
+  });
+
+  it("saves the document and turns Save off again", async () => {
+    const { app, api } = make();
+    await app.openPath("/docs/form.pdf");
+    await flush();
+    const input = field(0) as HTMLInputElement;
+    input.value = "Ada";
+    change(input);
+    await flush();
+    saveButton().click();
+    await flush();
+    expect(api.save).toHaveBeenCalledTimes(1);
+    expect(app.unsavedCount).toBe(0);
+    expect(saveButton().disabled).toBe(true);
+  });
+
+  it("asks for a new name with Save a copy", async () => {
+    const { app, api } = make();
+    await app.openPath("/docs/form.pdf");
+    await flush();
+    copyButton().click();
+    await flush();
+    expect(api.saveAs).toHaveBeenCalledTimes(1);
+    expect(app.tabCount).toBe(1);
+  });
+
+  it("have a name and a key in their label for a screen reader and a tooltip", () => {
+    make();
+    expect(saveButton().getAttribute("aria-label")).toBe("Save");
+    expect(saveButton().title).toBe("Save (Ctrl+S)");
+    expect(copyButton().getAttribute("aria-label")).toBe("Save a copy");
+    expect(copyButton().title).toContain("Ctrl+Shift+S");
+  });
+
+  it("go off when the tab with changes is closed", async () => {
+    const { app } = make();
+    await app.openPath("/docs/form.pdf");
+    await flush();
+    const input = field(0) as HTMLInputElement;
+    input.value = "Ada";
+    change(input);
+    await flush();
+    const closing = app.requestClose(1);
+    await flush();
+    pressButton("Don't save");
+    await closing;
+    expect(saveButton().disabled).toBe(true);
+    expect(copyButton().disabled).toBe(true);
+  });
+});
+
+describe("keyboard shortcuts on a layout without Latin letters", () => {
+  const press = (target: HTMLElement, key: string, code: string, init: KeyboardEventInit = {}) =>
+    target.dispatchEvent(
+      new KeyboardEvent("keydown", { key, code, ctrlKey: true, bubbles: true, cancelable: true, ...init }),
+    );
+
+  it("saves with Ctrl+S on a Russian layout (the key prints a Cyrillic letter)", async () => {
+    const { app, api } = make();
+    await app.openPath("/docs/form.pdf");
+    await flush();
+    const input = field(0) as HTMLInputElement;
+    input.value = "Ada";
+    change(input);
+    await flush();
+    press(document.body, "ы", "KeyS");
+    await flush();
+    expect(api.save).toHaveBeenCalledTimes(1);
+  });
+
+  it("saves a copy on a Hebrew layout, undoes on an Arabic one and closes with Ctrl+W on a Greek one", async () => {
+    const { app, api } = make();
+    await app.openPath("/docs/form.pdf");
+    await flush();
+    press(document.body, "ד", "KeyS", { shiftKey: true });
+    await flush();
+    expect(api.saveAs).toHaveBeenCalledTimes(1);
+    field(1).click();
+    await flush();
+    expect(field(1).getAttribute("aria-checked")).toBe("true");
+    press(field(1), "ئ", "KeyZ");
+    await flush();
+    expect(field(1).getAttribute("aria-checked")).toBe("false");
+    press(document.body, "ς", "KeyW");
+    await flush();
+    expect(app.tabCount).toBe(0);
+  });
+
+  it("opens the file dialog with Ctrl+O on a Russian layout", () => {
+    const { deps } = make();
+    press(document.body, "щ", "KeyO");
+    expect(deps.pickFiles).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the letter that is printed on a Dvorak layout", async () => {
+    const { app, api, deps } = make();
+    await app.openPath("/docs/form.pdf");
+    await flush();
+    const input = field(0) as HTMLInputElement;
+    input.value = "Ada";
+    change(input);
+    await flush();
+    // The key in the S place prints O on Dvorak: it opens the file dialog and does not save.
+    press(document.body, "o", "KeyS");
+    await flush();
+    expect(deps.pickFiles).toHaveBeenCalledTimes(1);
+    expect(api.save).not.toHaveBeenCalled();
+    // The key that prints S sits in the semicolon place.
+    press(document.body, "s", "Semicolon");
+    await flush();
+    expect(api.save).toHaveBeenCalledTimes(1);
+  });
+});
