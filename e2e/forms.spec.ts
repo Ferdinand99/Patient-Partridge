@@ -279,6 +279,12 @@ test("tells once, calmly, that scripts do not run, and still fills the form in",
   // It is a status line, not a question: nothing is covered and nothing waits for an answer.
   await expect(page.locator(".notice")).toHaveCount(0);
   await expect(page.locator(".form-bar")).toHaveAttribute("role", "status");
+  // A message of several lines stays inside its pill.
+  const box = await page.locator(".form-bar-pill").boundingBox();
+  const words = await page.locator(".form-bar-text").boundingBox();
+  expect(words!.height).toBeGreaterThan(30);
+  expect(words!.y).toBeGreaterThanOrEqual(box!.y);
+  expect(words!.y + words!.height).toBeLessThanOrEqual(box!.y + box!.height);
   await fullname(page).fill("works");
   await page.keyboard.press("Tab");
   await expect.poll(async () => (await sets(page)).length).toBe(1);

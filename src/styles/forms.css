@@ -129,6 +129,7 @@ button.form-field:focus:not(:focus-visible) {
   height: 0;
   overflow: visible;
   display: flex;
+  align-items: flex-start;
   justify-content: center;
   pointer-events: none;
 }
