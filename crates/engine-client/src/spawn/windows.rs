@@ -71,6 +71,8 @@ use windows_sys::Win32::System::Threading::{
 
 use partridge_protocol::FontScript;
 
+mod container;
+
 use super::{engine_args, EngineProcess, SpawnRequest, SpawnedEngine};
 
 const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x0002_0002;
@@ -146,6 +148,10 @@ fn engine_desktop() -> Option<&'static Vec<u16>> {
                 let desktop =
                     CreateDesktopW(own.as_ptr(), null(), null(), 0, GENERIC_ALL_ACCESS, null());
                 if desktop.is_null() {
+                    return None;
+                }
+                // The package of the engine needs access to it, or the engine cannot start.
+                if container::allow_desktop(desktop).is_err() {
                     return None;
                 }
                 Some(wide(OsStr::new(&format!("{station}\\{desktop_name}"))))
@@ -445,6 +451,12 @@ fn make_tokens() -> io::Result<(Owned, Owned)> {
         // the two start out equal, and the engine lowers its own level to untrusted just before
         // it gives up the start identity (see `partridge-engine`).
         drop(nobody);
+
+        // The AppContainer: the same two tokens, as tokens of a package that has no capabilities.
+        // The start identity has to be one of the same package, or the system lowers it to
+        // "identification" and the loader fails.
+        let lockdown = container::lowbox(&lockdown, false)?;
+        let initial = container::lowbox(&initial, true)?;
         Ok((lockdown, initial))
     }
 }
@@ -612,6 +624,7 @@ fn pipe_file(handle: Owned) -> File {
 /// Starts the engine with all restrictions.
 pub(super) fn spawn(request: &SpawnRequest<'_>) -> io::Result<SpawnedEngine> {
     let _only_one = START.lock().unwrap_or_else(|e| e.into_inner());
+    container::allow_files(request.program, request.args)?;
     let (lockdown, initial) = make_tokens()?;
     let job = make_job(request.memory_limit.unwrap_or(DEFAULT_MEMORY_LIMIT))?;
     let (child_in, parent_in) = make_pipe(true)?;

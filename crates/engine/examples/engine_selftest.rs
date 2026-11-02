@@ -150,9 +150,13 @@ fn verdict(name: &str, denied: bool, detail: String) -> String {
 }
 
 fn probe(args: &[String], say: &mut dyn FnMut(String)) {
-    let [file, dir, exe, pid, port, title] = args else {
-        panic!("probe needs FILE DIR EXE PID PORT TITLE");
+    let [file, dir, exe, pid, port, title, extra @ ..] = args else {
+        panic!("probe needs FILE DIR EXE PID PORT TITLE [HOST_ADDRESS DNS_NAME]");
     };
+    // A listener on an address of this computer that is not the loopback one ("-" when there is
+    // none), and a name for the lookup ("-" for none).
+    let host_address = extra.first().map(String::as_str).filter(|a| *a != "-");
+    let dns_name = extra.get(1).map(String::as_str).filter(|a| *a != "-");
     let mut report = |name: &str, result: std::io::Result<()>| {
         let (denied, detail) = match result {
             Ok(()) => (false, String::new()),
@@ -199,6 +203,35 @@ fn probe(args: &[String], say: &mut dyn FnMut(String)) {
         "bind_udp_socket",
         std::net::UdpSocket::bind("127.0.0.1:0").map(|_| ()),
     );
+    // A datagram to the UDP socket the test listens on, from a socket of our own.
+    report(
+        "udp_send",
+        std::net::UdpSocket::bind("0.0.0.0:0")
+            .and_then(|s| s.send_to(b"hello", address).map(|_| ())),
+    );
+    // The same as the TCP connection, to an address of this computer that is not the loopback
+    // one: the way to the network card, not only the loopback device.
+    if let Some(host) = host_address {
+        let host: std::net::SocketAddr = host.parse().expect("HOST_ADDRESS");
+        report(
+            "connect_host_address",
+            std::net::TcpStream::connect_timeout(&host, std::time::Duration::from_secs(2))
+                .map(|_| ()),
+        );
+    }
+    // A name lookup: the resolver asks a service of the system, and that asks a server.
+    if let Some(name) = dns_name {
+        use std::net::ToSocketAddrs;
+        report(
+            "dns_lookup",
+            (name, 443).to_socket_addrs().and_then(|mut found| {
+                found
+                    .next()
+                    .map(|_| ())
+                    .ok_or_else(|| std::io::Error::other("no address"))
+            }),
+        );
+    }
 
     // Processes.
     report(
