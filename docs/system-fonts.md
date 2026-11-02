@@ -22,8 +22,9 @@ script.
 - **The first intact file wins.** A file that is missing, cut short or not a font is passed over for
   the next one in the list. A collection file (`.ttc`) is used from its first font.
 - **The lists are read again for each document you open**, so a font installed while the app runs
-  is used from the next document you open (open the file again; no restart of the app is needed).
-  A document that is already open keeps what it had.
+  is used from the next document you open: close the tab and open the file again (no restart of the
+  app is needed). A tab that is already open keeps what it had, and opening the same file again
+  only shows that tab.
 - If nothing in the list exists for a script, text in that script that the PDF does not carry the
   font for shows as blanks, and the reader tells you once for the document. You can still search,
   select and copy that text.
@@ -33,9 +34,12 @@ script.
   the font shows as blanks on every system. Chinese, Japanese and Korean are asked for by character
   set and work whatever the font is called, also when the name is written in the code page of the
   language.
-- The reader hands PDFium at most 512 MiB of system font data for one document. PDFium keeps a copy
-  for every font name a PDF asks about, so a file that names hundreds of different fonts gets the
-  first of them drawn and the rest blank; the reader tells you.
+- The reader hands PDFium at most 512 MiB of font data for one document. PDFium keeps one copy of a
+  font file for each combination of font name, weight and slant that the PDF asks for, and font
+  objects that ask alike share that copy: a PDF merged from many parts that all use "SimSun" costs
+  one copy. A file that names hundreds of different fonts gets the first of them drawn and the rest
+  blank; the reader tells you. A font file of 55 MB (some of the macOS ones) allows about nine
+  different names, one of 19 MB (Noto) about 26.
 
 ## The lists
 

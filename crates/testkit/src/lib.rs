@@ -521,6 +521,16 @@ pub fn script_pdf_with_font(script: &str, name: &str) -> Vec<u8> {
 /// each with a line of text in the page. A reader that serves a system font for each name holds a
 /// copy of that font for each of them, in a file of a few hundred bytes per font.
 pub fn many_fonts_pdf(fonts: usize) -> Vec<u8> {
+    japanese_fonts_pdf(fonts, true)
+}
+
+/// As `many_fonts_pdf`, with every font object named alike (`SimSun`), the way a PDF merged from
+/// many parts has them: `fonts` objects, one font to ask for.
+pub fn same_name_fonts_pdf(fonts: usize) -> Vec<u8> {
+    japanese_fonts_pdf(fonts, false)
+}
+
+fn japanese_fonts_pdf(fonts: usize, distinct_names: bool) -> Vec<u8> {
     let mut resources = String::new();
     let mut content = String::new();
     for i in 0..fonts {
@@ -538,8 +548,13 @@ pub fn many_fonts_pdf(fonts: usize) -> Vec<u8> {
         stream_object("", &content),
     ];
     for i in 0..fonts {
+        let name = if distinct_names {
+            format!("CJKFont{:04}", i + 1)
+        } else {
+            "SimSun".to_string()
+        };
         let (font, descendant, _) = cid_font(
-            &format!("CJKFont{:04}", i + 1),
+            &name,
             "90ms-RKSJ-H",
             "Japan1",
             2,

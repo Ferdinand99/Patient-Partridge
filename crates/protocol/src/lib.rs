@@ -1824,7 +1824,7 @@ pub fn check_font(head: &[u8], file_len: u64) -> Result<(), &'static str> {
     if tables == 0 || tables > MAX_FONT_TABLES {
         return Err("the number of tables is not that of a font");
     }
-    let (mut cmap, mut outlines) = (false, false);
+    let (mut cmap, mut outlines, mut head_table) = (false, false, false);
     for i in 0..tables {
         let at = start + 12 + 16 * i;
         let record = head
@@ -1837,14 +1837,68 @@ pub fn check_font(head: &[u8], file_len: u64) -> Result<(), &'static str> {
         }
         match &record[..4] {
             b"cmap" => cmap = true,
+            b"head" => head_table = true,
             b"glyf" | b"CFF " | b"CFF2" => outlines = true,
             _ => {}
         }
     }
-    if !cmap || !outlines {
-        return Err("the font has no character map or no outlines");
+    if !cmap || !outlines || !head_table {
+        return Err("the font has no character map, no outlines or no header table");
     }
     Ok(())
+}
+
+/// Where a table of the first font lies, as (offset, length) from the start of the file, read from
+/// the table directory in `head`. `None` when the directory is not there or has no such table.
+pub fn font_table(head: &[u8], tag: &[u8; 4]) -> Option<(u64, u64)> {
+    let start = if head.get(..4)? == b"ttcf" {
+        u32::from_be_bytes(head.get(12..16)?.try_into().ok()?) as usize
+    } else {
+        0
+    };
+    let tables = u16::from_be_bytes(head.get(start + 4..start + 6)?.try_into().ok()?) as usize;
+    (0..tables.min(MAX_FONT_TABLES)).find_map(|i| {
+        let at = start + 12 + 16 * i;
+        let record = head.get(at..at + 16)?;
+        (&record[..4] == tag).then(|| {
+            (
+                u32::from_be_bytes([record[8], record[9], record[10], record[11]]) as u64,
+                u32::from_be_bytes([record[12], record[13], record[14], record[15]]) as u64,
+            )
+        })
+    })
+}
+
+/// How many bytes of the `head` table [`check_head_table`] needs.
+pub const FONT_HEAD_TABLE_BYTES: usize = 54;
+
+/// Checks the `head` table of a font: its length, the magic number every intact one has
+/// (0x5F0F3CF5) and a sane units-per-em. A font whose tables were overwritten fails here, which
+/// the table directory alone does not show, and FreeType refuses it too.
+pub fn check_head_table(table: &[u8]) -> Result<(), &'static str> {
+    if table.len() < FONT_HEAD_TABLE_BYTES {
+        return Err("the header table is too short");
+    }
+    if table[12..16] != [0x5F, 0x0F, 0x3C, 0xF5] {
+        return Err("the header table has the wrong magic number");
+    }
+    let units_per_em = u16::from_be_bytes([table[18], table[19]]);
+    if !(16..=16384).contains(&units_per_em) {
+        return Err("the header table has a units-per-em that is not that of a font");
+    }
+    Ok(())
+}
+
+/// [`check_font`] and [`check_head_table`] on a font file held whole in memory.
+pub fn check_font_data(data: &[u8]) -> Result<(), &'static str> {
+    let head = &data[..data.len().min(FONT_HEAD_BYTES)];
+    check_font(head, data.len() as u64)?;
+    let (offset, length) = font_table(head, b"head").ok_or("the font has no header table")?;
+    let table = usize::try_from(offset)
+        .ok()
+        .and_then(|o| data.get(o..o.checked_add(usize::try_from(length).ok()?)?))
+        .ok_or("the header table lies outside the file")?;
+    check_head_table(table)
 }
 
 #[cfg(test)]
@@ -1882,7 +1936,8 @@ mod font_script_tests {
 
     #[test]
     fn an_intact_font_header_passes_and_a_cut_file_does_not() {
-        let tables: [(&[u8; 4], u32, u32); 2] = [(b"cmap", 100, 50), (b"glyf", 150, 850)];
+        let tables: [(&[u8; 4], u32, u32); 3] =
+            [(b"cmap", 100, 50), (b"glyf", 150, 800), (b"head", 950, 50)];
         let ok = header(0, &tables);
         assert_eq!(check_font(&ok, 1000), Ok(()));
         // The same header on a file that was cut short.
@@ -1893,13 +1948,46 @@ mod font_script_tests {
     }
 
     #[test]
+    fn the_header_table_must_be_a_real_one() {
+        let mut head = vec![0u8; 54];
+        head[12..16].copy_from_slice(&[0x5F, 0x0F, 0x3C, 0xF5]);
+        head[18..20].copy_from_slice(&1000u16.to_be_bytes());
+        assert_eq!(check_head_table(&head), Ok(()));
+        assert!(check_head_table(&head[..53]).is_err());
+        head[12] = 0;
+        assert!(check_head_table(&head).is_err());
+        head[12] = 0x5F;
+        head[18..20].copy_from_slice(&0u16.to_be_bytes());
+        assert!(check_head_table(&head).is_err());
+    }
+
+    #[test]
+    fn a_whole_font_is_checked_down_to_its_header_table() {
+        // cmap and glyf at 100 and 104, head at 108 (54 bytes), 162 bytes in all.
+        let tables: [(&[u8; 4], u32, u32); 3] =
+            [(b"cmap", 100, 4), (b"glyf", 104, 4), (b"head", 108, 54)];
+        let mut font = header(0, &tables);
+        font.resize(162, 0);
+        font[108 + 12..108 + 16].copy_from_slice(&[0x5F, 0x0F, 0x3C, 0xF5]);
+        font[108 + 18..108 + 20].copy_from_slice(&2048u16.to_be_bytes());
+        assert_eq!(check_font_data(&font), Ok(()));
+        assert_eq!(font_table(&font, b"head"), Some((108, 54)));
+        assert_eq!(font_table(&font, b"nope"), None);
+        // The directory is the same, the contents are not.
+        font[108..162].fill(0xA5);
+        assert!(check_font_data(&font).is_err());
+        assert!(check_font_data(&font[..120]).is_err());
+    }
+
+    #[test]
     fn what_is_not_a_font_does_not_pass() {
         assert!(check_font(b"", 0).is_err());
         assert!(check_font(b"%PDF-1.7 not a font at all......", 100).is_err());
         assert!(check_font(&[0; 64], 64).is_err());
         // No outlines, or no character map.
-        assert!(check_font(&header(0, &[(b"cmap", 50, 10)]), 1000).is_err());
-        assert!(check_font(&header(0, &[(b"glyf", 50, 10)]), 1000).is_err());
+        assert!(check_font(&header(0, &[(b"cmap", 50, 10), (b"head", 60, 54)]), 1000).is_err());
+        assert!(check_font(&header(0, &[(b"glyf", 50, 10), (b"head", 60, 54)]), 1000).is_err());
+        assert!(check_font(&header(0, &[(b"cmap", 50, 10), (b"glyf", 60, 10)]), 1000).is_err());
         // Wildly many tables.
         let mut many = header(0, &[]);
         many[4..6].copy_from_slice(&60_000u16.to_be_bytes());

@@ -647,7 +647,7 @@ export class App {
     tab.fontsTold = true;
     await showNotice(this.noticeLayer, {
       title: "Some text may not show",
-      detail: `"${tab.name}" has text in ${describeFontScripts(missed)} that the file does not carry the fonts for, and the reader could not use a font of this computer for it, so that text shows as blanks. You can still search, select and copy it. The reader only looks for a few fonts that come with the system (the list is in the project's documentation). If you install one of them for all users, open the file again; a font installed for one user only is not used.`,
+      detail: `"${tab.name}" has text in ${describeFontScripts(missed)} that the file does not carry the fonts for, and the reader could not use a font of this computer for it, so that text shows as blanks. You can still search, select and copy it. The reader only looks for a few fonts that come with the system (the list is in the project's documentation). If you install one of them for all users, close this tab and open the file again; a font installed for one user only is not used.`,
       buttons: [{ id: "ok", label: "OK", primary: true }],
     });
   }

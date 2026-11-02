@@ -28,7 +28,9 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
-use partridge_protocol::{check_font, FontScript, FONT_HEAD_BYTES};
+use partridge_protocol::{
+    check_font, check_head_table, font_table, FontScript, FONT_HEAD_BYTES, FONT_HEAD_TABLE_BYTES,
+};
 
 /// Largest font file the app hands over. The biggest CJK fonts of the systems are below 128 MB.
 pub const MAX_FONT_BYTES: u64 = 128 * 1024 * 1024;
@@ -245,7 +247,28 @@ fn is_usable(file: &File, path: &Path) -> bool {
     if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_FONT_BYTES {
         return false;
     }
-    read_head(file, meta.len()).is_some_and(|head| check_font(&head, meta.len()).is_ok())
+    let Some(head) = read_head(file, meta.len()) else {
+        return false;
+    };
+    if check_font(&head, meta.len()).is_err() {
+        return false;
+    }
+    // The header table too: a file whose tables were overwritten has an intact directory.
+    let Some((offset, length)) = font_table(&head, b"head") else {
+        return false;
+    };
+    if length < FONT_HEAD_TABLE_BYTES as u64 {
+        return false;
+    }
+    let mut table = [0u8; FONT_HEAD_TABLE_BYTES];
+    let mut filled = 0;
+    while filled < table.len() {
+        match read_at(file, &mut table[filled..], offset + filled as u64) {
+            Ok(0) | Err(_) => return false,
+            Ok(n) => filled += n,
+        }
+    }
+    check_head_table(&table).is_ok()
 }
 
 /// The first of the paths that can be opened and passes [`is_usable`], with the open file.
@@ -288,18 +311,26 @@ pub fn open_all() -> Vec<(FontScript, File)> {
 mod tests {
     use super::*;
 
-    /// A font header that passes the check: a `cmap` and a `glyf` table, both at the end of the
+    /// A font that passes the check: a `cmap`, a `glyf` and a `head` table, all at the end of the
     /// file after `filler` bytes of other data (so that a file cut short loses them).
     fn font(filler: usize) -> Vec<u8> {
-        let mut out = vec![0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0];
-        let end = 44 + filler as u32;
-        for (tag, offset) in [(b"cmap", end), (b"glyf", end + 4)] {
+        let mut out = vec![0, 1, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0];
+        let end = 60 + filler as u32;
+        for (tag, offset, length) in [
+            (b"cmap", end, 4u32),
+            (b"glyf", end + 4, 4),
+            (b"head", end + 8, 54),
+        ] {
             out.extend_from_slice(tag);
             out.extend_from_slice(&[0; 4]);
             out.extend_from_slice(&offset.to_be_bytes());
-            out.extend_from_slice(&4u32.to_be_bytes());
+            out.extend_from_slice(&length.to_be_bytes());
         }
         out.extend_from_slice(&vec![9u8; filler + 8]);
+        let head_at = out.len();
+        out.resize(head_at + 54, 0);
+        out[head_at + 12..head_at + 16].copy_from_slice(&[0x5F, 0x0F, 0x3C, 0xF5]);
+        out[head_at + 18..head_at + 20].copy_from_slice(&1000u16.to_be_bytes());
         out
     }
 
@@ -351,6 +382,13 @@ mod tests {
         let good = dir.join("good.ttf");
         std::fs::write(&good, font(100)).unwrap();
         assert!(is_usable(&File::open(&good).unwrap(), &good));
+        // A font whose tables were overwritten, with the directory left, is not.
+        let mut garbled = font(100);
+        let at = garbled.len() - 54;
+        garbled[at..].fill(0xA5);
+        let bad = dir.join("garbled.ttf");
+        std::fs::write(&bad, garbled).unwrap();
+        assert!(!is_usable(&File::open(&bad).unwrap(), &bad));
         // Text with the name of a font is not.
         let text = dir.join("text.ttf");
         std::fs::write(&text, b"this is not a font, but its name says it is one").unwrap();

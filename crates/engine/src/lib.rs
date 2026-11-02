@@ -433,9 +433,9 @@ fn load_pdfium(
     }
     let missed = provider.missed_scripts();
     // The font source lives as long as the process, like the library.
-    let source = Box::leak(sysfontinfo::SysFontInfo::new(provider));
+    let source = sysfontinfo::SysFontInfo::new(provider).into_ptr();
     // SAFETY: the pointer is to a structure that is never freed, built for this interface.
-    unsafe { pdfium.bindings().FPDF_SetSystemFontInfo(source.as_ptr()) };
+    unsafe { pdfium.bindings().FPDF_SetSystemFontInfo(source) };
     // The engine lives as long as the process: leaking gives every document a 'static library.
     Ok((Box::leak(Box::new(pdfium)), missed))
 }

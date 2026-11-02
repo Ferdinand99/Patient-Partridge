@@ -269,6 +269,32 @@ fn font_names_in_a_code_page_find_the_font_of_their_script() {
     assert!(failures.is_empty(), "drawn as blanks: {failures:?}");
 }
 
+/// A document merged from many parts has a font object in each, all named alike. PDFium keeps one
+/// copy of the font for them, so nothing may be refused: 40 objects of a 55 MB font would be 2 GB
+/// if every request were charged.
+#[test]
+fn a_page_with_40_font_objects_of_one_name_is_drawn_and_nothing_is_refused() {
+    if !system_fonts::available().contains(&FontScript::Japanese) {
+        println!("japanese: no font on this system, nothing to hold");
+        return;
+    }
+    let file = kit::TempFile::new("same.pdf", &kit::same_name_fonts_pdf(40));
+    let mut config = config(true);
+    config.memory_limit = Some(1024 * 1024 * 1024);
+    let client = EngineClient::new(config);
+    let doc = client.open(&file.path_str(), None).unwrap();
+    let bitmap = client.render(doc.doc, 0, 612, 792).unwrap();
+    // 40 lines of text 4 points high, one under the other, from the top.
+    let ink = ink_anywhere(&bitmap);
+    println!("40 font objects of one name: {ink} marked pixels");
+    assert!(ink > 500, "{ink} marked pixels: the lines are not all drawn");
+    assert!(
+        client.font_report(doc.doc).unwrap().is_empty(),
+        "a font was refused"
+    );
+    assert_eq!(client.spawn_count(), 1);
+}
+
 /// One page with 150 unembedded fonts of different names would, with a font file of 20 MB or more
 /// behind each name, make PDFium hold 3 GB. The engine hands PDFium a bounded number of bytes and
 /// the rest of the page stays blank; the engine stays up and keeps working.
@@ -363,6 +389,69 @@ fn a_truncated_font_is_refused_before_pdfium_sees_it() {
     assert_eq!(client.spawn_count(), 1);
     assert_eq!(client.font_report(doc.doc).unwrap(), vec![script]);
     // The next document goes on.
+    let plain = kit::TempFile::new("plain.pdf", &kit::simple_pdf(1));
+    let doc = client.open(&plain.path_str(), None).unwrap();
+    assert!(ink_anywhere(&client.render(doc.doc, 0, 612, 792).unwrap()) > 0);
+}
+
+/// Overwrites what is in every table of the first font but the `head` table, and leaves the
+/// directory: the file passes the checks of the app and of the engine, and is not a font.
+fn garble_tables(bytes: &[u8]) -> Vec<u8> {
+    let be32 = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+    let mut out = bytes.to_vec();
+    let start = if &bytes[..4] == b"ttcf" { be32(12) } else { 0 };
+    let tables = u16::from_be_bytes([bytes[start + 4], bytes[start + 5]]) as usize;
+    let directory_end = start + 12 + 16 * tables;
+    for i in 0..tables {
+        let at = start + 12 + 16 * i;
+        let (offset, length) = (be32(at + 8), be32(at + 12));
+        if &bytes[at..at + 4] == b"head" || offset < directory_end {
+            continue;
+        }
+        let end = (offset + length).min(bytes.len());
+        for (k, b) in out[offset..end].iter_mut().enumerate() {
+            *b = (k as u8).wrapping_mul(167) ^ 0x5A;
+        }
+    }
+    out
+}
+
+/// PDFium is given a font that passes every check of ours and that FreeType cannot use. What
+/// happens is printed; the engine may be restarted once (the window offers to open the document
+/// again), no more, and the next document goes on.
+#[test]
+fn a_font_that_passes_the_checks_and_cannot_be_parsed_costs_at_most_one_engine() {
+    let Some((script, path)) = system_fonts::found().first().cloned() else {
+        println!("no system font here, nothing to damage");
+        return;
+    };
+    let name = script.name();
+    let garbled = garble_tables(&std::fs::read(&path).unwrap());
+    assert!(
+        partridge_protocol::check_font_data(&garbled).is_ok(),
+        "the damaged font has to pass the check, or it never reaches PDFium"
+    );
+    let damaged = kit::TempFile::new("garbled.ttf", &garbled);
+    let file = kit::TempFile::new("script.pdf", &kit::script_pdf(name));
+    let mut cfg = config(true);
+    cfg.system_font_files = Some(vec![(script, damaged.path().to_path_buf())]);
+    let client = EngineClient::new(cfg);
+    let opened = client.open(&file.path_str(), None).unwrap();
+    let outcome = match client.render(opened.doc, 0, 612, 792) {
+        Ok(bitmap) => format!(
+            "the page was drawn with {} dark pixels, script reported as refused: {:?}",
+            ink(&bitmap),
+            client.font_report(opened.doc).map(|r| !r.is_empty())
+        ),
+        Err(e) => format!("the render failed: {e:?}"),
+    };
+    println!(
+        "{name}: unparsable font that passes the checks: {outcome}; engines started: {}",
+        client.spawn_count()
+    );
+    summary(&format!("| {name} | unparsable font | {outcome} |"));
+    assert!(client.spawn_count() <= 2, "more than one restart");
+    // The next document goes on, with the engine of its own.
     let plain = kit::TempFile::new("plain.pdf", &kit::simple_pdf(1));
     let doc = client.open(&plain.path_str(), None).unwrap();
     assert!(ink_anywhere(&client.render(doc.doc, 0, 612, 792).unwrap()) > 0);

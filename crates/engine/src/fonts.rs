@@ -25,13 +25,13 @@
 //! reader. A PDF that embeds its fonts, which is nearly every PDF made for the web or print, is not
 //! affected.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
-use partridge_protocol::{check_font, FontScript, FONT_HEAD_BYTES};
+use partridge_protocol::{check_font_data, FontScript};
 
 /// Most font files read at start.
 pub const MAX_FONT_FILES: usize = 64;
@@ -40,9 +40,13 @@ pub const MAX_FONT_BYTES: u64 = 96 * 1024 * 1024;
 /// Largest system font file the engine reads, in bytes.
 pub const MAX_SYSTEM_FONT_BYTES: u64 = 128 * 1024 * 1024;
 /// Most bytes of font data the engine hands to PDFium for one document. PDFium keeps its own copy
-/// of a font for every name a PDF asks about, so a page with 150 font names would otherwise cost
-/// 150 copies. Past this the source says "no font" and the text stays blank.
+/// of a font for every combination of name, weight and slant that a PDF asks about (not for every
+/// font object: objects that ask alike share the copy), so a page with 150 font names would
+/// otherwise cost 150 copies. Each combination is charged once, the first time. Past the budget the
+/// source says "no font" and the text stays blank.
 pub const FONT_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
+/// Longest font name the source looks at, in bytes. A longer one is no font name.
+pub const MAX_FACE_NAME: usize = 256;
 
 struct Font {
     /// Family name in the form used for matching: lower case letters and digits only, with the
@@ -87,9 +91,10 @@ impl SystemFont {
     fn read(&self, shared: &mut Vec<Arc<[u8]>>) -> Option<Arc<[u8]>> {
         let mut buffer = vec![0u8; usize::try_from(self.length).ok()?];
         read_exact_at(&self.file, &mut buffer, 0).ok()?;
-        // The app checked the header already; a file that changed since, or a handle that is not
-        // what it was said to be, is not handed to PDFium.
-        check_font(&buffer[..buffer.len().min(FONT_HEAD_BYTES)], self.length).ok()?;
+        // The app checked the file already; a file that changed since, or a handle that is not
+        // what it was said to be, is not handed to PDFium. The whole file is here, so the check
+        // goes down to the header table.
+        check_font_data(&buffer).ok()?;
         if let Some(same) = shared.iter().find(|d| d[..] == buffer[..]) {
             return Some(same.clone());
         }
@@ -248,8 +253,11 @@ pub struct MemoryFonts {
     system: HashMap<FontScript, SystemFont>,
     /// The distinct system font files already read, so that scripts sharing a file share its bytes.
     shared: Vec<Arc<[u8]>>,
-    /// Bytes of system font still allowed to go to PDFium.
+    /// Bytes of font data still allowed to go to PDFium.
     budget_left: u64,
+    /// The copies already charged: (file, name as PDFium gave it, weight, italic). PDFium keeps one
+    /// copy for each, so asking again costs nothing.
+    charged: HashSet<(usize, Vec<u8>, i32, bool)>,
     /// The scripts that were asked for and refused, one bit each (bit n is `FontScript::ALL[n]`).
     missed: Arc<AtomicU8>,
 }
@@ -261,6 +269,7 @@ impl Default for MemoryFonts {
             system: HashMap::new(),
             shared: Vec::new(),
             budget_left: FONT_BUDGET_BYTES,
+            charged: HashSet::new(),
             missed: Arc::new(AtomicU8::new(0)),
         }
     }
@@ -395,22 +404,53 @@ impl MemoryFonts {
             .map(|(i, _)| i)
     }
 
-    /// Answers PDFium's question for a font. `face` is the name as PDFium has it, with the bytes
-    /// that are not UTF-8 replaced (it is only used to tell a script by name, and for the fonts of
-    /// the `fonts` folder: a Chinese font written in GBK has the character set to go by).
-    /// `charset` is the character set PDFium asks for. Returns what to hand over, or `None` for
-    /// "no font".
-    pub fn serve(&mut self, face: &str, italic: bool, charset: i32) -> Option<Served> {
+    /// Charges the copy PDFium will keep of `data` for this request, unless it was charged before.
+    /// False when the budget does not allow it.
+    fn charge(&mut self, data: &Arc<[u8]>, face: &[u8], weight: i32, italic: bool) -> bool {
+        let key = (
+            Arc::as_ptr(data) as *const u8 as usize,
+            face.to_vec(),
+            weight,
+            italic,
+        );
+        if self.charged.contains(&key) {
+            return true;
+        }
+        let size = data.len() as u64;
+        if size > self.budget_left {
+            return false;
+        }
+        self.budget_left -= size;
+        self.charged.insert(key);
+        true
+    }
+
+    /// Answers PDFium's question for a font. `face` is the name as PDFium has it, in whatever
+    /// bytes the PDF wrote it (a name in GBK or Shift-JIS is not UTF-8; it is only used to tell a
+    /// script by name and for the fonts of the `fonts` folder: a Chinese font written in GBK has
+    /// the character set to go by). `charset` is the character set PDFium asks for. Returns what to
+    /// hand over, or `None` for "no font".
+    pub fn serve(
+        &mut self,
+        face: &[u8],
+        weight: i32,
+        italic: bool,
+        charset: i32,
+    ) -> Option<Served> {
+        // A name that long is no font name; it would only make the lookups slow.
+        if face.len() > MAX_FACE_NAME {
+            return None;
+        }
+        let name = String::from_utf8_lossy(face);
         // A script the app has a system font for: PDFium asked for the character set (or for a
         // name made for the script), and the name chooses nothing else. The name never chooses a
         // file.
-        let script = script_of_charset(charset).or_else(|| script_of_name(face));
+        let script = script_of_charset(charset).or_else(|| script_of_name(&name));
         let mut refused = false;
         if let Some(script) = script {
             if let Some(system) = self.system.get_mut(&script) {
                 match system.bytes(&mut self.shared) {
-                    Some(data) if (data.len() as u64) <= self.budget_left => {
-                        self.budget_left -= data.len() as u64;
+                    Some(data) if self.charge(&data, face, weight, italic) => {
                         return Some(Served {
                             data,
                             charset: charset_of(script),
@@ -422,13 +462,17 @@ impl MemoryFonts {
                 refused = true;
             }
         }
-        let bold = names_bold(face);
-        let italic = italic || names_italic(face);
-        if let Some(index) = self.find(face, bold, italic) {
-            return Some(Served {
-                data: self.fonts[index].data.clone(),
-                charset: CHARSET_DEFAULT,
-            });
+        let bold = names_bold(&name);
+        let slanted = italic || names_italic(&name);
+        if let Some(index) = self.find(&name, bold, slanted) {
+            let data = self.fonts[index].data.clone();
+            if self.charge(&data, face, weight, italic) {
+                return Some(Served {
+                    data,
+                    charset: CHARSET_DEFAULT,
+                });
+            }
+            refused = true;
         }
         if refused {
             if let Some(script) = script {
@@ -497,16 +541,27 @@ mod tests {
         assert!(MemoryFonts::load_dir(Path::new("/definitely/not/here")).is_empty());
     }
 
-    /// A tiny file that passes the check: a `cmap` and a `glyf` table.
+    /// A tiny font that passes the check: a `cmap`, a `glyf` and a `head` table at the end of the
+    /// file, after `filler` bytes (so a file cut short loses them).
     fn small_font(fill: u8) -> Vec<u8> {
-        let mut out = vec![0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0];
-        for (tag, offset) in [(b"cmap", 44u32), (b"glyf", 48u32)] {
+        let mut out = vec![0, 1, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0];
+        let end = 60 + fill as u32;
+        for (tag, offset, length) in [
+            (b"cmap", end, 4u32),
+            (b"glyf", end + 4, 4),
+            (b"head", end + 8, 54),
+        ] {
             out.extend_from_slice(tag);
             out.extend_from_slice(&[0; 4]);
             out.extend_from_slice(&offset.to_be_bytes());
-            out.extend_from_slice(&4u32.to_be_bytes());
+            out.extend_from_slice(&length.to_be_bytes());
         }
+        out.extend_from_slice(&vec![fill; fill as usize]);
+        let head_at = out.len() + 8;
         out.extend_from_slice(&[fill; 8]);
+        out.resize(head_at + 54, 0);
+        out[head_at + 12..head_at + 16].copy_from_slice(&[0x5F, 0x0F, 0x3C, 0xF5]);
+        out[head_at + 18..head_at + 20].copy_from_slice(&1000u16.to_be_bytes());
         out
     }
 
@@ -526,17 +581,17 @@ mod tests {
             FontScript::ChineseSimplified,
             temp_file("a", &small_font(1)),
         );
-        // The bytes of a name in GBK, decoded lossily, say nothing; the character set does.
-        let served = set.serve("\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}", false, CHARSET_GB2312);
+        // A name in GBK (not UTF-8) tells nothing; the character set does.
+        let served = set.serve(&[0xCB, 0xCE, 0xCC, 0xE5], 400, false, CHARSET_GB2312);
         assert_eq!(served.map(|s| s.charset), Some(CHARSET_GB2312));
         // Another script has no font: refused, and remembered.
-        assert!(set.serve("x", false, CHARSET_HANGEUL).is_none());
+        assert!(set.serve(b"x", 400, false, CHARSET_HANGEUL).is_none());
         assert_eq!(
             scripts_of_bits(set.missed.load(Ordering::Relaxed)),
             vec![FontScript::Korean]
         );
         // Latin text is nobody's business.
-        assert!(set.serve("Arial", false, 0).is_none());
+        assert!(set.serve(b"Arial", 400, false, 0).is_none());
         assert_eq!(
             set.missed.load(Ordering::Relaxed),
             1 << FontScript::Korean.code()
@@ -549,26 +604,56 @@ mod tests {
         let font = small_font(7);
         set.add_system(FontScript::Japanese, temp_file("j", &font));
         set.add_system(FontScript::Korean, temp_file("k", &font));
-        let a = set.serve("a", false, CHARSET_SHIFTJIS).unwrap();
-        let b = set.serve("b", false, CHARSET_HANGEUL).unwrap();
+        let a = set.serve(b"a", 400, false, CHARSET_SHIFTJIS).unwrap();
+        let b = set.serve(b"b", 400, false, CHARSET_HANGEUL).unwrap();
         assert!(Arc::ptr_eq(&a.data, &b.data));
     }
 
     #[test]
-    fn past_the_budget_the_answer_is_no_font_and_the_script_is_reported() {
+    fn the_same_request_again_costs_nothing_and_a_new_copy_costs_the_file() {
         let mut set = MemoryFonts::default();
         set.add_system(FontScript::Japanese, temp_file("j", &small_font(2)));
         let size = small_font(2).len() as u64;
         set.set_budget(size * 3);
-        for i in 0..3 {
-            assert!(set.serve("name", false, CHARSET_SHIFTJIS).is_some(), "{i}");
+        // A document merged from ten parts: ten font objects that ask alike make one copy.
+        for i in 0..10 {
+            assert!(set.serve(b"SimSun", 400, false, CHARSET_SHIFTJIS).is_some(), "{i}");
         }
+        // Three copies in all fit: this name, the same name in bold, and one more name.
+        assert!(set.serve(b"SimSun", 700, false, CHARSET_SHIFTJIS).is_some());
+        assert!(set.serve(b"SimHei", 400, false, CHARSET_SHIFTJIS).is_some());
         assert_eq!(set.missed.load(Ordering::Relaxed), 0);
-        assert!(set.serve("name", false, CHARSET_SHIFTJIS).is_none());
+        // A fourth copy does not, and the script is reported; the ones charged still work.
+        assert!(set.serve(b"FangSong", 400, false, CHARSET_SHIFTJIS).is_none());
         assert_eq!(
             scripts_of_bits(set.missed.load(Ordering::Relaxed)),
             vec![FontScript::Japanese]
         );
+        assert!(set.serve(b"SimHei", 400, false, CHARSET_SHIFTJIS).is_some());
+        // The italic form is a copy of its own.
+        assert!(set.serve(b"SimSun", 400, true, CHARSET_SHIFTJIS).is_none());
+    }
+
+    #[test]
+    fn the_fonts_folder_is_charged_too() {
+        let mut set = MemoryFonts::default();
+        set.add("NotoSans-Regular", small_font(2));
+        let size = small_font(2).len() as u64;
+        set.set_budget(size * 2);
+        // The names Noto-Sans and Noto_Sans are the same font to the matching and two copies to PDFium.
+        assert!(set.serve(b"Noto-Sans", 400, false, 0).is_some());
+        assert!(set.serve(b"Noto-Sans", 400, false, 0).is_some());
+        assert!(set.serve(b"Noto_Sans", 400, false, 0).is_some());
+        assert!(set.serve(b"Noto Sans", 400, false, 0).is_none());
+    }
+
+    #[test]
+    fn a_name_that_is_too_long_is_no_font_name() {
+        let mut set = MemoryFonts::default();
+        set.add_system(FontScript::Japanese, temp_file("j", &small_font(2)));
+        let long = vec![b'a'; MAX_FACE_NAME + 1];
+        assert!(set.serve(&long, 400, false, CHARSET_SHIFTJIS).is_none());
+        assert!(set.serve(&long[1..], 400, false, CHARSET_SHIFTJIS).is_some());
     }
 
     #[test]
@@ -578,7 +663,7 @@ mod tests {
             FontScript::Thai,
             temp_file("t", b"%PDF-1.4 not a font, 64 bytes of text......"),
         );
-        assert!(set.serve("Angsana", false, 0).is_none());
+        assert!(set.serve(b"Angsana", 400, false, 0).is_none());
         assert_eq!(
             scripts_of_bits(set.missed.load(Ordering::Relaxed)),
             vec![FontScript::Thai]
@@ -588,6 +673,13 @@ mod tests {
         cut.truncate(cut.len() - 6);
         let mut set = MemoryFonts::default();
         set.add_system(FontScript::Thai, temp_file("c", &cut));
-        assert!(set.serve("Angsana", false, 0).is_none());
+        assert!(set.serve(b"Angsana", 400, false, 0).is_none());
+        // The directory is intact, the header table is not.
+        let mut garbled = small_font(3);
+        let at = garbled.len() - 54;
+        garbled[at..].fill(0xA5);
+        let mut set = MemoryFonts::default();
+        set.add_system(FontScript::Thai, temp_file("g", &garbled));
+        assert!(set.serve(b"Angsana", 400, false, 0).is_none());
     }
 }

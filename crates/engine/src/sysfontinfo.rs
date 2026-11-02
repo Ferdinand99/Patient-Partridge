@@ -59,10 +59,11 @@ impl SysFontInfo {
         })
     }
 
-    /// The pointer to give to `FPDF_SetSystemFontInfo`. The structure must stay where it is for as
-    /// long as PDFium lives.
-    pub fn as_ptr(&mut self) -> *mut FPDF_SYSFONTINFO {
-        &mut self.base
+    /// The pointer to give to `FPDF_SetSystemFontInfo`. The structure is given up for good: it is
+    /// never freed, and PDFium may call back into it for as long as the process lives.
+    pub fn into_ptr(self: Box<SysFontInfo>) -> *mut FPDF_SYSFONTINFO {
+        // The pointer to the whole structure, which starts with `base`.
+        Box::into_raw(self) as *mut FPDF_SYSFONTINFO
     }
 }
 
@@ -83,14 +84,16 @@ unsafe extern "C" fn release(this: *mut FPDF_SYSFONTINFO) {
 
 unsafe extern "C" fn map_font(
     this: *mut FPDF_SYSFONTINFO,
-    _weight: c_int,
+    weight: c_int,
     italic: FPDF_BOOL,
     charset: c_int,
     _pitch_family: c_int,
     face: *const c_char,
     _exact: *mut FPDF_BOOL,
 ) -> *mut c_void {
-    // A panic must not unwind into PDFium: it means "no font".
+    // A panic must not unwind into PDFium. In a debug build it is caught and means "no font"; a
+    // release build aborts on a panic (`panic = "abort"`), which ends the engine, and the app
+    // offers to open the document again. No panic source is known.
     catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: see `info`.
         let info = unsafe { info(this) }?;
@@ -100,10 +103,9 @@ unsafe extern "C" fn map_font(
             // SAFETY: PDFium passes a string with a closing zero.
             unsafe { CStr::from_ptr(face) }.to_bytes()
         };
-        // Bytes that are not UTF-8 (a name in GBK or Shift-JIS) become replacement characters:
-        // such a name tells nothing, the character set does.
-        let name = String::from_utf8_lossy(raw);
-        let served = info.fonts.serve(&name, italic != 0, charset)?;
+        // The name goes to the font source as the bytes the PDF wrote: a name in GBK or Shift-JIS
+        // is not UTF-8 and tells nothing, the character set does.
+        let served = info.fonts.serve(raw, weight, italic != 0, charset)?;
         let key = info.next;
         info.next += 1;
         let mut face = raw.to_vec();
