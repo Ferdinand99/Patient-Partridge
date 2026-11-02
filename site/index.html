@@ -402,11 +402,10 @@
               <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#alert"></use></svg>
               <p>
                 <span class="callout-title">What the sandbox does not cover</span>
-                On all three systems the engine cannot use the network, and on Windows it checks that
-                each time it starts. No sandbox is perfect: a bug in the operating system itself can be
-                used to leave one, the app (the window) is not sandboxed, and the Windows block has
-                been tried on Windows Server 2022 and 2025 but not yet on Windows 10 and 11.
-                The README lists what is and is not protected.
+                On Windows the engine is not blocked from the network. If someone finds a bug in PDFium
+                and builds a PDF that exploits it, that code could use the internet, though it still
+                cannot open your other files. Linux and macOS block the network too. This gap will be
+                closed in a later version. The README lists what is and is not protected.
               </p>
             </div>
             <div class="callout status-info reveal d1">
@@ -538,7 +537,7 @@
               <details>
                 <summary>Is it safe to open PDFs from strangers?<svg class="icon" aria-hidden="true"><use href="assets/icons.svg#chevron-down"></use></svg></summary>
                 <div class="faq-body">
-                  <p>Safer than before, but no PDF reader is risk-free. The engine runs in a sandbox that keeps it from your other files, from starting programs and from the network, but no sandbox is perfect, and this is early software. Read the <a href="#security">security section</a> first.</p>
+                  <p>Safer than before, but no PDF reader is risk-free. The engine runs in a sandbox, but on Windows it can still reach the network, and this is early software. Read the <a href="#security">security section</a> first.</p>
                 </div>
               </details>
             </li>

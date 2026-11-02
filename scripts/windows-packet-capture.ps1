@@ -58,6 +58,7 @@ function Capture([string]$phase, [bool]$keepPrivilege) {
   $refused = ([regex]::Matches($test, 'raw_echo_sent_\d: denied')).Count
   Say "echo requests the program says it sent: $sent; refused: $refused"
   $script:counts["$phase-sent"] = $sent
+  $script:counts["$phase-refused"] = $refused
 }
 
 Capture 'control' $false
@@ -74,5 +75,6 @@ if ($env:GITHUB_STEP_SUMMARY) { $summary | Add-Content -LiteralPath $env:GITHUB_
 if ($counts['control-sent'] -lt 1) { throw 'The control could not send an echo request: the capture proves nothing.' }
 if (($counts['control'] + $counts['control-dropped']) -lt 1) { throw 'pktmon did not see the control''s echo requests: the capture proves nothing about the sandbox.' }
 if ($counts['sandbox-sent'] -ne 0) { throw 'The sandbox sent an echo request.' }
+if ($counts['sandbox-refused'] -ne 5) { throw "The sandbox run did not refuse the 5 raw sockets (refused: $($counts['sandbox-refused'])): it may not have run." }
 if (($counts['sandbox'] + $counts['sandbox-dropped']) -ne 0) { throw 'pktmon saw echo requests to the documentation address from the sandbox run.' }
 Say 'The sandbox sent nothing, and the capture sees what the control sends.'

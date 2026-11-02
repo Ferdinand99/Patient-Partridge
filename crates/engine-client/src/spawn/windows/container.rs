@@ -1,10 +1,12 @@
 //! The AppContainer layer of the Windows sandbox.
 //!
-//! An AppContainer token carries a package SID and no capabilities. Windows Filtering Platform
-//! blocks every network access of such a token (connect, send, DNS), loopback included, because the
-//! token lacks the capabilities that allow a network (`internetClient` and the like). That is the
-//! only thing on Windows that stops a process from using the network without a firewall rule, and
-//! it needs no administrator, no installer step and no signature.
+//! An AppContainer token carries a package SID and no capabilities. Windows refuses a TCP
+//! connection and the making of a datagram socket for such a token, and a name lookup fails,
+//! loopback included, because the token lacks the capabilities that allow a network
+//! (`internetClient` and the like). Which part of Windows refuses is not known (see
+//! `docs/windows-sandbox.md`). The layer needs no firewall rule, no administrator, no installer
+//! step and no signature. A raw ICMP socket is not stopped by it; the engine's token also loses
+//! the privilege that lets it open the socket device.
 //!
 //! The token is made with `NtCreateLowBoxToken` from the restricted token that the app already
 //! builds (the call that `CreateProcess` makes for the `SECURITY_CAPABILITIES` attribute, but on a
@@ -17,8 +19,8 @@
 //! That call writes under `HKCU\Software\Classes\Local Settings\Software\Microsoft\Windows\
 //! CurrentVersion\AppContainer\Mappings` and creates a folder under `%LOCALAPPDATA%\Packages`, which
 //! would need clean-up (`DeleteAppContainerProfile`) and would leave traces if the app is killed.
-//! A token does not need a registered profile to be an AppContainer, and the network filters only
-//! look at the token. So nothing is written to the registry and there is nothing to remove.
+//! A token does not need a registered profile to be an AppContainer, and the network refusal only
+//! looks at the token. So nothing is written to the registry and there is nothing to remove.
 //!
 //! **Files.** An AppContainer can open only what is open to its package SID or to "all application
 //! packages". The system folders are open to the latter; the folder a per-user install lives in is

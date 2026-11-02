@@ -7,10 +7,12 @@
 //!   network by itself: a process with only this token can still make a socket and connect.
 //! - **AppContainer without capabilities** (see `container`). The same two tokens (the engine's
 //!   and the one its first thread starts with) are turned into tokens of a package that holds no
-//!   capability. The system's network filters refuse every network access of such a process:
-//!   connect, send and name lookup, loopback included. This is what blocks the network. The
-//!   restricted token stays under it: an object must be open to the restricting SID and to the
-//!   package.
+//!   capability. Windows refuses a TCP connection and the making of a datagram socket for such a
+//!   process, and a name lookup fails, loopback included. The restricted token stays under it:
+//!   an object must be open to the restricting SID and to the package.
+//! - **No privilege.** `SeChangeNotifyPrivilege`, the one privilege the restricted token keeps, is
+//!   taken out of the engine's token (not out of its first thread's start identity). Without it
+//!   the engine cannot open the socket device, so it cannot make any socket, raw ones included.
 //! - **Untrusted integrity level**, below everything the user owns (set by the engine on its own
 //!   token just before it gives up the start identity).
 //! - **A job object of its own** (so no race with another job): a single process, no child
@@ -506,12 +508,7 @@ fn remove_bypass_traverse_checking(token: &Owned) -> io::Result<()> {
             "AdjustTokenPrivileges",
         )?;
         // The call succeeds with `ERROR_NOT_ALL_ASSIGNED` when the privilege was not in the token.
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(1300) {
-            return Err(io::Error::other(
-                "AdjustTokenPrivileges: the privilege is not in the token",
-            ));
-        }
+        // That is the wanted state, so it is not an error; the engine checks the result itself.
     }
     Ok(())
 }
