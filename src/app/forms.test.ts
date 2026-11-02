@@ -925,6 +925,93 @@ describe("a second press while a save is being answered", () => {
   });
 });
 
+describe("a Save pressed while another save is running", () => {
+  const ctrlS = () =>
+    document.body.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "s", code: "KeyS", ctrlKey: true, bubbles: true, cancelable: true }),
+    );
+  const tabsOf = (app: App) => (app as unknown as { tabs: { id: number; doc: number }[] }).tabs;
+  const activate = (app: App, id: number) => (app as unknown as { activate(id: number): void }).activate(id);
+  const box = (index: number) => document.querySelector(`.form-field[data-form-index="${index}"]`) as HTMLInputElement;
+  const edit = async (index: number, text: string) => {
+    const el = box(index);
+    el.focus();
+    el.value = text;
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.blur();
+    change(el);
+    await flush();
+  };
+
+  async function twoDocuments() {
+    const m = make({ fields: [textField(0, "comments"), textField(1, "other")] });
+    let doc = 0;
+    m.api.open.mockImplementation((path: string) =>
+      Promise.resolve({ doc: ++doc, name: path.split("/").pop() ?? "", pages: [letter, letter], position: null }),
+    );
+    await m.app.openPath("/docs/a.pdf");
+    await flush();
+    return m;
+  }
+
+  it("saves the other tab while the first tab is still being saved", async () => {
+    const m = await twoDocuments();
+    await edit(0, "one");
+    await m.app.openPath("/docs/b.pdf");
+    await flush();
+    await edit(0, "two");
+    const [a, b] = tabsOf(m.app);
+    activate(m.app, a.id);
+    await flush();
+    let end: (v: SavedFile) => void = () => undefined;
+    m.api.save.mockImplementationOnce(() => new Promise((r) => (end = r)));
+    ctrlS();
+    await flush();
+    activate(m.app, b.id);
+    await flush();
+    ctrlS();
+    await flush();
+    end({ path: "/docs/a.pdf", name: "a.pdf" });
+    await flush();
+    const saved = m.api.save.mock.calls.map((c) => (c as unknown[])[0]);
+    expect(saved).toHaveLength(2);
+    expect(saved).toContain(1);
+    expect(saved).toContain(2);
+    expect(m.app.unsavedCount).toBe(0);
+  });
+
+  it("saves an edit made after the running save began, when Save is pressed again", async () => {
+    const m = await twoDocuments();
+    await edit(0, "one");
+    let end: (v: SavedFile) => void = () => undefined;
+    m.api.save.mockImplementationOnce(() => new Promise((r) => (end = r)));
+    ctrlS();
+    await flush();
+    await edit(1, "later");
+    ctrlS();
+    await flush();
+    end({ path: "/docs/a.pdf", name: "a.pdf" });
+    await flush();
+    expect(m.api.save).toHaveBeenCalledTimes(2);
+    expect(m.app.unsavedCount).toBe(0);
+  });
+
+  it("still ignores a second Save with no change in between, also on a running save", async () => {
+    const m = await twoDocuments();
+    await edit(0, "one");
+    let end: (v: SavedFile) => void = () => undefined;
+    m.api.save.mockImplementationOnce(() => new Promise((r) => (end = r)));
+    ctrlS();
+    await flush();
+    ctrlS();
+    await flush();
+    end({ path: "/docs/a.pdf", name: "a.pdf" });
+    await flush();
+    expect(m.api.save).toHaveBeenCalledTimes(1);
+    expect(m.app.unsavedCount).toBe(0);
+  });
+});
+
 describe("Ctrl+P with a lost engine", () => {
   it("does not open the print dialog when the flush ends the tab", async () => {
     const { app, api } = make();

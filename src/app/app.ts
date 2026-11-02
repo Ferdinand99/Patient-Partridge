@@ -115,6 +115,8 @@ interface Tab {
   dirtyTold: boolean;
   /** Set while the document is being saved; resolves with the answer of that save. */
   saving: Promise<boolean> | null;
+  /** The revision of the document when the running save began. */
+  savingFrom: number;
   view: DocumentView;
   /** The annotations of the document, or null when the app process offers none. */
   annotator: Annotator | null;
@@ -249,8 +251,12 @@ export class App {
   private readonly printRoot: HTMLElement;
   private printJob: PrintJob | null = null;
   private printing = false;
-  /** A save asked for by the reader is under way: a second press waits for nothing and is ignored. */
-  private savingByUser = false;
+  /**
+   * The saves the reader asked for that are under way, per tab (a press on another tab is its own
+   * save). A second press on the same tab is ignored, unless it is a Save and the document changed
+   * since the running save began.
+   */
+  private readonly savingByUser = new Map<Tab, { asCopy: boolean; count: number }>();
   private readonly positionDelay: number;
 
   constructor(
@@ -723,6 +729,7 @@ export class App {
       history: new EditHistory(),
       dirtyTold: false,
       saving: null,
+      savingFrom: 0,
       view: undefined as unknown as DocumentView,
       annotator: null,
       sidebarDoc: undefined as unknown as SidebarDocument,
@@ -1203,17 +1210,28 @@ export class App {
   }
 
   /**
-   * A save the reader asked for with a button or a key. A second press while the first is still
-   * being answered (a dialog open, a question on the screen) does nothing: it would ask again, and
-   * would open a second dialog after the first was cancelled. Resolves with false when ignored.
+   * A save the reader asked for with a button or a key. A second press on the same tab while the
+   * first is still being answered (a dialog open, a question on the screen) does nothing: it would
+   * ask again, and would open a second dialog after the first was cancelled. The exception is a
+   * Save pressed after the document changed since the running save began: it is let through and
+   * waits for the running save. A press on another tab is a save of its own. Resolves with false
+   * when ignored.
    */
   private async saveFromUser(asCopy: boolean): Promise<boolean> {
-    if (this.savingByUser) return false;
-    this.savingByUser = true;
+    const tab = this.active;
+    const running = tab ? this.savingByUser.get(tab) : undefined;
+    if (tab && running) {
+      const changed = tab.saving !== null && (tab.history.revision !== tab.savingFrom || tab.view.hasPendingFormInput);
+      if (asCopy || running.asCopy || !changed) return false;
+    }
+    const entry = running ?? { asCopy, count: 0 };
+    entry.count++;
+    if (tab) this.savingByUser.set(tab, entry);
     try {
       await (asCopy ? this.saveActiveAs() : this.saveActive());
     } finally {
-      this.savingByUser = false;
+      entry.count--;
+      if (tab && entry.count === 0 && this.savingByUser.get(tab) === entry) this.savingByUser.delete(tab);
     }
     return true;
   }
@@ -1250,6 +1268,7 @@ export class App {
       await tab.saving.catch(() => false);
       if (!asCopy && !this.isDirty(tab)) return true;
     }
+    tab.savingFrom = tab.history.revision;
     const running = this.writeTab(tab, asCopy);
     tab.saving = running;
     try {
