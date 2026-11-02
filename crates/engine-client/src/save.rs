@@ -1028,7 +1028,7 @@ mod macos_acl {
 }
 
 /// True when the file has an extended ACL (an entry beyond the mode bits) on macOS.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", test))]
 pub(crate) fn has_acl(path: &Path) -> Result<bool, SaveError> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
