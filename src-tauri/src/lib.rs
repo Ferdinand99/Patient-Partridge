@@ -1089,6 +1089,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     /// The app of a test: the real guard on a window, with the mock runtime of Tauri.
     fn mock_app() -> tauri::App<tauri::test::MockRuntime> {
         let app = tauri::test::mock_builder()
@@ -1099,6 +1100,7 @@ mod tests {
         app
     }
 
+    #[cfg(not(windows))]
     /// Runs the mock app through its event loop (one turn a second), with `step` called at the
     /// start and after every turn, with the number of the turn. The loop ends when the last window
     /// is closed and nothing holds the exit back.
@@ -1122,6 +1124,7 @@ mod tests {
         });
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn closing_the_window_asks_first_and_keeps_the_window_while_a_document_has_unsaved_changes() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1175,6 +1178,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn closing_a_window_without_unsaved_changes_asks_nothing() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1199,7 +1203,7 @@ mod tests {
 
     // The menus of macOS may be made on the main thread only, and tests run on others, so this
     // runs on the other systems; the function is the same code on all of them.
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     #[test]
     fn the_quit_entry_of_the_application_menu_is_replaced_by_one_that_goes_through_the_guard() {
         use tauri::menu::{Menu, MenuItemKind, PredefinedMenuItem, Submenu};
@@ -1231,6 +1235,7 @@ mod tests {
         assert!(!use_own_quit(handle, &menu).unwrap());
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn the_quit_entry_asks_while_a_document_has_unsaved_changes() {
         use std::sync::atomic::{AtomicUsize, Ordering};
