@@ -1122,6 +1122,27 @@ mod tests {
     }
 
     #[test]
+    fn a_document_that_was_closed_during_the_check_is_not_saved() {
+        let dir = Dir::new("closed");
+        let path = original_in(&dir);
+        let (client, doc) = client("save-good");
+        let result = save_document(
+            &client,
+            doc,
+            &path,
+            None,
+            SaveOptions::default(),
+            &accept,
+            &|| false,
+        );
+        match result {
+            Err(ClientError::Engine { code, .. }) => assert_eq!(code, ErrorCode::UnknownDocument),
+            other => panic!("{other:?}"),
+        }
+        assert_untouched(&dir, &path);
+    }
+
+    #[test]
     fn the_check_is_told_what_the_document_is() {
         let dir = Dir::new("info");
         let path = original_in(&dir);

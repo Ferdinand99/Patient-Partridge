@@ -1133,6 +1133,8 @@ mod tests {
             counter.fetch_add(1, Ordering::SeqCst);
         });
         let seen = asked.clone();
+        let reached = Arc::new(AtomicUsize::new(0));
+        let turns = reached.clone();
         run_mock(app, move |handle, turn| match turn {
             0 => {
                 let window =
@@ -1145,6 +1147,7 @@ mod tests {
                 window.close().unwrap();
             }
             1 => {
+                turns.fetch_add(1, Ordering::SeqCst);
                 assert_eq!(seen.load(Ordering::SeqCst), 1, "the window was not asked");
                 assert!(
                     handle.get_webview_window("main").is_some(),
@@ -1164,6 +1167,12 @@ mod tests {
             }
         });
         assert_eq!(asked.load(Ordering::SeqCst), 1);
+        // The app was still running after the first close request: the window had been kept.
+        assert_eq!(
+            reached.load(Ordering::SeqCst),
+            1,
+            "the window was closed at once"
+        );
     }
 
     #[test]
