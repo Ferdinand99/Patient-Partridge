@@ -983,3 +983,79 @@ pub fn forms_holes_pdf() -> Vec<u8> {
     objects[1] = b"<< /Type /Pages /Kids [99 0 R 4 0 R 98 0 R 6 0 R] /Count 4 >>".to_vec();
     assemble(&objects, "")
 }
+
+/// What a form needs for the tests of a dictionary with no `/Rect`, and of a `/Rect` written in an
+/// unusual way. The form has `keep` ("kept"), `plain` and `date`, which is a text field with a
+/// format script of its own and the entries `date` gives. With `parent` set, `date` is a field with
+/// that text among its entries and a single widget below it, and the widget holds the entries of
+/// `date`.
+#[derive(Default)]
+pub struct Unplaced<'a> {
+    /// Objects numbered from 6, in the order given, before the fields.
+    pub objects: &'a [&'a str],
+    /// Entries of the catalog.
+    pub catalog: &'a str,
+    /// Entries of the page.
+    pub page: &'a str,
+    /// Entries of the field above the widget of `date`.
+    pub parent: Option<&'a str>,
+    /// Entries of the widget of `date`.
+    pub date: &'a str,
+    /// The `/Rect` of the widget of `date`, as text; a plain box when `None`.
+    pub rect: Option<&'a str>,
+    /// Whether the form has a "Clear" button.
+    pub clear: bool,
+}
+
+pub fn forms_unplaced_pdf(spec: &Unplaced) -> Vec<u8> {
+    let mut objs = Objects::new(6);
+    let page = 4;
+    for body in spec.objects {
+        objs.add(body.as_bytes());
+    }
+    let keep = text(&mut objs, page, "keep", 740, "kept", "");
+    let plain = text(&mut objs, page, "plain", 700, "", "");
+    let rect = spec.rect.unwrap_or("[100 660 300 680]");
+    let (field, widget) = match spec.parent {
+        None => {
+            let widget = objs.add(format!(
+                "<< /Type /Annot /Subtype /Widget /FT /Tx /T (date) /Rect {rect} /F 4 \
+                 /P {page} 0 R /DA (/Helv 12 Tf 0 g) {} >>",
+                spec.date
+            ));
+            (widget, widget)
+        }
+        Some(parent) => {
+            let field = objs.reserve();
+            let widget = objs.add(format!(
+                "<< /Type /Annot /Subtype /Widget /Parent {field} 0 R /Rect {rect} /F 4 \
+                 /P {page} 0 R /DA (/Helv 12 Tf 0 g) {} >>",
+                spec.date
+            ));
+            objs.set(
+                field,
+                format!("<< /FT /Tx /T (date) {parent} /Kids [{widget} 0 R] >>"),
+            );
+            (field, widget)
+        }
+    };
+    let mut fields = vec![keep, plain, field];
+    let mut annots = vec![keep, plain, widget];
+    if spec.clear {
+        let clear = clear_button(&mut objs, page, 620);
+        fields.push(clear);
+        annots.push(clear);
+    }
+    let annot_list: String = annots.iter().fold(String::new(), |mut s, f| {
+        let _ = write!(s, "{f} 0 R ");
+        s
+    });
+    let page_spec = PageSpec {
+        width: 612,
+        height: 792,
+        content: Some("0 g 10 10 1 1 re f\n".to_string()),
+        extra: format!("/Annots [{annot_list}] {}", spec.page),
+    };
+    let catalog = format!("{} {}", catalog(&fields), spec.catalog);
+    build(&[page_spec], &catalog, "", objs.bodies)
+}

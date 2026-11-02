@@ -110,7 +110,7 @@ export const ACTIONS_NOTICE =
 
 /** What the form bar says about fields that are left alone for the action they carry. */
 export const BLOCKED_NOTICE =
-  "Some fields in this form cannot be filled in here. Each of them may have an action that could clear or hide fields, and Patient Partridge does not run such actions. It leaves these fields as they are, so that nothing you have typed gets cleared. To fill them in, use another PDF reader.";
+  "Some fields in this form cannot be filled in here. Each of them may have an action that could clear or hide fields. Patient Partridge leaves these fields as they are, because the PDF library could otherwise run those actions and clear what you have typed. To fill them in, use another PDF reader.";
 
 /** What the form bar says when no field of the form can be filled in. */
 export const FORM_BLOCKED_NOTICE =
@@ -568,7 +568,7 @@ export class FormLayer {
     if (field.actionBlocked) {
       const why = field.formBlocked
         ? "No field of this form can be filled in here: Patient Partridge cannot be sure that filling it in would not clear or hide other fields."
-        : "This field cannot be filled in here: it may have an action that could clear or hide fields, and Patient Partridge does not run actions.";
+        : "This field cannot be filled in here: it may have an action that could clear or hide fields, so Patient Partridge leaves it as it is.";
       el.title = `${field.tooltip ? `${field.tooltip} - ` : ""}${why}`;
     }
     if (field.required) el.setAttribute("aria-required", "true");

@@ -43,8 +43,11 @@
 //!   its box (`/Rect`) and whether its own actions reach one. A widget that PDFium lists with an
 //!   action is left alone when a record with the same keys and the same box reaches one, when no
 //!   record has them (the file and PDFium do not agree about the widget), and when a record that
-//!   reaches one has no box that can be read and has the same keys. A harmless widget with the box
-//!   and keys of a harmful one is left alone too. Nothing depends on where a widget sits in a page,
+//!   reaches one has a `/Rect` that cannot be read and has the same keys. A dictionary with no
+//!   `/Rect` key at all (a page, the catalog, a bookmark, a field above its widgets) is not
+//!   recorded: PDFium gives a widget such as that an empty box, and the reader never fills one in.
+//!   A harmless widget with the box and keys of a harmful one is left alone too. Nothing depends on
+//!   where a widget sits in a page,
 //!   on the page tree or on the trailer, so none of them can be made to point at another widget.
 //! - A reset button that reaches a reset itself blocks nothing else, and a script that does not
 //!   reach a reset or a hide through `/Next` blocks nothing, because scripts never run.
@@ -52,9 +55,14 @@
 //!   limits allow, or a document that holds a compressed object stream (whose content is not read)
 //!   all count as reaching one, for the whole form.
 //!
-//! The work is bounded: each object is read once for each way it is reached, every token read costs
-//! one step of a budget that grows with the size of the document, and the search reports progress
-//! while it runs.
+//! The work is limited, not strictly bounded by the size of the file. Most of it is: each object is
+//! read once for each way it is reached, every token read costs one step of a budget that grows with
+//! the size of the document, and the search reports progress while it runs. Two things are not
+//! counted as they deserve. A string costs one step whatever its length, and a definition with no
+//! content costs none. The `/AA` of every dictionary is also read again each time it is met, where
+//! an action is read once. So a file made to be slow, with many `/AA` entries that all point at a
+//! large string, can keep the search busy for minutes, and the window then stops the engine and
+//! closes the document. This is a known limit; it is not a way to change a form.
 
 use std::collections::HashMap;
 
@@ -699,7 +707,14 @@ impl Scanner<'_, '_> {
                     if has_a || has_aa {
                         let reaches = self.own_actions(v)?;
                         own |= reaches;
-                        self.records.add(has_a, has_aa, rect_of(v), reaches)?;
+                        // A dictionary with no `/Rect` key is no widget that PDFium gives a box: it
+                        // gives such a widget an empty one, and the reader never fills it in. A
+                        // `/Rect` that is there and cannot be read is recorded as a box nobody
+                        // has, so that it still fails closed.
+                        if v.get(b"Rect").is_some() {
+                            let rect = self.rect_of(v)?;
+                            self.records.add(has_a, has_aa, rect, reaches)?;
+                        }
                     }
                     stack.extend(pairs.iter().map(|(_, v)| v));
                 }
@@ -814,27 +829,60 @@ impl Scanner<'_, '_> {
     }
 }
 
-/// `[left, bottom, right, top]` of a `/Rect` of four numbers.
-fn rect_of(annot: &Val) -> Option<[f64; 4]> {
-    let Some(Val::Array(items)) = annot.get(b"Rect") else {
-        return None;
-    };
-    let mut n = [0f64; 4];
-    if items.len() != 4 {
-        return None;
-    }
-    for (slot, item) in n.iter_mut().zip(items) {
-        let Val::Num(v) = item else {
-            return None;
+impl Scanner<'_, '_> {
+    /// `[left, bottom, right, top]` of the `/Rect` of a dictionary: four numbers, given as an array
+    /// or as a reference to one, where each number may also be a reference. A reference is followed
+    /// one level, as PDFium reads a box; a reference to a reference, a missing or twice defined
+    /// object, or anything that is not a number gives `None`.
+    fn rect_of(&mut self, annot: &Val) -> R<Option<[f64; 4]>> {
+        let Some(rect) = annot.get(b"Rect") else {
+            return Ok(None);
         };
-        *slot = *v;
+        match rect {
+            Val::Array(items) => self.box_of(items),
+            Val::Ref(number) => match self.only_value(*number)? {
+                Some(Val::Array(items)) => self.box_of(&items),
+                _ => Ok(None),
+            },
+            _ => Ok(None),
+        }
     }
-    Some([
-        n[0].min(n[2]),
-        n[1].min(n[3]),
-        n[0].max(n[2]),
-        n[1].max(n[3]),
-    ])
+
+    fn box_of(&mut self, items: &[Val]) -> R<Option<[f64; 4]>> {
+        if items.len() != 4 {
+            return Ok(None);
+        }
+        let mut n = [0f64; 4];
+        for (slot, item) in n.iter_mut().zip(items) {
+            let value = match item {
+                Val::Num(v) => Some(*v),
+                Val::Ref(number) => match self.only_value(*number)? {
+                    Some(Val::Num(v)) => Some(v),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let Some(value) = value else {
+                return Ok(None);
+            };
+            *slot = value;
+        }
+        Ok(Some([
+            n[0].min(n[2]),
+            n[1].min(n[3]),
+            n[0].max(n[2]),
+            n[1].max(n[3]),
+        ]))
+    }
+
+    /// The value of an object that is defined exactly once, or `None`.
+    fn only_value(&mut self, number: u64) -> R<Option<Val>> {
+        let defs = self.defs(number);
+        match defs.as_slice() {
+            [(start, end)] => Ok(Some(self.load(*start, *end)?)),
+            _ => Ok(None),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1032,12 +1080,15 @@ mod tests {
     }
 
     #[test]
-    fn a_harmful_dictionary_with_no_box_that_can_be_read_blocks_every_widget_with_its_keys() {
+    fn a_harmful_dictionary_with_a_box_that_cannot_be_read_blocks_every_widget_with_its_keys() {
         for rect in [
-            "",
             "/Rect [10 10 110]",
             "/Rect [10 10 110 (x)]",
             "/Rect 7 0 R",
+            "/Rect 8 0 R",
+            "/Rect [10 10 110 7 0 R]",
+            "/Rect (box)",
+            "/Rect null",
         ] {
             let bytes = one_page(&[
                 &format!(
@@ -1045,12 +1096,84 @@ mod tests {
                 ),
                 &format!("<< {WIDGET} /AA << /Fo << /S /URI >> >> >>"),
                 &format!("<< {WIDGET} /A << /S /URI >> >>"),
+                // Object 7 is a name, 8 a reference to a reference.
+                "/Name",
+                "7 0 R",
             ]);
             let scan = run(&bytes);
             assert!(!scan.whole_form, "{rect}");
             assert!(scan.blocks_widget(false, true, RECT), "{rect}");
             // The same box, the other key: no harmful dictionary is without a box there.
             assert!(!scan.blocks_widget(true, false, RECT), "{rect}");
+        }
+    }
+
+    #[test]
+    fn a_harmful_dictionary_with_no_box_key_blocks_no_widget() {
+        // A page, the catalog, a bookmark, a field above its widgets: none of them is a widget, and
+        // PDFium gives no box to a widget that has no `/Rect`.
+        for (what, objects) in [
+            (
+                "page",
+                vec![
+                    "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+                    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+                    "<< /Type /Page /Parent 2 0 R /Annots [4 0 R] /AA << /O << /S /Hide >> >> >>"
+                        .to_string(),
+                    format!("<< {WIDGET} /AA << /Fo << /S /URI >> >> >>"),
+                ],
+            ),
+            (
+                "catalog",
+                vec![
+                    "<< /Type /Catalog /AA << /WC << /S /ResetForm >> >> >>".to_string(),
+                    format!("<< {WIDGET} /AA << /Fo << /S /URI >> >> >>"),
+                ],
+            ),
+            (
+                "bookmark",
+                vec![
+                    "<< /Title (b) /A << /S /ResetForm >> >>".to_string(),
+                    format!("<< {WIDGET} /A << /S /URI >> >>"),
+                ],
+            ),
+            (
+                "parent",
+                vec![
+                    "<< /FT /Tx /T (t) /AA << /Fo << /S /ResetForm >> >> /Kids [2 0 R] >>"
+                        .to_string(),
+                    format!("<< {WIDGET} /Parent 1 0 R /AA << /Fo << /S /URI >> >> >>"),
+                ],
+            ),
+        ] {
+            let refs: Vec<&str> = objects.iter().map(String::as_str).collect();
+            let scan = run(&doc(&refs));
+            assert!(!scan.whole_form, "{what}");
+            let (has_a, has_aa) = (what == "bookmark", what != "bookmark");
+            assert!(!scan.blocks_widget(has_a, has_aa, RECT), "{what}");
+        }
+    }
+
+    #[test]
+    fn a_box_given_by_reference_is_the_box_of_the_widget() {
+        for rect in [
+            "/Rect 6 0 R",
+            "/Rect [7 0 R 8 0 R 9 0 R 10 0 R]",
+            "/Rect [10 10 110 10 0 R]",
+        ] {
+            let bytes = one_page(&[
+                &format!("<< /Type /Annot /Subtype /Widget {rect} /AA << /Fo << /S /URI >> >> >>"),
+                &format!("<< {WIDGET} /A << /S /ResetForm >> >>"),
+                "[10 10 110 30]",
+                "10",
+                "10",
+                "110",
+                "30",
+            ]);
+            let scan = run(&bytes);
+            assert!(!scan.whole_form, "{rect}");
+            assert!(!scan.blocks_widget(false, true, RECT), "{rect}");
+            assert!(scan.blocks_widget(true, false, RECT), "{rect}");
         }
     }
 
