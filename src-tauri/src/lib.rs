@@ -29,7 +29,7 @@ use serde::Serialize;
 use session::SessionStore;
 use tauri::webview::PageLoadEvent;
 use tauri::{AppHandle, Emitter, Manager, State};
-use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+use tauri_plugin_dialog::DialogExt;
 use updates::UpdateState;
 
 static START: OnceLock<Instant> = OnceLock::new();
@@ -512,48 +512,37 @@ async fn save_pdf_as(
     // The dialog is the user's to answer for as long as they like; the gate (which an update
     // install closes) is entered only afterwards, so the dialog never holds an update back.
     let chosen = tauri::async_runtime::spawn_blocking(move || {
-        let mut dialog = dialog_app
-            .dialog()
-            .file()
-            .add_filter("PDF documents", &["pdf"]);
-        if let Some(window) = dialog_app.get_webview_window("main") {
-            dialog = dialog.set_parent(&window);
-        }
-        if let Some(dir) = current.parent() {
-            dialog = dialog.set_directory(dir);
-        }
-        if let Some(name) = current.file_name() {
-            dialog = dialog.set_file_name(name.to_string_lossy());
-        }
-        let chosen = dialog.blocking_save_file()?;
-        let Ok(chosen) = chosen.into_path() else {
-            return Some(Err(()));
-        };
+        let mut start = current;
         // A name typed without an ending gets `.pdf`. The dialog asked about replacing the name as
-        // it was typed; if the name with the ending is another file that exists, that is asked
-        // here, so nothing is replaced without a question.
-        let plan = plan_save_target(chosen, |p| p.exists());
-        if plan.ask_to_replace {
-            let mut sure = dialog_app
+        // it was typed; when the name with the ending is another file that exists, the dialog is
+        // shown again with that name, so the system asks the question about the right file and
+        // nothing is replaced without one. (The message boxes of the system are not used: they
+        // need a manifest that the test programs of Windows do not have.)
+        for _ in 0..3 {
+            let mut dialog = dialog_app
                 .dialog()
-                .message(format!(
-                    "{} already exists. Do you want to replace it?",
-                    plan.path.file_name().unwrap_or_default().to_string_lossy()
-                ))
-                .title("Replace the file?")
-                .kind(MessageDialogKind::Warning)
-                .buttons(MessageDialogButtons::OkCancelCustom(
-                    "Replace".into(),
-                    "Cancel".into(),
-                ));
+                .file()
+                .add_filter("PDF documents", &["pdf"]);
             if let Some(window) = dialog_app.get_webview_window("main") {
-                sure = sure.parent(&window);
+                dialog = dialog.set_parent(&window);
             }
-            if !sure.blocking_show() {
-                return None;
+            if let Some(dir) = start.parent() {
+                dialog = dialog.set_directory(dir);
             }
+            if let Some(name) = start.file_name() {
+                dialog = dialog.set_file_name(name.to_string_lossy());
+            }
+            let chosen = dialog.blocking_save_file()?;
+            let Ok(chosen) = chosen.into_path() else {
+                return Some(Err(()));
+            };
+            let plan = plan_save_target(chosen, |p| p.exists());
+            if !plan.ask_to_replace {
+                return Some(Ok(plan.path));
+            }
+            start = plan.path;
         }
-        Some(Ok(plan.path))
+        None
     })
     .await
     .map_err(|e| CommandError {
