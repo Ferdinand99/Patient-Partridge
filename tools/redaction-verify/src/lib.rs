@@ -432,6 +432,12 @@ pub struct Options {
     pub check_valid: bool,
     /// The user password of the file. A file without one opens with an empty password.
     pub password: Option<String>,
+    /// How long one call of qpdf or Poppler may take before it is killed and the check ends with
+    /// an error. The default is the variable `VERIFIER_TOOL_TIMEOUT` (seconds), or 120 s.
+    pub tool_timeout: std::time::Duration,
+    /// How long all the calls for the file may take together. The default is the variable
+    /// `VERIFIER_FILE_BUDGET` (seconds), or 900 s.
+    pub file_budget: std::time::Duration,
 }
 
 impl Default for Options {
@@ -441,6 +447,8 @@ impl Default for Options {
             features: Features::default(),
             check_valid: true,
             password: None,
+            tool_timeout: tools::tool_timeout_from_env(),
+            file_budget: tools::file_budget_from_env(),
         }
     }
 }
@@ -642,11 +650,18 @@ pub fn verify(pdf: &Path, spec: &Spec, opts: &Options) -> Result<Report> {
         qdf: std::cell::OnceCell::new(),
         revisions: std::cell::OnceCell::new(),
     };
+    tools::begin(opts.tool_timeout, opts.file_budget);
     let mut report = Report {
         tools: tools::versions(),
         ..Report::default()
     };
-    layers::run(&ctx, &mut report)?;
+    let ran = layers::run(&ctx, &mut report);
+    // A tool that was killed for taking too long leaves the file partly checked: whatever else was
+    // found, the result is "could not check", never a report.
+    if let Some(why) = tools::stopped() {
+        return Err(Error(why));
+    }
+    ran?;
     Ok(report)
 }
 

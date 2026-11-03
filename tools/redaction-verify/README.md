@@ -32,6 +32,22 @@ printed (a hit names the kind, the position and the start of a digest) unless `-
 from the top, then from the left), so words that were drawn in another order than they are read are
 found. A word hyphenated at the end of a line is found too.
 
+## Time limits
+
+Every call of qpdf or Poppler has a time limit, and all the calls for one file share a budget.
+
+| setting | environment variable | flag | default |
+|---|---|---|---|
+| one call | `VERIFIER_TOOL_TIMEOUT` (seconds) | `--tool-timeout SECS` | 120 s |
+| all calls for the file | `VERIFIER_FILE_BUDGET` (seconds) | `--file-budget SECS` | 900 s |
+
+A flag wins over the variable. A call that runs over, or that is still running when the budget is
+used up, is killed together with everything it started (it runs in a process group of its own), and
+the run ends with exit status 2 and a message that names the tool and the setting. That holds even
+when another layer has found a leak: the file was not fully checked, so no report is given. A value
+must be a number above 0 (a fraction is allowed). In the library, `Options::tool_timeout` and
+`Options::file_budget` carry the same settings.
+
 ## Regions
 
 A region (`{"page": 1, "rect": [x0, y0, x1, y1], "fill": "#000000"}`) must pass three checks:

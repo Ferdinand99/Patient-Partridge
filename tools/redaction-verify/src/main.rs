@@ -11,6 +11,10 @@
 //!   --only L,L / --skip L,L   layers: raw, qdf, carve, decode, text, structure, images, fonts
 //!   --region P:X0,Y0,X1,Y1[:TOL[:RRGGBB]]   a redacted rectangle of page P, and the colour it was filled with
 //!   --show-values          print the values of hit needles (default: kind, position, digest)
+//!   --tool-timeout SECS    the longest one call of qpdf or Poppler may take (default 120, or the
+//!                          variable VERIFIER_TOOL_TIMEOUT); a call over the limit is killed, exit 2
+//!   --file-budget SECS     the longest all calls for the file may take (default 900, or the
+//!                          variable VERIFIER_FILE_BUDGET)
 //! ```
 //!
 //! Exit status: 0 nothing found, 1 something found, 2 the check could not be done.
@@ -24,7 +28,7 @@ fn usage() -> ExitCode {
     eprintln!(
         "usage: redaction-verify [--spec FILE] [--text S].. [--metadata S].. [--field S].. \
          [--bookmark S].. [--attachment S].. [--image-sha256 HEX].. [--forbid-key /K].. \
-         [--scrubbed] [--single-revision] [--only LAYERS] [--skip LAYERS] [--show-values] FILE.pdf"
+         [--scrubbed] [--single-revision] [--only LAYERS] [--skip LAYERS] [--show-values] [--tool-timeout SECS] [--file-budget SECS] FILE.pdf"
     );
     ExitCode::from(2)
 }
@@ -63,6 +67,11 @@ fn region(s: &str) -> Result<Region, String> {
     })
 }
 
+fn seconds(name: &str, text: &str) -> Result<std::time::Duration, String> {
+    redaction_verify::tools::parse_seconds(text)
+        .ok_or_else(|| format!("{name} wants a number of seconds above 0, not \"{text}\""))
+}
+
 fn run() -> Result<ExitCode, String> {
     let mut args = std::env::args().skip(1);
     let mut spec = Spec::default();
@@ -74,6 +83,8 @@ fn run() -> Result<ExitCode, String> {
     let mut single = false;
     let mut fonts = false;
     let mut password: Option<String> = None;
+    let mut tool_timeout = None;
+    let mut file_budget = None;
     while let Some(a) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
         match a.as_str() {
@@ -99,6 +110,12 @@ fn run() -> Result<ExitCode, String> {
             "--skip" => skip.extend(layers(&value("--skip")?)?),
             "--show-values" => show = true,
             "--fonts" => fonts = true,
+            "--tool-timeout" => {
+                tool_timeout = Some(seconds("--tool-timeout", &value("--tool-timeout")?)?);
+            }
+            "--file-budget" => {
+                file_budget = Some(seconds("--file-budget", &value("--file-budget")?)?);
+            }
             "--region" => spec.regions.push(region(&value("--region")?)?),
             "--password-file" => {
                 let path = value("--password-file")?;
@@ -135,6 +152,12 @@ fn run() -> Result<ExitCode, String> {
         opts.layers.insert(Layer::Fonts);
     }
     opts.password = password;
+    if let Some(t) = tool_timeout {
+        opts.tool_timeout = t;
+    }
+    if let Some(b) = file_budget {
+        opts.file_budget = b;
+    }
     let report = verify(&file, &spec, &opts).map_err(|e| e.to_string())?;
     print!("{}", report.render(&spec, show));
     Ok(if !report.hits.is_empty() {
