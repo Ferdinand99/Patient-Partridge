@@ -1,0 +1,253 @@
+/* The form designer: the boxes over the pages, the handles, the lines a box snaps to, and the panel.
+
+   Boxes are placed with percentages of the page (see src/viewer/designlayer.ts), so they are right at
+   every zoom. While the designer is on, the controls that fill in the fields are out of the way. */
+
+.viewer-designing .form-layer {
+  display: none;
+}
+
+.design-layer {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.design-boxes,
+.design-guides {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.design-box {
+  position: absolute;
+  box-sizing: border-box;
+  min-width: 4px;
+  min-height: 4px;
+  border: 1px solid var(--brand);
+  border-radius: 2px;
+  background: var(--brand-fill);
+  color: var(--brand);
+  pointer-events: auto;
+  cursor: move;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.design-box:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
+.design-box-picked {
+  border-width: 2px;
+  background: var(--brand-ring);
+}
+
+.design-box-locked {
+  border-style: dashed;
+  border-color: var(--muted);
+  background: transparent;
+  color: var(--muted);
+  cursor: default;
+}
+
+.design-name {
+  position: absolute;
+  inset-inline-start: 2px;
+  top: -1.35em;
+  max-width: 14em;
+  overflow: hidden;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: var(--card);
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  box-shadow: 0 0 0 1px var(--line-strong);
+  pointer-events: none;
+}
+
+.design-box:not(.design-box-picked):not(:hover):not(:focus-visible) .design-name {
+  display: none;
+}
+
+.design-handle {
+  position: absolute;
+  box-sizing: border-box;
+  width: 10px;
+  height: 10px;
+  border: 2px solid var(--brand);
+  border-radius: 2px;
+  background: var(--card);
+  touch-action: none;
+}
+
+.design-handle:focus-visible {
+  outline: 2px solid var(--text);
+  outline-offset: 1px;
+}
+
+.design-handle-nw { left: -6px; top: -6px; cursor: nwse-resize; }
+.design-handle-n { left: calc(50% - 5px); top: -6px; cursor: ns-resize; }
+.design-handle-ne { right: -6px; top: -6px; cursor: nesw-resize; }
+.design-handle-e { right: -6px; top: calc(50% - 5px); cursor: ew-resize; }
+.design-handle-se { right: -6px; bottom: -6px; cursor: nwse-resize; }
+.design-handle-s { left: calc(50% - 5px); bottom: -6px; cursor: ns-resize; }
+.design-handle-sw { left: -6px; bottom: -6px; cursor: nesw-resize; }
+.design-handle-w { left: -6px; top: calc(50% - 5px); cursor: ew-resize; }
+
+.design-capture {
+  position: absolute;
+  inset: 0;
+  pointer-events: auto;
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.design-capture[hidden],
+.design-ghost[hidden] {
+  display: none;
+}
+
+.design-ghost {
+  position: absolute;
+  box-sizing: border-box;
+  border: 1px dashed var(--brand);
+  background: var(--brand-fill);
+  pointer-events: none;
+}
+
+.design-guide {
+  position: absolute;
+  background: var(--info);
+  pointer-events: none;
+}
+
+.design-guide-x {
+  top: 0;
+  bottom: 0;
+  width: 1px;
+}
+
+.design-guide-y {
+  left: 0;
+  right: 0;
+  height: 1px;
+}
+
+.design-guide-text {
+  background: var(--ok);
+}
+
+.design-guide-field {
+  background: var(--bad);
+}
+
+/* The panel */
+
+.design-panel {
+  flex: none;
+  width: 17rem;
+  min-height: 0;
+  overflow: auto;
+  padding: var(--sp-3);
+  border-inline-start: 1px solid var(--line);
+  background: var(--bg);
+}
+
+.design-panel[hidden],
+.design-panel [hidden] {
+  display: none;
+}
+
+.design-title {
+  margin: 0 0 var(--sp-2);
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.design-subtitle {
+  margin: var(--sp-4) 0 var(--sp-2);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.design-empty,
+.design-note,
+.design-hint {
+  font-size: 12px;
+}
+
+.design-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.design-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.design-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.design-label {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.design-check .design-label {
+  color: var(--text);
+}
+
+.design-choices {
+  min-height: 6rem;
+  font-family: inherit;
+}
+
+.design-error {
+  margin: var(--sp-2) 0 0;
+  color: var(--bad-text);
+  font-size: 12px;
+}
+
+.design-remove {
+  margin-top: var(--sp-3);
+}
+
+.design-order {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.design-order-item {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.design-order-pick {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-align: start;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.design-order-pick[aria-current="true"] {
+  color: var(--brand);
+  font-weight: 600;
+}

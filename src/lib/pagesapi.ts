@@ -3,6 +3,7 @@
 
 import { Channel, invoke } from "@tauri-apps/api/core";
 import type { PageSizePt } from "../viewer/layout";
+import type { DesignOp, DesignWidgetInfo } from "./formdesign";
 import type { SavedFile } from "./api";
 
 /** A page box in the page's own coordinates: left, bottom, right, top, in points. */
@@ -81,6 +82,12 @@ export interface PageToolsApi {
     onProgress: PageProgress,
   ): Promise<SavedFile | null>;
   pagesCancel(doc: number): Promise<CancelResult>;
+  /** The form designer: whether the document can take fields, and the names of the fields it has. */
+  designCheck?(doc: number): Promise<string[]>;
+  /** The widgets of a page that the designer lists. */
+  designList?(doc: number, page: number): Promise<DesignWidgetInfo[]>;
+  /** Makes a batch of changes with one reload of the document. */
+  designApply?(doc: number, ops: DesignOp[]): Promise<PagesChanged>;
 }
 
 interface ChangedWire {
@@ -154,5 +161,14 @@ export const pagesApi: PageToolsApi = {
   },
   pagesCancel(doc) {
     return invoke<CancelResult>("pages_cancel", { doc });
+  },
+  designCheck(doc) {
+    return invoke<string[]>("author_check", { doc });
+  },
+  designList(doc, page) {
+    return invoke<DesignWidgetInfo[]>("author_list", { doc, page });
+  },
+  async designApply(doc, ops) {
+    return changed(await invoke<ChangedWire>("author_apply", { doc, ops }));
   },
 };

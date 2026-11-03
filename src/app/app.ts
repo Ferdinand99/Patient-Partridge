@@ -31,6 +31,8 @@ import { PageOps, REFUSED_FIELD_CODE, type PageHost } from "./pageops";
 import { PagePanel, type PagePanelHost } from "./pagepanel";
 import { Annotator, CLEAN_REFUSALS, annotationNotice, type AnnotatorApi } from "./annotator";
 import { AnnotBar } from "./annotbar";
+import { DesignBar } from "./designbar";
+import { FormDesigner } from "./formdesigner";
 import { EditHistory, type Edit } from "./history";
 import { MenuController } from "./menu";
 import {
@@ -354,6 +356,9 @@ export class App {
   private readonly api: AppDeps["api"];
   private readonly selectionProxy: HTMLElement;
   private readonly annotbar: AnnotBar;
+  private readonly designbar: DesignBar;
+  /** The form designer ("Edit form"), when the app process has it. */
+  private designer: FormDesigner | null = null;
   private readonly annotStatus: HTMLElement;
   private readonly popovers: HTMLElement;
   /** Whether the annotation bar is shown. */
@@ -417,6 +422,16 @@ export class App {
       undo: () => void this.undoActive(),
       redo: () => void this.redoActive(),
     });
+    this.designbar = new DesignBar(root, {
+      toggle: (open) => void this.setDesigning(open),
+      setTool: (tool) => {
+        this.designer?.setTool(tool);
+        this.active?.view.designLayer?.setTool(tool);
+      },
+      remove: () => this.designer?.removeSelectedWidget(),
+      undo: () => void this.undoActive(),
+      redo: () => void this.redoActive(),
+    });
     this.copyStatus = byId(root, "copy-status");
     this.printRoot = byId(root, "print-root");
     this.find = new FindBar(root, {
@@ -461,6 +476,24 @@ export class App {
       });
       this.pageOps = ops;
       this.pagePanel = new PagePanel(root, ops, host);
+      if (ops.canDesign) {
+        this.designer = new FormDesigner(root, {
+          target: () => {
+            const t = this.active;
+            return t ? { doc: t.doc, name: t.name, view: t.view, history: t.history, pages: t.sidebarDoc.pages } : null;
+          },
+          api: deps.pages,
+          ops,
+          pageText: (doc, page) => deps.api.getPageText(doc, page),
+          notice: (options) => showNotice(this.noticeLayer, options),
+          announce: (text) => this.announce(text),
+          changed: () => this.syncDesignBar(),
+          pendingChanged: (doc) => {
+            const tab = this.tabs.find((t) => t.doc === doc);
+            if (tab) this.historyChanged(tab);
+          },
+        });
+      }
     }
     this.sidebar = new Sidebar(root, {
       api: this.api,
@@ -481,6 +514,7 @@ export class App {
     if (!tab) return;
     tab.sidebarDoc.pages = pages;
     tab.view.replacePages(pages, show);
+    this.designer?.pagesChanged(doc);
     // What the annotations of the tab keep by page number and by id means other things now.
     tab.annotator?.pagesChanged();
     this.find.forget(tab.view);
@@ -499,6 +533,7 @@ export class App {
    * begun meanwhile would run after the pages changed, with page numbers that mean other pages.
    */
   private holdEdits(busy: boolean): void {
+    this.designer?.setBusy(busy);
     const doc = busy ? (this.pageOps?.busyDoc ?? null) : this.heldDoc;
     this.heldDoc = busy ? doc : null;
     const tab = doc === null ? undefined : this.tabs.find((t) => t.doc === doc);
@@ -1161,6 +1196,7 @@ export class App {
       next.view.start();
     }
     this.syncChrome();
+    void this.designer?.followTab();
     next.view.element.focus({ preventScroll: true });
   }
 
@@ -1363,6 +1399,7 @@ export class App {
     }
     this.find.forget(tab.view);
     tab.annotator?.destroy();
+    this.designer?.forget(tab.doc);
     tab.view.destroy();
     this.sidebar.forget(tab.doc);
     this.signatures.forget(tab.doc);
@@ -1432,6 +1469,8 @@ export class App {
 
   /** Shows or hides the annotation bar. Hiding it puts the pointer back to picking. */
   private setAnnotating(open: boolean, focus = false): void {
+    // The annotation tools and the form designer both take the pointer: one at a time.
+    if (open && this.designer?.open) void this.setDesigning(false);
     this.annotOpen = open;
     if (!open) {
       for (const tab of this.tabs) tab.annotator?.setTool("select");
@@ -1474,6 +1513,39 @@ export class App {
       canRedo: tab?.history.canRedo ?? false,
       undoLabel: tab?.history.undoLabel ?? null,
       redoLabel: tab?.history.redoLabel ?? null,
+    });
+    this.syncDesignBar();
+  }
+
+  /** Opens or closes the form designer ("Edit form"). Opening it closes the annotation bar. */
+  private async setDesigning(open: boolean): Promise<void> {
+    const designer = this.designer;
+    if (!designer) return;
+    if (open) {
+      if (this.annotOpen) this.setAnnotating(false);
+      await designer.openMode();
+    } else {
+      await designer.closeMode();
+    }
+    this.syncDesignBar();
+    if (open && designer.open) this.designbar.focusBar();
+  }
+
+  /** Brings the bar of the form designer in step with the document in front. */
+  private syncDesignBar(): void {
+    const designer = this.designer;
+    const tab = this.active;
+    this.designbar.render({
+      available: designer !== null,
+      open: designer?.open ?? false,
+      enabled: designer !== null && tab !== null,
+      tool: designer?.tool ?? "select",
+      canRemove: designer?.canRemove ?? false,
+      canUndo: tab?.history.canUndo ?? false,
+      canRedo: tab?.history.canRedo ?? false,
+      undoLabel: tab?.history.undoLabel ?? null,
+      redoLabel: tab?.history.redoLabel ?? null,
+      note: designer?.hint ? designer.hint : null,
     });
   }
 
@@ -2184,6 +2256,16 @@ export class App {
 
   private onKeyDown(e: KeyboardEvent): void {
     if (this.noticeLayer.childElementCount === 0 && this.annotationKey(e)) {
+      e.preventDefault();
+      return;
+    }
+    if (
+      e.key === "Escape" &&
+      this.noticeLayer.childElementCount === 0 &&
+      this.designer?.open &&
+      !(e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement || e.target instanceof HTMLTextAreaElement) &&
+      this.designer.handleEscape()
+    ) {
       e.preventDefault();
       return;
     }

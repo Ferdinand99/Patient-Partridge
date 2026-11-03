@@ -523,6 +523,14 @@ button.outline-toggle {
   display: none;
 }
 
+.designbar .segmented > button {
+  gap: 4px;
+}
+
+.designbar .segmented > button > span {
+  font-size: 12px;
+}
+
 .annotbar-note {
   margin-inline-start: 8px;
   font-size: 12px;

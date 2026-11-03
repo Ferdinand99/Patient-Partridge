@@ -19,6 +19,7 @@ import { describePageError } from "../lib/pageerrors";
 import type { SavedFile } from "../lib/api";
 import type { InsertOptions, PageToolsApi } from "../lib/pagesapi";
 import type { PageSizePt } from "../viewer/layout";
+import type { DesignOp } from "../lib/formdesign";
 import { showBusyBox, type BusyBox } from "./busybox";
 import type { Edit, EditHistory } from "./history";
 import type { NoticeOptions, NoticeResult } from "./notice";
@@ -106,6 +107,8 @@ export class PageOps {
   /** What the running tool shows in its box, and whether the delay has run out. */
   private running: { title: string; stoppable: boolean; doc: number; name: string } | null = null;
   private due = false;
+  /** The settling that comes before a tool is going on (the designer sends its changes then). */
+  private settling = false;
   /** A Stop was asked for during this run, whether or not it could end the step in hand. */
   private stopAsked = false;
   private holds = 0;
@@ -313,6 +316,52 @@ export class PageOps {
     );
   }
 
+  /** True when the app process has the form designer. */
+  get canDesign(): boolean {
+    return this.api.designApply !== undefined;
+  }
+
+  /**
+   * Makes a batch of changes to the form fields of the document in front, with one reload of the
+   * document and one step in the history. Resolves with true when the engine made them; when it
+   * refused, the reader was told why and the document is as it was.
+   */
+  async applyDesign(ops: DesignOp[], label: string): Promise<boolean> {
+    const apply = this.api.designApply;
+    if (!apply || ops.length === 0) return false;
+    // Another tool is about to begin and asks the designer to send what it holds first: the
+    // change is made inside the work of that tool, which is already marked as working.
+    if (this.settling) return this.applyDesignInside(apply, ops, label);
+    const t = await this.start([]);
+    if (!t) return false;
+    const done = await this.run(t, "Changing the form", async () => {
+      const r = await apply.call(this.api, t.doc, ops);
+      t.history.push(this.snapshotEdit(t, label, r.snapshot));
+      this.host.applyPages(t.doc, r.pages);
+      if (r.snapshot === 0) void this.host.notice({ title: "This cannot be taken back", detail: TOOL_NOTES.undoGone, buttons: OK });
+      return true;
+    });
+    return done === true;
+  }
+
+  private async applyDesignInside(
+    apply: NonNullable<PageToolsApi["designApply"]>,
+    ops: DesignOp[],
+    label: string,
+  ): Promise<boolean> {
+    const t = this.host.target();
+    if (!t) return false;
+    try {
+      const r = await apply.call(this.api, t.doc, ops);
+      t.history.push(this.snapshotEdit(t, label, r.snapshot));
+      this.host.applyPages(t.doc, r.pages);
+      return true;
+    } catch (e) {
+      await this.fail(t, e);
+      return false;
+    }
+  }
+
   /** Copies pages into a new file the user chooses. Resolves with the file, or null when stopped. */
   async extract(pages: number[]): Promise<SavedFile | null> {
     const t = await this.start(pages);
@@ -513,7 +562,16 @@ export class PageOps {
       this.showBox();
     }, this.delay);
     try {
-      if (this.host.settle && !(await this.host.settle(t.doc))) return null;
+      if (this.host.settle) {
+        this.settling = true;
+        let ready: boolean;
+        try {
+          ready = await this.host.settle(t.doc);
+        } finally {
+          this.settling = false;
+        }
+        if (!ready) return null;
+      }
       return await work();
     } catch (e) {
       await this.fail(t, e);
