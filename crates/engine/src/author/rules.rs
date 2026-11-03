@@ -258,8 +258,21 @@ pub fn check_props(kind: DesignKind, p: &DesignProps) -> Result<(), AuthorError>
 
 /// The export values of a radio group: all given, none empty, none the same twice.
 pub fn check_exports(exports: &[String], default: &str) -> Result<(), AuthorError> {
+    check_exports_kept(exports, default, &[])
+}
+
+/// As [`check_exports`], for a group some of whose words are the ones it already has (`kept[i]`):
+/// a word that another program chose and the reader did not change is not asked about again, the same
+/// as a size or a limit. The words still have to differ from each other.
+pub fn check_exports_kept(
+    exports: &[String],
+    default: &str,
+    kept: &[bool],
+) -> Result<(), AuthorError> {
     for (i, e) in exports.iter().enumerate() {
-        check_export(e)?;
+        if !kept.get(i).copied().unwrap_or(false) {
+            check_export(e)?;
+        }
         if exports[..i].contains(e) {
             return Err(refused(format!(
                 "Two radio buttons of the group have the value \u{201c}{e}\u{201d}. Give each its own."
@@ -428,6 +441,7 @@ mod tests {
                 "name" => check_name(&text),
                 "tooltip" => check_tooltip(&text),
                 "export" => check_export(&text),
+                "kept" => check_exports_kept(std::slice::from_ref(&text), "", &[true]),
                 "drawn" => check_drawable("x", &text, false),
                 "multiline" => check_drawable("x", &text, true),
                 "fontsize" => check_props(

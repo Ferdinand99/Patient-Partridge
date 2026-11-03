@@ -745,3 +745,124 @@ describe("the document changing under the designer", () => {
     expect(s.page.querySelectorAll(".design-box")).toHaveLength(0);
   });
 });
+
+describe("a word that another program chose for a button", () => {
+  const panel = () => document.getElementById("design-panel") as HTMLElement;
+  const control = (id: RegExp) => [...panel().querySelectorAll<HTMLInputElement>("input, select, textarea")].find((c) => id.test(c.id))!;
+  const change = (id: RegExp, value: string) => {
+    const c = control(id);
+    c.value = value;
+    c.dispatchEvent(new Event("change", { bubbles: true }));
+  };
+  const error = () => panel().querySelector(".design-error") as HTMLElement;
+
+  it("is not asked about again when the tooltip of the check box or its name is changed, and a new word with an accent is refused", async () => {
+    const box = item("si", [100, 100, 120, 120], { kind: "checkbox", props: { ...emptyProps(), exportValue: "S\u00ed" } });
+    const s = setup([box]);
+    await s.designer.openMode();
+    await flushPromises();
+    s.page.querySelector<HTMLElement>(".design-box")!.dispatchEvent(pointer("pointerdown", 110, 110));
+    change(/-tooltip$/, "Yes or no");
+    expect(error().hidden).toBe(true);
+    change(/-name$/, "renamed");
+    expect(error().hidden).toBe(true);
+    await s.designer.flush(1);
+    const op = s.applied[0].ops[0];
+    expect(op.op === "update" && op.newName).toBe("renamed");
+    expect(op.op === "update" && op.props.exportValue).toBe("S\u00ed");
+    change(/-exportValue$/, "J\u00e5");
+    expect(error().hidden).toBe(false);
+    expect(error().textContent).toMatch(/cannot be used/);
+  });
+
+  it("is not asked about again for the buttons of a group that were left as they are, and the words are not sent then", async () => {
+    const group = (widget: number, word: string, rect: Rect) => item("grp", rect, { kind: "radio", widget, widgets: 2, export: word });
+    const s = setup([group(0, "F\u00f8rste", [10, 10, 24, 24]), group(1, "Andre", [40, 10, 54, 24])]);
+    await s.designer.openMode();
+    await flushPromises();
+    s.page.querySelector<HTMLElement>(".design-box")!.dispatchEvent(pointer("pointerdown", 15, 15));
+    change(/-tooltip$/, "Pick one");
+    expect(error().hidden).toBe(true);
+    await s.designer.flush(1);
+    const op = s.applied[0].ops[0];
+    expect(op.op === "update" && op.exports).toBeUndefined();
+    // A new word with an accent for the picked button is refused.
+    change(/-buttonValue$/, "\u00c5rst");
+    expect(error().textContent).toMatch(/cannot be used/);
+  });
+});
+
+describe("the panel while another tool works", () => {
+  it("says why nothing can be changed", async () => {
+    const s = setup([item("a", [100, 100, 200, 150])]);
+    await s.designer.openMode();
+    await flushPromises();
+    s.designer.setBusy(true);
+    const note = document.querySelector("#design-panel .design-note") as HTMLElement;
+    expect(note.hidden).toBe(false);
+    expect(note.textContent).toBe("The pages are being changed. Try again in a moment.");
+    s.designer.setBusy(false);
+    expect(note.hidden).toBe(true);
+  });
+});
+
+describe("a change made while the designer's own batch is on its way, when the tools are told to wait", () => {
+  it("is queued behind the batch, not refused, although the pages are marked as being worked on", async () => {
+    const s = setup([item("a", [100, 100, 200, 150])]);
+    await s.designer.openMode();
+    await flushPromises();
+    let finish!: () => void;
+    s.apply.mockImplementationOnce(
+      (doc: number, ops: DesignOp[], label: string) =>
+        new Promise<DesignResult>((resolve) => {
+          s.applied.push({ doc, ops, label });
+          // The page tools mark the document as worked on while the batch is made, and the window tells the designer.
+          s.designer.setBusy(true);
+          finish = () => {
+            s.designer.setBusy(false);
+            resolve("done");
+          };
+        }),
+    );
+    const box = () => s.page.querySelector<HTMLElement>(".design-box")!;
+    key(box(), "ArrowRight");
+    const sending = s.designer.flush(1);
+    await flushPromises();
+    box().dispatchEvent(pointer("pointerdown", 150, 120));
+    const name = document.querySelector<HTMLInputElement>('#design-panel input[id$="-name"]')!;
+    expect(name.disabled).toBe(false);
+    name.value = "renamed";
+    name.dispatchEvent(new Event("change", { bubbles: true }));
+    expect((document.querySelector("#design-panel .design-error") as HTMLElement).hidden).toBe(true);
+    finish();
+    await sending;
+    expect(s.applied).toHaveLength(2);
+  });
+});
+
+describe("a radio group whose buttons are not all read", () => {
+  it("gets its next button after all the buttons the engine says it has", async () => {
+    const s = setup();
+    await s.designer.openMode();
+    await flushPromises();
+    s.designer.setTool("radio");
+    placeAt(s, 100, 420);
+    await s.designer.flush(1);
+    // The document is read again: the group has three buttons, and only the first is on the page that is shown.
+    s.listed.push(item("Group 1", [90, 409, 104, 423], { kind: "radio", widget: 0, widgets: 3, export: "Choice1" }));
+    s.designer.pagesChanged(1);
+    s.view.designLayer?.destroy();
+    s.view.designLayer = (s.view.setDesign.mock.calls[0][0] as (p: unknown[]) => DesignLayer)([SIZE, SIZE]);
+    s.page.replaceChildren();
+    s.view.designLayer.mount(0, s.page);
+    s.designer.setTool("radio");
+    await flushPromises();
+    placeAt(s, 200, 420);
+    const op = (await (async () => {
+      await s.designer.flush(1);
+      return s.applied[1].ops[0];
+    })()) as DesignOp;
+    expect(op.op === "addWidget" && op.widget.export).toBe("Choice4");
+    expect(s.designer.isPicked({ name: "Group 1", widget: 3 })).toBe(true);
+  });
+});

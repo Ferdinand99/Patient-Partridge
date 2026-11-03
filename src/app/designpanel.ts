@@ -134,11 +134,11 @@ export class DesignPanel {
     text("defaultText", "Starts with", "text");
 
     // Check box.
-    text("exportValue", "Value when checked", "checkbox");
+    text("exportValue", "Value when checked", "checkbox", "The word the form sends. It is not shown on the page.");
     check("startsOn", "Starts checked", "checkbox");
 
     // Radio button.
-    text("buttonValue", "Value of this button", "radio", "Each button of a group has a value of its own.");
+    text("buttonValue", "Value of this button", "radio", "The word the form sends. It is not shown on the page. Each button of a group has a value of its own.");
     check("buttonOn", "This button starts picked", "radio");
 
     // Choices.
@@ -256,6 +256,9 @@ export class DesignPanel {
       case "signature":
         break;
     }
+    // The words are sent when one of them was changed; a group with buttons on pages that were not
+    // read has more buttons than the panel knows, and its words are left to the engine.
+    if (exports && exports.every((e, i) => e === this.state?.group[i]?.export)) exports = undefined;
     return { name: value("name"), props: p, exports };
   }
 
@@ -287,8 +290,11 @@ export class DesignPanel {
       const w = state.widget;
       this.empty.hidden = w !== null;
       this.title.textContent = w ? KIND_LABELS[w.kind] : "Field";
-      this.note.textContent = state.note ?? "";
-      this.note.hidden = state.note === null;
+      // While another tool works on the pages the controls cannot be used, and a reader who tabs into
+      // the panel is told why instead of finding nothing.
+      const note = state.busy === true ? "The pages are being changed. Try again in a moment." : state.note;
+      this.note.textContent = note ?? "";
+      this.note.hidden = note === null;
       this.form.hidden = w === null;
       this.removeButton.hidden = w === null;
       this.removeButton.disabled = !w?.editable || state.busy === true;

@@ -1063,7 +1063,8 @@ fn the_value_of_a_check_box_in_two_places_is_on_the_field() {
     let first = revision(&out.bytes, bytes.len(), 6).expect("a widget was written");
     let second = revision(&out.bytes, bytes.len(), 7).expect("a widget was written");
     assert_eq!(get(&first, "AS"), Some(&b"/A"[..]));
-    assert_eq!(get(&second, "AS"), Some(&b"/B"[..]));
+    // The value of the field names one word, so only the widget that has it is on.
+    assert_eq!(get(&second, "AS"), Some(&b"/Off"[..]));
     for widget in [&first, &second] {
         assert_eq!(get(widget, "V"), None);
         assert_eq!(get(widget, "DV"), None);
@@ -1292,4 +1293,156 @@ fn the_buffer_that_comes_out_has_no_room_the_document_will_not_use() {
     assert!(out.bytes.len() > big.len());
     let spare = out.bytes.capacity() - out.bytes.len();
     assert!(spare < 16 * 1024, "{spare} bytes of room");
+}
+
+// ---- a word another program chose is not asked about again ----------------------------------------
+
+/// A check box from another program whose word has an accent: the on-state is `S` and the bytes of
+/// the letter i with an acute accent, as a name.
+fn accented_checkbox() -> Vec<u8> {
+    pdf(&[
+        "<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        &format!("<< {PAGE} /Annots [4 0 R] >>"),
+        "<< /Type /Annot /Subtype /Widget /FT /Btn /T (si) /Rect [10 10 24 24] /P 3 0 R /AS /Off /F 4 /V /Off /AP << /N << /S#C3#AD 6 0 R /Off 7 0 R >> >> >>",
+        "<< /Fields [4 0 R] /DA (/Helv 0 Tf 0 g) /DR << /Font << /Helv 8 0 R /ZaDb 8 0 R >> >> >>",
+        "<< /Type /XObject /Subtype /Form /BBox [0 0 14 14] >>",
+        "<< /Type /XObject /Subtype /Form /BBox [0 0 14 14] >>",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ])
+}
+
+/// A radio group from another program, one of whose words has the letter o with a stroke.
+fn accented_radio() -> Vec<u8> {
+    let kid = |word: &str, x: u32| {
+        format!(
+            "<< /Type /Annot /Subtype /Widget /Rect [{x} 10 {} 24] /P 3 0 R /Parent 4 0 R /AS /Off /F 4 /AP << /N << /{word} 6 0 R /Off 7 0 R >> >> >>",
+            x + 14
+        )
+    };
+    pdf(&[
+        "<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        &format!("<< {PAGE} /Annots [8 0 R 9 0 R] >>"),
+        "<< /FT /Btn /Ff 49152 /T (grp) /V /Off /Kids [8 0 R 9 0 R] >>",
+        "<< /Fields [4 0 R] /DA (/Helv 0 Tf 0 g) /DR << /Font << /Helv 10 0 R /ZaDb 10 0 R >> >> >>",
+        "<< /Type /XObject /Subtype /Form /BBox [0 0 14 14] >>",
+        "<< /Type /XObject /Subtype /Form /BBox [0 0 14 14] >>",
+        &kid("F#C3#B8rste", 10),
+        &kid("Andre", 40),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ])
+}
+
+#[test]
+fn a_check_box_whose_word_has_an_accent_can_be_changed_without_changing_the_word() {
+    let bytes = accented_checkbox();
+    let mut a = Author::new(bytes.clone(), geo(0)).unwrap();
+    let shown = listed(&mut a, 0);
+    assert!(shown[0].editable);
+    assert_eq!(shown[0].props.export_value, "S\u{ed}");
+    // Only the tooltip.
+    let mut props = shown[0].props.clone();
+    props.tooltip = "Yes or no".into();
+    update(&mut a, "si", props.clone());
+    // A rename and Required.
+    props.required = true;
+    a.apply(&[AuthorOp::Update {
+        name: "si".into(),
+        new_name: "renamed".into(),
+        props: props.clone(),
+        exports: vec![],
+    }])
+    .unwrap();
+    // Starting checked keeps the word.
+    props.default_value = "on".into();
+    a.apply(&[AuthorOp::Update {
+        name: "renamed".into(),
+        new_name: String::new(),
+        props: props.clone(),
+        exports: vec![],
+    }])
+    .unwrap();
+    let out = a.finish().unwrap();
+    let field = revision(&out.bytes, bytes.len(), 4).unwrap();
+    assert_eq!(get(&field, "V"), Some(&b"/S#C3#AD"[..]));
+    // A new word with an accent is still refused.
+    let mut a = Author::new(bytes, geo(0)).unwrap();
+    let mut props = listed(&mut a, 0)[0].props.clone();
+    props.export_value = "J\u{e5}".into();
+    assert!(refusal(a.apply(&[AuthorOp::Update {
+        name: "si".into(),
+        new_name: String::new(),
+        props,
+        exports: vec![],
+    }]))
+    .contains("cannot be used"));
+}
+
+#[test]
+fn a_radio_group_whose_word_has_an_accent_can_be_changed_without_changing_the_words() {
+    let bytes = accented_radio();
+    let mut a = Author::new(bytes.clone(), geo(0)).unwrap();
+    let shown = listed(&mut a, 0);
+    assert_eq!(shown.len(), 2);
+    assert!(shown[0].editable);
+    assert_eq!(shown[0].export, "F\u{f8}rste");
+    let props = shown[0].props.clone();
+    // The tooltip, with the words not sent, and with the words as they are.
+    let mut with_tip = props.clone();
+    with_tip.tooltip = "Pick one".into();
+    update(&mut a, "grp", with_tip.clone());
+    a.apply(&[AuthorOp::Update {
+        name: "grp".into(),
+        new_name: "renamed".into(),
+        props: with_tip.clone(),
+        exports: vec!["F\u{f8}rste".into(), "Andre".into()],
+    }])
+    .unwrap();
+    // Another button gets a new word: that one is asked about, and may not have an accent.
+    let refused_word = refusal(a.apply(&[AuthorOp::Update {
+        name: "renamed".into(),
+        new_name: String::new(),
+        props: with_tip.clone(),
+        exports: vec!["F\u{f8}rste".into(), "Andr\u{e9}".into()],
+    }]));
+    assert!(refused_word.contains("cannot be used"), "{refused_word}");
+    // The words still have to differ.
+    let twice = refusal(a.apply(&[AuthorOp::Update {
+        name: "renamed".into(),
+        new_name: String::new(),
+        props: with_tip,
+        exports: vec!["Andre".into(), "Andre".into()],
+    }]));
+    assert!(twice.contains("its own"), "{twice}");
+    let out = a.finish().unwrap();
+    assert!(has(
+        &revision(&out.bytes, bytes.len(), 4).unwrap(),
+        b"/T (renamed)"
+    ));
+}
+
+#[test]
+fn a_widget_that_is_also_the_catalog_is_not_written() {
+    // The one widget of the field is object 1, the catalog: a change to it would be written over
+    // when the catalog is written with the form.
+    let bytes = pdf(&[
+        "<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        &format!("<< {PAGE} >>"),
+        "<< /FT /Tx /T (f) /Kids [1 0 R] >>",
+        "<< /Fields [4 0 R] /DA (/Helv 0 Tf 0 g) /DR << /Font << /Helv 6 0 R /ZaDb 6 0 R >> >> >>",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]);
+    let mut a = Author::new(bytes, geo(0)).unwrap();
+    let moved = a.apply(&[AuthorOp::Move {
+        name: "f".into(),
+        widget: 0,
+        page: 0,
+        rect: [10.0, 10.0, 100.0, 30.0],
+    }]);
+    assert!(
+        matches!(moved, Err(AuthorError::Unsupported(_))),
+        "{moved:?}"
+    );
 }

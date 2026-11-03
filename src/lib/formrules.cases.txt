@@ -5,7 +5,8 @@
 # not makes one of the two tests fail.
 #
 # kinds: name, tooltip, export (the word of a button), drawn (text a field draws, one line),
-# multiline (the same where a line break is allowed), fontsize and maxlen (numbers).
+# multiline (the same where a line break is allowed), kept (a button word that was left as it was),
+# fontsize and maxlen (numbers).
 
 name	ok	first_name
 name	ok	Text 1
@@ -85,3 +86,8 @@ maxlen	ok	1
 maxlen	ok	32767
 maxlen	no	32768
 maxlen	no	100000
+
+kept	ok	S\u00ed
+kept	ok	F\u00f8rste
+kept	ok	\u65e5\u672c
+kept	ok	Yes

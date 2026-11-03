@@ -356,6 +356,9 @@ describe("the rules of the window and of the engine", () => {
         return exportProblem(text);
       case "drawn":
         return textProblem("x", text);
+      case "kept":
+        // A word the reader left as it was.
+        return exportsProblem([text], "", [text]);
       case "multiline":
         return textProblem("x", text, true);
       case "fontsize":
@@ -402,6 +405,10 @@ describe("the rules of the window and of the engine", () => {
     expect(exportsProblem(["S", "M"], "XL")).toMatch(/not one of the buttons/);
     expect(exportsProblem(["S", "S"], "")).toMatch(/twice|its own/);
     expect(exportsProblem(["S", ""], "")).toMatch(/Give each/);
+    // A word that was left as it was is not asked about again, a new one is, and the words still differ.
+    expect(exportsProblem(["S\u00ed", "Andre"], "", ["S\u00ed", "Andre"])).toBeNull();
+    expect(exportsProblem(["S\u00ed", "\u00c1ndre"], "", ["S\u00ed", "Andre"])).toMatch(/cannot be used/);
+    expect(exportsProblem(["S\u00ed", "S\u00ed"], "", ["S\u00ed", "S\u00ed"])).toMatch(/its own/);
   });
 });
 

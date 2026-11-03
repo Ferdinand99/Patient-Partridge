@@ -404,6 +404,10 @@ impl Author {
         if !length_changed && checked.max_len > partridge_protocol::MAX_FIELD_LENGTH {
             checked.max_len = 0;
         }
+        // The word of a check box is checked when the reader changes it, not when it is left alone.
+        if props.export_value == old.export_value {
+            checked.export_value.clear();
+        }
         rules::check_props(view.kind, &checked)?;
         let current_states: Vec<Vec<u8>> = view
             .widgets
@@ -439,7 +443,17 @@ impl Author {
             } else {
                 props.default_value.clone()
             };
-            rules::check_exports(&list, &default)?;
+            // A button whose word is the one it has is not asked about again.
+            let kept: Vec<bool> = list
+                .iter()
+                .enumerate()
+                .map(|(i, w)| {
+                    current_states
+                        .get(i)
+                        .is_some_and(|s| String::from_utf8_lossy(s) == w.as_str())
+                })
+                .collect();
+            rules::check_exports_kept(&list, &default, &kept)?;
             list
         } else {
             Vec::new()
@@ -626,7 +640,21 @@ impl Author {
                                 .cloned()
                                 .unwrap_or_else(|| box_state.clone())
                         };
+                        // The value of the field names one word: only the widgets that have that word
+                        // are on, the others (a check box whose widgets have words of their own) stay off.
+                        let field_word: Vec<u8> = if export_changed {
+                            box_state.clone()
+                        } else {
+                            current_states
+                                .first()
+                                .filter(|s| !s.is_empty())
+                                .cloned()
+                                .unwrap_or_else(|| box_state.clone())
+                        };
                         let widget_on = if changed_default {
+                            box_on && own == field_word
+                        } else if export_changed {
+                            // One new word for every widget: they are on when the field is.
                             box_on
                         } else {
                             self.widget_is_on(w)

@@ -242,10 +242,14 @@ export function exportProblem(value: string): string | null {
   return null;
 }
 
-/** What is wrong with the words of the buttons of a radio group, or null. */
-export function exportsProblem(exports: readonly string[], picked: string): string | null {
+/**
+ * What is wrong with the words of the buttons of a radio group, or null. `current` are the words the
+ * buttons have now: a word that is left as it is (another program chose it) is not asked about again,
+ * the same as a size or a limit; the words still have to differ from each other.
+ */
+export function exportsProblem(exports: readonly string[], picked: string, current: readonly string[] = []): string | null {
   for (const [i, e] of exports.entries()) {
-    const bad = exportProblem(e);
+    const bad = current[i] === e ? null : exportProblem(e);
     if (bad) return bad;
     if (exports.indexOf(e) !== i) return `Two radio buttons have the value “${e}”. Give each its own.`;
   }

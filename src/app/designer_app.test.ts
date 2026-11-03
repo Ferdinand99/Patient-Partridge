@@ -490,3 +490,33 @@ describe("while a file is written", () => {
     }
   });
 });
+
+describe("leaving a tab", () => {
+  it("sends what the designer holds for it before the tab is put behind", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"], shouldAdvanceTime: true });
+    try {
+      const m = make({ distinctDocs: true });
+      await m.app.openPath("/docs/first.pdf");
+      await flush();
+      designButton().click();
+      await flush();
+      $("dtool-text").click();
+      place(300, 400);
+      const internals = m.app as unknown as {
+        designer: { flush(doc: number): Promise<boolean> };
+        tabs: { view: { setActive(on: boolean): void } }[];
+      };
+      const flushed = vi.spyOn(internals.designer, "flush");
+      const setActive = vi.spyOn(internals.tabs[0].view, "setActive");
+      await m.app.openPath("/docs/second.pdf");
+      await flush();
+      const left = setActive.mock.calls.findIndex((c) => c[0] === false);
+      expect(left).toBeGreaterThanOrEqual(0);
+      const firstFlush = flushed.mock.calls.findIndex((c) => c[0] === 1);
+      expect(firstFlush).toBeGreaterThanOrEqual(0);
+      expect(flushed.mock.invocationCallOrder[firstFlush]).toBeLessThan(setActive.mock.invocationCallOrder[left]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

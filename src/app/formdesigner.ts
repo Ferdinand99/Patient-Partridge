@@ -618,10 +618,18 @@ export class FormDesigner {
     const asked: DesignProps = { ...props };
     if (props.fontSize === w.props.fontSize) asked.fontSize = 0;
     if (props.maxLen === w.props.maxLen && props.maxLen > LIMITS.maxLen) asked.maxLen = 0;
+    // The same for the word of a check box, and for the words of the buttons of a group.
+    if (props.exportValue === w.props.exportValue) asked.exportValue = "";
     const problem =
       nameProblem(newName, this.taken(s), w.name) ??
       propsProblem(w.kind, asked) ??
-      (w.kind === "radio" && exports ? exportsProblem(exports, props.defaultValue) : null);
+      (w.kind === "radio" && exports
+        ? exportsProblem(
+            exports,
+            props.defaultValue,
+            this.group(s, w.name).map((g) => g.export),
+          )
+        : null);
     if (problem) return problem;
     const sameProps = JSON.stringify(props) === JSON.stringify(w.props);
     const sameExports = exports === undefined || exports.every((e, i) => e === (this.group(s, w.name)[i]?.export ?? ""));
