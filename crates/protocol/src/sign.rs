@@ -220,7 +220,8 @@ impl SignRequest {
                 let reason = get_text(r)?;
                 let location = get_text(r)?;
                 let t = r.take(8)?;
-                let signed_at = i64::from_le_bytes([t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7]]);
+                let signed_at =
+                    i64::from_le_bytes([t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7]]);
                 if !(0..=MAX_UNIX_TIME).contains(&signed_at) {
                     return Err(ProtocolError::InvalidLength);
                 }
@@ -295,7 +296,9 @@ impl SignResponse {
                 let hole_end = r.u32()?;
                 let field = get_text(r)?;
                 // The hole is `<`, an even number of hexadecimal digits and `>`, inside the file.
-                let digits = hole_end.checked_sub(hole_start).and_then(|n| n.checked_sub(2));
+                let digits = hole_end
+                    .checked_sub(hole_start)
+                    .and_then(|n| n.checked_sub(2));
                 let sound = size as usize <= MAX_SAVE_BYTES
                     && hole_end <= size
                     && digits.is_some_and(|n| {

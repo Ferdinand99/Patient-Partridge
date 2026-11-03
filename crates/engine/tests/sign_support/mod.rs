@@ -168,11 +168,7 @@ pub fn sign_with(
 }
 
 /// As `sign_with`, with a box inside the first page whatever its size is.
-pub fn sign_in_page(
-    engine: &mut Engine,
-    pdf: &[u8],
-    file: &str,
-) -> (Vec<u8>, SignatureReport) {
+pub fn sign_in_page(engine: &mut Engine, pdf: &[u8], file: &str) -> (Vec<u8>, SignatureReport) {
     let (doc, sizes) = crate::common::open_sized(engine, pdf, None).unwrap();
     let (w, h) = (sizes[0].0 as f32, sizes[0].1 as f32);
     let identity = identity(file);

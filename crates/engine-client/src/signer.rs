@@ -15,8 +15,8 @@ use std::thread;
 use std::time::Duration;
 
 use partridge_signer_protocol::{
-    read_frame, write_frame, Certificate, ErrorCode, HashKind, Request, Response,
-    MAX_P12_BYTES, MAX_PASSWORD_BYTES, PROTOCOL_VERSION,
+    read_frame, write_frame, Certificate, ErrorCode, HashKind, Request, Response, MAX_P12_BYTES,
+    MAX_PASSWORD_BYTES, PROTOCOL_VERSION,
 };
 use zeroize::Zeroize;
 
@@ -152,7 +152,9 @@ impl SignerSession {
                     session.kill();
                     return Err(signer_error(
                         "signer_sandbox_unavailable",
-                        format!("the signer did not report a sandbox, so it was not used ({sandbox})"),
+                        format!(
+                            "the signer did not report a sandbox, so it was not used ({sandbox})"
+                        ),
                     ));
                 }
                 session.sandbox = sandbox;
@@ -214,7 +216,10 @@ impl SignerSession {
             }
             Err(RecvTimeoutError::Timeout) => {
                 self.kill();
-                Err(signer_error("signer_stopped", "the signer did not answer in time"))
+                Err(signer_error(
+                    "signer_stopped",
+                    "the signer did not answer in time",
+                ))
             }
         }
     }
@@ -229,13 +234,22 @@ impl SignerSession {
             ));
         }
         if password.len() > MAX_PASSWORD_BYTES {
-            return Err(signer_error("signer_wrong_password", "the password is too long"));
+            return Err(signer_error(
+                "signer_wrong_password",
+                "the password is too long",
+            ));
         }
-        let mut message = Request::Load {
+        let mut request = Request::Load {
             p12: p12.to_vec(),
             password: password.as_bytes().to_vec(),
+        };
+        let mut message = request.encode();
+        // The copy of the password in the request is overwritten at once; the one in the message
+        // after it has gone out.
+        if let Request::Load { p12, password } = &mut request {
+            p12.zeroize();
+            password.zeroize();
         }
-        .encode();
         let timeout = self.config.load_timeout;
         let outcome = self.exchange(&message, timeout);
         // The message holds the password: it is overwritten whatever came of it.
@@ -265,7 +279,13 @@ impl SignerSession {
             ));
         }
         let timeout = self.config.timeout;
-        match self.exchange(&Request::Sign { digest: digest.to_vec() }.encode(), timeout)? {
+        match self.exchange(
+            &Request::Sign {
+                digest: digest.to_vec(),
+            }
+            .encode(),
+            timeout,
+        )? {
             Response::Signed { cms } => Ok(cms),
             Response::Error { code, message } => Err(signer_error(code_of(code), message)),
             _ => {

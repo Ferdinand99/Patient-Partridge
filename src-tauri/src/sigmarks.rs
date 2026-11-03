@@ -765,7 +765,9 @@ struct ImageSize {
 /// The picture of a request that carries one in the way `add_signature_image` does: the size in the
 /// header and the pixels as the body. Used by the signature with a certificate, which keeps the
 /// picture until the file is signed.
-pub fn image_mark_of_request(request: &tauri::ipc::Request<'_>) -> Result<SignatureMark, CommandError> {
+pub fn image_mark_of_request(
+    request: &tauri::ipc::Request<'_>,
+) -> Result<SignatureMark, CommandError> {
     let size: ImageSize = request
         .headers()
         .get(IMAGE_HEADER)
@@ -775,7 +777,10 @@ pub fn image_mark_of_request(request: &tauri::ipc::Request<'_>) -> Result<Signat
     if !mark_image_size_ok(size.width, size.height) {
         return Err(bad("that image is bigger than a signature picture may be"));
     }
-    let pixels = pixels_of(request.body(), size.width as usize * size.height as usize * 4)?;
+    let pixels = pixels_of(
+        request.body(),
+        size.width as usize * size.height as usize * 4,
+    )?;
     if pixels.len() != size.width as usize * size.height as usize * 4 {
         return Err(bad("the pixels do not fit the size of the image"));
     }

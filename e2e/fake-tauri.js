@@ -342,6 +342,67 @@
     return [x, y, x + w, y + h];
   }
 
+  // Signing with a certificate, the way the app process does it: a file is chosen, opened with a
+  // password (the password "test" opens it), and the document is signed into a new file whose name
+  // is the document's name with " (signed)" before the ending. Nothing is signed for real.
+  LINES["/docs/book (signed).pdf"] = LINES["/docs/book.pdf"];
+  SIGNATURES["/docs/book (signed).pdf"] = { total: 1, unlisted: 0, trustAnchors: 0, items: [signature({})] };
+  const cert = {
+    picked: false,
+    // What the next opening of the file says, when it is not the certificate below.
+    loadFailure: null,
+    signFailure: null,
+    cancelSave: false,
+    certificate: {
+      name: "Anna Alvorlig", issuer: "Test Root", selfSigned: false, serial: "01ab",
+      fingerprint: "ab".repeat(32), notBefore: 1577836800, notAfter: 4733510400,
+      now: Math.floor(Date.now() / 1000), key: "ECDSA P-256", maySign: true, chain: 2,
+    },
+    fields: [],
+    imageMark: null,
+    signed: [],
+    forgotten: 0,
+  };
+  state.cert = cert;
+  function certificate(cmd, args) {
+    switch (cmd) {
+      case "sign_pick_certificate":
+        cert.picked = true;
+        return "anna.p12";
+      case "sign_load_certificate": {
+        if (!cert.picked) throw { code: "sign_no_file", message: "no file" };
+        if (cert.loadFailure) throw cert.loadFailure;
+        if (args.password !== "test") throw { code: "signer_wrong_password", message: "wrong" };
+        return JSON.parse(JSON.stringify(cert.certificate));
+      }
+      case "sign_forget_certificate":
+        cert.forgotten += 1;
+        cert.picked = false;
+        return null;
+      case "sign_set_image_mark":
+        cert.imageMark = { size: args };
+        return null;
+      case "sign_list_fields":
+        return JSON.parse(JSON.stringify(cert.fields));
+      case "sign_document": {
+        if (cert.signFailure) {
+          const f = cert.signFailure;
+          cert.signFailure = null;
+          throw f;
+        }
+        if (cert.cancelSave) {
+          cert.cancelSave = false;
+          return null;
+        }
+        const path = docs.get(args.doc)?.path ?? "/docs/book.pdf";
+        const out = path.replace(/\.pdf$/, " (signed).pdf");
+        cert.signed.push({ doc: args.doc, args: args.args, path: out });
+        return { path: out, name: out.split("/").pop(), field: "Signature1", signer: cert.certificate.name, fingerprint: cert.certificate.fingerprint };
+      }
+    }
+    throw { code: "internal", message: "unknown command " + cmd };
+  }
+
   // The signatures kept for later, the way the app process keeps them: twenty at the most.
   const marks = [];
   let nextMark = 1;
@@ -629,6 +690,13 @@
       case "delete_signature_mark":
       case "clear_signature_marks":
         return mark(cmd, args);
+      case "sign_pick_certificate":
+      case "sign_load_certificate":
+      case "sign_forget_certificate":
+      case "sign_set_image_mark":
+      case "sign_list_fields":
+      case "sign_document":
+        return certificate(cmd, args);
       case "set_dirty":
         state.dirty[args.doc] = args.dirty;
         return null;

@@ -15,15 +15,15 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use partridge_engine_client::{
-    Certificate, CertificateKey, ClientError, SaveOptions, SignOptions, SignPlace, SignerConfig,
-    SignerSession, SignatureMark,
+    Certificate, CertificateKey, ClientError, SaveOptions, SignOptions, SignPlace, SignatureFont,
+    SignatureMark, SignerConfig, SignerSession,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
 use zeroize::Zeroize;
 
-use super::sigmarks::{self, MarkBody, SignatureMarkStore};
+use super::sigmarks;
 use super::updates::{self, UpdateState};
 use super::{blocking, choose_save_target, CommandError, Engine};
 
@@ -121,8 +121,12 @@ impl CertificateView {
 /// Reads a certificate file: a plain file, not bigger than the signer takes.
 fn read_certificate_file(path: &Path) -> Result<Vec<u8>, CommandError> {
     use std::io::Read;
-    let meta = std::fs::metadata(path)
-        .map_err(|_| error("sign_file_unreadable", "The certificate file could not be read."))?;
+    let meta = std::fs::metadata(path).map_err(|_| {
+        error(
+            "sign_file_unreadable",
+            "The certificate file could not be read.",
+        )
+    })?;
     if !meta.is_file() {
         return Err(error("sign_file_unreadable", "That is not a file."));
     }
@@ -138,9 +142,17 @@ fn read_certificate_file(path: &Path) -> Result<Vec<u8>, CommandError> {
             f.take(partridge_engine_client::MAX_CERTIFICATE_FILE as u64 + 1)
                 .read_to_end(&mut bytes)
         })
-        .map_err(|_| error("sign_file_unreadable", "The certificate file could not be read."))?;
+        .map_err(|_| {
+            error(
+                "sign_file_unreadable",
+                "The certificate file could not be read.",
+            )
+        })?;
     if bytes.len() > partridge_engine_client::MAX_CERTIFICATE_FILE {
-        return Err(error("signer_too_large", "The certificate file is too big."));
+        return Err(error(
+            "signer_too_large",
+            "The certificate file is too big.",
+        ));
     }
     Ok(bytes)
 }
@@ -217,9 +229,15 @@ pub async fn sign_load_certificate(
         match result {
             Ok((signer, Ok(c))) => (Some(signer), Ok(c)),
             // A wrong password: the signer stays, ready for another try.
-            Ok((signer, Err(e @ ClientError::Signer { code: "signer_wrong_password", .. }))) => {
-                (Some(signer), Err(CommandError::from(e)))
-            }
+            Ok((
+                signer,
+                Err(
+                    e @ ClientError::Signer {
+                        code: "signer_wrong_password",
+                        ..
+                    },
+                ),
+            )) => (Some(signer), Err(CommandError::from(e))),
             Ok((signer, Err(e))) => {
                 signer.close();
                 (None, Err(CommandError::from(e)))
@@ -287,12 +305,22 @@ pub enum PlaceArgs {
     Field { page: u32, name: String },
 }
 
-/// The picture for the box: none, a saved signature by its id, or the imported one.
+/// The picture for the box: none, a drawn or a typed one (the same shapes as a saved signature), or
+/// the imported one, which was handed over before as pixels.
 #[derive(Deserialize, Debug)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum MarkArgs {
     None,
-    Saved { id: String },
+    Draw {
+        width: f32,
+        height: f32,
+        line: f32,
+        strokes: Vec<Vec<[f32; 2]>>,
+    },
+    Type {
+        font: String,
+        text: String,
+    },
     Image,
 }
 
@@ -329,33 +357,43 @@ fn signed_name(current: &Path) -> PathBuf {
 }
 
 fn mark_of(
-    args: &MarkArgs,
-    store: &SignatureMarkStore,
+    args: MarkArgs,
     certificate: &CertificateState,
 ) -> Result<Option<SignatureMark>, CommandError> {
-    match args {
-        MarkArgs::None => Ok(None),
+    let mark = match args {
+        MarkArgs::None => return Ok(None),
+        MarkArgs::Draw {
+            width,
+            height,
+            line,
+            strokes,
+        } => SignatureMark::Strokes {
+            width,
+            height,
+            line,
+            strokes,
+        },
+        MarkArgs::Type { font, text } => SignatureMark::Typed {
+            font: SignatureFont::from_name(&font).ok_or_else(|| {
+                error(
+                    "invalid_request",
+                    "That font is not one of the signature fonts.",
+                )
+            })?,
+            text,
+        },
         MarkArgs::Image => state(certificate)
             .image
             .clone()
-            .map(Some)
-            .ok_or_else(|| error("invalid_request", "No picture was given.")),
-        MarkArgs::Saved { id } => {
-            let marks = store.0.lock().unwrap_or_else(|e| e.into_inner()).list();
-            let stored = marks
-                .into_iter()
-                .find(|m| &m.id == id)
-                .ok_or_else(|| error("invalid_request", "That saved signature is not there any more."))?;
-            match &stored.body {
-                MarkBody::Image { .. } => state(certificate)
-                    .image
-                    .clone()
-                    .map(Some)
-                    .ok_or_else(|| error("invalid_request", "No picture was given.")),
-                body => Ok(body.to_mark()),
-            }
-        }
+            .ok_or_else(|| error("invalid_request", "No picture was given."))?,
+    };
+    if !mark.within_caps() {
+        return Err(error(
+            "invalid_request",
+            "That picture is outside the limits for a signature picture.",
+        ));
     }
+    Ok(Some(mark))
 }
 
 /// Signs the document with the certificate that was opened and writes the signed file where the
@@ -368,7 +406,6 @@ pub async fn sign_document(
     engine: State<'_, Engine>,
     update_state: State<'_, UpdateState>,
     certificate: State<'_, CertificateState>,
-    marks: State<'_, SignatureMarkStore>,
     doc: u64,
     args: SignArgs,
 ) -> Result<Option<SignedInfo>, CommandError> {
@@ -385,7 +422,7 @@ pub async fn sign_document(
     let Some(current) = pool.source_path(doc) else {
         return Err(error("unknown_document", "The document is not open."));
     };
-    let mark = mark_of(&args.mark, &marks, &certificate)?;
+    let mark = mark_of(args.mark, &certificate)?;
     let place = match args.place {
         PlaceArgs::Invisible => SignPlace::Invisible,
         PlaceArgs::Rect { page, rect } => SignPlace::Rect { page, rect },
@@ -465,14 +502,26 @@ mod tests {
     fn a_file_that_is_not_a_plain_file_or_is_too_big_is_refused_before_the_signer_sees_it() {
         let dir = std::env::temp_dir().join(format!("partridge-certsign-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(read_certificate_file(&dir).unwrap_err().code, "sign_file_unreadable");
         assert_eq!(
-            read_certificate_file(&dir.join("missing.p12")).unwrap_err().code,
+            read_certificate_file(&dir).unwrap_err().code,
+            "sign_file_unreadable"
+        );
+        assert_eq!(
+            read_certificate_file(&dir.join("missing.p12"))
+                .unwrap_err()
+                .code,
             "sign_file_unreadable"
         );
         let big = dir.join("big.p12");
-        std::fs::write(&big, vec![0u8; partridge_engine_client::MAX_CERTIFICATE_FILE + 1]).unwrap();
-        assert_eq!(read_certificate_file(&big).unwrap_err().code, "signer_too_large");
+        std::fs::write(
+            &big,
+            vec![0u8; partridge_engine_client::MAX_CERTIFICATE_FILE + 1],
+        )
+        .unwrap();
+        assert_eq!(
+            read_certificate_file(&big).unwrap_err().code,
+            "signer_too_large"
+        );
         let ok = dir.join("ok.p12");
         std::fs::write(&ok, b"abc").unwrap();
         assert_eq!(read_certificate_file(&ok).unwrap(), b"abc".to_vec());

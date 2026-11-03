@@ -12,8 +12,9 @@ use common::designer::{add, apply_ok, open as open_designer, widget};
 use common::*;
 use partridge_engine::sigcheck::TrustList;
 use partridge_protocol::{
-    DesignField, DesignKind, DesignProps, ErrorCode, RequestBody, ResponseBody, SignPlace, SignRequest, SignResponse,
-    SignatureFont, SignatureMark, SignatureReason as R, SignatureState as S,
+    DesignField, DesignKind, DesignProps, ErrorCode, RequestBody, ResponseBody, SignPlace,
+    SignRequest, SignResponse, SignatureFont, SignatureMark, SignatureReason as R,
+    SignatureState as S,
 };
 use partridge_testkit as kit;
 use sign_support::*;
@@ -56,7 +57,10 @@ fn a_document_signed_with_each_kind_of_key_is_intact_and_names_its_signer() {
             Some(id.certificate().fingerprint.as_str()),
             "{file}"
         );
-        assert_eq!(info.serial.as_deref(), Some(id.certificate().serial.as_str()));
+        assert_eq!(
+            info.serial.as_deref(),
+            Some(id.certificate().serial.as_str())
+        );
         // The byte range covers the whole file except the hole.
         assert_eq!(info.byte_range.len(), 4);
         assert_eq!(info.byte_range[0], 0);
@@ -66,7 +70,9 @@ fn a_document_signed_with_each_kind_of_key_is_intact_and_names_its_signer() {
         assert_eq!(info.stated_reason.as_deref(), Some("I have read this"));
         assert_eq!(info.stated_location.as_deref(), Some("Oslo"));
         assert!(
-            info.claimed_time.as_deref().is_some_and(|t| t.starts_with("2026-06-15 12:00")),
+            info.claimed_time
+                .as_deref()
+                .is_some_and(|t| t.starts_with("2026-06-15 12:00")),
             "{:?}",
             info.claimed_time
         );
@@ -111,7 +117,9 @@ fn the_file_before_the_hole_is_what_pdfium_wrote_and_the_hole_is_empty() {
     // The hole is `<`, zeros and `>`; nothing else of the new part is zeros that long.
     assert_eq!(p.bytes[p.hole_start], b'<');
     assert_eq!(p.bytes[p.hole_end - 1], b'>');
-    assert!(p.bytes[p.hole_start + 1..p.hole_end - 1].iter().all(|b| *b == b'0'));
+    assert!(p.bytes[p.hole_start + 1..p.hole_end - 1]
+        .iter()
+        .all(|b| *b == b'0'));
     assert_eq!((p.hole_end - p.hole_start - 2) / 2, 6_000);
     // The byte range in the file is right already, so nothing in the file changes after the hole
     // is filled (the app only writes the signature).
@@ -144,7 +152,10 @@ fn the_old_bytes_stay_and_the_new_part_is_a_valid_update() {
     assert!(count(&signed, b"/Version /1.7") >= 1);
     // The file opens, has its pages, and the field is on the page asked for.
     let doc = open(e, &signed, None).unwrap();
-    let ResponseBody::DocInfo { pages, security, .. } = ask(e, RequestBody::DocInfo { doc }) else {
+    let ResponseBody::DocInfo {
+        pages, security, ..
+    } = ask(e, RequestBody::DocInfo { doc })
+    else {
         panic!("no description");
     };
     assert_eq!((pages, security), (3, 0));
@@ -176,8 +187,11 @@ fn the_pages_are_what_they_were_before_the_signature() {
     ] {
         let (doc, sizes) = open_sized(e, &pdf, None).unwrap();
         let (w, h) = (sizes[0].0 as f32, sizes[0].1 as f32);
-        let ResponseBody::Fingerprint { digest: before, pages, .. } =
-            ask(e, RequestBody::Sign(SignRequest::Fingerprint { doc }))
+        let ResponseBody::Fingerprint {
+            digest: before,
+            pages,
+            ..
+        } = ask(e, RequestBody::Sign(SignRequest::Fingerprint { doc }))
         else {
             panic!("no fingerprint");
         };
@@ -193,15 +207,20 @@ fn the_pages_are_what_they_were_before_the_signature() {
         let signed = finish(begin(e, s).unwrap(), &identity);
         ask(e, RequestBody::Close { doc });
         let doc = open(e, &signed, None).unwrap();
-        let ResponseBody::Fingerprint { digest: after, pages: pages_after, .. } =
-            ask(e, RequestBody::Sign(SignRequest::Fingerprint { doc }))
+        let ResponseBody::Fingerprint {
+            digest: after,
+            pages: pages_after,
+            ..
+        } = ask(e, RequestBody::Sign(SignRequest::Fingerprint { doc }))
         else {
             panic!("no fingerprint");
         };
         assert_eq!((pages, before), (pages_after, after), "{name}");
         // The plain description does see the new annotation: the two differ.
-        let ResponseBody::Fingerprint { digest: plain_after, .. } =
-            ask(e, RequestBody::Fingerprint { doc })
+        let ResponseBody::Fingerprint {
+            digest: plain_after,
+            ..
+        } = ask(e, RequestBody::Fingerprint { doc })
         else {
             panic!("no fingerprint");
         };
@@ -382,12 +401,12 @@ fn a_box_that_cannot_hold_a_signature_is_refused() {
     let doc = open(e, &kit::simple_pdf(2), None).unwrap();
     let rect = |r: [f32; 4]| SignPlace::Rect { page: 0, rect: r };
     for bad in [
-        [100.0, 100.0, 110.0, 110.0],       // too small
-        [100.0, 100.0, 300.0, 110.0],       // too flat
-        [-50.0, 100.0, 100.0, 200.0],       // off the left edge
-        [500.0, 100.0, 700.0, 200.0],       // off the right edge
-        [100.0, 700.0, 300.0, 900.0],       // off the bottom
-        [300.0, 100.0, 100.0, 200.0],       // backwards
+        [100.0, 100.0, 110.0, 110.0], // too small
+        [100.0, 100.0, 300.0, 110.0], // too flat
+        [-50.0, 100.0, 100.0, 200.0], // off the left edge
+        [500.0, 100.0, 700.0, 200.0], // off the right edge
+        [100.0, 700.0, 300.0, 900.0], // off the bottom
+        [300.0, 100.0, 100.0, 200.0], // backwards
     ] {
         assert_eq!(
             begin(e, spec(doc, rect(bad))).err(),
@@ -396,7 +415,17 @@ fn a_box_that_cannot_hold_a_signature_is_refused() {
         );
     }
     assert_eq!(
-        begin(e, spec(doc, SignPlace::Rect { page: 2, rect: [100.0, 100.0, 300.0, 200.0] })).err(),
+        begin(
+            e,
+            spec(
+                doc,
+                SignPlace::Rect {
+                    page: 2,
+                    rect: [100.0, 100.0, 300.0, 200.0]
+                }
+            )
+        )
+        .err(),
         Some(ErrorCode::PageOutOfRange)
     );
     // A box that fills the page is fine.
@@ -443,10 +472,7 @@ fn a_page_that_is_turned_gets_the_box_where_it_was_drawn_and_a_matching_look() {
         let rect = [30.0, 40.0, 30.0 + 150.0, 40.0 + 50.0];
         assert!(rect[2] <= w as f32 && rect[3] <= h as f32);
         let identity = identity("p256.p12");
-        let mut s = spec(
-            doc,
-            SignPlace::Rect { page: 0, rect },
-        );
+        let mut s = spec(doc, SignPlace::Rect { page: 0, rect });
         s.reserve = identity.certificate().signature_bytes + 64;
         let signed = finish(begin(e, s).unwrap(), &identity);
         ask(e, RequestBody::Close { doc });
@@ -459,18 +485,38 @@ fn a_page_that_is_turned_gets_the_box_where_it_was_drawn_and_a_matching_look() {
         else {
             panic!("no fields");
         };
-        let field = fields.iter().find(|f| f.name == "Signature1").expect("the new field");
+        let field = fields
+            .iter()
+            .find(|f| f.name == "Signature1")
+            .expect("the new field");
         for (got, want) in field.rect.iter().zip(rect) {
-            assert!((got - want).abs() < 1.0, "{degrees}: {:?} for {rect:?}", field.rect);
+            assert!(
+                (got - want).abs() < 1.0,
+                "{degrees}: {:?} for {rect:?}",
+                field.rect
+            );
         }
         // The look is turned to match: the form carries a matrix that is a quarter turn or a half.
         let text = String::from_utf8_lossy(&signed);
-        let matrix = text.split("/Matrix [").nth(1).unwrap().split(']').next().unwrap().to_string();
-        let v: Vec<f32> = matrix.split_whitespace().map(|n| n.parse().unwrap()).collect();
+        let matrix = text
+            .split("/Matrix [")
+            .nth(1)
+            .unwrap()
+            .split(']')
+            .next()
+            .unwrap()
+            .to_string();
+        let v: Vec<f32> = matrix
+            .split_whitespace()
+            .map(|n| n.parse().unwrap())
+            .collect();
         assert_eq!(v.len(), 6);
         match degrees {
             180 => assert!(v[0] < -0.99 && v[3] < -0.99, "{matrix}"),
-            _ => assert!(v[0].abs() < 0.01 && v[3].abs() < 0.01 && v[1].abs() > 0.99, "{matrix}"),
+            _ => assert!(
+                v[0].abs() < 0.01 && v[3].abs() < 0.01 && v[1].abs() > 0.99,
+                "{matrix}"
+            ),
         }
         ask(e, RequestBody::Close { doc });
     }
@@ -483,7 +529,12 @@ fn a_page_with_a_box_that_does_not_start_at_zero_is_signed_where_it_was_drawn() 
     let pdf = kit::far_box_pdf();
     let (doc, sizes) = open_sized(e, &pdf, None).unwrap();
     let (w, h) = sizes[0];
-    let rect = [10.0, 10.0, (w as f32 - 10.0).min(210.0), (h as f32 - 10.0).min(80.0)];
+    let rect = [
+        10.0,
+        10.0,
+        (w as f32 - 10.0).min(210.0),
+        (h as f32 - 10.0).min(80.0),
+    ];
     let identity = identity("p256.p12");
     let mut s = spec(doc, SignPlace::Rect { page: 0, rect });
     s.reserve = identity.certificate().signature_bytes + 64;
@@ -558,10 +609,18 @@ fn a_picture_of_each_kind_is_part_of_the_look() {
         s.reserve = identity.certificate().signature_bytes + 64;
         let signed = finish(begin(e, s).unwrap(), &identity);
         ask(e, RequestBody::Close { doc });
-        assert_eq!(report(e, &signed).items[0].state, S::UnknownSigner, "{name}");
+        assert_eq!(
+            report(e, &signed).items[0].state,
+            S::UnknownSigner,
+            "{name}"
+        );
         match name {
             "image" => {
-                assert_eq!(count(&signed, b"/Subtype /Image"), 2, "colour and transparency");
+                assert_eq!(
+                    count(&signed, b"/Subtype /Image"),
+                    2,
+                    "colour and transparency"
+                );
                 assert!(count(&signed, b"/SMask") >= 1);
                 assert!(count(&signed, b"RunLengthDecode") >= 2);
             }
@@ -670,7 +729,9 @@ fn the_engine_with_the_file_open_does_not_see_a_signature_that_is_not_there_yet(
     // The file with the empty hole is not an intact signature: the hole holds nothing.
     let r = report(e, &p.bytes);
     assert!(
-        r.items.iter().all(|i| !matches!(i.state, S::UnknownSigner | S::Trusted)),
+        r.items
+            .iter()
+            .all(|i| !matches!(i.state, S::UnknownSigner | S::Trusted)),
         "{r:?}"
     );
     ask(e, RequestBody::Close { doc });

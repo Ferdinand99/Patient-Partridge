@@ -186,7 +186,11 @@ pub fn string_value(bytes: &[u8]) -> Option<String> {
         }
         b'<' => {
             let inner = bytes.get(1..bytes.len().checked_sub(1)?)?;
-            let digits: Vec<u8> = inner.iter().copied().filter(|b| !b.is_ascii_whitespace()).collect();
+            let digits: Vec<u8> = inner
+                .iter()
+                .copied()
+                .filter(|b| !b.is_ascii_whitespace())
+                .collect();
             let mut out = Vec::new();
             for pair in digits.chunks(2) {
                 let hi = (pair[0] as char).to_digit(16)?;
@@ -199,8 +203,10 @@ pub fn string_value(bytes: &[u8]) -> Option<String> {
     };
     if raw.starts_with(&[0xfe, 0xff]) {
         let units: Vec<u16> = raw[2..]
-            .chunks_exact(2)
-            .map(|p| u16::from_be_bytes([p[0], p[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|p| u16::from_be_bytes(*p))
             .collect();
         return String::from_utf16(&units).ok();
     }
@@ -276,8 +282,9 @@ fn changed_dictionary(b: &[u8], entries: &[Entry], changes: &[(&str, String)]) -
 fn list_with(b: &[u8], value: &Range<usize>, reference: &str) -> Option<String> {
     let text = std::str::from_utf8(b.get(value.clone())?).ok()?;
     let text = text.trim_end();
-    let inner = text.strip_suffix(']')?;
-    text.starts_with('[').then(|| format!("{inner} {reference}]"))
+    let inner = text.strip_suffix(']')?.trim_end();
+    text.starts_with('[')
+        .then(|| format!("{inner} {reference}]"))
 }
 
 /// What a walk of the form found about one field.
@@ -293,15 +300,13 @@ struct FieldNode {
 }
 
 /// Every field of the form, all levels: its full name, its object, its type.
-fn walk_fields(
-    table: &Table<'_>,
-    fields: &Range<usize>,
-) -> Found<Vec<FieldNode>> {
+fn walk_fields(table: &Table<'_>, fields: &Range<usize>) -> Found<Vec<FieldNode>> {
     let b = table.bytes;
     let mut out: Vec<FieldNode> = Vec::new();
     let mut seen: HashSet<u32> = HashSet::new();
     // (the list of fields to read, the name so far, the type so far, the depth)
-    let mut stack: Vec<(Range<usize>, String, Option<Vec<u8>>, usize)> = Vec::new();
+    type Work = (Range<usize>, String, Option<Vec<u8>>, usize);
+    let mut stack: Vec<Work> = Vec::new();
     stack.push((fields.clone(), String::new(), None, 0));
     while let Some((list, prefix, kind, depth)) = stack.pop() {
         let Some(list) = table.resolve(&list)? else {
@@ -483,7 +488,9 @@ fn rewrite_list(
         .object(n)?
         .ok_or_else(|| structure(&format!("the {what} is not there")))?;
     if !plain_object(b, &object.value) {
-        return Err(structure(&format!("the {what} is followed by more than a list")));
+        return Err(structure(&format!(
+            "the {what} is followed by more than a list"
+        )));
     }
     let body = list_with(b, &object.value, reference)
         .ok_or_else(|| structure(&format!("the {what} is not a list")))?;
@@ -519,7 +526,10 @@ pub fn prepare(base: Vec<u8>, pages: usize, spec: &Spec<'_>) -> Result<Prepared,
     if count(b, b"/ByteRange") > 0 || count(b, b"/DocMDP") > 0 {
         return Err(Refusal::AlreadySigned);
     }
-    let limit = b.len().saturating_mul(WORK_TIMES).saturating_add(WORK_EXTRA);
+    let limit = b
+        .len()
+        .saturating_mul(WORK_TIMES)
+        .saturating_add(WORK_EXTRA);
     let table = Table::read(b, limit)?;
     if entry(&table.trailer, b"Encrypt").is_some() {
         return Err(Refusal::Encrypted);
@@ -540,8 +550,8 @@ pub fn prepare(base: Vec<u8>, pages: usize, spec: &Spec<'_>) -> Result<Prepared,
         .ok_or_else(|| structure("the size of the table of objects is not a number"))?;
     let root_value =
         entry(&table.trailer, b"Root").ok_or_else(|| structure("the file names no catalog"))?;
-    let root_number = reference_number(b, root_value)
-        .ok_or_else(|| structure("the catalog is not an object"))?;
+    let root_number =
+        reference_number(b, root_value).ok_or_else(|| structure("the catalog is not an object"))?;
     let (root, catalog) = plain_dictionary(&table, root_number, "catalog")?;
 
     let mut update = Update {
@@ -668,7 +678,9 @@ pub fn prepare(base: Vec<u8>, pages: usize, spec: &Spec<'_>) -> Result<Prepared,
                 match entry(entries, b"Fields") {
                     None => changes.push(("Fields", format!("[{reference}]"))),
                     Some(f) => {
-                        if let Some(text) = add_to_list(&mut update, &table, f, reference, "list of fields")? {
+                        if let Some(text) =
+                            add_to_list(&mut update, &table, f, reference, "list of fields")?
+                        {
                             changes.push(("Fields", text));
                         }
                     }
@@ -772,10 +784,8 @@ pub fn prepare(base: Vec<u8>, pages: usize, spec: &Spec<'_>) -> Result<Prepared,
     // The field.
     match existing {
         Some((n, object, entries)) => {
-            let mut changes: Vec<(&str, String)> = vec![
-                ("V", format!("{sig_number} 0 R")),
-                ("F", "132".to_string()),
-            ];
+            let mut changes: Vec<(&str, String)> =
+                vec![("V", format!("{sig_number} 0 R")), ("F", "132".to_string())];
             if let Some(form) = appearance {
                 changes.push(("AP", format!("<</N {form} 0 R>>")));
             }
@@ -870,8 +880,7 @@ pub fn prepare(base: Vec<u8>, pages: usize, spec: &Spec<'_>) -> Result<Prepared,
     // The hole and the byte range, in the part that was added.
     let unwritten = || structure("the signature was not written");
     let range_at = find(&bytes, b"/ByteRange [", base_len).ok_or_else(unwritten)? + 12;
-    let contents_at =
-        find(&bytes, b"/Contents <", range_at).ok_or_else(unwritten)? + 10;
+    let contents_at = find(&bytes, b"/Contents <", range_at).ok_or_else(unwritten)? + 10;
     let hole_end = contents_at + 1 + spec.reserve * 2 + 1;
     if bytes.get(contents_at) != Some(&b'<') || bytes.get(hole_end - 1) != Some(&b'>') {
         return Err(unwritten());
@@ -913,10 +922,13 @@ mod tests {
     fn text_is_written_as_a_literal_or_as_utf_16() {
         assert_eq!(text_string("Anna (Alvorlig)"), "(Anna \\(Alvorlig\\))");
         assert_eq!(text_string("a\\b"), "(a\\\\b)");
-        assert_eq!(text_string("\u{c5}se"), "<FEFF00C50073006500>");
+        assert_eq!(text_string("\u{c5}se"), "<FEFF00C500730065>");
         assert_eq!(text_string("\u{1f600}"), "<FEFFD83DDE00>");
         for text in ["plain", "\u{c5}se \u{d8}", "\u{6d4b}\u{8bd5}", "(x)\\"] {
-            assert_eq!(string_value(text_string(text).as_bytes()).as_deref(), Some(text));
+            assert_eq!(
+                string_value(text_string(text).as_bytes()).as_deref(),
+                Some(text)
+            );
         }
     }
 
@@ -929,7 +941,10 @@ mod tests {
 
     #[test]
     fn marks_are_counted_whole() {
-        assert_eq!(count(b"/ByteRange /ByteRange x /ByteRang", b"/ByteRange"), 2);
+        assert_eq!(
+            count(b"/ByteRange /ByteRange x /ByteRang", b"/ByteRange"),
+            2
+        );
         assert_eq!(count(b"", b"/ByteRange"), 0);
         assert_eq!(count(b"//ByteRange", b"/ByteRange"), 1);
     }
@@ -954,7 +969,10 @@ mod tests {
     #[test]
     fn a_list_gets_a_reference_at_its_end() {
         let text = b"[1 0 R 2 0 R ]";
-        assert_eq!(list_with(text, &(0..text.len()), "7 0 R").unwrap(), "[1 0 R 2 0 R 7 0 R]");
+        assert_eq!(
+            list_with(text, &(0..text.len()), "7 0 R").unwrap(),
+            "[1 0 R 2 0 R 7 0 R]"
+        );
         let text = b"[]";
         assert_eq!(list_with(text, &(0..2), "7 0 R").unwrap(), "[ 7 0 R]");
         let text = b"<< >>";

@@ -45,12 +45,15 @@ fn test_switch(_name: &str) -> bool {
     false
 }
 
-/// Runs the steps above.
-pub fn prepare() -> Prepared {
+/// Runs the steps above. `memory_limit` is the most memory the app allows, if it said; the signer
+/// never takes more than [`MEMORY_LIMIT_BYTES`] whatever it is told.
+pub fn prepare(memory_limit: Option<u64>) -> Prepared {
     #[cfg(unix)]
     partridge_sandbox::fds::close_all_above(2);
     let protocol = stdio::take_protocol_output();
-    let limit_set = limits::limit_memory(MEMORY_LIMIT_BYTES);
+    let limit_set = limits::limit_memory(
+        memory_limit.map_or(MEMORY_LIMIT_BYTES, |m| m.min(MEMORY_LIMIT_BYTES)),
+    );
 
     // The first use of the random number source can open a file; after the sandbox it could not.
     let mut warm = [0u8; 8];

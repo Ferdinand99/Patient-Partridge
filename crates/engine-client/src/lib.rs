@@ -58,7 +58,7 @@ pub use pool::{Cancelled, EnginePool, ExtractOptions, InsertOptions, InsertOutco
 mod save;
 pub use save::{verify_written, DocInfo, Fingerprint, SaveError, SaveOptions, SaveOutcome};
 mod sign;
-pub use sign::{SignOptions, SignOutcome};
+pub use sign::{verify_signed, SignOptions, SignOutcome};
 mod signer;
 pub use signer::{SignerConfig, SignerSession};
 /// The biggest certificate file the signer takes, in bytes.
@@ -185,10 +185,7 @@ pub enum ClientError {
     Save(SaveError),
     /// The signer (the process that holds a certificate and its key) refused, failed or stopped.
     /// The code is stable, for the window; the message is for a log.
-    Signer {
-        code: &'static str,
-        message: String,
-    },
+    Signer { code: &'static str, message: String },
 }
 
 impl fmt::Display for ClientError {

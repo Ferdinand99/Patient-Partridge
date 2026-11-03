@@ -328,7 +328,7 @@ pub fn fingerprint_with(
                 })
                 .count()
         } else {
-            page.annotations().len() as usize
+            page.annotations().len()
         };
         put(&(annotations as u64).to_le_bytes());
         if index % 32 == 31 {

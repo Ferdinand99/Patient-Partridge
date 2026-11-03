@@ -99,7 +99,7 @@ fn every_request_round_trips_and_has_one_encoding() {
 fn every_answer_round_trips_and_is_cut_nowhere() {
     let answers = [
         SignResponse::Ready {
-            size: 40_000,
+            size: 50_000,
             hole_start: 30_000,
             hole_end: 30_000 + 2 + 12_000,
             field: "Signature1".into(),
@@ -128,7 +128,10 @@ fn every_answer_round_trips_and_is_cut_nowhere() {
         let bytes = response.encode();
         assert_eq!(Response::decode(bytes.clone()).unwrap(), response);
         for cut in 0..bytes.len() {
-            assert!(Response::decode(bytes[..cut].to_vec()).is_err(), "cut at {cut}");
+            assert!(
+                Response::decode(bytes[..cut].to_vec()).is_err(),
+                "cut at {cut}"
+            );
         }
     }
 }
@@ -149,7 +152,12 @@ fn the_texts_are_capped_and_must_be_plain() {
     let long_name = (MAX_SIGN_TEXT_BYTES as u32 + 1).to_le_bytes();
     bytes[at - 4..at].copy_from_slice(&long_name);
     assert!(Request::decode(&bytes).is_err());
-    for text in ["tab\there", "line\nbreak", "\u{202e}flipped", "zero\u{200b}width"] {
+    for text in [
+        "tab\there",
+        "line\nbreak",
+        "\u{202e}flipped",
+        "zero\u{200b}width",
+    ] {
         assert!(
             !accepted(SignSpec {
                 reason: text.into(),
@@ -179,10 +187,22 @@ fn the_reserve_and_the_time_are_held_to_their_caps() {
         assert!(!accepted(SignSpec { reserve, ..spec() }), "{reserve}");
     }
     for signed_at in [0, 1, MAX_UNIX_TIME] {
-        assert!(accepted(SignSpec { signed_at, ..spec() }), "{signed_at}");
+        assert!(
+            accepted(SignSpec {
+                signed_at,
+                ..spec()
+            }),
+            "{signed_at}"
+        );
     }
     for signed_at in [-1, MAX_UNIX_TIME + 1, i64::MIN, i64::MAX] {
-        assert!(!accepted(SignSpec { signed_at, ..spec() }), "{signed_at}");
+        assert!(
+            !accepted(SignSpec {
+                signed_at,
+                ..spec()
+            }),
+            "{signed_at}"
+        );
     }
 }
 
@@ -252,12 +272,7 @@ fn a_hole_that_cannot_be_in_the_file_is_refused() {
     assert!(Response::decode(answer(10_000, 200, 100)).is_err());
     assert!(Response::decode(answer(10_000, 100, 100 + good + 1)).is_err());
     assert!(Response::decode(answer(10_000, 100, 100 + good - 2)).is_err());
-    assert!(Response::decode(answer(
-        1 << 24,
-        100,
-        100 + 2 + 2 * MAX_SIGN_RESERVE + 2
-    ))
-    .is_err());
+    assert!(Response::decode(answer(1 << 24, 100, 100 + 2 + 2 * MAX_SIGN_RESERVE + 2)).is_err());
     assert!(Response::decode(answer(u32::MAX, 100, 100 + good)).is_err());
 }
 

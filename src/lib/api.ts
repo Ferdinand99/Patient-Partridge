@@ -5,6 +5,7 @@ import type { PageSizePt } from "../viewer/layout";
 import type { FormFieldInfo, FormInfo, FormValueIn } from "../viewer/forms";
 import type { PageLinkInfo } from "../viewer/overlays";
 import type { SignaturesInfo } from "./signatures";
+import type { CertificateInfo, SignField, SignRequestArgs, SignedFile } from "./certsign";
 import type { Annotation, AnnotKind, Rgba, StampName } from "./annotations";
 import type { DrawnPicture, Rect, SavedBody, SavedPicture, TypedPicture } from "./signpicture";
 import { bodyOf } from "./signpicture";
@@ -314,6 +315,45 @@ export const api = {
     return invoke<SignaturesInfo>("get_signatures", { doc });
   },
 
+  /**
+   * Asks which certificate file to use, in the dialog of the system (the app opens it: the window
+   * names no file). Resolves with the name of the file, or null when the person cancels.
+   */
+  signPickCertificate(): Promise<string | null> {
+    return invoke<string | null>("sign_pick_certificate");
+  },
+
+  /** Opens the chosen certificate file with its password. The password is not kept. */
+  signLoadCertificate(password: string): Promise<CertificateInfo> {
+    return invoke<CertificateInfo>("sign_load_certificate", { password });
+  },
+
+  /** Lets the key go and forgets the file that was chosen. */
+  async signForgetCertificate(): Promise<void> {
+    await invoke<void>("sign_forget_certificate");
+  },
+
+  /** An imported picture for the box of the signature, as raw pixels. Kept until the file is signed. */
+  async signSetImageMark(width: number, height: number, rgba: Uint8ClampedArray): Promise<void> {
+    const bytes = new Uint8Array(rgba.buffer, rgba.byteOffset, rgba.byteLength);
+    await invoke<void>("sign_set_image_mark", bytes, {
+      headers: { "x-signature-image": JSON.stringify({ width, height }) },
+    });
+  },
+
+  /** The signature fields of a document that nobody has signed. Names are text from the file. */
+  signListFields(doc: number): Promise<SignField[]> {
+    return invoke<SignField[]>("sign_list_fields", { doc });
+  },
+
+  /**
+   * Signs the document with the certificate that was opened and writes the signed copy where the
+   * person says (the app opens the dialog). Resolves with null when the person cancels the dialog.
+   */
+  signDocument(doc: number, args: SignRequestArgs): Promise<SignedFile | null> {
+    return invoke<SignedFile | null>("sign_document", { doc, args });
+  },
+
   /** What kind of form a document has, and whether it has scripts or actions. */
   formInfo(doc: number): Promise<FormInfo> {
     return invoke<FormInfo>("form_info", { doc });
@@ -459,3 +499,13 @@ export const api = {
     await invoke<void>("open_releases_page");
   },
 };
+
+/** What signing with a certificate needs from the app process. Without all of it the tool is off. */
+export interface CertSignApi {
+  signPickCertificate(): Promise<string | null>;
+  signLoadCertificate(password: string): Promise<CertificateInfo>;
+  signForgetCertificate(): Promise<void>;
+  signSetImageMark(width: number, height: number, rgba: Uint8ClampedArray): Promise<void>;
+  signListFields(doc: number): Promise<SignField[]>;
+  signDocument(doc: number, args: SignRequestArgs): Promise<SignedFile | null>;
+}

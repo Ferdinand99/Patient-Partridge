@@ -11,17 +11,29 @@ use std::process::ExitCode;
 use partridge_signer::startup;
 
 fn main() -> ExitCode {
-    // The signer takes no arguments: nothing the app could tell it on a command line changes what
-    // it does.
-    if std::env::args_os().len() > 1 {
-        return ExitCode::from(2);
-    }
+    // The one thing the app may tell the signer on its command line is how much memory it may use
+    // (the app does this for every program it starts); the signer can only lower its own limit.
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let limit = match args.as_slice() {
+        [] => None,
+        [flag, value] if flag == "--memory-limit" => {
+            match value.to_str().and_then(|v| v.parse::<u64>().ok()) {
+                Some(bytes) => Some(bytes),
+                None => return ExitCode::from(2),
+            }
+        }
+        _ => return ExitCode::from(2),
+    };
     let startup::Prepared {
         mut signer,
         protocol,
         ..
-    } = startup::prepare();
+    } = startup::prepare(limit);
     let mut input = BufReader::new(io::stdin().lock());
     let mut output = BufWriter::new(protocol);
-    ExitCode::from(partridge_signer::serve(&mut input, &mut output, &mut signer))
+    ExitCode::from(partridge_signer::serve(
+        &mut input,
+        &mut output,
+        &mut signer,
+    ))
 }

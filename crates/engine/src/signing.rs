@@ -174,9 +174,7 @@ fn begin(
                     && rect[1] >= -slack
                     && rect[2] <= pw + slack
                     && rect[3] <= ph + slack;
-                if !inside
-                    || rect[2] - rect[0] < MIN_SIGN_SIDE
-                    || rect[3] - rect[1] < MIN_SIGN_SIDE
+                if !inside || rect[2] - rect[0] < MIN_SIGN_SIDE || rect[3] - rect[1] < MIN_SIGN_SIDE
                 {
                     return fail(
                         ErrorCode::SignRefused,
@@ -204,14 +202,15 @@ fn begin(
                         "the page has no signature field of that name",
                     );
                 };
-                let look = if rect[2] - rect[0] >= SMALLEST_LOOK && rect[3] - rect[1] >= SMALLEST_LOOK {
-                    match geometry(&page, rect) {
-                        Some(g) => Some(make_look(&g)?),
-                        None => None,
-                    }
-                } else {
-                    None
-                };
+                let look =
+                    if rect[2] - rect[0] >= SMALLEST_LOOK && rect[3] - rect[1] >= SMALLEST_LOOK {
+                        match geometry(&page, rect) {
+                            Some(g) => Some(make_look(&g)?),
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
                 (index, look, Some(name.clone()), [0.0; 4])
             }
         };

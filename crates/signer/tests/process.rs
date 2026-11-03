@@ -150,6 +150,54 @@ fn a_message_that_cannot_be_read_ends_the_signer() {
 }
 
 #[test]
+fn the_signer_takes_the_memory_limit_and_nothing_else() {
+    // The limit that the app puts on every program it starts is taken (and can only lower the one
+    // the signer has).
+    let mut child = Command::new(env!("CARGO_BIN_EXE_partridge-signer"))
+        .args(["--memory-limit", "268435456"])
+        .env_clear()
+        .env("PARTRIDGE_TEST_ENFORCE", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut input = BufWriter::new(child.stdin.take().unwrap());
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+    write_frame(
+        &mut input,
+        &Request::Hello {
+            version: PROTOCOL_VERSION,
+        }
+        .encode(),
+    )
+    .unwrap();
+    let frame = read_frame(&mut output).unwrap().unwrap();
+    assert!(matches!(
+        Response::decode(&frame).unwrap(),
+        Response::Hello { .. }
+    ));
+    drop(input);
+    assert!(child.wait().unwrap().success());
+    // Nothing else is taken.
+    for args in [
+        &["--memory-limit"][..],
+        &["--memory-limit", "many"],
+        &["--other", "1"],
+        &["x", "y", "z"],
+    ] {
+        let status = Command::new(env!("CARGO_BIN_EXE_partridge-signer"))
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(2), "{args:?}");
+    }
+}
+
+#[test]
 fn the_signer_takes_no_arguments() {
     let status = Command::new(env!("CARGO_BIN_EXE_partridge-signer"))
         .arg("--anything")

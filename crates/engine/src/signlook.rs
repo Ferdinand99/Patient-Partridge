@@ -92,7 +92,8 @@ pub fn winansi(c: char) -> u8 {
 
 /// The widths of Helvetica for the characters 32 to 126, in thousandths of the size.
 const WIDTHS: [u16; 95] = [
-    278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278, // space to /
+    278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278,
+    278, // space to /
     556, 556, 556, 556, 556, 556, 556, 556, 556, 556, // 0 to 9
     278, 278, 584, 584, 584, 556, 1015, // : to @
     667, 667, 722, 722, 667, 611, 778, 722, 278, 500, 667, 556, 833, 722, 778, 667, 778, 722, 667,
@@ -175,7 +176,11 @@ fn rgb_of(color: [u8; 4]) -> String {
 }
 
 /// Draws the picture in `area`. Returns the instructions and the raster, if the picture is one.
-fn draw_mark(mark: &SignatureMark, color: [u8; 4], area: Area) -> Result<(String, Option<Raster>), String> {
+fn draw_mark(
+    mark: &SignatureMark,
+    color: [u8; 4],
+    area: Area,
+) -> Result<(String, Option<Raster>), String> {
     let aspect = sigmark::aspect_of(mark)?;
     let Some((ox, oy, w, h)) = fit_in(aspect, area) else {
         return Ok((String::new(), None));
@@ -195,14 +200,19 @@ fn draw_mark(mark: &SignatureMark, color: [u8; 4], area: Area) -> Result<(String
                 num((line * s).max(0.05))
             ));
             for stroke in strokes {
-                let at = |p: &[f32; 2]| {
-                    format!("{} {}", num(ox + p[0] * s), num(oy + h - p[1] * s))
+                let at =
+                    |p: &[f32; 2]| format!("{} {}", num(ox + p[0] * s), num(oy + h - p[1] * s));
+                let Some(first) = stroke.first() else {
+                    continue;
                 };
-                let Some(first) = stroke.first() else { continue };
                 out.push_str(&format!("{} m ", at(first)));
                 if stroke.len() == 1 {
                     // A dot: a line so short that its round ends are all there is.
-                    out.push_str(&format!("{} {} l ", num(ox + first[0] * s + 0.01), num(oy + h - first[1] * s)));
+                    out.push_str(&format!(
+                        "{} {} l ",
+                        num(ox + first[0] * s + 0.01),
+                        num(oy + h - first[1] * s)
+                    ));
                 }
                 for p in &stroke[1..] {
                     out.push_str(&format!("{} l ", at(p)));
@@ -217,7 +227,9 @@ fn draw_mark(mark: &SignatureMark, color: [u8; 4], area: Area) -> Result<(String
                 .map_err(|_| "that text cannot be set in this font".to_string())?;
             let b = outline.bounds;
             let s = w / (b[2] - b[0]);
-            let at = |x: f32, y: f32| format!("{} {}", num(ox + (x - b[0]) * s), num(oy + (y - b[1]) * s));
+            let at = |x: f32, y: f32| {
+                format!("{} {}", num(ox + (x - b[0]) * s), num(oy + (y - b[1]) * s))
+            };
             out.push_str(&format!("q {} rg\n", rgb_of(color)));
             for path in &outline.paths {
                 for seg in path {
@@ -246,7 +258,7 @@ fn draw_mark(mark: &SignatureMark, color: [u8; 4], area: Area) -> Result<(String
             let pixels = *width as usize * *height as usize;
             let mut rgb = Vec::with_capacity(pixels * 3);
             let mut alpha = Vec::with_capacity(pixels);
-            for p in rgba.chunks_exact(4) {
+            for p in rgba.as_chunks::<4>().0 {
                 rgb.extend_from_slice(&p[..3]);
                 alpha.push(p[3]);
             }
@@ -402,7 +414,7 @@ mod tests {
                     i += l + 1;
                 }
                 _ => {
-                    out.extend(std::iter::repeat(data[i]).take(257 - l));
+                    out.extend(std::iter::repeat_n(data[i], 257 - l));
                     i += 1;
                 }
             }
@@ -495,19 +507,43 @@ mod tests {
             line: 2.0,
             strokes: vec![vec![[5.0, 5.0], [90.0, 30.0]]],
         };
-        let wide = build(300.0, 80.0, [1.0, 0.0, 0.0, 1.0], &["x".into()], Some(&mark), [0, 0, 0, 255])
-            .unwrap();
-        let tall = build(80.0, 300.0, [1.0, 0.0, 0.0, 1.0], &["x".into()], Some(&mark), [0, 0, 0, 255])
-            .unwrap();
+        let wide = build(
+            300.0,
+            80.0,
+            [1.0, 0.0, 0.0, 1.0],
+            &["x".into()],
+            Some(&mark),
+            [0, 0, 0, 255],
+        )
+        .unwrap();
+        let tall = build(
+            80.0,
+            300.0,
+            [1.0, 0.0, 0.0, 1.0],
+            &["x".into()],
+            Some(&mark),
+            [0, 0, 0, 255],
+        )
+        .unwrap();
         let first_x = |look: &Look| {
             let text = String::from_utf8(look.content.clone()).unwrap();
             let at = text.find(" w 1 J 1 j\n").unwrap() + 11;
-            text[at..].split_whitespace().next().unwrap().parse::<f32>().unwrap()
+            text[at..]
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse::<f32>()
+                .unwrap()
         };
         let first_y = |look: &Look| {
             let text = String::from_utf8(look.content.clone()).unwrap();
             let at = text.find(" w 1 J 1 j\n").unwrap() + 11;
-            text[at..].split_whitespace().nth(1).unwrap().parse::<f32>().unwrap()
+            text[at..]
+                .split_whitespace()
+                .nth(1)
+                .unwrap()
+                .parse::<f32>()
+                .unwrap()
         };
         assert!(first_x(&wide) < 300.0 * 0.42);
         assert!(first_y(&tall) > 300.0 * 0.45);
@@ -519,7 +555,15 @@ mod tests {
             font: partridge_protocol::SignatureFont::GreatVibes,
             text: "Anna".into(),
         };
-        let look = build(240.0, 70.0, [1.0, 0.0, 0.0, 1.0], &["x".into()], Some(&typed), [10, 20, 120, 255]).unwrap();
+        let look = build(
+            240.0,
+            70.0,
+            [1.0, 0.0, 0.0, 1.0],
+            &["x".into()],
+            Some(&typed),
+            [10, 20, 120, 255],
+        )
+        .unwrap();
         let text = String::from_utf8(look.content).unwrap();
         assert!(text.contains(" c "));
         assert!(text.contains("f\nQ"));
@@ -529,7 +573,15 @@ mod tests {
             height: 1,
             rgba: vec![1, 2, 3, 255, 4, 5, 6, 0],
         };
-        let look = build(240.0, 70.0, [1.0, 0.0, 0.0, 1.0], &["x".into()], Some(&image), [0, 0, 0, 255]).unwrap();
+        let look = build(
+            240.0,
+            70.0,
+            [1.0, 0.0, 0.0, 1.0],
+            &["x".into()],
+            Some(&image),
+            [0, 0, 0, 255],
+        )
+        .unwrap();
         let raster = look.raster.unwrap();
         assert_eq!((raster.width, raster.height), (2, 1));
         assert_eq!(raster.rgb, vec![1, 2, 3, 4, 5, 6]);

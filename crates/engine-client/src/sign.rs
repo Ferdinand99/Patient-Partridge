@@ -131,17 +131,24 @@ pub fn verify_signed(
             )));
         }
         let item = &report.items[0];
-        if !matches!(item.state, SignatureState::UnknownSigner | SignatureState::Trusted) {
+        if !matches!(
+            item.state,
+            SignatureState::UnknownSigner | SignatureState::Trusted
+        ) {
             return Err(verify(format!(
                 "its signature does not hold ({:?}, {:?})",
                 item.state, item.reason
             )));
         }
         if item.sub_filter != "ETSI.CAdES.detached" {
-            return Err(verify("its signature is of another form than the one made".into()));
+            return Err(verify(
+                "its signature is of another form than the one made".into(),
+            ));
         }
         if item.fingerprint.as_deref() != Some(certificate.fingerprint.as_str()) {
-            return Err(verify("its signature is not made with the certificate that was used".into()));
+            return Err(verify(
+                "its signature is not made with the certificate that was used".into(),
+            ));
         }
         // The signature covers the whole file but the place of the signature itself.
         let range = &item.byte_range;
@@ -157,7 +164,10 @@ pub fn verify_signed(
             .sign_fingerprint(opened.doc)
             .map_err(|e| verify(format!("its pages could not be looked at ({e})")))?;
         if seen.failed > 0 {
-            return Err(verify(format!("{} of its pages could not be read", seen.failed)));
+            return Err(verify(format!(
+                "{} of its pages could not be read",
+                seen.failed
+            )));
         }
         if seen.pages != expected.pages || seen.digest != expected.digest {
             return Err(verify(
@@ -214,7 +224,8 @@ pub(crate) fn sign_document(
         .into());
     }
     let hash = certificate.hash();
-    let reserve = (certificate.signature_bytes + RESERVE_MARGIN).clamp(MIN_SIGN_RESERVE, MAX_SIGN_RESERVE);
+    let reserve =
+        (certificate.signature_bytes + RESERVE_MARGIN).clamp(MIN_SIGN_RESERVE, MAX_SIGN_RESERVE);
     if certificate.signature_bytes + RESERVE_MARGIN > MAX_SIGN_RESERVE {
         return Err(ClientError::Signer {
             code: "signer_too_large",
@@ -224,41 +235,42 @@ pub(crate) fn sign_document(
 
     let mut field = String::new();
     let outcome = {
-        let mut stream = |sink: &mut dyn FnMut(&[u8]) -> io::Result<()>| -> Result<u64, SaveStreamError> {
-            let spec = SignSpec {
-                doc: 0,
-                place: options.place.clone(),
-                name: options.name.clone(),
-                reason: options.reason.clone(),
-                location: options.location.clone(),
-                signed_at: options.signed_at,
-                mark: options.mark.clone(),
-                color: options.color,
-                reserve,
+        let mut stream =
+            |sink: &mut dyn FnMut(&[u8]) -> io::Result<()>| -> Result<u64, SaveStreamError> {
+                let spec = SignSpec {
+                    doc: 0,
+                    place: options.place.clone(),
+                    name: options.name.clone(),
+                    reason: options.reason.clone(),
+                    location: options.location.clone(),
+                    signed_at: options.signed_at,
+                    mark: options.mark.clone(),
+                    color: options.color,
+                    reserve,
+                };
+                let mut prepared = client.sign_prepare(doc, spec)?;
+                let hole = (prepared.hole_start, prepared.hole_end);
+                let digest = digest_of(&prepared.bytes, hole, hash);
+                let cms = signer.sign_digest(&digest, hash)?;
+                let room = (hole.1 - hole.0 - 2) / 2;
+                if cms.len() > room {
+                    return Err(SaveStreamError::Client(ClientError::Signer {
+                        code: "signer_too_large",
+                        message: "the signature does not fit the room that was kept for it".into(),
+                    }));
+                }
+                // The signature goes in as hexadecimal; what is left of the hole stays zeros.
+                for (i, byte) in cms.iter().enumerate() {
+                    let at = hole.0 + 1 + 2 * i;
+                    prepared.bytes[at] = b"0123456789abcdef"[usize::from(byte >> 4)];
+                    prepared.bytes[at + 1] = b"0123456789abcdef"[usize::from(byte & 15)];
+                }
+                field = prepared.field.clone();
+                for piece in prepared.bytes.chunks(1 << 20) {
+                    sink(piece).map_err(SaveStreamError::Sink)?;
+                }
+                Ok(prepared.bytes.len() as u64)
             };
-            let mut prepared = client.sign_prepare(doc, spec)?;
-            let hole = (prepared.hole_start, prepared.hole_end);
-            let digest = digest_of(&prepared.bytes, hole, hash);
-            let cms = signer.sign_digest(&digest, hash)?;
-            let room = (hole.1 - hole.0 - 2) / 2;
-            if cms.len() > room {
-                return Err(SaveStreamError::Client(ClientError::Signer {
-                    code: "signer_too_large",
-                    message: "the signature does not fit the room that was kept for it".into(),
-                }));
-            }
-            // The signature goes in as hexadecimal; what is left of the hole stays zeros.
-            for (i, byte) in cms.iter().enumerate() {
-                let at = hole.0 + 1 + 2 * i;
-                prepared.bytes[at] = b"0123456789abcdef"[usize::from(byte >> 4)];
-                prepared.bytes[at + 1] = b"0123456789abcdef"[usize::from(byte & 15)];
-            }
-            field = prepared.field.clone();
-            for piece in prepared.bytes.chunks(1 << 20) {
-                sink(piece).map_err(SaveStreamError::Sink)?;
-            }
-            Ok(prepared.bytes.len() as u64)
-        };
         write_checked(
             target,
             expected,

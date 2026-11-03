@@ -117,7 +117,12 @@ fn set_of_one(element: Vec<u8>) -> Vec<u8> {
 pub(crate) fn signature_size(identity: &Identity) -> usize {
     let digest = vec![0u8; hash_of(identity).len()];
     let attributes = signed_attributes(identity, &digest);
-    assemble(identity, &attributes, &vec![0x30; identity.longest_signature()]).len()
+    assemble(
+        identity,
+        &attributes,
+        &vec![0x30; identity.longest_signature()],
+    )
+    .len()
 }
 
 /// Signs the digest of the signed part of the file.

@@ -279,12 +279,20 @@ pub enum Request {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Response {
-    Hello { version: u32, sandbox: String },
+    Hello {
+        version: u32,
+        sandbox: String,
+    },
     Loaded(Certificate),
     /// The signature, as DER (a CMS `ContentInfo`).
-    Signed { cms: Vec<u8> },
+    Signed {
+        cms: Vec<u8>,
+    },
     Closed,
-    Error { code: ErrorCode, message: String },
+    Error {
+        code: ErrorCode,
+        message: String,
+    },
 }
 
 fn put_u32(out: &mut Vec<u8>, v: u32) {
@@ -322,7 +330,10 @@ impl<'a> Reader<'a> {
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], ProtocolError> {
         let end = self.at.checked_add(n).ok_or(ProtocolError::Truncated)?;
-        let slice = self.data.get(self.at..end).ok_or(ProtocolError::Truncated)?;
+        let slice = self
+            .data
+            .get(self.at..end)
+            .ok_or(ProtocolError::Truncated)?;
         self.at = end;
         Ok(slice)
     }

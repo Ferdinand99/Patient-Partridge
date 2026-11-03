@@ -134,9 +134,8 @@ pub fn load(p12: &[u8], password: &str) -> Result<Identity, SignerError> {
             "the private key does not belong to any certificate in the file",
         ));
     }
-    Err(unsupported.unwrap_or_else(|| {
-        SignerError::new(ErrorCode::KeyUnsupported, "the key cannot be used")
-    }))
+    Err(unsupported
+        .unwrap_or_else(|| SignerError::new(ErrorCode::KeyUnsupported, "the key cannot be used")))
 }
 
 /// What the library's errors mean for the person who typed the password.
@@ -206,9 +205,17 @@ fn classify(pkcs8: &[u8]) -> Option<(Kind, &[u8])> {
         let curve = der::read(name.rest)?;
         let curve_is = |dotted: &str| curve.tag == 0x06 && curve.content == oid_content(dotted);
         if curve_is(OID_P256) {
-            Kind::Ec(&signature::ECDSA_P256_SHA256_ASN1_SIGNING, 32, KeyKind::EcdsaP256)
+            Kind::Ec(
+                &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+                32,
+                KeyKind::EcdsaP256,
+            )
         } else if curve_is(OID_P384) {
-            Kind::Ec(&signature::ECDSA_P384_SHA384_ASN1_SIGNING, 48, KeyKind::EcdsaP384)
+            Kind::Ec(
+                &signature::ECDSA_P384_SHA384_ASN1_SIGNING,
+                48,
+                KeyKind::EcdsaP384,
+            )
         } else if curve_is(OID_P521) {
             Kind::Other("ECDSA P-521".to_string())
         } else {
@@ -250,7 +257,9 @@ fn pair(pkcs8: &[u8], certs: &[&[u8]]) -> Result<(Key, usize), Paired> {
             }
             let at = certs
                 .iter()
-                .position(|der| rsa_of_certificate(der).is_some_and(|c| c == (n.clone(), e.clone())))
+                .position(|der| {
+                    rsa_of_certificate(der).is_some_and(|c| c == (n.clone(), e.clone()))
+                })
                 .ok_or(Paired::NoCertificate)?;
             Ok((Key::Rsa(pair), at))
         }
@@ -284,8 +293,12 @@ fn rsa_numbers(public: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     let outer = der::read(public)?;
     let n = der::read(outer.content)?;
     let e = der::read(n.rest)?;
-    (outer.tag == 0x30 && n.tag == 0x02 && e.tag == 0x02)
-        .then(|| (der::unsigned(n.content).to_vec(), der::unsigned(e.content).to_vec()))
+    (outer.tag == 0x30 && n.tag == 0x02 && e.tag == 0x02).then(|| {
+        (
+            der::unsigned(n.content).to_vec(),
+            der::unsigned(e.content).to_vec(),
+        )
+    })
 }
 
 fn rsa_of_certificate(der: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
@@ -336,9 +349,8 @@ fn ec_scalar(private: &[u8], size: usize) -> Option<Vec<u8>> {
 
 /// The name as people read it: the common name, else the organisation, else the unit.
 fn display_name(name: &X509Name<'_>) -> String {
-    let text = |value: Option<&AttributeTypeAndValue<'_>>| {
-        value.and_then(|a| a.as_str().ok()).map(clean)
-    };
+    let text =
+        |value: Option<&AttributeTypeAndValue<'_>>| value.and_then(|a| a.as_str().ok()).map(clean);
     text(name.iter_common_name().next())
         .or_else(|| text(name.iter_organization().next()))
         .or_else(|| text(name.iter_organizational_unit().next()))
@@ -397,7 +409,10 @@ fn chain_of(leaf: usize, certs: &[&[u8]]) -> Vec<Vec<u8>> {
 fn finish(key: Key, leaf: usize, certs: &[&[u8]]) -> Result<Identity, SignerError> {
     let chain = chain_of(leaf, certs);
     let (_, cert) = X509Certificate::from_der(&chain[0]).map_err(|_| {
-        SignerError::new(ErrorCode::NotACertificateFile, "the certificate cannot be read")
+        SignerError::new(
+            ErrorCode::NotACertificateFile,
+            "the certificate cannot be read",
+        )
     })?;
     let key_kind = match &key {
         Key::Rsa(pair) => {

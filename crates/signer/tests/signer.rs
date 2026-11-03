@@ -37,8 +37,18 @@ fn each_kind_of_key_is_read_with_its_certificate_and_its_chain() {
         ("p256.p12", KeyKind::EcdsaP256, 2, "Test Signer P-256"),
         ("p384.p12", KeyKind::EcdsaP384, 2, "Test Signer P-384"),
         // The older form that Windows and macOS still export (triple DES and a SHA-1 MAC).
-        ("rsa2048-legacy.p12", KeyKind::Rsa(2048), 3, "Test Signer RSA 2048"),
-        ("p256-legacy.p12", KeyKind::EcdsaP256, 2, "Test Signer P-256 legacy"),
+        (
+            "rsa2048-legacy.p12",
+            KeyKind::Rsa(2048),
+            3,
+            "Test Signer RSA 2048",
+        ),
+        (
+            "p256-legacy.p12",
+            KeyKind::EcdsaP256,
+            2,
+            "Test Signer P-256 legacy",
+        ),
     ];
     for (file, key, chain, name) in cases {
         let identity = loaded(file);
@@ -88,7 +98,10 @@ fn a_file_without_a_chain_gives_a_chain_of_one_and_a_self_made_certificate_says_
 fn an_empty_password_opens_a_file_that_was_made_with_one() {
     let p12 = fixture("rsa2048-empty-password.p12");
     assert!(load(&p12, "").is_ok());
-    assert_eq!(load(&p12, "test").err().unwrap().code, ErrorCode::WrongPassword);
+    assert_eq!(
+        load(&p12, "test").err().unwrap().code,
+        ErrorCode::WrongPassword
+    );
 }
 
 #[test]
@@ -284,7 +297,9 @@ fn a_signature_is_a_der_structure_with_the_certificates_of_the_chain() {
     let cms = sign(&identity, &[9; 32]).unwrap();
     // ContentInfo, then the identifier of signed data.
     assert_eq!(cms[0], 0x30);
-    let signed_data = [0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x02];
+    let signed_data = [
+        0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x02,
+    ];
     assert!(cms.windows(signed_data.len()).any(|w| w == signed_data));
     // The three certificates are in it whole.
     let archive =
@@ -294,7 +309,9 @@ fn a_signature_is_a_der_structure_with_the_certificates_of_the_chain() {
         assert!(cms.windows(der.len()).any(|w| w == der));
     }
     // The ESS signing-certificate-v2 attribute and the digest are in it.
-    let ess = [0x06, 0x0B, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x02, 0x2F];
+    let ess = [
+        0x06, 0x0B, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x02, 0x2F,
+    ];
     assert!(cms.windows(ess.len()).any(|w| w == ess));
     assert!(cms.windows(32).any(|w| w == [9u8; 32]));
 }
@@ -306,7 +323,10 @@ fn the_same_digest_gives_the_same_signature_with_rsa_and_another_one_with_ecdsa(
     let rsa = loaded("rsa2048.p12");
     assert_eq!(sign(&rsa, &[1; 32]).unwrap(), sign(&rsa, &[1; 32]).unwrap());
     let p256 = loaded("p256.p12");
-    assert_ne!(sign(&p256, &[1; 32]).unwrap(), sign(&p256, &[1; 32]).unwrap());
+    assert_ne!(
+        sign(&p256, &[1; 32]).unwrap(),
+        sign(&p256, &[1; 32]).unwrap()
+    );
 }
 
 // ---- the requests of the protocol -----------------------------------------------------------------
@@ -345,7 +365,9 @@ fn nothing_is_done_before_the_greeting_and_a_wrong_version_is_refused() {
         ErrorCode::ProtocolMismatch
     );
     assert_eq!(
-        code(signer.handle(Request::Sign { digest: vec![0; 32] })),
+        code(signer.handle(Request::Sign {
+            digest: vec![0; 32]
+        })),
         ErrorCode::InvalidRequest
     );
 }
@@ -354,7 +376,9 @@ fn nothing_is_done_before_the_greeting_and_a_wrong_version_is_refused() {
 fn a_signature_needs_a_certificate_and_one_certificate_is_held_at_a_time() {
     let mut signer = greeted();
     assert_eq!(
-        code(signer.handle(Request::Sign { digest: vec![0; 32] })),
+        code(signer.handle(Request::Sign {
+            digest: vec![0; 32]
+        })),
         ErrorCode::NotLoaded
     );
     // A wrong password leaves the signer ready for another try.
@@ -379,14 +403,18 @@ fn a_signature_needs_a_certificate_and_one_certificate_is_held_at_a_time() {
         })),
         ErrorCode::InvalidRequest
     );
-    let Response::Signed { cms } = signer.handle(Request::Sign { digest: vec![5; 32] }) else {
+    let Response::Signed { cms } = signer.handle(Request::Sign {
+        digest: vec![5; 32],
+    }) else {
         panic!("not signed");
     };
     assert!(cms.len() <= info.signature_bytes as usize);
     // After Close the key is gone.
     assert_eq!(signer.handle(Request::Close), Response::Closed);
     assert_eq!(
-        code(signer.handle(Request::Sign { digest: vec![5; 32] })),
+        code(signer.handle(Request::Sign {
+            digest: vec![5; 32]
+        })),
         ErrorCode::NotLoaded
     );
 }

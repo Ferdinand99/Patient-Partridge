@@ -396,6 +396,8 @@ impl EnginePool {
             &|| state(&self.state).docs.contains_key(&handle),
         )?;
         outcome.path = target.to_path_buf();
+        // Another open document that reads the file that was replaced no longer holds that file.
+        self.mark_replaced(handle, target);
         Ok(outcome)
     }
 
