@@ -95,7 +95,28 @@ fn code_of(code: ErrorCode) -> &'static str {
 impl SignerSession {
     /// Starts a signer and greets it. The signer must say that it is locked in, unless the policy
     /// allows a development build to go on without.
+    ///
+    /// On Windows a start that ends before the greeting because the system's loader could not
+    /// find a library (exit code `0xC0000135`) is tried again, up to three times in all, as the
+    /// start of the engine is (see `EngineClient`): nothing is relaxed by trying again, every
+    /// attempt starts the signer with all its restrictions.
     pub fn start(config: &SignerConfig) -> Result<SignerSession, ClientError> {
+        let mut attempt = 1;
+        loop {
+            match Self::start_once(config) {
+                Err(ClientError::Signer { message, .. })
+                    if attempt < 3
+                        && cfg!(windows)
+                        && message.contains("exit code: 3221225781") =>
+                {
+                    attempt += 1;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    fn start_once(config: &SignerConfig) -> Result<SignerSession, ClientError> {
         let spawned = spawn_engine(&SpawnRequest {
             program: &config.program,
             args: &[],
@@ -207,7 +228,16 @@ impl SignerSession {
                 ))
             }
             Ok(Heard::Closed) | Err(RecvTimeoutError::Disconnected) => {
-                let how = self.process.try_wait().ok().flatten().unwrap_or_default();
+                // The process may still be ending: its exit code tells a start that failed in the
+                // system's loader from one that failed in the signer.
+                let mut how = String::new();
+                for _ in 0..40 {
+                    if let Ok(Some(status)) = self.process.try_wait() {
+                        how = status;
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(25));
+                }
                 self.kill();
                 Err(signer_error(
                     "signer_stopped",

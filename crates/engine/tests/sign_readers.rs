@@ -45,6 +45,15 @@ fn have(tool: &str) -> bool {
     found
 }
 
+/// Where the tools are told to put output that nobody reads.
+fn null_device() -> &'static str {
+    if cfg!(windows) {
+        "NUL"
+    } else {
+        "/dev/null"
+    }
+}
+
 fn run(tool: &str, args: &[&str]) -> (bool, String) {
     let out = Command::new(tool)
         .args(args)
@@ -367,7 +376,7 @@ fn openssl_verifies_the_signature_on_its_own() {
                 "-binary",
                 "-noverify",
                 "-out",
-                "/dev/null",
+                null_device(),
             ],
         );
         assert!(
@@ -392,7 +401,7 @@ fn openssl_verifies_the_signature_on_its_own() {
                 "-purpose",
                 "any",
                 "-out",
-                "/dev/null",
+                null_device(),
             ],
         );
         assert!(
@@ -417,7 +426,7 @@ fn openssl_verifies_the_signature_on_its_own() {
                 "-binary",
                 "-noverify",
                 "-out",
-                "/dev/null",
+                null_device(),
             ],
         );
         assert!(!ok, "{file}: a changed file was verified");

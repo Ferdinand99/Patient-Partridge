@@ -26,11 +26,20 @@ struct Running {
     output: BufReader<ChildStdout>,
 }
 
+/// A debug build goes on without a sandbox unless it is told to insist. On Windows the sandbox is
+/// made by the app when it starts the program (an AppContainer), not by the program itself, so a
+/// program started here has none to find; the tests that start the signer through the client
+/// (crates/engine/tests/sign_process.rs) insist on it there.
+fn insist(command: &mut Command) -> &mut Command {
+    if cfg!(windows) {
+        command
+    } else {
+        command.env("PARTRIDGE_TEST_ENFORCE", "1")
+    }
+}
+
 fn start() -> Running {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_partridge-signer"))
-        .env_clear()
-        // A debug build goes on without a sandbox unless it is told to insist.
-        .env("PARTRIDGE_TEST_ENFORCE", "1")
+    let mut child = insist(Command::new(env!("CARGO_BIN_EXE_partridge-signer")).env_clear())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -65,6 +74,7 @@ fn the_signer_program_greets_loads_signs_and_ends() {
     eprintln!("signer sandbox: {sandbox}");
     #[cfg(target_os = "linux")]
     assert!(sandbox.contains("seccomp"), "{sandbox}");
+    #[cfg(not(windows))]
     assert!(!sandbox.starts_with("none"), "{sandbox}");
 
     let wrong = signer.ask(Request::Load {
@@ -153,15 +163,16 @@ fn a_message_that_cannot_be_read_ends_the_signer() {
 fn the_signer_takes_the_memory_limit_and_nothing_else() {
     // The limit that the app puts on every program it starts is taken (and can only lower the one
     // the signer has).
-    let mut child = Command::new(env!("CARGO_BIN_EXE_partridge-signer"))
-        .args(["--memory-limit", "268435456"])
-        .env_clear()
-        .env("PARTRIDGE_TEST_ENFORCE", "1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut child = insist(
+        Command::new(env!("CARGO_BIN_EXE_partridge-signer"))
+            .args(["--memory-limit", "268435456"])
+            .env_clear(),
+    )
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .spawn()
+    .unwrap();
     let mut input = BufWriter::new(child.stdin.take().unwrap());
     let mut output = BufReader::new(child.stdout.take().unwrap());
     write_frame(

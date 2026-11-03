@@ -18,6 +18,10 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # The test programs are many and each links the engine; the line tables are enough for a
+  # backtrace and keep the build folder small enough for the disk of a runner.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
   rust:
@@ -50,6 +54,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      # The test builds fill the disk of a runner; software the job does not use is taken off first.
+      - name: Make room on the disk (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
       - name: Install Tauri Linux dependencies
         if: runner.os == 'Linux'
         run: |
