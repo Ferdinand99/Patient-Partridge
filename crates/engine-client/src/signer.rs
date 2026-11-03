@@ -97,17 +97,21 @@ impl SignerSession {
     /// allows a development build to go on without.
     ///
     /// On Windows a start that ends before the greeting because the system's loader could not
-    /// find a library (exit code `0xC0000135`) is tried again, up to three times in all, as the
-    /// start of the engine is (see `EngineClient`): nothing is relaxed by trying again, every
-    /// attempt starts the signer with all its restrictions.
+    /// find a library (exit code `0xC0000135`) or was not let open one (`0xC0000022`) is tried
+    /// again, up to five times in all, as the start of the engine is (see `EngineClient`): the
+    /// loader hands library loading to helper threads that have no rights in the locked-down
+    /// token, and many starts at once can lose that race now and then. Nothing is relaxed by
+    /// trying again: every attempt starts the signer with all its restrictions, and a start that
+    /// fails for another reason, or every time, is reported as it was.
     pub fn start(config: &SignerConfig) -> Result<SignerSession, ClientError> {
         let mut attempt = 1;
         loop {
             match Self::start_once(config) {
                 Err(ClientError::Signer { message, .. })
-                    if attempt < 3
+                    if attempt < 5
                         && cfg!(windows)
-                        && message.contains("exit code: 3221225781") =>
+                        && (message.contains("exit code: 3221225781")
+                            || message.contains("exit code: 3221225506")) =>
                 {
                     attempt += 1;
                 }
