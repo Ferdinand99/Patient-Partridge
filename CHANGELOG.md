@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/Ferdinand99/Patient-Partridge/compare/v0.2.0...v0.2.1) (2026-11-03)
+
+
+### Bug Fixes
+
+* an empty signature field no longer counts as a signature ([#52](https://github.com/Ferdinand99/Patient-Partridge/issues/52)) ([9474eb2](https://github.com/Ferdinand99/Patient-Partridge/commit/9474eb2afef54f6981e194433064c65572989b28))
+
 ## [0.2.0](https://github.com/Ferdinand99/Patient-Partridge/compare/v0.1.0...v0.2.0) (2026-11-02)
 
 
