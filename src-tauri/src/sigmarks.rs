@@ -243,6 +243,9 @@ pub struct SignatureMarks {
     earlier: Option<PathBuf>,
     /// The file is there and could not be read as a list, so it is moved aside before it is replaced.
     unreadable: bool,
+    /// The list is that of the earlier file, which has not been written to the file yet. Once it is,
+    /// the earlier file goes, so that a picture the person deletes meanwhile does not come back.
+    adopted: bool,
 }
 
 /// What reading the file gave.
@@ -276,6 +279,7 @@ impl SignatureMarks {
             seen,
             earlier: None,
             unreadable,
+            adopted: false,
         }
     }
 
@@ -310,6 +314,7 @@ impl SignatureMarks {
         };
         if self.unreadable || fs::symlink_metadata(&to).is_err() {
             self.marks = old;
+            self.adopted = true;
             return;
         }
         let missing: Vec<StoredMark> = old
@@ -484,6 +489,18 @@ impl SignatureMarks {
         write_replacing(file, &json)?;
         self.unreadable = false;
         self.seen = stamp_of(file);
+        // The list now holds what the earlier file held, with the changes made since: the earlier
+        // file has nothing more to give, and a picture that was deleted must not come back from it.
+        if self.adopted {
+            let gone = match &self.earlier {
+                Some(old) => match fs::remove_file(old) {
+                    Ok(()) => true,
+                    Err(e) => e.kind() == io::ErrorKind::NotFound,
+                },
+                None => true,
+            };
+            self.adopted = !gone;
+        }
         Ok(())
     }
 }
@@ -1515,6 +1532,62 @@ mod tests {
         let mut marks = SignatureMarks::load_moving(Some(to.clone()), Some(from.clone()));
         assert!(from.exists());
         assert_eq!(marks.list().len(), 1);
+    }
+
+    #[test]
+    fn a_picture_deleted_while_the_old_list_is_in_use_does_not_come_back() {
+        // The new place cannot be made at the first start, and can be later.
+        let dir = TempDir::new();
+        let from = dir.0.join("roaming").join("signatures.json");
+        let to = dir.0.join("local").join("signatures.json");
+        let mut old = SignatureMarks::load(Some(from.clone()));
+        let first = old.add("Old", draw(), 1).unwrap();
+        old.add("Old two", typed(), 2).unwrap();
+        fs::write(dir.0.join("local"), b"in the way").unwrap();
+        let mut marks = SignatureMarks::load_moving(Some(to.clone()), Some(from.clone()));
+        assert_eq!(marks.len(), 2);
+        fs::remove_file(dir.0.join("local")).unwrap();
+        marks.delete(&first.id).unwrap();
+        assert!(!from.exists(), "the earlier file goes with the first write");
+        let mut next = SignatureMarks::load_moving(Some(to.clone()), Some(from.clone()));
+        let names: Vec<String> = next.list().into_iter().map(|m| m.name).collect();
+        assert_eq!(names, vec!["Old two"]);
+
+        // The new place holds a file of a later version: the same.
+        let dir = TempDir::new();
+        let from = dir.0.join("roaming").join("signatures.json");
+        let to = dir.0.join("local").join("signatures.json");
+        let mut old = SignatureMarks::load(Some(from.clone()));
+        let first = old.add("Old", draw(), 1).unwrap();
+        old.add("Old two", typed(), 2).unwrap();
+        fs::create_dir_all(to.parent().unwrap()).unwrap();
+        fs::write(&to, b"{\"version\":2,\"marks\":[]}").unwrap();
+        let mut marks = SignatureMarks::load_moving(Some(to.clone()), Some(from.clone()));
+        assert_eq!(marks.len(), 2);
+        assert!(from.exists(), "nothing is removed before a write");
+        marks.delete(&first.id).unwrap();
+        assert!(!from.exists());
+        let mut next = SignatureMarks::load_moving(Some(to.clone()), Some(from.clone()));
+        let names: Vec<String> = next.list().into_iter().map(|m| m.name).collect();
+        assert_eq!(names, vec!["Old two"]);
+        // The version 2 file is kept aside, not written over.
+        assert!(aside_name(&to, 0).exists());
+    }
+
+    #[test]
+    fn the_old_file_is_kept_when_the_first_write_fails() {
+        let dir = TempDir::new();
+        let from = dir.0.join("roaming").join("signatures.json");
+        let to = dir.0.join("local").join("signatures.json");
+        SignatureMarks::load(Some(from.clone()))
+            .add("Old", draw(), 1)
+            .unwrap();
+        fs::write(dir.0.join("local"), b"in the way").unwrap();
+        let mut marks = SignatureMarks::load_moving(Some(to), Some(from.clone()));
+        // The folder is still not there to be made: the change fails, and the old file stays.
+        assert!(marks.add("New", typed(), 2).is_err());
+        assert!(from.exists());
+        assert_eq!(marks.len(), 1);
     }
 
     #[test]
