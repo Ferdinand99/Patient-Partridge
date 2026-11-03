@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use unicode_normalization::UnicodeNormalization;
+
 use crate::strings::{self, StringKind};
 
 /// Which switches of the search are on. A test turns one off to show that the hit disappears
@@ -49,6 +51,12 @@ pub enum Via {
     Folded,
     /// A decoded value in the document structure (string, name or key).
     Structure,
+    /// Text decoded from a content stream through the fonts of the file.
+    Decoded,
+    /// Rich text or XML with the markup taken out and the entities decoded.
+    Markup,
+    /// A trace of the text in a font that stays in the file.
+    Font,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -72,6 +80,9 @@ impl fmt::Display for Form {
             Via::Split => "split-text",
             Via::Folded => "folded-text",
             Via::Structure => "structure-value",
+            Via::Decoded => "decoded-text",
+            Via::Markup => "markup-stripped",
+            Via::Font => "font-trace",
         };
         write!(f, "{enc}/{via}")
     }
@@ -104,6 +115,11 @@ struct Entry {
     index: usize,
     text: String,
     patterns: Vec<Pattern>,
+    /// The patterns of the text with all white space taken out (empty when that is the same).
+    stripped: Vec<Pattern>,
+    /// The text normalised (NFKC) with white space folded, and with it taken out.
+    folded_chars: Vec<char>,
+    stripped_chars: Vec<char>,
 }
 
 pub fn patterns(text: &str, features: &Features) -> Vec<Pattern> {
@@ -165,6 +181,127 @@ pub fn fold_space(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// The text in NFKC form: ligatures and compatibility forms become plain letters, and a letter
+/// with a combining mark becomes one character, so that NFC and NFD forms compare equal.
+pub fn norm(text: &str) -> String {
+    text.nfkc().collect()
+}
+
+/// White space, soft hyphens and zero-width characters: what a reader does not see between letters.
+fn is_blank(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            '\u{AD}' | '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}'
+        )
+}
+
+/// Normalised, with all white space folded to one space.
+pub fn fold_norm(text: &str) -> String {
+    let n: String = norm(text)
+        .chars()
+        .map(|c| if is_blank(c) { ' ' } else { c })
+        .collect();
+    fold_space(&n)
+}
+
+/// Normalised, with all white space taken out.
+pub fn strip_norm(text: &str) -> String {
+    norm(text).chars().filter(|c| !is_blank(*c)).collect()
+}
+
+/// Offsets where `pat` is in `hay`; a [`crate::fonts::GAP`] in `hay` stands for any one
+/// character. At least half of the characters of `pat` must be matched by real characters, so
+/// that text of which the font tells nothing is not a match for everything.
+pub fn find_wild(hay: &[char], pat: &[char]) -> Vec<usize> {
+    let mut out = Vec::new();
+    if pat.is_empty() || hay.len() < pat.len() {
+        return out;
+    }
+    for i in 0..=hay.len() - pat.len() {
+        let mut real = 0usize;
+        let mut ok = true;
+        for (h, p) in hay[i..i + pat.len()].iter().zip(pat) {
+            if h == p {
+                real += 1;
+            } else if *h != crate::fonts::GAP {
+                ok = false;
+                break;
+            }
+        }
+        if ok && real * 2 >= pat.len() && real > 0 {
+            out.push(i);
+            if out.len() >= 16 {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// The text of rich text or XML: tags taken out (replaced by `gap`), entities decoded.
+pub fn strip_markup(s: &str, gap: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(c) = rest.chars().next() {
+        if let Some(body) = rest.strip_prefix("<![CDATA[") {
+            let end = body.find("]]>").unwrap_or(body.len());
+            out.push_str(&body[..end]);
+            rest = body.get(end + 3..).unwrap_or("");
+        } else if c == '<' {
+            match rest.find('>') {
+                Some(e) => {
+                    out.push_str(gap);
+                    rest = &rest[e + 1..];
+                }
+                None => {
+                    out.push_str(rest);
+                    break;
+                }
+            }
+        } else if c == '&' {
+            let semi = rest
+                .char_indices()
+                .take(12)
+                .find(|(_, ch)| *ch == ';')
+                .map(|(i, _)| i);
+            match semi.and_then(|e| entity(&rest[1..e]).map(|d| (d, e))) {
+                Some((d, e)) => {
+                    out.push(d);
+                    rest = &rest[e + 1..];
+                }
+                None => {
+                    out.push('&');
+                    rest = &rest[1..];
+                }
+            }
+        } else {
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    out
+}
+
+fn entity(name: &str) -> Option<char> {
+    match name {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        "nbsp" => Some('\u{A0}'),
+        _ => {
+            let n = name.strip_prefix('#')?;
+            let v = match n.strip_prefix(['x', 'X']) {
+                Some(h) => u32::from_str_radix(h, 16).ok()?,
+                None => n.parse().ok()?,
+            };
+            char::from_u32(v)
+        }
+    }
+}
+
 impl NeedleSet {
     /// `texts` is a list of (needle index, text). An empty text would match everywhere and is
     /// refused by the caller.
@@ -172,10 +309,21 @@ impl NeedleSet {
         NeedleSet {
             entries: texts
                 .iter()
-                .map(|&(index, text)| Entry {
-                    index,
-                    text: text.to_owned(),
-                    patterns: patterns(text, &features),
+                .map(|&(index, text)| {
+                    let stripped_text: String =
+                        text.chars().filter(|c| !c.is_whitespace()).collect();
+                    Entry {
+                        index,
+                        text: text.to_owned(),
+                        patterns: patterns(text, &features),
+                        stripped: if stripped_text.is_empty() || stripped_text == text {
+                            Vec::new()
+                        } else {
+                            patterns(&stripped_text, &features)
+                        },
+                        folded_chars: fold_norm(text).chars().collect(),
+                        stripped_chars: strip_norm(text).chars().collect(),
+                    }
                 })
                 .collect(),
             features,
@@ -236,9 +384,25 @@ impl NeedleSet {
         if !self.features.split_text {
             return out;
         }
-        for obj in crate::content::text_objects(buf) {
+        for obj in crate::content::text_chains(buf) {
             self.scan(&obj.joined, obj.offset, Via::Split, true, &mut out);
             self.scan(&obj.spaced, obj.offset, Via::Split, true, &mut out);
+            // The same with the white space of the needle taken out: a text that is set letter by
+            // letter or word by word without a space between.
+            for e in &self.entries {
+                for p in &e.stripped {
+                    for _ in find_all(&obj.joined, &p.bytes) {
+                        out.push(BufHit {
+                            needle: e.index,
+                            offset: obj.offset,
+                            form: Form {
+                                encoding: p.encoding,
+                                via: Via::Split,
+                            },
+                        });
+                    }
+                }
+            }
         }
         out.sort();
         out.dedup();
@@ -251,6 +415,8 @@ impl NeedleSet {
     pub fn search_text(&self, text: &str) -> Vec<BufHit> {
         let mut out = Vec::new();
         let folded = fold_space(text);
+        let nfolded = fold_norm(text);
+        let nstripped = strip_norm(text);
         for e in &self.entries {
             for off in find_all(text.as_bytes(), e.text.as_bytes()) {
                 out.push(BufHit {
@@ -263,16 +429,22 @@ impl NeedleSet {
                 });
             }
             let want = fold_space(&e.text);
-            if !want.is_empty() {
-                for off in find_all(folded.as_bytes(), want.as_bytes()) {
-                    out.push(BufHit {
-                        needle: e.index,
-                        offset: off,
-                        form: Form {
-                            encoding: Encoding::Utf8,
-                            via: Via::Folded,
-                        },
-                    });
+            for (hay, want) in [
+                (&folded, want),
+                (&nfolded, fold_norm(&e.text)),
+                (&nstripped, strip_norm(&e.text)),
+            ] {
+                if !want.is_empty() {
+                    for off in find_all(hay.as_bytes(), want.as_bytes()) {
+                        out.push(BufHit {
+                            needle: e.index,
+                            offset: off,
+                            form: Form {
+                                encoding: Encoding::Utf8,
+                                via: Via::Folded,
+                            },
+                        });
+                    }
                 }
             }
         }
@@ -294,6 +466,65 @@ impl NeedleSet {
             })
             .collect();
         out.retain(|h| best.contains(&(h.needle, h.form.via)));
+        // The folded forms find the same text: one hit for a needle is enough.
+        let mut seen = std::collections::BTreeSet::new();
+        out.retain(|h| h.form.via != Via::Folded || seen.insert(h.needle));
+        out
+    }
+
+    /// Searches text that was read from a content stream through fonts. A [`crate::fonts::GAP`]
+    /// is a character the font could not tell. Compared with white space folded and with it
+    /// taken out, both sides normalised.
+    pub fn search_decoded(&self, text: &[char]) -> Vec<BufHit> {
+        let marker = '\u{E000}';
+        let joined: String = text
+            .iter()
+            .map(|c| if *c == crate::fonts::GAP { marker } else { *c })
+            .collect();
+        let folded: Vec<char> = fold_norm(&joined)
+            .chars()
+            .map(|c| if c == marker { crate::fonts::GAP } else { c })
+            .collect();
+        let stripped: Vec<char> = strip_norm(&joined.replace(marker, "")).chars().collect();
+        let mut out = Vec::new();
+        for e in &self.entries {
+            let hits = [
+                find_wild(&folded, &e.folded_chars),
+                find_wild(&stripped, &e.stripped_chars),
+            ];
+            for off in hits.into_iter().flatten() {
+                out.push(BufHit {
+                    needle: e.index,
+                    offset: off,
+                    form: Form {
+                        encoding: Encoding::Utf8,
+                        via: Via::Decoded,
+                    },
+                });
+            }
+        }
+        out.sort();
+        out.dedup_by_key(|h| h.needle);
+        out
+    }
+
+    /// Searches rich text or XML (`/RC`, XMP): the text with the markup taken out and the
+    /// entities decoded, with a tag read as nothing and as a space.
+    pub fn search_markup(&self, text: &str) -> Vec<BufHit> {
+        let mut out = Vec::new();
+        for gap in ["", " "] {
+            for h in self.search_text(&strip_markup(text, gap)) {
+                out.push(BufHit {
+                    form: Form {
+                        encoding: Encoding::Utf8,
+                        via: Via::Markup,
+                    },
+                    ..h
+                });
+            }
+        }
+        out.sort();
+        out.dedup_by_key(|h| h.needle);
         out
     }
 
@@ -302,7 +533,12 @@ impl NeedleSet {
     pub fn search_value(&self, value: &str) -> Vec<BufHit> {
         let mut out = Vec::new();
         for e in &self.entries {
-            if let Some(off) = value.find(e.text.as_str()) {
+            let at = value.find(e.text.as_str()).or_else(|| {
+                // Another Unicode form of the same text (NFC against NFD, ligatures).
+                let hay = fold_norm(value);
+                hay.find(fold_norm(&e.text).as_str())
+            });
+            if let Some(off) = at {
                 out.push(BufHit {
                     needle: e.index,
                     offset: off,
@@ -375,5 +611,52 @@ mod tests {
         let set = NeedleSet::new(&[(0, "John Smith")], Features::default());
         assert!(set.search_text("ask John\nSmith now").len() == 1);
         assert!(set.search_text("ask John Smyth now").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod more_tests {
+    use super::*;
+    use crate::fonts::GAP;
+
+    #[test]
+    fn markup_is_taken_out_and_entities_are_decoded() {
+        let s = "<p>Smith &amp; <b>Sons</b> &#x45;&#82; &lt;x&gt;</p><![CDATA[<raw>]]>";
+        assert_eq!(strip_markup(s, ""), "Smith & Sons ER <x><raw>");
+        assert_eq!(strip_markup("a<br/>b", " "), "a b");
+        assert_eq!(strip_markup("a & b &unknown; c", ""), "a & b &unknown; c");
+    }
+
+    #[test]
+    fn a_marked_up_phrase_is_found() {
+        let set = NeedleSet::new(&[(0, "Ola Nordmann")], Features::default());
+        assert_eq!(
+            set.search_markup("<p>Ola <span>Nordmann</span></p>").len(),
+            1
+        );
+        assert_eq!(set.search_markup("<p>Ola</p><p>Nordmann</p>").len(), 1);
+        assert!(set.search_markup("<p>Ola</p><p>Nils</p>").is_empty());
+    }
+
+    #[test]
+    fn a_gap_matches_one_character_but_not_most_of_the_phrase() {
+        let hay: Vec<char> = "xx Ola\u{FFFD}Nordmann xx".chars().collect();
+        let pat: Vec<char> = "Ola Nordmann".chars().collect();
+        assert_eq!(find_wild(&hay, &pat), vec![3]);
+        let blind = vec![GAP; 12];
+        assert!(find_wild(&blind, &pat).is_empty());
+    }
+
+    #[test]
+    fn decomposed_and_ligature_forms_compare_equal() {
+        let set = NeedleSet::new(&[(0, "\u{e5}fi")], Features::default());
+        assert_eq!(set.search_decoded(&['a', '\u{30A}', '\u{FB01}']).len(), 1);
+        // White space between letters does not hide a phrase.
+        let set = NeedleSet::new(&[(0, "SECRET")], Features::default());
+        assert_eq!(
+            set.search_decoded(&"S E C R E T".chars().collect::<Vec<_>>())
+                .len(),
+            1
+        );
     }
 }

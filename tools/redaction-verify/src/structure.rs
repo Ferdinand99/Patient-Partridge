@@ -11,8 +11,10 @@ use serde_json::{Map, Value};
 
 use crate::layers::{push, Ctx};
 use crate::search::find_all;
-use crate::tools;
 use crate::{Hit, Layer, Report, Result, Subject};
+
+/// Keys whose value is rich text (XHTML) or a style string.
+const RICH_KEYS: [&str; 3] = ["/RC", "/RV", "/DS"];
 
 pub fn run(ctx: &Ctx, rep: &mut Report) -> Result<()> {
     if ctx.opts.check_valid {
@@ -21,7 +23,7 @@ pub fn run(ctx: &Ctx, rep: &mut Report) -> Result<()> {
     if ctx.spec.single_revision {
         revisions(ctx, rep);
     }
-    let out = tools::qpdf(&[
+    let out = ctx.qpdf(&[
         OsStr::new("--json=2"),
         OsStr::new("--json-key=qpdf"),
         OsStr::new("--json-stream-data=none"),
@@ -56,6 +58,7 @@ pub fn run(ctx: &Ctx, rep: &mut Report) -> Result<()> {
         ctx,
         objects,
         metadata: BTreeSet::new(),
+        rich: BTreeSet::new(),
         hits: Vec::new(),
     };
     for (key, entry) in objects {
@@ -75,7 +78,11 @@ pub fn run(ctx: &Ctx, rep: &mut Report) -> Result<()> {
         }
     }
     let metadata = std::mem::take(&mut w.metadata);
+    let rich = std::mem::take(&mut w.rich);
     rep.hits.append(&mut w.hits);
+    for id in rich {
+        rich_stream(ctx, rep, &id)?;
+    }
     for id in metadata {
         xmp(ctx, rep, &id)?;
     }
@@ -87,6 +94,8 @@ struct Walk<'a> {
     objects: &'a Map<String, Value>,
     /// Object numbers that a `/Metadata` entry points to.
     metadata: BTreeSet<String>,
+    /// Streams that are the value of `/RC`, `/RV` or `/DS`.
+    rich: BTreeSet<String>,
     hits: Vec<Hit>,
 }
 
@@ -105,11 +114,27 @@ impl Walk<'_> {
     fn walk(&mut self, v: &Value, path: &str) {
         match v {
             Value::Object(m) => {
+                let is_field = m.contains_key("/FT")
+                    || m.get("/Subtype").and_then(Value::as_str) == Some("u:/Widget")
+                    || m.get("/Subtype").and_then(Value::as_str) == Some("/Widget")
+                    || (m.contains_key("/T") && m.contains_key("/Parent"));
                 for (k, val) in m {
-                    let name = k.strip_prefix('/').unwrap_or(k);
                     let here = format!("{path} {k}");
-                    self.text(name, &format!("{here} (key)"));
-                    if self.ctx.spec.forbidden_keys.iter().any(|f| f == k) && !self.is_empty(val, 0)
+                    if let Some(n) = k.strip_prefix("n:/") {
+                        self.name_bytes(n, &format!("{here} (key)"));
+                    } else {
+                        let name = k.strip_prefix('/').unwrap_or(k);
+                        self.text(name, &format!("{here} (key)"));
+                    }
+                    if RICH_KEYS.contains(&k.as_str()) {
+                        self.rich_value(val, &here);
+                    }
+                    // `/V` and `/DV` mean something else outside the form fields (the version of
+                    // the encryption dictionary, for one).
+                    let field_only = k == "/V" || k == "/DV";
+                    if self.ctx.spec.forbidden_keys.iter().any(|f| f == k)
+                        && (is_field || !field_only)
+                        && !self.is_empty(val, 0)
                     {
                         self.hits.push(Hit {
                             layer: Layer::Structure,
@@ -137,10 +162,65 @@ impl Walk<'_> {
                     self.text(t, path);
                 } else if let Some(h) = s.strip_prefix("b:") {
                     self.binary(&unhex(h), path);
+                } else if let Some(n) = s.strip_prefix("n:/") {
+                    self.name_bytes(n, &format!("{path} (name)"));
                 } else if let Some(n) = s.strip_prefix('/') {
                     self.text(n, &format!("{path} (name)"));
                 }
             }
+            _ => {}
+        }
+    }
+
+    /// A name that is not UTF-8 (qpdf writes it as `n:/..`): `#xx` escapes are bytes. It is
+    /// searched as bytes (Latin-1 and UTF-8 forms of the needle).
+    fn name_bytes(&mut self, escaped: &str, location: &str) {
+        let raw = escaped.as_bytes();
+        let mut bytes = Vec::with_capacity(raw.len());
+        let mut j = 0;
+        while j < raw.len() {
+            if raw[j] == b'#' && j + 2 < raw.len() {
+                if let Some(v) = std::str::from_utf8(&raw[j + 1..j + 3])
+                    .ok()
+                    .and_then(|h| u8::from_str_radix(h, 16).ok())
+                {
+                    bytes.push(v);
+                    j += 3;
+                    continue;
+                }
+            }
+            bytes.push(raw[j]);
+            j += 1;
+        }
+        self.binary(&bytes, location);
+    }
+
+    /// Rich text or XML: searched with the markup taken out and the entities decoded.
+    fn markup(&mut self, value: &str, location: &str) {
+        for h in self.ctx.set.search_markup(value) {
+            self.hits.push(Hit {
+                layer: Layer::Structure,
+                subject: Subject::Needle(h.needle),
+                offset: Some(h.offset),
+                location: format!("{location} (markup taken out)"),
+                form: Some(h.form),
+            });
+        }
+    }
+
+    /// The value of `/RC`, `/RV` or `/DS`: a string, or a stream that is shown later.
+    fn rich_value(&mut self, val: &Value, here: &str) {
+        match val {
+            Value::String(s) => {
+                if let Some(t) = s.strip_prefix("u:") {
+                    self.markup(t, here);
+                } else if let Some(h) = s.strip_prefix("b:") {
+                    self.markup(&String::from_utf8_lossy(&unhex(h)), here);
+                } else if let Some(r) = reference(s) {
+                    self.rich.insert(r.to_owned());
+                }
+            }
+            Value::Array(a) => a.iter().for_each(|x| self.rich_value(x, here)),
             _ => {}
         }
     }
@@ -214,10 +294,55 @@ fn unhex(s: &str) -> Vec<u8> {
         .collect()
 }
 
+/// The text of an XML or rich text stream: UTF-8, or UTF-16 with a byte order mark.
+fn decode_xml(b: &[u8]) -> String {
+    if let Some(rest) = b.strip_prefix(&[0xFE, 0xFF]) {
+        let units: Vec<u16> = rest
+            .chunks(2)
+            .map(|p| u16::from(p[0]) << 8 | u16::from(*p.get(1).unwrap_or(&0)))
+            .collect();
+        return String::from_utf16_lossy(&units);
+    }
+    if let Some(rest) = b.strip_prefix(&[0xFF, 0xFE]) {
+        let units: Vec<u16> = rest
+            .chunks(2)
+            .map(|p| u16::from(*p.get(1).unwrap_or(&0)) << 8 | u16::from(p[0]))
+            .collect();
+        return String::from_utf16_lossy(&units);
+    }
+    String::from_utf8_lossy(b).into_owned()
+}
+
+/// A stream that is the value of `/RC`, `/RV` or `/DS`.
+fn rich_stream(ctx: &Ctx, rep: &mut Report, id: &str) -> Result<()> {
+    let number = id.split(' ').next().unwrap_or(id);
+    let out = ctx.qpdf(&[
+        OsStr::new(&format!("--show-object={number}")),
+        OsStr::new("--filtered-stream-data"),
+        ctx.path.as_os_str(),
+    ])?;
+    if out.status != 0 && out.status != 3 {
+        rep.problems.push(format!(
+            "structure: qpdf cannot show the rich text stream {id} (exit {})",
+            out.status
+        ));
+        return Ok(());
+    }
+    for h in ctx.set.search_markup(&decode_xml(&out.stdout)) {
+        push(
+            rep,
+            Layer::Structure,
+            &h,
+            format!("rich text stream, object {id} (markup taken out)"),
+        );
+    }
+    Ok(())
+}
+
 /// The XMP packet that `/Metadata` points to, with its filters undone by qpdf.
 fn xmp(ctx: &Ctx, rep: &mut Report, id: &str) -> Result<()> {
     let number = id.split(' ').next().unwrap_or(id);
-    let out = tools::qpdf(&[
+    let out = ctx.qpdf(&[
         OsStr::new(&format!("--show-object={number}")),
         OsStr::new("--filtered-stream-data"),
         ctx.path.as_os_str(),
@@ -237,12 +362,20 @@ fn xmp(ctx: &Ctx, rep: &mut Report, id: &str) -> Result<()> {
             format!("XMP metadata, object {id}"),
         );
     }
+    for h in ctx.set.search_markup(&decode_xml(&out.stdout)) {
+        push(
+            rep,
+            Layer::Structure,
+            &h,
+            format!("XMP metadata, object {id} (markup taken out)"),
+        );
+    }
     Ok(())
 }
 
 /// `qpdf --check`: the file must be one that other readers accept.
 fn check(ctx: &Ctx, rep: &mut Report) -> Result<()> {
-    let out = tools::qpdf(&[OsStr::new("--check"), ctx.path.as_os_str()])?;
+    let out = ctx.qpdf(&[OsStr::new("--check"), ctx.path.as_os_str()])?;
     if out.status == 0 {
         return Ok(());
     }

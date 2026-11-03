@@ -3,6 +3,9 @@
 //! the code under test cannot make a fixture look clean.
 #![allow(dead_code)]
 
+pub mod jpeg;
+pub mod review;
+
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
@@ -259,6 +262,12 @@ pub struct Doc {
     pub actions: bool,
     /// An optional-content group that is switched off: `/oc1` in the resources.
     pub hidden_layer: bool,
+    /// `/RC` (rich text) of the form field widget.
+    pub rc: Option<Bytes>,
+    /// Streams that nothing refers to: object number, dictionary entries without `/Length`, data.
+    pub orphans: Vec<(u32, String, Bytes)>,
+    /// Filter entries and stored data for the body of the attachment, instead of Flate.
+    pub attachment_stream: Option<(String, Bytes)>,
 }
 
 impl Doc {
@@ -279,6 +288,9 @@ impl Doc {
             page_image: None,
             actions: false,
             hidden_layer: false,
+            rc: None,
+            orphans: Vec::new(),
+            attachment_stream: None,
         }
     }
 
@@ -308,6 +320,7 @@ impl Doc {
                 200, 30, 30, 30, 200, 30, 30, 30, 200, 90, 90, 90,
             ])),
             actions: true,
+            rc: Some(lit("A benign note")),
             ..Doc::bare()
         }
     }
@@ -438,18 +451,23 @@ impl Doc {
             pdf.obj(
                 15,
                 &[
-                    b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (field1) /Rect [72 600 300 620] /P 3 0 R /V "
+                    b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (field1) /DA (/Helv 12 Tf 0 g) /Rect [72 600 300 620] /P 3 0 R /V "
                         .as_slice(),
                     v,
                     b" /DV ",
                     dv,
+                    b" /RC ",
+                    self.rc.as_deref().unwrap_or(b"()"),
                     b" >>",
                 ]
                 .concat(),
             );
         }
         if let Some((name, desc, body)) = &self.attachment {
-            pdf.stream(16, "/Type /EmbeddedFile /Filter /FlateDecode", &flate(body));
+            match &self.attachment_stream {
+                Some((dict, data)) => pdf.stream(16, &format!("/Type /EmbeddedFile {dict}"), data),
+                None => pdf.stream(16, "/Type /EmbeddedFile /Filter /FlateDecode", &flate(body)),
+            }
             pdf.obj(
                 17,
                 &[
@@ -469,6 +487,9 @@ impl Doc {
         }
         if self.actions {
             pdf.obj(19, b"<< /S /JavaScript /JS (alert) >>");
+        }
+        for (n, dict, data) in &self.orphans {
+            pdf.stream(*n, dict, data);
         }
         pdf.xref(&trailer);
         pdf
@@ -513,6 +534,11 @@ impl Doc {
 /// font and Info dictionary are in the object stream (compressed). `info` is the content of the
 /// Info dictionary.
 pub fn object_stream_file(info: &[u8], content: &[u8]) -> Bytes {
+    object_stream_file_with(info, content, false)
+}
+
+/// Like [`object_stream_file`]; with `predicted` the object stream is Flate with the PNG predictor.
+pub fn object_stream_file_with(info: &[u8], content: &[u8], predicted: bool) -> Bytes {
     let mut pdf = Pdf::new("1.5");
     let objs: Vec<(u32, Bytes)> = vec![
         (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
@@ -540,13 +566,21 @@ pub fn object_stream_file(info: &[u8], content: &[u8]) -> Bytes {
     let mut stm = header.into_bytes();
     stm.extend(body);
     pdf.stream(4, "", content);
+    let (parms, packed) = if predicted {
+        (
+            " /DecodeParms << /Predictor 12 /Columns 16 >>",
+            flate(&png_up(&stm, 16)),
+        )
+    } else {
+        ("", flate(&stm))
+    };
     pdf.stream(
         6,
         &format!(
-            "/Type /ObjStm /N {} /First {first} /Filter /FlateDecode",
+            "/Type /ObjStm /N {} /First {first} /Filter /FlateDecode{parms}",
             objs.len()
         ),
-        &flate(&stm),
+        &packed,
     );
     // The cross-reference stream is object 8. One entry per object 0..=8: type, field 2 (4
     // bytes), field 3 (2 bytes).
@@ -604,4 +638,184 @@ pub fn encrypt(dir: &Dir, bytes: &[u8]) -> Bytes {
         .expect("qpdf runs");
     assert!(status.success(), "qpdf --encrypt failed");
     std::fs::read(out).unwrap()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Encoders for the stream filters, written here so that a test file does not depend on the code
+// under test to be made.
+
+/// LZW as PDF writes it: codes of 9 to 12 bits, most significant bit first. `early_change`
+/// moves the width change one code earlier (the default of the filter).
+pub fn lzw_encode(data: &[u8], early_change: bool) -> Bytes {
+    use std::collections::HashMap;
+    struct Bits {
+        out: Bytes,
+        acc: u32,
+        n: u32,
+    }
+    impl Bits {
+        fn put(&mut self, code: u32, width: u32) {
+            self.acc = (self.acc << width) | code;
+            self.n += width;
+            while self.n >= 8 {
+                self.out.push((self.acc >> (self.n - 8)) as u8);
+                self.n -= 8;
+                self.acc &= (1 << self.n) - 1;
+            }
+        }
+    }
+    let early = u32::from(early_change);
+    let width_for = |next: u32| -> u32 {
+        let size = next - 1 + early;
+        if size >= 2048 {
+            12
+        } else if size >= 1024 {
+            11
+        } else if size >= 512 {
+            10
+        } else {
+            9
+        }
+    };
+    let fresh =
+        || -> HashMap<Bytes, u32> { (0..=255u8).map(|b| (vec![b], u32::from(b))).collect() };
+    let mut table = fresh();
+    let mut next = 258u32;
+    let mut bits = Bits {
+        out: Vec::new(),
+        acc: 0,
+        n: 0,
+    };
+    bits.put(256, 9);
+    let mut w: Bytes = Vec::new();
+    for &c in data {
+        let mut wc = w.clone();
+        wc.push(c);
+        if table.contains_key(&wc) {
+            w = wc;
+            continue;
+        }
+        bits.put(table[&w], width_for(next));
+        table.insert(wc, next);
+        next += 1;
+        if next >= 4094 {
+            bits.put(256, width_for(next));
+            table = fresh();
+            next = 258;
+        }
+        w = vec![c];
+    }
+    if !w.is_empty() {
+        bits.put(table[&w], width_for(next));
+        next += 1;
+    }
+    bits.put(257, width_for(next));
+    if bits.n > 0 {
+        bits.out.push((bits.acc << (8 - bits.n)) as u8);
+    }
+    bits.out
+}
+
+/// The data with the PNG "Up" predictor applied, rows of `columns` bytes (the filter byte of each
+/// row is 2).
+pub fn png_up(data: &[u8], columns: usize) -> Bytes {
+    let mut out = Vec::new();
+    let mut prev = vec![0u8; columns];
+    for row in data.chunks(columns) {
+        let mut cur = row.to_vec();
+        cur.resize(columns, 0);
+        out.push(2);
+        out.extend(cur.iter().zip(&prev).map(|(a, b)| a.wrapping_sub(*b)));
+        prev = cur;
+    }
+    out
+}
+
+/// RunLength: the data as literal runs of at most 128 bytes.
+pub fn run_length(data: &[u8]) -> Bytes {
+    let mut out = Vec::new();
+    for chunk in data.chunks(128) {
+        out.push((chunk.len() - 1) as u8);
+        out.extend_from_slice(chunk);
+    }
+    out.push(128);
+    out
+}
+
+// ---------------------------------------------------------------------------------------------
+// Running the command line.
+
+/// Encrypts a file like [`encrypt`], and keeps the objects that nothing refers to.
+pub fn encrypt_keep(dir: &Dir, bytes: &[u8], user: &str) -> Bytes {
+    let input = dir.put("plain-for-encrypt.pdf", bytes);
+    let out = dir.0.path().join("encrypted-keep.pdf");
+    let status = Command::new("qpdf")
+        .args([
+            "--preserve-unreferenced",
+            "--encrypt",
+            user,
+            "owner-secret",
+            "256",
+            "--",
+        ])
+        .arg(&input)
+        .arg(&out)
+        .status()
+        .expect("qpdf runs");
+    assert!(status.success(), "qpdf --encrypt failed");
+    std::fs::read(out).unwrap()
+}
+
+/// What the command line printed and returned.
+pub struct Run {
+    pub code: i32,
+    pub out: String,
+}
+
+impl Run {
+    /// The layers named in the `LEAK layer=..` lines.
+    pub fn layers(&self) -> std::collections::BTreeSet<String> {
+        self.out
+            .lines()
+            .filter_map(|l| l.strip_prefix("LEAK layer="))
+            .map(|r| r.split_whitespace().next().unwrap_or("").to_owned())
+            .collect()
+    }
+
+    pub fn problems(&self) -> Vec<&str> {
+        self.out
+            .lines()
+            .filter_map(|l| l.strip_prefix("PROBLEM "))
+            .collect()
+    }
+}
+
+/// Runs the command line on `file` with these arguments and environment variables.
+pub fn cli_on(file: &std::path::Path, args: &[&str], env: &[(&str, &str)]) -> Run {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_redaction-verify"));
+    cmd.args(args).arg(file);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("the binary runs");
+    Run {
+        code: out.status.code().unwrap_or(-1),
+        out: String::from_utf8_lossy(&out.stdout).into_owned()
+            + &String::from_utf8_lossy(&out.stderr),
+    }
+}
+
+/// Runs the command line on the bytes, with a spec file when `spec` is given.
+pub fn cli(bytes: &[u8], spec: Option<&str>, args: &[&str], env: &[(&str, &str)]) -> Run {
+    let dir = Dir::new();
+    let file = dir.put("file.pdf", bytes);
+    let mut all: Vec<String> = Vec::new();
+    if let Some(s) = spec {
+        let p = dir.put("spec.json", s.as_bytes());
+        all.push("--spec".into());
+        all.push(p.to_string_lossy().into_owned());
+    }
+    all.extend(args.iter().map(|a| (*a).to_owned()));
+    let refs: Vec<&str> = all.iter().map(String::as_str).collect();
+    cli_on(&file, &refs, env)
 }

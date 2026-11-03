@@ -13,6 +13,7 @@ use std::ops::Range;
 use flate2::read::{DeflateDecoder, ZlibDecoder};
 use sha2::{Digest, Sha256};
 
+use crate::pdfobj::{Doc, Entry, Obj};
 use crate::search::find_all;
 use crate::strings::{is_delim, is_space};
 
@@ -163,7 +164,28 @@ fn name_at(dict: &[u8], pos: usize) -> Option<String> {
     while j < dict.len() && !is_space(dict[j]) && !is_delim(dict[j]) {
         j += 1;
     }
-    Some(String::from_utf8_lossy(&dict[pos + 1..j]).into_owned())
+    Some(unescape_name(&dict[pos + 1..j]))
+}
+
+/// A name with its `#xx` escapes undone, bytes as Latin-1 characters.
+fn unescape_name(raw: &[u8]) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut j = 0;
+    while j < raw.len() {
+        if raw[j] == b'#' && j + 2 < raw.len() {
+            if let Some(v) = std::str::from_utf8(&raw[j + 1..j + 3])
+                .ok()
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+            {
+                out.push(v as char);
+                j += 3;
+                continue;
+            }
+        }
+        out.push(raw[j] as char);
+        j += 1;
+    }
+    out
 }
 
 /// The name that is the value of `key`, without the slash.
@@ -232,12 +254,12 @@ fn filter_names(dict: &[u8]) -> Vec<String> {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Params {
-    predictor: i64,
-    colors: usize,
-    bits: usize,
-    columns: usize,
-    early_change: bool,
+pub struct Params {
+    pub predictor: i64,
+    pub colors: usize,
+    pub bits: usize,
+    pub columns: usize,
+    pub early_change: bool,
 }
 
 impl Default for Params {
@@ -312,21 +334,116 @@ pub struct Decoded {
     pub applied: Vec<String>,
     /// A filter that was not undone (images, encryption); `data` is what it would read.
     pub stopped_at: Option<String>,
+    /// Why the stream is not fully decoded, if it is not: a `/Filter` that cannot be read, a filter
+    /// that is not an image codec and is not undone, or damaged Flate data. A caller that must not
+    /// miss anything reports this.
+    pub problem: Option<String>,
+}
+
+/// The filters of a stream and their parameters.
+#[derive(Debug, Clone, Default)]
+pub struct FilterSpec {
+    pub names: Vec<String>,
+    pub params: Vec<Params>,
+    /// There is a `/Filter` entry that could not be read.
+    pub unreadable: bool,
+}
+
+impl FilterSpec {
+    /// From the text of a stream dictionary. An indirect `/Filter` cannot be read this way.
+    pub fn from_text(dict: &[u8]) -> Self {
+        let names = filter_names(dict);
+        FilterSpec {
+            unreadable: key_pos(dict, "/Filter").is_some() && names.is_empty(),
+            params: filter_params(dict, names.len()),
+            names,
+        }
+    }
+
+    /// From a parsed stream dictionary; indirect values are followed.
+    pub fn from_obj(dict: &Obj, doc: &Doc) -> Self {
+        let mut names = Vec::new();
+        let mut unreadable = false;
+        let raw = dict.get("Filter").or_else(|| dict.get("F"));
+        match doc.resolve(raw.unwrap_or(&Obj::Null)) {
+            Obj::Name(n) => names.push(n.clone()),
+            Obj::Array(a) => {
+                for x in a {
+                    match doc.resolve(x) {
+                        Obj::Name(n) => names.push(n.clone()),
+                        _ => unreadable = true,
+                    }
+                }
+            }
+            Obj::Null => unreadable = matches!(raw, Some(Obj::Ref(_))),
+            _ => unreadable = true,
+        }
+        let parms = dict.get("DecodeParms").or_else(|| dict.get("DP"));
+        let read = |d: &Obj| -> Params {
+            let d = doc.resolve(d);
+            let n = |k: &str, default: i64| {
+                doc.dget(d, k).int().unwrap_or(default).clamp(1, 1 << 20) as usize
+            };
+            Params {
+                predictor: doc.dget(d, "Predictor").int().unwrap_or(1),
+                colors: n("Colors", 1),
+                bits: n("BitsPerComponent", 8),
+                columns: n("Columns", 1),
+                early_change: doc.dget(d, "EarlyChange").int().unwrap_or(1) != 0,
+            }
+        };
+        let mut params = vec![Params::default(); names.len()];
+        match parms.map(|p| doc.resolve(p)) {
+            Some(d @ Obj::Dict(_)) => params.iter_mut().for_each(|p| *p = read(d)),
+            Some(Obj::Array(a)) => {
+                for (i, x) in a.iter().enumerate().take(names.len()) {
+                    if doc.resolve(x).is_dict() {
+                        params[i] = read(x);
+                    }
+                }
+            }
+            _ => {}
+        }
+        FilterSpec {
+            names,
+            params,
+            unreadable,
+        }
+    }
+}
+
+/// Filters that make images. A stream that stops at one of these is an image the carver does not
+/// open.
+pub fn is_image_filter(name: &str) -> bool {
+    matches!(
+        name,
+        "DCTDecode" | "DCT" | "JPXDecode" | "CCITTFaxDecode" | "CCF" | "JBIG2Decode"
+    )
 }
 
 pub fn decode(raw: &[u8], dict: &[u8]) -> Decoded {
-    let mut names = filter_names(dict);
-    if names.is_empty() && key_pos(dict, "/Filter").is_some() && raw.first() == Some(&0x78) {
-        // A filter entry that cannot be read, such as an indirect object. A zlib header says Flate.
+    decode_spec(raw, &FilterSpec::from_text(dict))
+}
+
+pub fn decode_spec(raw: &[u8], spec: &FilterSpec) -> Decoded {
+    let mut names = spec.names.clone();
+    if names.is_empty() && spec.unreadable && raw.first() == Some(&0x78) {
+        // A filter entry that cannot be read. A zlib header says Flate.
         names.push("FlateDecode".into());
     }
-    let params = filter_params(dict, names.len());
+    let mut params = spec.params.clone();
+    params.resize(names.len(), Params::default());
     let mut data = raw.to_vec();
     let mut applied = Vec::new();
     let mut stopped_at = None;
+    let mut damaged = false;
     for (name, p) in names.iter().zip(params) {
         match name.as_str() {
-            "FlateDecode" | "Fl" => data = predict(inflate(&data), &p),
+            "FlateDecode" | "Fl" => {
+                let (d, ok) = inflate(&data);
+                damaged |= !ok;
+                data = predict(d, &p);
+            }
             "LZWDecode" | "LZW" => data = predict(lzw(&data, p.early_change), &p),
             "ASCIIHexDecode" | "AHx" => data = ascii_hex(&data),
             "ASCII85Decode" | "A85" => data = ascii85(&data),
@@ -338,37 +455,51 @@ pub fn decode(raw: &[u8], dict: &[u8]) -> Decoded {
         }
         applied.push(name.clone());
     }
+    let problem = if spec.unreadable {
+        Some("its /Filter entry cannot be read".to_owned())
+    } else if let Some(s) = stopped_at.as_deref().filter(|s| !is_image_filter(s)) {
+        Some(format!("filter {s} is not undone"))
+    } else if damaged {
+        Some("Flate data is damaged".to_owned())
+    } else {
+        None
+    };
     Decoded {
         data,
         applied,
         stopped_at,
+        problem,
     }
 }
 
-fn read_partial<R: Read>(mut r: R) -> Vec<u8> {
+/// Reads all that the decoder gives. The flag is false when it stopped on an error.
+fn read_partial<R: Read>(mut r: R) -> (Vec<u8>, bool) {
     let mut out = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
         match r.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => return (out, true),
+            Err(_) => return (out, false),
             Ok(n) => {
                 out.extend_from_slice(&chunk[..n]);
                 if out.len() > MAX_OUTPUT {
-                    break;
+                    return (out, false);
                 }
             }
         }
     }
-    out
 }
 
-/// Inflates as far as the data goes: a damaged stream gives what could be read.
-fn inflate(data: &[u8]) -> Vec<u8> {
-    let out = read_partial(ZlibDecoder::new(data));
-    if out.is_empty() {
-        return read_partial(DeflateDecoder::new(data));
+/// Inflates as far as the data goes: a damaged stream gives what could be read, and `false`.
+fn inflate(data: &[u8]) -> (Vec<u8>, bool) {
+    let (out, ok) = read_partial(ZlibDecoder::new(data));
+    if out.is_empty() && !ok {
+        let (raw, raw_ok) = read_partial(DeflateDecoder::new(data));
+        if !raw.is_empty() {
+            return (raw, raw_ok);
+        }
     }
-    out
+    (out, ok)
 }
 
 fn ascii_hex(data: &[u8]) -> Vec<u8> {
@@ -592,7 +723,6 @@ fn paeth(a: u8, b: u8, c: u8) -> u8 {
 // Carving.
 
 /// A stream with its filters undone.
-#[derive(Debug)]
 pub struct Carved<'a> {
     pub obj: Option<(u32, u32)>,
     /// Where it was found: empty for the file, or the chain of streams it sits in.
@@ -603,6 +733,10 @@ pub struct Carved<'a> {
     pub raw: &'a [u8],
     pub decoded: &'a Decoded,
     pub is_image: bool,
+    /// The objects of the buffer the stream was found in.
+    pub doc: &'a Doc<'a>,
+    /// The object the stream belongs to, if its header was read.
+    pub entry: Option<&'a Entry>,
 }
 
 impl Carved<'_> {
@@ -626,17 +760,32 @@ impl Carved<'_> {
     }
 }
 
-/// Calls `each` for every stream of `buf` and of the streams inside decoded streams.
-pub fn carve(buf: &[u8], each: &mut dyn FnMut(&Carved)) {
-    carve_in(buf, 0, "", each);
+/// What to do with the streams of a buffer. `begin` and `end` bracket the buffer (the file, and
+/// each decoded stream that holds streams); `stream` is called for each stream in it.
+pub trait Visitor {
+    fn begin(&mut self, _doc: &Doc, _within: &str) {}
+    fn stream(&mut self, _c: &Carved) {}
+    fn end(&mut self, _doc: &Doc, _within: &str) {}
 }
 
-fn carve_in(buf: &[u8], depth: usize, within: &str, each: &mut dyn FnMut(&Carved)) {
+/// Visits every stream of `buf` and of the streams inside decoded streams.
+pub fn carve(buf: &[u8], v: &mut dyn Visitor) {
+    carve_in(buf, 0, "", v);
+}
+
+fn carve_in(buf: &[u8], depth: usize, within: &str, v: &mut dyn Visitor) {
+    let doc = Doc::scan(buf);
+    v.begin(&doc, within);
     for s in find_streams(buf) {
         let raw = &buf[s.body.clone()];
-        let decoded = decode(raw, &s.dict);
-        let is_image = name_value(&s.dict, "/Subtype").as_deref() == Some("Image");
-        each(&Carved {
+        let entry = doc.at_body(s.body.start);
+        let spec = match entry {
+            Some(e) => FilterSpec::from_obj(&e.value, &doc),
+            None => FilterSpec::from_text(&s.dict),
+        };
+        let decoded = decode_spec(raw, &spec);
+        let is_image = looks_like_image(&s.dict);
+        v.stream(&Carved {
             obj: s.obj,
             within: within.to_owned(),
             body_offset: s.body.start,
@@ -644,15 +793,29 @@ fn carve_in(buf: &[u8], depth: usize, within: &str, each: &mut dyn FnMut(&Carved
             raw,
             decoded: &decoded,
             is_image,
+            doc: &doc,
+            entry,
         });
         if depth < MAX_DEPTH && !is_image && find_from(&decoded.data, b"stream", 0).is_some() {
             let label = s.obj.map_or_else(
                 || format!("{within}stream at {} > ", s.body.start),
                 |(n, g)| format!("{within}object {n} {g} > "),
             );
-            carve_in(&decoded.data, depth + 1, &label, each);
+            carve_in(&decoded.data, depth + 1, &label, v);
         }
     }
+    v.end(&doc, within);
+}
+
+/// Whether the dictionary text is that of an image: an image XObject, or a stream that has the
+/// size and sample entries of one (a thumbnail may leave out `/Subtype`).
+pub fn looks_like_image(dict: &[u8]) -> bool {
+    name_value(dict, "/Subtype").as_deref() == Some("Image")
+        || (key_pos(dict, "/Width").is_some()
+            && key_pos(dict, "/Height").is_some()
+            && (key_pos(dict, "/BitsPerComponent").is_some()
+                || key_pos(dict, "/ColorSpace").is_some()
+                || key_pos(dict, "/ImageMask").is_some()))
 }
 
 pub fn sha256_hex(data: &[u8]) -> String {
@@ -733,10 +896,15 @@ mod tests {
         let mut f = b"4 0 obj\n<< /Filter /FlateDecode >>\nstream\n".to_vec();
         f.extend(flate(inner));
         f.extend(b"\nendstream\nendobj\n");
-        let mut seen = Vec::new();
-        carve(&f, &mut |c| {
-            seen.push((c.within.clone(), c.decoded.data.clone()))
-        });
+        struct Seen(Vec<(String, Vec<u8>)>);
+        impl Visitor for Seen {
+            fn stream(&mut self, c: &Carved) {
+                self.0.push((c.within.clone(), c.decoded.data.clone()));
+            }
+        }
+        let mut seen = Seen(Vec::new());
+        carve(&f, &mut seen);
+        let seen = seen.0;
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[1].1, b"secret");
         assert!(seen[1].0.starts_with("object 4 0"));

@@ -19,7 +19,7 @@ use std::collections::BTreeSet;
 use common::*;
 use redaction_verify::{verify, Features, Layer, Options, Report, Spec};
 
-const MARKS: [&str; 24] = [
+const MARKS: [&str; 28] = [
     "LEAK-00-JUNK",
     "LEAK-01-PLAIN",
     "LEAK-02-FLATE",
@@ -44,6 +44,10 @@ const MARKS: [&str; 24] = [
     "LEAK-21-ENCRYPTED",
     "LEAK-22-GLYPHS",
     "LEAK-23-INFO",
+    "LEAK-24-ORPHAN",
+    "LEAK-25-LZWEARLY",
+    "LEAK-26-LZWLATE",
+    "LEAK-27-PNGOBJSTM",
 ];
 
 const IMG_A: [u8; 12] = [11, 22, 33, 44, 55, 66, 77, 88, 99, 111, 122, 133];
@@ -181,7 +185,7 @@ fn cases() -> Vec<Case> {
         "plain content stream",
         with(&benign().with_content(&page(&tj(&lit(MARKS[1]))))),
         1,
-        &[Raw, Qdf, Carve, Text],
+        &[Raw, Qdf, Carve, Decode, Text],
     );
 
     let mut flate_doc = benign().with_content(&page(&tj(&lit(MARKS[2]))));
@@ -190,14 +194,14 @@ fn cases() -> Vec<Case> {
         "Flate content stream",
         with(&flate_doc),
         2,
-        &[Qdf, Carve, Text],
+        &[Qdf, Carve, Decode, Text],
     );
 
     add(
         "text in a hex string",
         with(&benign().with_content(&page(&tj(&hex(MARKS[3]))))),
         3,
-        &[Raw, Qdf, Carve, Text],
+        &[Raw, Qdf, Carve, Decode, Text],
     );
 
     let mut d = benign();
@@ -221,7 +225,7 @@ fn cases() -> Vec<Case> {
         "text split over a TJ array",
         with(&benign().with_content(&page(b"[(LEAK-0) -20 (7-SPLIT)] TJ"))),
         7,
-        &[Raw, Qdf, Carve, Text],
+        &[Raw, Qdf, Carve, Decode, Text],
     );
 
     add(
@@ -240,7 +244,7 @@ fn cases() -> Vec<Case> {
         "compressed old revision",
         d.build_with_new_content(&page(&tj(&lit("Quarterly report"))), true),
         9,
-        &[Carve],
+        &[Carve, Decode],
     );
 
     let d = benign().with_content(&page(&tj(&lit(MARKS[10]))));
@@ -248,7 +252,7 @@ fn cases() -> Vec<Case> {
         "plain old revision",
         d.build_with_new_content(&page(&tj(&lit("Quarterly report"))), false),
         10,
-        &[Raw, Carve],
+        &[Raw, Carve, Decode],
     );
 
     let mut d = benign();
@@ -288,7 +292,12 @@ fn cases() -> Vec<Case> {
 
     let mut d = benign();
     d.field = Some((lit(MARKS[15]), lit("Name")));
-    add("form field value", with(&d), 15, &[Raw, Qdf, Structure]);
+    add(
+        "form field value",
+        with(&d),
+        15,
+        &[Raw, Qdf, Text, Structure],
+    );
 
     let mut d = benign();
     d.field = Some((lit("Jane Doe"), lit(MARKS[16])));
@@ -334,13 +343,57 @@ fn cases() -> Vec<Case> {
         .as_bytes(),
     );
     let encrypted = encrypt(&dir, &d.build());
-    add("hidden text in an encrypted file", encrypted, 21, &[Qdf]);
+    add(
+        "hidden text in an encrypted file",
+        encrypted,
+        21,
+        &[Qdf, Carve, Decode],
+    );
 
-    add("text as glyph codes", glyph_case(), 22, &[Text]);
+    add("text as glyph codes", glyph_case(), 22, &[Decode, Text]);
 
     let mut d = benign();
     d.info = Some([b"/Title ".as_slice(), &lit(MARKS[23])].concat());
     add("Info /Title", with(&d), 23, &[Raw, Qdf, Structure]);
+
+    // A stream that nothing refers to and that is not a content stream: only a scan finds it.
+    let mut d = benign();
+    d.orphans.push((
+        20,
+        "/Filter /FlateDecode".into(),
+        flate(format!("the notes: {}", MARKS[24]).as_bytes()),
+    ));
+    add("data stream that nothing refers to", with(&d), 24, &[Carve]);
+
+    // LZW with both settings of EarlyChange, and a PNG-predicted object stream. qpdf reads the
+    // attachments too, so it must agree with the verifier's own decoders.
+    for (idx, early, name) in [
+        (25, true, "LZW attachment (EarlyChange 1)"),
+        (26, false, "LZW attachment (EarlyChange 0)"),
+    ] {
+        let mut d = benign();
+        let body = lzw_body(MARKS[idx]);
+        let parms = if early {
+            ""
+        } else {
+            " /DecodeParms << /EarlyChange 0 >>"
+        };
+        d.attachment_stream = Some((
+            format!("/Filter /LZWDecode{parms}"),
+            lzw_encode(&body, early),
+        ));
+        add(name, with(&d), idx, &[Qdf, Carve]);
+    }
+    add(
+        "Info in a PNG-predicted object stream",
+        object_stream_file_with(
+            &[b"/Title ".as_slice(), &lit(MARKS[27])].concat(),
+            b"BT /F1 12 Tf 72 720 Td (Quarterly report) Tj ET",
+            true,
+        ),
+        27,
+        &[Qdf, Carve, Structure],
+    );
 
     // Images.
     let mut d = benign();
@@ -371,6 +424,24 @@ fn cases() -> Vec<Case> {
     add("page thumbnail", with(&d), D, &[Images]);
 
     v
+}
+
+/// Several thousand bytes of pseudo-random words, then the mark: long enough for LZW to run its
+/// table through the code widths 9 to 12.
+fn lzw_body(mark: &str) -> Bytes {
+    let mut x: u32 = 0x1234_5678;
+    let mut out = Bytes::new();
+    while out.len() < 6000 {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        out.push(b'a' + (x % 26) as u8);
+        if x.is_multiple_of(7) {
+            out.push(b' ');
+        }
+    }
+    out.extend_from_slice(format!(" {mark} ").as_bytes());
+    out
 }
 
 fn lossy(b: &[u8]) -> String {
@@ -435,10 +506,10 @@ fn with_the_expected_layers_off_nothing_is_found() {
 }
 
 #[test]
-fn every_layer_is_the_only_one_for_some_leak() {
-    // For each layer there is a file that no other layer sees: remove the layer and a real leak
-    // goes through.
-    for layer in Layer::ALL {
+fn these_layers_are_the_only_one_for_some_leak() {
+    // For each of these layers there is a file that no other layer sees: remove the layer and a
+    // real leak goes through. The other layers have such files in `review.rs`.
+    for layer in [Layer::Raw, Layer::Carve, Layer::Structure, Layer::Images] {
         let sole = cases().into_iter().any(|c| c.layers == [layer]);
         assert!(sole, "no leak in the tests is found by {layer} alone");
     }
@@ -641,7 +712,7 @@ fn clean_files_report_nothing() {
         assert!(r.is_clean(), "{name} is not clean:\n{}", show(&r));
         assert_eq!(
             r.layers_run,
-            Layer::ALL.to_vec(),
+            Layer::DEFAULT.to_vec(),
             "{name}: not every layer ran"
         );
     }

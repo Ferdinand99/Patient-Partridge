@@ -1,11 +1,17 @@
-//! The layers that read bytes and tool output: raw, qdf, carve, text, images. The structure layer
-//! has its own file.
+//! The layers that read bytes and tool output: raw, qdf, carve, decode, text, images and fonts.
+//! The structure layer has its own file.
 
-use std::ffi::OsStr;
+use std::cell::OnceCell;
+use std::collections::BTreeSet;
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
-use crate::carve;
-use crate::search::{BufHit, NeedleSet};
+use tempfile::NamedTempFile;
+
+use crate::carve::{self, Carved, Visitor};
+use crate::pdfobj::{Doc, Entry, Obj};
+use crate::search::{find_all, BufHit, NeedleSet};
+use crate::textdec::{self, Resolver};
 use crate::tools;
 use crate::{Hit, Layer, NeedleKind, Options, Report, Result, Spec, Subject};
 
@@ -15,11 +21,62 @@ pub struct Ctx<'a> {
     pub spec: &'a Spec,
     pub opts: &'a Options,
     pub set: &'a NeedleSet,
+    /// The user password, in a file that qpdf reads.
+    pub password: Option<NamedTempFile>,
+    /// The copy of the file that qpdf normalised, or why there is none.
+    pub qdf: OnceCell<std::result::Result<Vec<u8>, String>>,
 }
 
 impl Ctx<'_> {
-    fn on(&self, layer: Layer) -> bool {
+    pub fn on(&self, layer: Layer) -> bool {
         self.opts.layers.contains(&layer)
+    }
+
+    /// Runs qpdf with the password of the file, if there is one.
+    pub fn qpdf(&self, args: &[&OsStr]) -> Result<tools::Output> {
+        let mut all: Vec<OsString> = Vec::new();
+        if let Some(f) = &self.password {
+            let mut a = OsString::from("--password-file=");
+            a.push(f.path());
+            all.push(a);
+        }
+        all.extend(args.iter().map(|a| (*a).to_owned()));
+        let refs: Vec<&OsStr> = all.iter().map(OsString::as_os_str).collect();
+        tools::qpdf(&refs)
+    }
+
+    /// The arguments that give a Poppler tool the password.
+    fn poppler_password(&self) -> Vec<OsString> {
+        match &self.opts.password {
+            Some(p) => vec![OsString::from("-upw"), OsString::from(p)],
+            None => Vec::new(),
+        }
+    }
+
+    /// `qpdf --qdf` of the file: object streams opened, streams uncompressed, encryption removed.
+    pub fn qdf_copy(&self) -> &std::result::Result<Vec<u8>, String> {
+        self.qdf.get_or_init(|| {
+            let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+            let out = dir.path().join("normalised.pdf");
+            let r = self
+                .qpdf(&[
+                    OsStr::new("--qdf"),
+                    OsStr::new("--object-streams=disable"),
+                    OsStr::new("--stream-data=uncompress"),
+                    self.path.as_os_str(),
+                    out.as_os_str(),
+                ])
+                .map_err(|e| e.0)?;
+            // 0 is success and 3 is success with warnings.
+            match std::fs::read(&out) {
+                Ok(b) if r.status == 0 || r.status == 3 => Ok(b),
+                _ => Err(format!(
+                    "qpdf could not normalise the file (exit {}): {}",
+                    r.status,
+                    first_line(&r.stderr)
+                )),
+            }
+        })
     }
 }
 
@@ -34,23 +91,67 @@ pub fn push(rep: &mut Report, layer: Layer, h: &BufHit, location: String) {
 }
 
 pub fn run(ctx: &Ctx, rep: &mut Report) -> Result<()> {
-    rep.layers_run = Layer::ALL.into_iter().filter(|l| ctx.on(*l)).collect();
-    if ctx.on(Layer::Raw) {
+    let has_text = !ctx.set.is_empty();
+    let has_images = ctx
+        .spec
+        .needles
+        .iter()
+        .any(|n| n.kind == NeedleKind::ImageSha256)
+        || !ctx.spec.regions.is_empty();
+    let has_rules = !ctx.spec.forbidden_keys.is_empty() || ctx.spec.single_revision;
+    // A layer that has nothing to look for did not run, and is not named as run.
+    let applies = |l: Layer| match l {
+        Layer::Raw | Layer::Qdf | Layer::Carve | Layer::Decode | Layer::Text | Layer::Fonts => {
+            has_text
+        }
+        Layer::Structure => has_text || has_rules,
+        Layer::Images => has_images,
+    };
+    rep.layers_run = Layer::ALL
+        .into_iter()
+        .filter(|l| ctx.on(*l) && applies(*l))
+        .collect();
+    if rep.layers_run.is_empty() {
+        rep.problems.push(
+            "nothing was checked: none of the selected layers has anything to look for in this spec"
+                .into(),
+        );
+        return Ok(());
+    }
+    let ran = |l: Layer| rep.layers_run.contains(&l);
+    let (do_raw, do_qdf, do_text, do_structure, do_images) = (
+        ran(Layer::Raw),
+        ran(Layer::Qdf),
+        ran(Layer::Text),
+        ran(Layer::Structure),
+        ran(Layer::Images),
+    );
+    let do_pass =
+        ran(Layer::Carve) || ran(Layer::Decode) || ran(Layer::Images) || ran(Layer::Fonts);
+    if do_raw {
         raw(ctx, rep);
     }
-    if ctx.on(Layer::Qdf) {
-        qdf(ctx, rep)?;
+    if do_qdf {
+        qdf(ctx, rep);
     }
-    if ctx.on(Layer::Carve) || ctx.on(Layer::Images) {
+    if do_pass {
         carve_pass(ctx, rep);
     }
-    if ctx.on(Layer::Text) {
+    if do_text {
         text(ctx, rep)?;
     }
-    if ctx.on(Layer::Images) {
+    if do_images {
         pdfimages(ctx, rep)?;
+        if !ctx.spec.regions.is_empty() {
+            match ctx.qdf_copy() {
+                Ok(bytes) => crate::regions::check(bytes, &ctx.spec.regions, rep),
+                Err(why) => rep.problems.push(format!(
+                    "images: the regions were not checked, because {why}"
+                )),
+            }
+        }
     }
-    if ctx.on(Layer::Structure) {
+    if do_structure {
         crate::structure::run(ctx, rep)?;
     }
     rep.hits
@@ -70,9 +171,6 @@ impl Hit {
 /// The file as written. Streams that have a filter are left to the carve layer: they are
 /// compressed, and a scan for strings in them would only find noise.
 fn raw(ctx: &Ctx, rep: &mut Report) {
-    if ctx.set.is_empty() {
-        return;
-    }
     let masks: Vec<(usize, usize)> = carve::find_streams(ctx.data)
         .iter()
         .filter(|s| s.has_filter())
@@ -87,36 +185,19 @@ fn raw(ctx: &Ctx, rep: &mut Report) {
 }
 
 /// A copy normalised by qpdf: no object streams, every stream decompressed. qpdf also decrypts
-/// a file whose user password is empty, which the other byte layers cannot.
-fn qdf(ctx: &Ctx, rep: &mut Report) -> Result<()> {
-    if ctx.set.is_empty() {
-        return Ok(());
-    }
-    let dir = tempfile::tempdir()?;
-    let out = dir.path().join("normalised.pdf");
-    let r = tools::qpdf(&[
-        OsStr::new("--qdf"),
-        OsStr::new("--object-streams=disable"),
-        OsStr::new("--stream-data=uncompress"),
-        ctx.path.as_os_str(),
-        out.as_os_str(),
-    ])?;
-    // 0 is success and 3 is success with warnings.
-    let bytes = match std::fs::read(&out) {
-        Ok(b) if r.status == 0 || r.status == 3 => b,
-        _ => {
-            rep.problems.push(format!(
-                "qdf: qpdf could not normalise the file (exit {}): {}",
-                r.status,
-                first_line(&r.stderr)
-            ));
-            return Ok(());
+/// a file whose user password is empty (or given), which the other byte layers cannot.
+fn qdf(ctx: &Ctx, rep: &mut Report) {
+    let bytes = match ctx.qdf_copy() {
+        Ok(b) => b,
+        Err(why) => {
+            rep.problems.push(format!("qdf: {why}"));
+            return;
         }
     };
-    for h in ctx.set.search(&bytes, &[]) {
+    for h in ctx.set.search(bytes, &[]) {
         push(rep, Layer::Qdf, &h, "qpdf-normalised copy".into());
     }
-    for h in ctx.set.search_split(&bytes) {
+    for h in ctx.set.search_split(bytes) {
         push(
             rep,
             Layer::Qdf,
@@ -124,17 +205,141 @@ fn qdf(ctx: &Ctx, rep: &mut Report) -> Result<()> {
             "qpdf-normalised copy, text object".into(),
         );
     }
-    Ok(())
 }
 
 fn first_line(s: &str) -> &str {
     s.lines().find(|l| !l.trim().is_empty()).unwrap_or("")
 }
 
-/// Every stream found by scanning. Gives the `carve` hits for text and the `images` hits for
-/// image hashes that match the stream as stored or with its filters undone.
+// ---------------------------------------------------------------------------------------------
+// Encrypted files. The bytes of an encrypted stream are noise, so the carve and decode layers read
+// copies that qpdf decrypts: one for the file, and one for each earlier revision (the file cut
+// after each `%%EOF`). Objects that nothing refers to stay in the copies.
+
+/// `None` when the file is not encrypted (it is carved as it is), else the decrypted copies.
+fn decrypted_copies(ctx: &Ctx, rep: &mut Report) -> Option<Vec<(String, Vec<u8>)>> {
+    let enc = match ctx.qpdf(&[OsStr::new("--show-encryption"), ctx.path.as_os_str()]) {
+        Ok(o) => o,
+        Err(e) => {
+            rep.problems.push(format!("carve: {e}"));
+            return Some(Vec::new());
+        }
+    };
+    let out = String::from_utf8_lossy(&enc.stdout).into_owned();
+    if enc.status != 0 && enc.status != 3 {
+        rep.problems.push(format!(
+            "carve: qpdf could not open the file to see whether it is encrypted (exit {}): {}",
+            enc.status,
+            first_line(&enc.stderr)
+        ));
+        return Some(Vec::new());
+    }
+    if out.contains("File is not encrypted") {
+        return None;
+    }
+    let dir = match tempfile::tempdir() {
+        Ok(d) => d,
+        Err(e) => {
+            rep.problems.push(format!("carve: {e}"));
+            return Some(Vec::new());
+        }
+    };
+    let mut ends: Vec<usize> = find_all(ctx.data, b"%%EOF")
+        .into_iter()
+        .map(|p| p + 5)
+        .collect();
+    match ends.last_mut() {
+        // Only white space after the last %%EOF: the file is that revision.
+        Some(last)
+            if ctx.data[*last..]
+                .iter()
+                .all(|b| crate::strings::is_space(*b)) =>
+        {
+            *last = ctx.data.len();
+        }
+        _ => ends.push(ctx.data.len()),
+    }
+    ends.dedup();
+    let mut copies = Vec::new();
+    let total = ends.len();
+    for (i, end) in ends.iter().enumerate() {
+        let (label, what) = if i + 1 == total {
+            ("decrypted copy: ".to_owned(), "last revision".to_owned())
+        } else {
+            (
+                format!("decrypted copy of revision {}: ", i + 1),
+                format!("revision {}", i + 1),
+            )
+        };
+        let input = dir.path().join(format!("rev{i}.pdf"));
+        let output = dir.path().join(format!("rev{i}-out.pdf"));
+        if std::fs::write(&input, &ctx.data[..*end]).is_err() {
+            rep.problems
+                .push("carve: cannot write a temporary file".into());
+            continue;
+        }
+        let r = ctx.qpdf(&[
+            OsStr::new("--qdf"),
+            OsStr::new("--object-streams=disable"),
+            OsStr::new("--preserve-unreferenced"),
+            input.as_os_str(),
+            output.as_os_str(),
+        ]);
+        match r {
+            Ok(r) if (r.status == 0 || r.status == 3) && output.exists() => {
+                if let Ok(b) = std::fs::read(&output) {
+                    copies.push((label, b));
+                }
+            }
+            Ok(r) => rep.problems.push(format!(
+                "carve: qpdf could not decrypt the file for the {} (exit {}): {}. It was not checked.",
+                what,
+                r.status,
+                first_line(&r.stderr)
+            )),
+            Err(e) => rep.problems.push(format!("carve: {e}")),
+        }
+    }
+    // A stream that qpdf does not reach cannot be decrypted without its object number.
+    let mut reached: BTreeSet<u32> = BTreeSet::new();
+    for (_, b) in &copies {
+        for p in find_all(b, b"%% Original object ID: ") {
+            let rest = &b[p + 23..];
+            let end = rest
+                .iter()
+                .position(|c| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
+            if let Some(n) = std::str::from_utf8(&rest[..end])
+                .ok()
+                .and_then(|s| s.parse().ok())
+            {
+                reached.insert(n);
+            }
+        }
+    }
+    let lost: Vec<u32> = carve::find_streams(ctx.data)
+        .iter()
+        .filter(|s| {
+            !carve::name_value(&s.dict, "/Type").is_some_and(|t| t == "XRef" || t == "ObjStm")
+        })
+        .filter_map(|s| s.obj.map(|o| o.0))
+        .filter(|n| !reached.contains(n))
+        .collect();
+    if !lost.is_empty() && !copies.is_empty() {
+        rep.problems.push(format!(
+            "carve: the file is encrypted and {} stream object(s) (such as {}) are not reached through any cross-reference table, so they cannot be decrypted and were not checked",
+            lost.len(),
+            lost[0]
+        ));
+    }
+    Some(copies)
+}
+
+// ---------------------------------------------------------------------------------------------
+// The pass over the streams: carve, decode, images (hashes) and fonts.
+
 fn carve_pass(ctx: &Ctx, rep: &mut Report) {
-    let want_images = ctx.on(Layer::Images);
+    let sources = decrypted_copies(ctx, rep);
     let image_needles: Vec<(usize, &str)> = ctx
         .spec
         .needles
@@ -143,20 +348,141 @@ fn carve_pass(ctx: &Ctx, rep: &mut Report) {
         .filter(|(_, n)| n.kind == NeedleKind::ImageSha256)
         .map(|(i, n)| (i, n.value.as_str()))
         .collect();
-    carve::carve(ctx.data, &mut |c| {
-        if ctx.on(Layer::Carve) {
-            let place = format!("stream {}", c.describe());
-            for h in ctx.set.search(&c.decoded.data, &[]) {
-                push(rep, Layer::Carve, &h, place.clone());
-            }
-            for h in ctx.set.search_split(&c.decoded.data) {
-                push(rep, Layer::Carve, &h, format!("{place}, text object"));
+    let mut pass = Pass {
+        ctx,
+        rep,
+        image_needles,
+        prefix: String::new(),
+        resolvers: Vec::new(),
+        drawn: Vec::new(),
+    };
+    match sources {
+        None => carve::carve(ctx.data, &mut pass),
+        Some(copies) => {
+            for (label, bytes) in copies {
+                pass.prefix = label;
+                carve::carve(&bytes, &mut pass);
             }
         }
-        if want_images && c.is_image && !image_needles.is_empty() {
+    }
+}
+
+struct Pass<'c, 'r> {
+    ctx: &'c Ctx<'c>,
+    rep: &'r mut Report,
+    image_needles: Vec<(usize, &'c str)>,
+    /// Said first in the place of a hit: which copy of the file the stream is in.
+    prefix: String,
+    resolvers: Vec<Resolver>,
+    /// The characters that the streams of the current buffer draw.
+    drawn: Vec<BTreeSet<char>>,
+}
+
+/// Streams that hold fonts, images, metadata, cross-reference data and other things that are not
+/// content streams.
+fn is_content_candidate(c: &Carved) -> bool {
+    if c.is_image || c.decoded.stopped_at.is_some() {
+        return false;
+    }
+    let ty = carve::name_value(c.dict, "/Type");
+    if ty
+        .as_deref()
+        .is_some_and(|t| matches!(t, "XRef" | "ObjStm" | "Metadata" | "EmbeddedFile"))
+    {
+        return false;
+    }
+    let sub = carve::name_value(c.dict, "/Subtype");
+    if sub
+        .as_deref()
+        .is_some_and(|t| matches!(t, "Type1C" | "CIDFontType0C" | "OpenType" | "XML"))
+    {
+        return false;
+    }
+    if ["/Length1", "/Length2", "/Length3"]
+        .iter()
+        .any(|k| carve::key_pos(c.dict, k).is_some())
+    {
+        return false;
+    }
+    // Content streams are text.
+    let head = &c.decoded.data[..c.decoded.data.len().min(4096)];
+    let binary = head
+        .iter()
+        .filter(|b| **b < 9 || (13 < **b && **b < 32))
+        .count();
+    binary * 20 <= head.len()
+}
+
+impl Pass<'_, '_> {
+    fn place(&self, c: &Carved) -> String {
+        format!("{}stream {}", self.prefix, c.describe())
+    }
+
+    fn decode_data(&mut self, doc: &Doc, entry: Option<&Entry>, data: &[u8], place: &str) {
+        let pieces = textdec::pieces(data);
+        if !pieces
+            .iter()
+            .any(|p| matches!(p, textdec::Piece::Show { .. }))
+        {
+            return;
+        }
+        let Some(res) = self.resolvers.last() else {
+            return;
+        };
+        let dec = textdec::decode(doc, res, entry, &pieces);
+        let on = self.ctx.on(Layer::Decode);
+        if on {
+            for p in &dec.problems {
+                self.rep.problem(format!(
+                    "decode: text in {place} was not checked, because of its font: {p}"
+                ));
+            }
+        }
+        for variant in &dec.variants {
+            if let Some(d) = self.drawn.last_mut() {
+                d.extend(textdec::chars_of(variant));
+            }
+            if on {
+                for h in self.ctx.set.search_decoded(variant) {
+                    push(
+                        self.rep,
+                        Layer::Decode,
+                        &h,
+                        format!("{place}, read through its fonts"),
+                    );
+                }
+            }
+        }
+    }
+}
+
+impl Visitor for Pass<'_, '_> {
+    fn begin(&mut self, doc: &Doc, _within: &str) {
+        self.resolvers.push(Resolver::new(doc));
+        self.drawn.push(BTreeSet::new());
+    }
+
+    fn stream(&mut self, c: &Carved) {
+        let ctx = self.ctx;
+        let place = self.place(c);
+        if (ctx.on(Layer::Carve) || ctx.on(Layer::Decode)) && !c.is_image {
+            if let Some(p) = &c.decoded.problem {
+                self.rep
+                    .problem(format!("carve: {place} was not fully decoded: {p}"));
+            }
+        }
+        if ctx.on(Layer::Carve) {
+            for h in ctx.set.search(&c.decoded.data, &[]) {
+                push(self.rep, Layer::Carve, &h, place.clone());
+            }
+            for h in ctx.set.search_split(&c.decoded.data) {
+                push(self.rep, Layer::Carve, &h, format!("{place}, text object"));
+            }
+        }
+        if ctx.on(Layer::Images) && c.is_image && !self.image_needles.is_empty() {
             let stored = carve::sha256_hex(c.raw);
             let decoded = carve::sha256_hex(&c.decoded.data);
-            for (i, want) in &image_needles {
+            for (i, want) in &self.image_needles {
                 let how = if *want == stored {
                     "as stored"
                 } else if *want == decoded {
@@ -164,31 +490,149 @@ fn carve_pass(ctx: &Ctx, rep: &mut Report) {
                 } else {
                     continue;
                 };
-                rep.hits.push(Hit {
+                self.rep.hits.push(Hit {
                     layer: Layer::Images,
                     subject: Subject::Needle(*i),
                     offset: Some(c.body_offset),
-                    location: format!("image {} {how}", c.describe()),
+                    location: format!("image {}{} {how}", self.prefix, c.describe()),
                     form: None,
                 });
             }
         }
-    });
+        if (ctx.on(Layer::Decode) || ctx.on(Layer::Fonts)) && is_content_candidate(c) {
+            self.decode_data(c.doc, c.entry, &c.decoded.data, &place);
+        }
+    }
+
+    fn end(&mut self, doc: &Doc, within: &str) {
+        let ctx = self.ctx;
+        if ctx.on(Layer::Decode) || ctx.on(Layer::Fonts) {
+            // A page whose contents are several streams: a text object may run over them.
+            let pages: Vec<(u32, Vec<u32>)> = doc
+                .entries()
+                .filter(|e| e.value.get("Type").and_then(Obj::name) == Some("Page"))
+                .filter_map(|e| match doc.dget(&e.value, "Contents") {
+                    Obj::Array(a) if a.len() > 1 => Some((
+                        e.num,
+                        a.iter()
+                            .filter_map(|x| match x {
+                                Obj::Ref(n) => Some(*n),
+                                _ => None,
+                            })
+                            .collect(),
+                    )),
+                    _ => None,
+                })
+                .collect();
+            for (num, parts) in pages {
+                let mut data = Vec::new();
+                for n in parts {
+                    if let Some(d) = doc.latest(n).and_then(|e| doc.stream_data(e)) {
+                        data.extend_from_slice(&d.data);
+                        data.push(b'\n');
+                    }
+                }
+                let entry = doc.latest(num);
+                let place = format!(
+                    "{}{}the content streams of page object {num}, joined",
+                    self.prefix, within
+                );
+                self.decode_data(doc, entry, &data, &place);
+            }
+        }
+        if ctx.on(Layer::Fonts) {
+            self.fonts(doc, within);
+        }
+        self.resolvers.pop();
+        self.drawn.pop();
+    }
+}
+
+impl Pass<'_, '_> {
+    /// Subset fonts that still map characters of the removed texts, when no remaining content
+    /// draws those characters.
+    fn fonts(&mut self, doc: &Doc, within: &str) {
+        let drawn = self.drawn.last().cloned().unwrap_or_default();
+        let texts: Vec<(usize, BTreeSet<char>)> = self
+            .ctx
+            .spec
+            .needles
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.kind != NeedleKind::ImageSha256)
+            .map(|(i, n)| (i, crate::fonts::char_set(&crate::search::norm(&n.value))))
+            .collect();
+        for e in doc.entries() {
+            let sub = e.value.get("Subtype").and_then(Obj::name);
+            if !matches!(sub, Some("Type0" | "Type1" | "TrueType" | "MMType1")) {
+                continue;
+            }
+            if e.value.get("BaseFont").is_none() {
+                continue;
+            }
+            let tr = crate::fonts::traces(doc, &e.value);
+            if !tr.subset {
+                continue;
+            }
+            for (i, chars) in &texts {
+                let kept: Vec<char> = chars
+                    .iter()
+                    .copied()
+                    .filter(|c| !drawn.contains(c) && tr.chars.contains_key(c))
+                    .collect();
+                if kept.is_empty() {
+                    continue;
+                }
+                let glyphs = match &tr.cid_set {
+                    Some(set) => {
+                        let has = kept.iter().any(|c| {
+                            tr.chars[c].iter().any(|code| {
+                                set.get((*code / 8) as usize)
+                                    .is_some_and(|b| b & (0x80 >> (code % 8)) != 0)
+                            })
+                        });
+                        if has {
+                            "the glyphs are in /CIDSet"
+                        } else {
+                            "the glyphs are not in /CIDSet"
+                        }
+                    }
+                    None => "/CIDSet does not say whether the glyphs are in the font program",
+                };
+                self.rep.hits.push(Hit {
+                    layer: Layer::Fonts,
+                    subject: Subject::Needle(*i),
+                    offset: None,
+                    location: format!(
+                        "{}{}subset font object {}: ToUnicode or /Differences still map {} of its {} distinct characters and no content draws them; {glyphs}",
+                        self.prefix,
+                        within,
+                        e.num,
+                        kept.len(),
+                        chars.len()
+                    ),
+                    form: Some(crate::search::Form {
+                        encoding: crate::search::Encoding::Utf8,
+                        via: crate::search::Via::Font,
+                    }),
+                });
+            }
+        }
+    }
 }
 
 /// What a reader can copy from the pages, in three reading orders.
 fn text(ctx: &Ctx, rep: &mut Report) -> Result<()> {
-    if ctx.set.is_empty() {
-        return Ok(());
-    }
     for mode in ["", "-raw", "-layout"] {
-        let mut args: Vec<&OsStr> = vec![OsStr::new("-enc"), OsStr::new("UTF-8")];
+        let mut args: Vec<OsString> = vec![OsString::from("-enc"), OsString::from("UTF-8")];
+        args.extend(ctx.poppler_password());
         if !mode.is_empty() {
-            args.push(OsStr::new(mode));
+            args.push(OsString::from(mode));
         }
-        args.push(ctx.path.as_os_str());
-        args.push(OsStr::new("-"));
-        let out = tools::pdftotext(&args)?;
+        args.push(ctx.path.as_os_str().to_owned());
+        args.push(OsString::from("-"));
+        let refs: Vec<&OsStr> = args.iter().map(OsString::as_os_str).collect();
+        let out = tools::pdftotext(&refs)?;
         let label = if mode.is_empty() {
             "reading order"
         } else {
@@ -201,6 +645,10 @@ fn text(ctx: &Ctx, rep: &mut Report) -> Result<()> {
                 first_line(&out.stderr)
             ));
             continue;
+        }
+        // Poppler says what it could not read on stderr and still exits with 0.
+        if let Some(l) = out.stderr.lines().find(|l| l.contains("Error")) {
+            rep.problem(format!("text: pdftotext {label} reported: {}", l.trim()));
         }
         let text = String::from_utf8_lossy(&out.stdout);
         for h in ctx.set.search_text(&text) {
@@ -236,7 +684,11 @@ fn pdfimages(ctx: &Ctx, rep: &mut Report) -> Result<()> {
     }
     let dir = tempfile::tempdir()?;
     let prefix = dir.path().join("img");
-    let out = tools::pdfimages(&[ctx.path.as_os_str(), prefix.as_os_str()])?;
+    let mut args: Vec<OsString> = ctx.poppler_password();
+    args.push(ctx.path.as_os_str().to_owned());
+    args.push(prefix.as_os_str().to_owned());
+    let refs: Vec<&OsStr> = args.iter().map(OsString::as_os_str).collect();
+    let out = tools::pdfimages(&refs)?;
     if out.status != 0 {
         rep.problems.push(format!(
             "images: pdfimages failed (exit {}): {}",

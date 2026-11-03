@@ -9,9 +9,11 @@
 //! | `raw`       | the bytes of the file as written                                                  |
 //! | `qdf`       | a copy that qpdf has normalised: streams decompressed, object streams opened      |
 //! | `carve`     | every stream found by scanning the bytes (old revisions, orphans, object streams) |
+//! | `decode`    | the text that every content stream shows, read through the fonts of the file      |
 //! | `text`      | what Poppler `pdftotext` reads from the pages                                     |
 //! | `structure` | the decoded strings, names and keys of the document, XMP, and forbidden keys      |
-//! | `images`    | hashes of every image, as stored, decoded, and as Poppler `pdfimages` draws it    |
+//! | `images`    | hashes of every image, and the pixels under the redacted regions                  |
+//! | `fonts`     | traces of removed text that stay in a subset font (only when asked for)           |
 //!
 //! Texts are searched as plain bytes, UTF-16 (both byte orders), inside hex strings and escaped
 //! strings, and joined over the operators of one text object.
@@ -26,10 +28,14 @@ use std::path::Path;
 
 pub mod carve;
 pub mod content;
+pub mod fonts;
 mod layers;
+pub mod pdfobj;
+mod regions;
 pub mod search;
 pub mod strings;
 mod structure;
+pub mod textdec;
 pub mod tools;
 
 pub use search::{Encoding, Features, Form, Via};
@@ -60,16 +66,32 @@ pub enum Layer {
     Raw,
     Qdf,
     Carve,
+    Decode,
     Text,
     Structure,
     Images,
+    Fonts,
 }
 
 impl Layer {
-    pub const ALL: [Layer; 6] = [
+    pub const ALL: [Layer; 8] = [
         Layer::Raw,
         Layer::Qdf,
         Layer::Carve,
+        Layer::Decode,
+        Layer::Text,
+        Layer::Structure,
+        Layer::Images,
+        Layer::Fonts,
+    ];
+
+    /// The layers that run unless the caller picks others. The font check reports what a subset
+    /// font keeps of removed text, which a caller may accept, so it runs only when asked for.
+    pub const DEFAULT: [Layer; 7] = [
+        Layer::Raw,
+        Layer::Qdf,
+        Layer::Carve,
+        Layer::Decode,
         Layer::Text,
         Layer::Structure,
         Layer::Images,
@@ -80,9 +102,11 @@ impl Layer {
             Layer::Raw => "raw",
             Layer::Qdf => "qdf",
             Layer::Carve => "carve",
+            Layer::Decode => "decode",
             Layer::Text => "text",
             Layer::Structure => "structure",
             Layer::Images => "images",
+            Layer::Fonts => "fonts",
         }
     }
 
@@ -134,7 +158,7 @@ pub struct Needle {
 }
 
 /// What must be gone from the file.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Spec {
     pub needles: Vec<Needle>,
     /// Dictionary keys that must be absent or hold nothing, such as `/Metadata` or `/Thumb`. See
@@ -142,11 +166,26 @@ pub struct Spec {
     pub forbidden_keys: Vec<String>,
     /// The file must have one revision: one `%%EOF` and one `startxref`.
     pub single_revision: bool,
+    /// Rectangles that were redacted: the images under them must be blank.
+    pub regions: Vec<Region>,
+}
+
+/// A rectangle on a page, in the default user space of the page (points, y up), under which the
+/// pixels of every image must be blank.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Region {
+    /// The page, counted from 1.
+    pub page: usize,
+    /// `[x0, y0, x1, y1]`.
+    pub rect: [f64; 4],
+    /// How far a covered pixel may differ from the others, per colour component. The default is
+    /// 0, and a small value for an image stored with a lossy codec.
+    pub tolerance: Option<u8>,
 }
 
 /// The document-level places that a redaction scrub empties (`/Info` counts as empty when it has
-/// no value left).
-pub const SCRUBBED_KEYS: [&str; 13] = [
+/// no value left). `/V` and `/DV` are looked at in form fields only.
+pub const SCRUBBED_KEYS: [&str; 14] = [
     "/Metadata",
     "/Outlines",
     "/StructTreeRoot",
@@ -157,6 +196,7 @@ pub const SCRUBBED_KEYS: [&str; 13] = [
     "/JavaScript",
     "/AA",
     "/OpenAction",
+    "/RC",
     "/V",
     "/DV",
     "/Info",
@@ -210,7 +250,8 @@ impl Spec {
 
     /// Reads a spec from JSON:
     /// `{"text": [..], "metadata": [..], "fields": [..], "bookmarks": [..], "attachments": [..],
-    /// "image_sha256": [..], "forbidden_keys": [..], "scrubbed": true, "single_revision": true}`.
+    /// "image_sha256": [..], "forbidden_keys": [..], "scrubbed": true, "single_revision": true,
+    /// "regions": [{"page": 1, "rect": [x0, y0, x1, y1], "tolerance": 0}]}`.
     pub fn from_json(json: &str) -> Result<Spec> {
         let v: serde_json::Value =
             serde_json::from_str(json).map_err(|e| Error(format!("the spec is not JSON: {e}")))?;
@@ -251,6 +292,8 @@ impl Spec {
                 }
             } else if key == "single_revision" {
                 spec.single_revision = val.as_bool() == Some(true);
+            } else if key == "regions" {
+                spec.regions.extend(regions_from_json(val)?);
             } else {
                 return Err(Error(format!("unknown key \"{key}\" in the spec")));
             }
@@ -259,7 +302,24 @@ impl Spec {
     }
 
     fn validate(&self) -> Result<()> {
+        for (i, r) in self.regions.iter().enumerate() {
+            if r.page == 0 || r.rect.iter().any(|v| !v.is_finite()) {
+                return Err(Error(format!(
+                    "region {} needs a page from 1 and four finite numbers",
+                    i + 1
+                )));
+            }
+        }
         for (i, n) in self.needles.iter().enumerate() {
+            if n.kind != NeedleKind::ImageSha256
+                && search::strip_norm(&n.value).is_empty()
+                && !n.value.is_empty()
+            {
+                return Err(Error(format!(
+                    "needle {i} ({}) is only white space and would match everywhere",
+                    n.kind.name()
+                )));
+            }
             if n.value.is_empty() {
                 return Err(Error(format!(
                     "needle {i} ({}) is empty and would match everywhere",
@@ -285,14 +345,17 @@ pub struct Options {
     pub features: Features,
     /// Report `qpdf --check` findings as problems.
     pub check_valid: bool,
+    /// The user password of the file. A file without one opens with an empty password.
+    pub password: Option<String>,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Options {
-            layers: Layer::ALL.into_iter().collect(),
+            layers: Layer::DEFAULT.into_iter().collect(),
             features: Features::default(),
             check_valid: true,
+            password: None,
         }
     }
 }
@@ -342,9 +405,19 @@ pub struct Report {
     /// tool that failed). A report with a problem is not clean.
     pub problems: Vec<String>,
     pub layers_run: Vec<Layer>,
+    /// The tools that did the work, with their versions.
+    pub tools: Vec<String>,
 }
 
 impl Report {
+    /// Adds a problem once. A report with a problem is not clean.
+    pub fn problem(&mut self, msg: impl Into<String>) {
+        let m = msg.into();
+        if self.problems.len() < 100 && !self.problems.contains(&m) {
+            self.problems.push(m);
+        }
+    }
+
     /// No leak and no problem.
     pub fn is_clean(&self) -> bool {
         self.hits.is_empty() && self.problems.is_empty()
@@ -418,6 +491,9 @@ impl Report {
                     .join(", ")
             ));
         }
+        if !self.tools.is_empty() {
+            out.push_str(&format!("tools: {}\n", self.tools.join("; ")));
+        }
         out
     }
 }
@@ -425,6 +501,20 @@ impl Report {
 /// Checks the saved file `pdf` against `spec` in the layers of `opts`.
 pub fn verify(pdf: &Path, spec: &Spec, opts: &Options) -> Result<Report> {
     spec.validate()?;
+    if spec.needles.is_empty()
+        && spec.forbidden_keys.is_empty()
+        && !spec.single_revision
+        && spec.regions.is_empty()
+    {
+        return Err(Error(
+            "the spec has no needle, no rule and no region: there is nothing to check".into(),
+        ));
+    }
+    if opts.layers.is_empty() {
+        return Err(Error(
+            "no layer is selected: there is nothing to check".into(),
+        ));
+    }
     let data =
         std::fs::read(pdf).map_err(|e| Error(format!("cannot read {}: {e}", pdf.display())))?;
     let texts: Vec<(usize, &str)> = spec
@@ -435,14 +525,59 @@ pub fn verify(pdf: &Path, spec: &Spec, opts: &Options) -> Result<Report> {
         .map(|(i, n)| (i, n.value.as_str()))
         .collect();
     let set = search::NeedleSet::new(&texts, opts.features);
+    let password = match &opts.password {
+        Some(p) => {
+            let mut f = tempfile::NamedTempFile::new()?;
+            std::io::Write::write_all(&mut f, p.as_bytes())?;
+            Some(f)
+        }
+        None => None,
+    };
     let ctx = layers::Ctx {
         path: pdf,
         data: &data,
         spec,
         opts,
         set: &set,
+        password,
+        qdf: std::cell::OnceCell::new(),
     };
-    let mut report = Report::default();
+    let mut report = Report {
+        tools: tools::versions(),
+        ..Report::default()
+    };
     layers::run(&ctx, &mut report)?;
     Ok(report)
+}
+
+fn regions_from_json(val: &serde_json::Value) -> Result<Vec<Region>> {
+    let bad =
+        || Error("\"regions\" must be a list of {\"page\": N, \"rect\": [x0, y0, x1, y1]}".into());
+    let list = val.as_array().ok_or_else(bad)?;
+    list.iter()
+        .map(|r| {
+            let o = r.as_object().ok_or_else(bad)?;
+            let page = o
+                .get("page")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(bad)?;
+            let rect: Vec<f64> = o
+                .get("rect")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(bad)?
+                .iter()
+                .map(|n| n.as_f64().ok_or_else(bad))
+                .collect::<Result<_>>()?;
+            let rect: [f64; 4] = rect.try_into().map_err(|_| bad())?;
+            let tolerance = match o.get("tolerance") {
+                None => None,
+                Some(t) => Some(u8::try_from(t.as_u64().ok_or_else(bad)?).map_err(|_| bad())?),
+            };
+            Ok(Region {
+                page: page as usize,
+                rect,
+                tolerance,
+            })
+        })
+        .collect()
 }
