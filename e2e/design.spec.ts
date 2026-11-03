@@ -322,9 +322,9 @@ test("tells why when the engine refuses a change, and shows the fields as the do
     s.pages.failNext = { cmd: "author_apply", error: { code: "author_refused", message: "The field has to be inside the page." } };
   });
   await place(page, "text", 200, 400);
-  await expect(page.locator(".notice")).toContainText("The field has to be inside the page.");
-  await expect(page.locator(".notice")).toContainText("That change to the form was not made");
-  await page.locator(".notice .btn-primary").click();
+  await expect(page.getByRole("alertdialog")).toContainText("The field has to be inside the page.");
+  await expect(page.getByRole("alertdialog")).toContainText("That change to the form was not made");
+  await page.getByRole("alertdialog").locator(".btn-primary").click();
   // Only the field the document has is on the page.
   await expect(page.locator(".design-box")).toHaveCount(1);
 });
