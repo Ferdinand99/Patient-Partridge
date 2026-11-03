@@ -157,7 +157,7 @@ fn cases() -> Vec<Case> {
     let show = cid_show();
     let benign_plus = |extra: &[u8]| [BENIGN, extra].concat();
 
-    // C1: text as glyph codes, in every place that a viewer does not show.
+    // Text as glyph codes, in every place that a viewer does not show.
     v.push(case(
         "CID text drawn on the page",
         Fx::new(&benign_plus(&show)).build(),
@@ -212,7 +212,7 @@ fn cases() -> Vec<Case> {
         Leak(&["decode"]),
     ));
 
-    // C2: word spaces written as kerning, and words in text objects of their own.
+    // Word spaces written as kerning, and words in text objects of their own.
     v.push(case(
         "kerned word space, hidden",
         Fx::new(BENIGN).hidden(TEX).build(),
@@ -254,10 +254,82 @@ fn cases() -> Vec<Case> {
         ))
         .build(),
         spec.clone(),
-        Leak(&["text"]),
+        Leak(&["decode", "text"]),
     ));
 
-    // C1: single-byte encodings that are not Latin-1.
+    // Words that are drawn in another order than they are read, where nothing draws them.
+    let words = |first: &str, second: &str| {
+        let fx = Fx::new(b"");
+        format!(
+            "BT /F2 12 Tf 110 600 Td {} Tj ET
+BT /F2 12 Tf 72 600 Td {} Tj ET
+",
+            fx.show(first),
+            fx.show(second)
+        )
+        .into_bytes()
+    };
+    let out_of_order = words("Nordmann", "Ola");
+    v.push(case(
+        "CID words drawn out of reading order, hidden",
+        Fx::new(BENIGN).hidden(&out_of_order).build(),
+        spec.clone(),
+        Leak(&["decode"]),
+    ));
+    v.push(case(
+        "CID words drawn out of reading order, drawn",
+        Fx::new(&benign_plus(&out_of_order)).build(),
+        spec.clone(),
+        Leak(&["decode", "text"]),
+    ));
+    v.push(case(
+        "words drawn out of reading order, hidden",
+        Fx::new(BENIGN)
+            .hidden(
+                b"BT /F1 12 Tf 110 600 Td (Nordmann) Tj ET BT /F1 12 Tf 72 600 Td (Ola) Tj ET
+",
+            )
+            .build(),
+        spec.clone(),
+        Leak(&["decode"]),
+    ));
+    // The surname is on the line above and drawn first: a reader reads the line above first.
+    v.push(case(
+        "words on two lines, drawn from the bottom up, hidden",
+        Fx::new(BENIGN)
+            .hidden(
+                b"BT /F1 12 Tf 72 580 Td (Nordmann) Tj ET BT /F1 12 Tf 72 600 Td (Ola) Tj ET
+",
+            )
+            .build(),
+        spec.clone(),
+        Leak(&["decode"]),
+    ));
+    // Another first name (made of letters of the font): not the phrase in either order.
+    v.push(case(
+        "words that are not the phrase in either order",
+        Fx::new(BENIGN).hidden(&words("Nordmann", "Nora")).build(),
+        spec.clone(),
+        Clean,
+    ));
+
+    // A word that is hyphenated at the end of a line.
+    let hyphenated = b"BT /F1 12 Tf 14 TL 72 600 Td (Ola Nord-) Tj T* (mann) Tj ET
+";
+    v.push(case(
+        "a word hyphenated over a line break, hidden",
+        Fx::new(BENIGN).hidden(hyphenated).build(),
+        spec.clone(),
+        Leak(&["decode"]),
+    ));
+    v.push(case(
+        "a word hyphenated over a line break, drawn",
+        Fx::new(&benign_plus(hyphenated)).build(),
+        spec.clone(),
+        Leak(&["decode", "text"]),
+    ));
+
+    // Single-byte encodings that are not Latin-1.
     let quote = text_spec("O\u{2019}Brien");
     v.push(case(
         "WinAnsi right quote, hidden",
@@ -306,7 +378,7 @@ fn cases() -> Vec<Case> {
         Leak(&["decode"]),
     ));
 
-    // I5: rich text and XML.
+    // Rich text and XML.
     v.push(case(
         "rich text with markup inside the phrase",
         freetext(r#"<?xml version="1.0"?><body xmlns="http://www.w3.org/1999/xhtml"><p>Ola <span style="font-weight:bold">Nordmann</span></p></body>"#).build(),
@@ -333,7 +405,7 @@ fn cases() -> Vec<Case> {
         Leak(&["structure"]),
     ));
 
-    // I1: images that are only partly covered.
+    // Images that are only partly covered.
     let orig = [200u8, 10, 10, 201, 11, 11, 0, 0, 255, 0, 0, 254];
     let bad = [200u8, 10, 10, 201, 11, 11, 0, 0, 0, 0, 0, 0];
     let top_row = r#"{"regions":[{"page":1,"rect":[72,450,172,500]}]}"#;
@@ -397,7 +469,7 @@ fn cases() -> Vec<Case> {
         Leak(&["images"]),
     ));
 
-    // I2: filters, indirect filters and encryption.
+    // Filters, indirect filters and encryption.
     let plain = plain_with_needle();
     let a85 = ascii85(&flate(&plain));
     let mut fx = Fx::new(BENIGN);
@@ -455,7 +527,7 @@ fn cases() -> Vec<Case> {
         Leak(&["qdf"]),
     ));
 
-    // I11: a string outside the streams, in a revision of an encrypted file that was replaced.
+    // A string outside the streams, in a revision of an encrypted file that was replaced.
     let old_info = |title: &[u8]| {
         let plain = Doc {
             info: Some([b"/Title (".as_slice(), title, b") /Producer (x)"].concat()),
@@ -478,7 +550,7 @@ fn cases() -> Vec<Case> {
         Clean,
     ));
 
-    // C3: glyph numbers that are small numbers, written as raw bytes in literal strings. A
+    // Glyph numbers that are small numbers, written as raw bytes in literal strings. A
     // content stream that is full of control bytes is content all the same.
     let low = fonts::codes(3, 1, NEEDLE);
     let low_font = || {
@@ -563,7 +635,7 @@ fn cases() -> Vec<Case> {
         Clean,
     ));
 
-    // I8: a single code inside a range of a character map.
+    // A single code inside a range of a character map.
     let over = |c: char| -> u16 { 0x0100 + c as u16 };
     let over_table: Vec<(u16, char)> = fonts::codes(0, 1, NEEDLE)
         .into_iter()
@@ -608,7 +680,7 @@ fn cases() -> Vec<Case> {
         Leak(&["decode", "text"]),
     ));
 
-    // I7: Type 3 fonts, which name their glyphs.
+    // Type 3 fonts, which name their glyphs.
     let proc = stream_obj("", b"500 0 d0 0 0 400 400 re f", false);
     let t3 = |names: &[String], tu: Option<Bytes>| {
         let mut fx = Fx::new(BENIGN);
@@ -646,7 +718,7 @@ fn cases() -> Vec<Case> {
         Leak(&["decode"]),
     ));
 
-    // m12: two resource names, each the name of two fonts of the file, in a stream that nothing
+    // Two resource names, each the name of two fonts of the file, in a stream that nothing
     // refers to. The phrase is in the first font of the first name and the second font of the
     // second name: a pair that reading all the first fonts, then all the second ones, never makes.
     let a_true = fonts::codes(0x0101, 7, "Ola ");
@@ -695,6 +767,91 @@ fn cases() -> Vec<Case> {
         file(&objs),
         scrubbed_spec(NEEDLE),
         Leak(&["decode"]),
+    ));
+
+    // The role of a stream comes before what its bytes look like.
+    v.push(case(
+        "page content that shows the word begincmap, hidden CID text",
+        Fx::new(
+            b"BT /F1 12 Tf 72 720 Td (How begincmap works) Tj ET
+",
+        )
+        .hidden(&show)
+        .build(),
+        spec.clone(),
+        Leak(&["decode"]),
+    ));
+    let acsp = [
+        b"%".as_slice(),
+        &[b'x'; 35],
+        b"acsp
+",
+    ]
+    .concat();
+    assert_eq!(&acsp[36..40], b"acsp");
+    v.push(case(
+        "page content with acsp at byte 36, hidden CID text",
+        Fx::new(&[acsp.as_slice(), BENIGN].concat())
+            .hidden(&show)
+            .build(),
+        spec.clone(),
+        Leak(&["decode"]),
+    ));
+    let mut fx = Fx::new(BENIGN).hidden(
+        b"/Fm1 Do
+",
+    );
+    fx.resources_extra.push_str(" /XObject << /Fm1 10 0 R >>");
+    fx.extra.insert(
+        10,
+        stream_obj(
+            "/Type /XObject /Subtype /Form /BBox [0 0 612 792] /Length1 0              /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >>",
+            &show,
+            true,
+        ),
+    );
+    v.push(case(
+        "a drawn form with a /Length1 key, hidden CID text",
+        fx.build(),
+        spec.clone(),
+        Leak(&["decode"]),
+    ));
+    // A form that carries the dictionary of another kind of stream is still a form.
+    let mut fx = Fx::new(BENIGN);
+    fx.extra.insert(
+        13,
+        stream_obj(
+            "/Type /Metadata /Subtype /Form /BBox [0 0 612 792]              /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >>",
+            &show,
+            true,
+        ),
+    );
+    v.push(case(
+        "a form in an object that nothing refers to, with the type of metadata",
+        fx.build(),
+        scrubbed_spec(NEEDLE),
+        Leak(&["decode"]),
+    ));
+    // A font program that holds the text is data: the byte layers still read it.
+    let mut fx = Fx::new(BENIGN);
+    fx.extra.insert(
+        9,
+        b"<< /Type /FontDescriptor /FontName /ABCDEF+DejaVuSans /Flags 32 /FontBBox [0 -200 1000 900]           /ItalicAngle 0 /Ascent 900 /Descent -200 /CapHeight 700 /StemV 80 /FontFile2 13 0 R >>"
+            .to_vec(),
+    );
+    fx.extra.insert(
+        13,
+        stream_obj(
+            "",
+            &[b"BT (".as_slice(), NEEDLE.as_bytes(), b") Tj ET"].concat(),
+            true,
+        ),
+    );
+    v.push(case(
+        "text in a font program, which is data and not content",
+        fx.build(),
+        spec.clone(),
+        Leak(&["qdf", "carve"]),
     ));
 
     // Clean files, one near each fix.

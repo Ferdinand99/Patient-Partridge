@@ -12,7 +12,7 @@
 //! | `decode`    | the text that every content stream shows, read through the fonts of the file      |
 //! | `text`      | what Poppler `pdftotext` reads from the pages                                     |
 //! | `structure` | the decoded strings, names and keys of the document, XMP, and forbidden keys      |
-//! | `images`    | hashes of every image, and the redacted regions (rendered, and image by image)   |
+//! | `images`    | hashes of every image, and the redacted regions (render, images, geometry)        |
 //! | `fonts`     | traces of removed text that stay in a subset font (only when asked for)           |
 //!
 //! Texts are searched as plain bytes, UTF-16 (both byte orders), inside hex strings and escaped
@@ -22,29 +22,63 @@
 //! exit status 2), never "clean". A code that a font cannot map, a stream that may be content and
 //! cannot be read, a region too small to render, a mask that cannot be decoded: each is a problem.
 //!
-//! A redacted region is checked twice. The page is rendered by Poppler (`pdftoppm`, an
-//! independent renderer) at [`RENDER_DPI`], and every pixel whose whole square lies inside the
-//! region must have the fill colour of the region (or, when the spec names none, one colour), with
-//! a margin of [`RENDER_MARGIN`] device pixels at the edge left out for anti-aliasing. Then every
-//! image under the region is decoded, with its soft mask and mask, and the samples whose whole
-//! square lies inside the region must be one value. The pixels the region only partly covers are
-//! not looked at by the image check, and the blocks of a JPEG that straddle the edge are not
-//! either. A region too small to leave one pixel after the margin is a problem, and so is a region
-//! over fewer than two whole samples of an image when the spec does not name the fill colour (one
-//! sample is one value, redacted or not).
+//! A redacted region is checked three ways, and it must pass all of them.
 //!
-//! Content streams are found from the structure of the file (the contents of a page, forms,
-//! appearances, patterns, Type 3 glyph procedures); a stream that nothing refers to is read as
-//! content when its operators are content operators, whatever bytes its strings hold. A stream
-//! that is neither an image, a font program nor content is listed as a note and checked by the
-//! byte layers only.
+//! 1. The render. The page is rendered by Poppler (`pdftoppm`, an independent renderer) at
+//!    [`RENDER_DPI`], and every pixel whose whole square lies inside the region must have the fill
+//!    colour of the region (or, when the spec names none, the middle colour of the region), with a
+//!    margin of [`RENDER_MARGIN`] device pixels at the edge left out for anti-aliasing. This sees
+//!    what a reader sees: masks, patterns, vector shapes and text that was turned into outlines.
+//! 2. The images. Every image that lies over the region, also one that is turned, is decoded with
+//!    its soft mask and mask, and the samples whose whole square lies inside the region must be one
+//!    value. The pixels the region only partly covers are not looked at. A JPEG is looked at only
+//!    where a whole block, and the blocks that its colour spreads from, lie inside the region; the
+//!    rest of it is left out of the render check too, because the codec changed those pixels. A
+//!    JPEG with no such block under the region, or with quantisation tables so coarse that a flat
+//!    block may be off by more than 16 levels of 255, is "could not check".
+//! 3. The geometry. Every path that is filled or stroked, every shading and every glyph of a Type 3
+//!    font that is shown, in the page, the forms it draws, the appearances of its annotations (all
+//!    states, and the icons of a widget) and the glyph procedures, is placed on the page. One that
+//!    meets the region is a leak, whatever its colour, clip, transparency, blend mode or optional
+//!    content: it is in the file, and shows when the box over it goes or the layer is turned on.
+//!    The only geometry allowed is the box that redacts: a fill of one rectangle that is the
+//!    region, in the fill colour that the region names. Where the bounds of something cannot be
+//!    computed, that is "could not check".
 //!
-//! Known limits. A font with no way to Unicode (a composite font without a `ToUnicode` map, an
-//! embedded symbolic font without an encoding, the glyph numbers of a font program) makes the text
-//! shown with it "could not check": the font program is not parsed. A code of a simple font or a
-//! `ToUnicode` map that has no character is read as a gap of up to three characters, and a text
-//! that a gap could turn into a phrase is "could not check" too. Images drawn through a tiling
-//! pattern are seen by the render only, and say so.
+//! Content streams are found from the structure of the file: the contents of a page, forms,
+//! appearances, patterns, Type 3 glyph procedures. A stream with such a role is always decoded as
+//! content; a stream that is a font program, a character map, an ICC profile or other data by the
+//! structure is data. Only a stream that nothing refers to is judged by how it looks, and then it
+//! is read as content when its operators are content operators, whatever bytes its strings hold.
+//! A stream that is neither an image, a font program nor content is listed as a note and checked
+//! by the byte layers only.
+//!
+//! Text is read in the order of the stream, and also in the order of the page: the glyphs are
+//! placed by the text matrix and the matrix of the page, and the runs of text are sorted by line
+//! and then by position along the line, so that words that were drawn in another order than they
+//! are read are joined as a reader joins them. A word that is hyphenated at the end of a line is
+//! found too.
+//!
+//! Known limits.
+//! - A font with no way to Unicode (a composite font without a `ToUnicode` map, an embedded
+//!   symbolic font without an encoding, the glyph numbers of a font program) makes the text shown
+//!   with it "could not check": the font program is not parsed.
+//! - A code of a simple font or a `ToUnicode` map that has no character, or whose character is in
+//!   a private use area, is read as a gap of up to three characters, and a text that a gap could
+//!   turn into a phrase is "could not check". Another reading of the same font dictionary can
+//!   clear the doubt; a reading of another font cannot.
+//! - A phrase that is split over the text of a page and the text of a form that it draws, or over
+//!   two annotation appearances, is not joined: each stream is read on its own. The same holds
+//!   for a word that is shown by one glyph of a Type 3 font that draws it (the glyph is a gap of
+//!   three characters at most).
+//! - Geometry in objects that no page draws (an orphan form, a pattern that is not used) is not
+//!   placed, because nothing says where it would be. The text of those objects is read.
+//! - Geometry is placed by its bounds, and bounds err on the side of a leak: a curve is bounded by
+//!   its control points, a stroke by the widest line a viewer draws. A line a few points from a
+//!   region can be a leak. A page background that is painted as a rectangle under a region is a
+//!   leak too, unless it is the box.
+//! - Images drawn through a tiling pattern or by Type 3 glyphs are seen by the render only, and
+//!   the check says so.
 //!
 //! It never calls PDFium and uses no PDF library of the app: the check stays independent of the
 //! code under test. Values to search for are never printed unless asked for; a hit names the

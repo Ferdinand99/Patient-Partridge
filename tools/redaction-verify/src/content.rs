@@ -12,6 +12,28 @@ use crate::strings::{is_delim, is_space, parse_hex, parse_literal};
 /// as a word space.
 pub const WORD_SPACE: f64 = -100.0;
 
+/// A transformation matrix `[a b c d e f]`, as the operands of `cm` and `Tm` give it.
+pub type Matrix = [f64; 6];
+
+pub const IDENTITY: Matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+
+/// `a` followed by `b`: the point goes through `a` first.
+pub fn mul(a: &Matrix, b: &Matrix) -> Matrix {
+    [
+        a[0] * b[0] + a[1] * b[2],
+        a[0] * b[1] + a[1] * b[3],
+        a[2] * b[0] + a[3] * b[2],
+        a[2] * b[1] + a[3] * b[3],
+        a[4] * b[0] + a[5] * b[2] + b[4],
+        a[4] * b[1] + a[5] * b[3] + b[5],
+    ]
+}
+
+/// The point `(x, y)` moved by the matrix.
+pub fn apply(m: &Matrix, x: f64, y: f64) -> (f64, f64) {
+    (m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5])
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Operand {
     Num(f64),

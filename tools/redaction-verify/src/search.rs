@@ -220,6 +220,22 @@ pub fn strip_norm(text: &str) -> String {
     norm(text).chars().filter(|c| !is_blank(*c)).collect()
 }
 
+/// The text with every hyphen that is followed by a space (a line break) taken out together with
+/// the space.
+pub fn dehyphenate(text: &[char]) -> Vec<char> {
+    let mut out = Vec::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        if text[i] == '-' && text.get(i + 1) == Some(&' ') && !out.is_empty() {
+            i += 2;
+        } else {
+            out.push(text[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Offsets where `pat` is in `hay`; a [`crate::fonts::GAP`] in `hay` stands for any one
 /// character. At least half of the characters of `pat` must be matched by real characters, so
 /// that text of which the font tells nothing is not a match for everything.
@@ -547,7 +563,10 @@ impl NeedleSet {
     /// behind characters that a font could not tell: no hit, but a phrase that would fit if the
     /// gaps were the right letters. The caller must not call such a text clean.
     pub fn search_decoded_wild(&self, text: &[char]) -> DecodedSearch {
-        let marker = '\u{E000}';
+        // A character outside every private use area stands for the gap while the text is
+        // normalised: private use characters never come out of a font (they are gaps already), so
+        // no character of the text can be taken for it.
+        let marker = '\u{FDD0}';
         let joined: String = text
             .iter()
             .map(|c| if *c == crate::fonts::GAP { marker } else { *c })
@@ -559,12 +578,21 @@ impl NeedleSet {
         };
         let folded = back(fold_norm(&joined));
         let stripped = back(strip_norm(&joined));
+        // A word that was hyphenated at the end of a line: the hyphen and the break are gone.
+        let dehyphenated = dehyphenate(&folded);
+        let dehyphenated_stripped: Vec<char> = dehyphenated
+            .iter()
+            .copied()
+            .filter(|c| !is_blank(*c))
+            .collect();
         let mut out = Vec::new();
         let mut possible = Vec::new();
         for e in &self.entries {
             let hits = [
                 find_wild(&folded, &e.folded_chars),
                 find_wild(&stripped, &e.stripped_chars),
+                find_wild(&dehyphenated, &e.folded_chars),
+                find_wild(&dehyphenated_stripped, &e.stripped_chars),
             ];
             let mut found = false;
             for off in hits.into_iter().flatten() {
@@ -580,7 +608,9 @@ impl NeedleSet {
             }
             if !found
                 && (could_match(&folded, &e.folded_chars)
-                    || could_match(&stripped, &e.stripped_chars))
+                    || could_match(&stripped, &e.stripped_chars)
+                    || could_match(&dehyphenated, &e.folded_chars)
+                    || could_match(&dehyphenated_stripped, &e.stripped_chars))
             {
                 possible.push(e.index);
             }
@@ -703,6 +733,16 @@ mod tests {
 mod more_tests {
     use super::*;
     use crate::fonts::GAP;
+
+    #[test]
+    fn a_hyphen_before_a_break_is_taken_out_with_the_break() {
+        let t = |s: &str| s.chars().collect::<Vec<char>>();
+        let back = |v: Vec<char>| v.into_iter().collect::<String>();
+        assert_eq!(back(dehyphenate(&t("Ola Nord- mann"))), "Ola Nordmann");
+        // A hyphen inside a word, and at the start of the text, stay.
+        assert_eq!(back(dehyphenate(&t("well-known"))), "well-known");
+        assert_eq!(back(dehyphenate(&t("- a"))), "- a");
+    }
 
     #[test]
     fn markup_is_taken_out_and_entities_are_decoded() {

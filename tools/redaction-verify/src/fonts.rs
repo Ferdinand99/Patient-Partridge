@@ -3,9 +3,11 @@
 //! and a simple font with `/Differences` or WinAnsi or MacRoman writes single bytes that are not
 //! Latin-1. The decoders here read `ToUnicode` maps, the encodings of simple fonts, and glyph names.
 //!
-//! A byte that has no known character becomes U+FFFD. The search treats it as a wildcard. A font
-//! that cannot be decoded at all (`Mapper::Unknown`) is reported to the caller, who must say that
-//! the text was not checked.
+//! A byte that has no known character becomes U+FFFD, and so does a character that a font maps into
+//! a private use area (such a map does not say what the glyph shows). The search treats it as a
+//! gap that may stand for a few characters, and a phrase that a gap could hide is "could not check".
+//! A font that cannot be decoded at all (`Mapper::Unknown`) is reported to the caller, who must say
+//! that the text was not checked.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
@@ -14,6 +16,23 @@ use std::sync::OnceLock;
 use crate::pdfobj::{Doc, Obj};
 
 pub const GAP: char = '\u{FFFD}';
+
+/// Whether a character is in a private use area (U+E000 to U+F8FF, planes 15 and 16). A font that
+/// maps a glyph there says nothing about what the glyph shows: symbolic TrueType fonts do it for
+/// every letter.
+pub fn is_private_use(c: char) -> bool {
+    matches!(c, '\u{E000}'..='\u{F8FF}' | '\u{F0000}'..='\u{10FFFF}')
+}
+
+/// The character a font gave for a code, or [`GAP`] when it is in a private use area: such a
+/// mapping is not trusted text.
+pub fn trusted(c: char) -> char {
+    if is_private_use(c) {
+        GAP
+    } else {
+        c
+    }
+}
 
 // ---------------------------------------------------------------------------------------------
 // Glyph names and the single-byte encodings.
@@ -630,7 +649,7 @@ impl CMap {
                 (l, be(&bytes[pos..pos + l]))
             });
             match self.lookup(l, code) {
-                Some(u) => out.extend(char::decode_utf16(u).map(|r| r.unwrap_or(GAP))),
+                Some(u) => out.extend(char::decode_utf16(u).map(|r| r.map_or(GAP, trusted))),
                 None => out.push(GAP),
             }
             pos += l;
@@ -675,10 +694,10 @@ impl Mapper {
             Mapper::Cmap(cm, len) => cm.decode(bytes, *len),
             Mapper::Table(t) => bytes
                 .iter()
-                .map(|b| t[usize::from(*b)].unwrap_or(GAP))
+                .map(|b| t[usize::from(*b)].map_or(GAP, trusted))
                 .collect(),
             Mapper::Ucs2 => char::decode_utf16(units(bytes))
-                .map(|r| r.unwrap_or(GAP))
+                .map(|r| r.map_or(GAP, trusted))
                 .collect(),
             Mapper::Unknown(_) => vec![GAP; bytes.len()],
         }
@@ -902,6 +921,35 @@ pub fn char_set(text: &str) -> BTreeSet<char> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_character_in_a_private_use_area_is_not_trusted() {
+        for c in [
+            '\u{E000}',
+            '\u{F04F}',
+            '\u{F8FF}',
+            '\u{F0000}',
+            '\u{10FFFD}',
+        ] {
+            assert!(is_private_use(c), "{c:?}");
+            assert_eq!(trusted(c), GAP);
+        }
+        for c in ['O', '\u{D7FF}', '\u{F900}', '\u{FFFD}', '\u{1F600}'] {
+            assert!(!is_private_use(c), "{c:?}");
+            assert_eq!(trusted(c), c);
+        }
+        // A map that gives a letter and a private use character.
+        let cm = CMap::parse(
+            b"1 begincodespacerange <0000> <FFFF> endcodespacerange\n\
+              2 beginbfchar <0001> <004F> <0002> <F04F> endbfchar",
+        );
+        assert_eq!(
+            cm.decode(&[0, 1, 0, 2], 2),
+            ['O', GAP],
+            "the private use character is a gap"
+        );
+        assert_eq!(Mapper::Ucs2.decode(&[0xE0, 0x00, 0, 0x41]), [GAP, 'A']);
+    }
 
     #[test]
     fn winansi_and_macroman_differ_from_latin1() {

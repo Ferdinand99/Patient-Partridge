@@ -1,54 +1,51 @@
 //! The region check: given the rectangles that were redacted, find out whether anything can still
-//! be seen inside them. There are two checks, and a region must pass both.
+//! be seen inside them, or be seen again. There are three checks, and a region must pass all.
 //!
 //! 1. The render. The page is drawn by Poppler (`pdftoppm`, a renderer that is not the engine under
 //!    test) at [`RENDER_DPI`]. Every device pixel whose whole square lies inside the region, less
 //!    a margin of [`RENDER_MARGIN`] pixels at the edge (anti-aliasing), must have the fill colour
-//!    of the region, or, if the spec names none, one colour. This sees what a reader sees: masks,
-//!    patterns, vector shapes and text that was turned into outlines.
-//! 2. The images. The images drawn over the region (page content, forms, annotation appearances)
+//!    of the region, or, if the spec names none, the middle colour of the region. This sees what
+//!    a reader sees: masks, patterns, vector shapes and text that was turned into outlines.
+//! 2. The images. The images drawn over the region (page content, forms, every state of every
+//!    annotation appearance, the icons of widgets, soft mask groups), also when they are turned,
 //!    are decoded, with their soft mask and mask, and the samples whose whole square lies inside
 //!    the region must all be one value (within a tolerance for a lossy codec). This does not
 //!    depend on the codec: a sample is what the decoder gives, however the engine stored the
 //!    image again.
+//! 3. The geometry. Paths, shadings and the glyphs of Type 3 fonts that are painted are placed on
+//!    the page by the matrices of the content that paints them, and any that meets the region is a
+//!    leak whatever its colour, clip, transparency, blend mode or optional content, except the
+//!    box that redacts (see [`check_paints`]). What a viewer cannot show now can be shown later.
 //!
 //! Where the check cannot be done (a codec that is not decoded, a mask that cannot be read, a
-//! region too small to leave a pixel after the margin, a render that fails) it is a problem.
+//! region too small to leave a pixel after the margin, a render that fails, content whose bounds
+//! are not known) it is a problem.
 //!
-//! A JPEG changes the pixels near the edge of what was blanked: the blocks that straddle the edge
-//! of the region (8 x 8 samples, 16 x 16 with subsampled colour, and the colour that spreads one
-//! sample further) are left out of both checks, and the rest may differ from one value by what the
-//! quantisation of a flat block allows (derived from the quantisation tables of the file).
+//! A JPEG changes the pixels near the edge of what was blanked. A block of samples that the edge of
+//! the region cuts (8 x 8 samples, 16 x 16 with subsampled colour) has the ringing of the codec all
+//! over it, and the colour of its samples spreads into the samples next to it. Those samples are
+//! left out of both the image check and the render check; a sample is compared only when every
+//! block that its colour comes from lies wholly inside the region. The rest may differ from one
+//! value by what the quantisation of a flat block allows, from the tables that the components of the
+//! image use (see [`JPEG_TOLERANCE_CAP`]). The blocks are in the grid of the image, so a turned
+//! image is looked at the same way as one that is not.
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
+use std::rc::Rc;
 
 use crate::carve;
-use crate::content::{for_each_op, Op};
+use crate::content::{apply, for_each_op, mul, Matrix, Op, IDENTITY};
 use crate::layers::Ctx;
 use crate::pdfobj::{Doc, Entry, Obj};
 use crate::tools;
 use crate::{Hit, Layer, Region, Report, Result, Subject, RENDER_DPI, RENDER_MARGIN};
 
-type M = [f64; 6];
-const IDENTITY: M = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+type M = Matrix;
 /// The most device pixels one render may have.
 const MAX_RENDER_PIXELS: usize = 80_000_000;
-
-fn mul(a: &M, b: &M) -> M {
-    [
-        a[0] * b[0] + a[1] * b[2],
-        a[0] * b[1] + a[1] * b[3],
-        a[2] * b[0] + a[3] * b[2],
-        a[2] * b[1] + a[3] * b[3],
-        a[4] * b[0] + a[5] * b[2] + b[4],
-        a[4] * b[1] + a[5] * b[3] + b[5],
-    ]
-}
-
-fn apply(m: &M, x: f64, y: f64) -> (f64, f64) {
-    (m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5])
-}
+/// The most samples of one image that the check keeps track of.
+const MAX_IMAGE_SAMPLES: usize = 40_000_000;
 
 fn invert(m: &M) -> Option<M> {
     let det = m[0] * m[3] - m[1] * m[2];
@@ -57,14 +54,6 @@ fn invert(m: &M) -> Option<M> {
     }
     let (a, b, c, d) = (m[3] / det, -m[1] / det, -m[2] / det, m[0] / det);
     Some([a, b, c, d, -(m[4] * a + m[5] * c), -(m[4] * b + m[5] * d)])
-}
-
-/// Whether the matrix maps the axes of the image onto the axes of the page (a turn by a multiple
-/// of 90 degrees, with or without a flip).
-fn axis_aligned(m: &M) -> bool {
-    let size = m[..4].iter().fold(0.0f64, |a, b| a.max(b.abs()));
-    let tiny = |v: f64| v.abs() < 1e-6 * (1.0 + size);
-    (tiny(m[1]) && tiny(m[2])) || (tiny(m[0]) && tiny(m[3]))
 }
 
 fn matrix_of(o: &Obj, doc: &Doc) -> M {
@@ -99,76 +88,562 @@ enum Source {
     Inline(Vec<u8>, Vec<u8>),
 }
 
+/// A colour that was set, as far as the check needs to know it: a device colour, or something
+/// else (a pattern, another colour space).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Colour {
+    Rgb([u8; 3]),
+    Other,
+}
+
+fn to_byte(v: f64) -> u8 {
+    (v.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+/// The colour that these operands of `sc`, `scn`, `g`, `rg` or `k` give in a device colour space.
+fn colour_of(n: &[f64]) -> Colour {
+    match n.len() {
+        1 => {
+            let g = to_byte(n[0]);
+            Colour::Rgb([g, g, g])
+        }
+        3 => Colour::Rgb([to_byte(n[0]), to_byte(n[1]), to_byte(n[2])]),
+        4 => {
+            let k = 1.0 - n[3].clamp(0.0, 1.0);
+            Colour::Rgb([
+                to_byte((1.0 - n[0].clamp(0.0, 1.0)) * k),
+                to_byte((1.0 - n[1].clamp(0.0, 1.0)) * k),
+                to_byte((1.0 - n[2].clamp(0.0, 1.0)) * k),
+            ])
+        }
+        _ => Colour::Other,
+    }
+}
+
+/// How far a painted rectangle may be from the region and still be the box that redacted it: the
+/// edge that the render check leaves out, in points.
+const BOX_TOLERANCE: f64 = RENDER_MARGIN as f64 * 72.0 / RENDER_DPI as f64;
+
+/// A path, a shading or the glyphs of a Type 3 font that are painted on the page: where they are,
+/// whatever their colour, clip, transparency or visibility.
+struct Painted {
+    /// The bounds on the page, in points: of the points of the path (and of its control points),
+    /// widened by the line when it is stroked.
+    bbox: [f64; 4],
+    kind: &'static str,
+    /// For the fill of a path that is one rectangle: the rectangle.
+    rect: Option<[f64; 4]>,
+    colour: Colour,
+    place: String,
+}
+
+/// The graphics state that the geometry depends on.
+#[derive(Clone)]
+struct Gs {
+    ctm: M,
+    line_width: f64,
+    miter: f64,
+    fill: Colour,
+    stroke: Colour,
+}
+
+/// The path that is being built.
+#[derive(Default)]
+struct PathState {
+    pts: Vec<(f64, f64)>,
+    rects: usize,
+    other: usize,
+}
+
+/// A Type 3 font, as far as the position of its glyphs needs.
+struct Type3 {
+    /// Some glyph procedure paints a path or a shading.
+    paints: bool,
+    matrix: M,
+    bbox: Option<[f64; 4]>,
+    first: i64,
+    widths: Vec<f64>,
+}
+
+/// Where the text is, for the shown glyphs of a Type 3 font.
+struct TextState {
+    tm: M,
+    tlm: M,
+    size: f64,
+    leading: f64,
+    char_space: f64,
+    word_space: f64,
+    scale: f64,
+    font: Option<Rc<Type3>>,
+    /// How far the text position may be off, in text space units, because the width of the glyphs
+    /// of other fonts is estimated.
+    uncertain: f64,
+}
+
+impl TextState {
+    fn new() -> TextState {
+        TextState {
+            tm: IDENTITY,
+            tlm: IDENTITY,
+            size: 0.0,
+            leading: 0.0,
+            char_space: 0.0,
+            word_space: 0.0,
+            scale: 100.0,
+            font: None,
+            uncertain: 0.0,
+        }
+    }
+
+    fn move_to(&mut self, tx: f64, ty: f64) {
+        self.tlm = mul(&[1.0, 0.0, 0.0, 1.0, tx, ty], &self.tlm);
+        self.tm = self.tlm;
+        self.uncertain = 0.0;
+    }
+}
+
 struct Walker<'a, 'd> {
     doc: &'a Doc<'d>,
     out: Vec<Placement>,
+    paints: Vec<Painted>,
     problems: Vec<String>,
+    /// The bounds of the page, form, pattern or glyph that is being walked, in points: nothing
+    /// that it paints is outside.
+    container: [f64; 4],
+    /// Where in the file the walk is, for the places in messages.
+    trail: Vec<String>,
+    fonts: HashMap<u32, Option<Rc<Type3>>>,
+    /// Annotations that a viewer draws from their own entries (an ink path, a line) because they
+    /// have no appearance stream: their rectangle and subtype.
+    bare: Vec<([f64; 4], String)>,
 }
 
-impl Walker<'_, '_> {
-    fn content(&mut self, data: &[u8], res: &Obj, ctm: M, depth: usize) {
-        if depth > 8 {
-            self.problems
-                .push("forms are nested more than 8 deep".to_owned());
+impl<'a, 'd> Walker<'a, 'd> {
+    fn new(doc: &'a Doc<'d>, container: [f64; 4]) -> Self {
+        Walker {
+            doc,
+            out: Vec::new(),
+            paints: Vec::new(),
+            problems: Vec::new(),
+            container,
+            trail: Vec::new(),
+            fonts: HashMap::new(),
+            bare: Vec::new(),
+        }
+    }
+
+    fn problem(&mut self, msg: String) {
+        if !self.problems.contains(&msg) {
+            self.problems.push(msg);
+        }
+    }
+
+    fn place(&self) -> String {
+        if self.trail.is_empty() {
+            "the page content".to_owned()
+        } else {
+            self.trail.join(", in ")
+        }
+    }
+
+    fn record(&mut self, p: Painted) {
+        if self.paints.len() < 100_000 {
+            self.paints.push(p);
+        }
+    }
+
+    /// A path that is painted. The bounds are those of the points (a curve stays inside the hull
+    /// of its control points), and of the line when it is stroked.
+    fn paint_path(&mut self, path: &PathState, gs: &Gs, fill: bool, stroke: bool) {
+        if path.pts.is_empty() {
             return;
         }
-        let mut ctm = ctm;
-        let mut stack: Vec<M> = Vec::new();
-        for_each_op(data, &mut |op: &Op| match op.name {
-            b"q" => stack.push(ctm),
-            b"Q" => {
-                if let Some(m) = stack.pop() {
-                    ctm = m;
-                }
-            }
-            b"cm" => {
-                let n = op.nums();
-                if n.len() == 6 {
-                    ctm = mul(&[n[0], n[1], n[2], n[3], n[4], n[5]], &ctm);
-                }
-            }
-            b"BI" => {
-                if let Some((d, data)) = op.inline {
-                    self.out.push(Placement {
-                        ctm,
-                        image: Source::Inline(d.to_vec(), data.to_vec()),
-                    });
-                }
-            }
-            b"Do" => {
-                let Some(name) = op.name_arg() else { return };
-                let name: String = name.iter().map(|b| char::from(*b)).collect();
-                let xo = self.doc.dget(res, "XObject");
-                let Some(Obj::Ref(n)) = self.doc.resolve(xo).get(&name) else {
-                    return;
+        if path
+            .pts
+            .iter()
+            .any(|(x, y)| !x.is_finite() || !y.is_finite())
+        {
+            self.problem(format!(
+                "a path in {} has coordinates that cannot be read, so where it paints is not known",
+                self.place()
+            ));
+            return;
+        }
+        let mut bbox = bounds(&path.pts);
+        if stroke {
+            // The widest line a viewer draws: a hairline is one device pixel, a join may reach
+            // the miter limit (at most 10 times the half width).
+            let scale = (gs.ctm[0].hypot(gs.ctm[1])).max(gs.ctm[2].hypot(gs.ctm[3]));
+            let half = (gs.line_width.abs() * scale).max(0.5) / 2.0;
+            let joins = path.pts.len() > 2;
+            let reach = half
+                * if joins {
+                    gs.miter.clamp(1.5, 10.0)
+                } else {
+                    1.5
                 };
-                self.xobject(*n, res, ctm, depth);
+            bbox = [
+                bbox[0] - reach,
+                bbox[1] - reach,
+                bbox[2] + reach,
+                bbox[3] + reach,
+            ];
+        }
+        let kind = match (fill, stroke) {
+            (true, true) => "fill and stroke of a path",
+            (true, false) => "fill of a path",
+            _ => "stroke of a path",
+        };
+        let rect = (fill && !stroke && path.rects == 1 && path.other == 0).then_some(bbox);
+        let place = self.place();
+        self.record(Painted {
+            bbox,
+            kind,
+            rect,
+            colour: gs.fill,
+            place,
+        });
+    }
+
+    /// `sh`: a shading paints the whole clip, which this check does not follow, so the bounds are
+    /// those of the shading (`/BBox`) or else of the page, form, pattern or glyph.
+    fn shading(&mut self, name: &[u8], res: &Obj, gs: &Gs) {
+        let name: String = name.iter().map(|b| char::from(*b)).collect();
+        let sh = self.doc.dget(self.doc.dget(res, "Shading"), &name);
+        let mut bbox = self.container;
+        if sh.is_dict() {
+            let b = sh
+                .get("BBox")
+                .map(|b| numbers(b, self.doc))
+                .unwrap_or_default();
+            if b.len() == 4 {
+                let pts = [
+                    apply(&gs.ctm, b[0], b[1]),
+                    apply(&gs.ctm, b[2], b[1]),
+                    apply(&gs.ctm, b[0], b[3]),
+                    apply(&gs.ctm, b[2], b[3]),
+                ];
+                bbox = bounds(&pts);
             }
-            // A pattern colour: its images are drawn wherever the pattern is painted.
-            b"scn" | b"SCN" | b"sc" | b"SC" => {
-                if let Some(name) = op.name_arg() {
-                    self.pattern(name, res);
-                }
-            }
-            // A Type 3 font draws its glyphs with content streams, which may draw images.
-            b"Tf" => {
-                if let Some(name) = op.name_arg() {
-                    self.type3(name, res);
-                }
-            }
-            // A soft mask is a form that is drawn in the space of the moment it is set.
-            b"gs" => {
-                if let Some(name) = op.name_arg() {
-                    let name: String = name.iter().map(|b| char::from(*b)).collect();
-                    let state = self.doc.dget(self.doc.dget(res, "ExtGState"), &name);
-                    let mask = self.doc.dget(state, "SMask");
-                    if let Some(Obj::Ref(n)) = mask.get("G") {
-                        self.xobject(*n, res, ctm, depth);
+        } else {
+            self.problem(format!(
+                "the shading /{name} in {} cannot be found, so where it paints is not known",
+                self.place()
+            ));
+            return;
+        }
+        let place = self.place();
+        self.record(Painted {
+            bbox,
+            kind: "shading",
+            rect: None,
+            colour: Colour::Other,
+            place,
+        });
+    }
+
+    fn content(&mut self, data: &[u8], res: &Obj, ctm: M, depth: usize) {
+        if depth > 8 {
+            self.problem("forms are nested more than 8 deep".to_owned());
+            return;
+        }
+        let mut gs = Gs {
+            ctm,
+            line_width: 1.0,
+            miter: 10.0,
+            fill: Colour::Rgb([0, 0, 0]),
+            stroke: Colour::Rgb([0, 0, 0]),
+        };
+        let mut stack: Vec<Gs> = Vec::new();
+        let mut path = PathState::default();
+        let mut ts = TextState::new();
+        for_each_op(data, &mut |op: &Op| {
+            let n = op.nums();
+            let point = |gs: &Gs, x: f64, y: f64| apply(&gs.ctm, x, y);
+            let malformed = |w: &mut Self, what: &str| {
+                w.problem(format!(
+                    "{what} in {} has the wrong operands, so where it paints is not known",
+                    w.place()
+                ));
+            };
+            match op.name {
+                b"q" => stack.push(gs.clone()),
+                b"Q" => {
+                    if let Some(g) = stack.pop() {
+                        gs = g;
                     }
                 }
+                b"cm" => {
+                    if n.len() == 6 {
+                        gs.ctm = mul(&[n[0], n[1], n[2], n[3], n[4], n[5]], &gs.ctm);
+                    } else {
+                        malformed(self, "a cm operator");
+                    }
+                }
+                b"w" => {
+                    if let Some(v) = n.first() {
+                        gs.line_width = *v;
+                    }
+                }
+                b"M" => {
+                    if let Some(v) = n.first() {
+                        gs.miter = *v;
+                    }
+                }
+                b"g" | b"rg" | b"k" => gs.fill = colour_of(&n),
+                b"G" | b"RG" | b"K" => gs.stroke = colour_of(&n),
+                b"cs" | b"CS" => {
+                    let c = match op.name_arg() {
+                        Some(b"DeviceGray" | b"DeviceRGB" | b"DeviceCMYK") => {
+                            Colour::Rgb([0, 0, 0])
+                        }
+                        _ => Colour::Other,
+                    };
+                    if op.name == b"cs" {
+                        gs.fill = c;
+                    } else {
+                        gs.stroke = c;
+                    }
+                }
+                // A pattern colour: its images are drawn wherever the pattern is painted.
+                b"scn" | b"SCN" | b"sc" | b"SC" => {
+                    let fill = matches!(op.name, b"scn" | b"sc");
+                    let c = if let Some(name) = op.name_arg() {
+                        self.pattern(name, res);
+                        Colour::Other
+                    } else {
+                        colour_of(&n)
+                    };
+                    if fill {
+                        gs.fill = c;
+                    } else {
+                        gs.stroke = c;
+                    }
+                }
+                b"m" | b"l" => {
+                    if n.len() == 2 {
+                        path.pts.push(point(&gs, n[0], n[1]));
+                        path.other += 1;
+                    } else {
+                        malformed(self, "a path operator");
+                    }
+                }
+                b"c" => {
+                    if n.len() == 6 {
+                        for i in 0..3 {
+                            path.pts.push(point(&gs, n[2 * i], n[2 * i + 1]));
+                        }
+                        path.other += 1;
+                    } else {
+                        malformed(self, "a path operator");
+                    }
+                }
+                b"v" | b"y" => {
+                    if n.len() == 4 {
+                        for i in 0..2 {
+                            path.pts.push(point(&gs, n[2 * i], n[2 * i + 1]));
+                        }
+                        path.other += 1;
+                    } else {
+                        malformed(self, "a path operator");
+                    }
+                }
+                b"re" => {
+                    if n.len() == 4 {
+                        let (x, y, w, h) = (n[0], n[1], n[2], n[3]);
+                        for (px, py) in [(x, y), (x + w, y), (x, y + h), (x + w, y + h)] {
+                            path.pts.push(point(&gs, px, py));
+                        }
+                        path.rects += 1;
+                    } else {
+                        malformed(self, "a path operator");
+                    }
+                }
+                b"f" | b"F" | b"f*" => {
+                    self.paint_path(&path, &gs, true, false);
+                    path = PathState::default();
+                }
+                b"S" | b"s" => {
+                    self.paint_path(&path, &gs, false, true);
+                    path = PathState::default();
+                }
+                b"B" | b"B*" | b"b" | b"b*" => {
+                    self.paint_path(&path, &gs, true, true);
+                    path = PathState::default();
+                }
+                b"n" => path = PathState::default(),
+                b"sh" => match op.name_arg() {
+                    Some(name) => self.shading(name, res, &gs),
+                    None => malformed(self, "an sh operator"),
+                },
+                b"BI" => {
+                    if let Some((d, data)) = op.inline {
+                        self.out.push(Placement {
+                            ctm: gs.ctm,
+                            image: Source::Inline(d.to_vec(), data.to_vec()),
+                        });
+                    }
+                }
+                b"Do" => {
+                    let Some(name) = op.name_arg() else { return };
+                    let name: String = name.iter().map(|b| char::from(*b)).collect();
+                    let xo = self.doc.dget(res, "XObject");
+                    let Some(Obj::Ref(n)) = self.doc.resolve(xo).get(&name) else {
+                        return;
+                    };
+                    self.xobject(*n, res, gs.ctm, depth);
+                }
+                // A soft mask is a form that is drawn in the space of the moment it is set.
+                b"gs" => {
+                    if let Some(name) = op.name_arg() {
+                        let name: String = name.iter().map(|b| char::from(*b)).collect();
+                        let state = self.doc.dget(self.doc.dget(res, "ExtGState"), &name);
+                        if let Some(w) = self.doc.dget(state, "LW").num() {
+                            gs.line_width = w;
+                        }
+                        if let Some(m) = self.doc.dget(state, "ML").num() {
+                            gs.miter = m;
+                        }
+                        let mask = self.doc.dget(state, "SMask");
+                        if let Some(Obj::Ref(n)) = mask.get("G") {
+                            self.xobject(*n, res, gs.ctm, depth);
+                        }
+                    }
+                }
+                // Text: only the glyphs of a Type 3 font paint geometry; the letters of the other
+                // fonts are the business of the text layers.
+                b"BT" => {
+                    ts.tm = IDENTITY;
+                    ts.tlm = IDENTITY;
+                    ts.uncertain = 0.0;
+                }
+                b"Tf" => {
+                    if let Some(name) = op.name_arg() {
+                        ts.font = self.type3(name, res);
+                    }
+                    if let Some(s) = n.last() {
+                        ts.size = *s;
+                    }
+                }
+                b"TL" => {
+                    if let Some(v) = n.last() {
+                        ts.leading = *v;
+                    }
+                }
+                b"Tc" => ts.char_space = n.last().copied().unwrap_or(0.0),
+                b"Tw" => ts.word_space = n.last().copied().unwrap_or(0.0),
+                b"Tz" => ts.scale = n.last().copied().unwrap_or(100.0),
+                b"Tm" => {
+                    if n.len() == 6 {
+                        ts.tlm = [n[0], n[1], n[2], n[3], n[4], n[5]];
+                        ts.tm = ts.tlm;
+                        ts.uncertain = 0.0;
+                    }
+                }
+                b"Td" | b"TD" => {
+                    if n.len() == 2 {
+                        if op.name == b"TD" {
+                            ts.leading = -n[1];
+                        }
+                        ts.move_to(n[0], n[1]);
+                    }
+                }
+                b"T*" => ts.move_to(0.0, -ts.leading),
+                b"Tj" | b"TJ" | b"'" | b"\"" => {
+                    if matches!(op.name, b"'" | b"\"") {
+                        if op.name == b"\"" && n.len() >= 2 {
+                            ts.word_space = n[0];
+                            ts.char_space = n[1];
+                        }
+                        ts.move_to(0.0, -ts.leading);
+                    }
+                    if let Some(items) = crate::content::shown(op) {
+                        self.show(&items, &mut ts, &gs);
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         });
+    }
+
+    /// Shown text: the glyphs of a Type 3 font that paints are geometry at the text position. The
+    /// width of the glyphs of other fonts is estimated, and the estimate widens the bounds.
+    fn show(&mut self, items: &[crate::content::ShownItem], ts: &mut TextState, gs: &Gs) {
+        use crate::content::ShownItem;
+        let size = ts.size;
+        let scale = ts.scale / 100.0;
+        let t3 = ts.font.clone();
+        let mut advance = 0.0;
+        for it in items {
+            match it {
+                ShownItem::Str(bytes) => match &t3 {
+                    Some(f) => {
+                        for b in bytes {
+                            let w = usize::try_from(i64::from(*b) - f.first)
+                                .ok()
+                                .and_then(|i| f.widths.get(i))
+                                .copied()
+                                .unwrap_or(0.0);
+                            let space = if *b == 32 { ts.word_space } else { 0.0 };
+                            advance += (w * f.matrix[0] * size + ts.char_space + space) * scale;
+                        }
+                    }
+                    None => {
+                        let est = bytes.len() as f64 * size.abs();
+                        ts.uncertain += est * scale;
+                        advance += est * 0.5 * scale;
+                    }
+                },
+                ShownItem::Kern(k) => advance -= k / 1000.0 * size * scale,
+            }
+        }
+        if let Some(f) = t3.filter(|f| f.paints) {
+            match f.bbox {
+                Some(b) => {
+                    let corners = [(b[0], b[1]), (b[2], b[1]), (b[0], b[3]), (b[2], b[3])]
+                        .map(|(x, y)| apply(&f.matrix, x, y));
+                    let (gx0, gx1) = corners
+                        .iter()
+                        .fold((f64::MAX, f64::MIN), |(l, h), p| (l.min(p.0), h.max(p.0)));
+                    let (gy0, gy1) = corners
+                        .iter()
+                        .fold((f64::MAX, f64::MIN), |(l, h), p| (l.min(p.1), h.max(p.1)));
+                    let (x0, x1) = (
+                        gx0.min(gx1) * size * scale + advance.min(0.0) - ts.uncertain,
+                        gx0.max(gx1) * size * scale + advance.max(0.0) + ts.uncertain,
+                    );
+                    let (y0, y1) = (gy0.min(gy1) * size, gy0.max(gy1) * size);
+                    let m = mul(&ts.tm, &gs.ctm);
+                    let pts = [
+                        apply(&m, x0.min(x1), y0.min(y1)),
+                        apply(&m, x0.max(x1), y0.min(y1)),
+                        apply(&m, x0.min(x1), y0.max(y1)),
+                        apply(&m, x0.max(x1), y0.max(y1)),
+                    ];
+                    let bbox = bounds(&pts);
+                    if bbox.iter().all(|v| v.is_finite()) {
+                        let place = self.place();
+                        self.record(Painted {
+                            bbox,
+                            kind: "glyphs of a Type 3 font",
+                            rect: None,
+                            colour: Colour::Other,
+                            place,
+                        });
+                    } else {
+                        self.problem(format!(
+                            "Type 3 text in {} has a position that cannot be read, so where it paints is not known",
+                            self.place()
+                        ));
+                    }
+                }
+                None => self.problem(format!(
+                    "a Type 3 font in {} that paints has no usable /FontBBox, so where its glyphs paint is not known",
+                    self.place()
+                )),
+            }
+        }
+        ts.tm = mul(&[1.0, 0.0, 0.0, 1.0, advance, 0.0], &ts.tm);
     }
 
     /// A tiling pattern that draws an image: where it is painted is not followed (that needs the
@@ -185,24 +660,32 @@ impl Walker<'_, '_> {
             let msg = format!(
                 "an image is drawn through the tiling pattern /{name}: where the pattern is painted is not followed, so the pixels of that image were checked only in the render"
             );
-            if !self.problems.contains(&msg) {
-                self.problems.push(msg);
-            }
+            self.problem(msg);
         }
     }
 
-    /// A Type 3 font whose glyph procedures draw an image: said, like a pattern, because where
-    /// the glyphs are shown is not followed.
-    fn type3(&mut self, name: &[u8], res: &Obj) {
+    /// A Type 3 font: whether its glyph procedures paint geometry, and the numbers that place its
+    /// glyphs. A font whose glyphs draw an image is said, like a pattern, because where the glyphs
+    /// are shown is not followed for images.
+    fn type3(&mut self, name: &[u8], res: &Obj) -> Option<Rc<Type3>> {
         let name: String = name.iter().map(|b| char::from(*b)).collect();
         let fonts = self.doc.dget(res, "Font");
         let font = self.doc.dget(fonts, &name);
         if self.doc.dget(font, "Subtype").name() != Some("Type3") {
-            return;
+            return None;
+        }
+        let key = match fonts.get(&name) {
+            Some(Obj::Ref(n)) => Some(*n),
+            _ => None,
+        };
+        if let Some(k) = key {
+            if let Some(c) = self.fonts.get(&k) {
+                return c.clone();
+            }
         }
         let own = font.get("Resources").map(|r| self.doc.resolve(r).clone());
         let font_res = own.unwrap_or_else(|| res.clone());
-        let found = self
+        let procs: Vec<&Entry> = self
             .doc
             .dget(font, "CharProcs")
             .entries()
@@ -211,15 +694,42 @@ impl Walker<'_, '_> {
                 Obj::Ref(n) => self.doc.latest(*n),
                 _ => None,
             })
-            .any(|e| e.stream.is_some() && draws_image(self.doc, e, &font_res, 0));
-        if found {
+            .filter(|e| e.stream.is_some())
+            .collect();
+        let draws = procs.iter().any(|e| draws_image(self.doc, e, &font_res, 0));
+        let paints = procs
+            .iter()
+            .any(|e| paints_geometry(self.doc, e, &font_res, 0));
+        if draws {
             let msg = format!(
                 "an image is drawn by the glyphs of the Type 3 font /{name}: where the glyphs are shown is not followed, so the pixels of that image were checked only in the render"
             );
-            if !self.problems.contains(&msg) {
-                self.problems.push(msg);
-            }
+            self.problem(msg);
         }
+        let matrix = {
+            let m = numbers(font.get("FontMatrix").unwrap_or(&Obj::Null), self.doc);
+            if m.len() == 6 {
+                [m[0], m[1], m[2], m[3], m[4], m[5]]
+            } else {
+                [0.001, 0.0, 0.0, 0.001, 0.0, 0.0]
+            }
+        };
+        let bbox = {
+            let b = numbers(font.get("FontBBox").unwrap_or(&Obj::Null), self.doc);
+            (b.len() == 4 && (b[2] - b[0]).abs() > 0.0 && (b[3] - b[1]).abs() > 0.0)
+                .then(|| [b[0], b[1], b[2], b[3]])
+        };
+        let info = Some(Rc::new(Type3 {
+            paints,
+            matrix,
+            bbox,
+            first: self.doc.dget(font, "FirstChar").int().unwrap_or(0),
+            widths: numbers(font.get("Widths").unwrap_or(&Obj::Null), self.doc),
+        }));
+        if let Some(k) = key {
+            self.fonts.insert(k, info.clone());
+        }
+        info
     }
 
     fn xobject(&mut self, n: u32, res: &Obj, ctm: M, depth: usize) {
@@ -234,7 +744,12 @@ impl Walker<'_, '_> {
                     return;
                 };
                 if let Some(p) = &d.problem {
-                    self.problems.push(format!("form object {n}: {p}"));
+                    self.problem(format!("form object {n}: {p}"));
+                }
+                if let Some(stop) = &d.stopped_at {
+                    self.problem(format!(
+                        "form object {n} has the filter {stop}, which is not decoded, so its content was not walked"
+                    ));
                 }
                 let m = e
                     .value
@@ -245,7 +760,27 @@ impl Walker<'_, '_> {
                     .get("Resources")
                     .map(|r| self.doc.resolve(r).clone());
                 let res2 = own.unwrap_or_else(|| res.clone());
-                self.content(&d.data, &res2, mul(&m, &ctm), depth + 1);
+                let full = mul(&m, &ctm);
+                // Nothing that the form paints is outside its box.
+                let saved = self.container;
+                let b = e
+                    .value
+                    .get("BBox")
+                    .map(|b| numbers(b, self.doc))
+                    .unwrap_or_default();
+                if b.len() == 4 {
+                    let pts = [
+                        apply(&full, b[0], b[1]),
+                        apply(&full, b[2], b[1]),
+                        apply(&full, b[0], b[3]),
+                        apply(&full, b[2], b[3]),
+                    ];
+                    self.container = bounds(&pts);
+                }
+                self.trail.push(format!("form object {n}"));
+                self.content(&d.data, &res2, full, depth + 1);
+                self.trail.pop();
+                self.container = saved;
             }
             _ => {}
         }
@@ -284,12 +819,55 @@ fn draws_image(doc: &Doc, e: &Entry, fallback: &Obj, depth: usize) -> bool {
     found
 }
 
-fn contents(doc: &Doc, page: &Entry) -> Option<Vec<u8>> {
-    let c = page.value.get("Contents")?;
+/// Whether the content of a glyph procedure paints a path or a shading (also through a form it
+/// draws).
+fn paints_geometry(doc: &Doc, e: &Entry, fallback: &Obj, depth: usize) -> bool {
+    let Some(d) = doc.stream_data(e) else {
+        // Content that cannot be read may paint anything.
+        return true;
+    };
+    let res = e
+        .value
+        .get("Resources")
+        .map_or_else(|| fallback.clone(), |r| doc.resolve(r).clone());
+    let mut found = false;
+    for_each_op(&d.data, &mut |op: &Op| match op.name {
+        b"f" | b"F" | b"f*" | b"S" | b"s" | b"B" | b"B*" | b"b" | b"b*" | b"sh" => found = true,
+        b"Do" => {
+            let Some(name) = op.name_arg() else { return };
+            let name: String = name.iter().map(|b| char::from(*b)).collect();
+            let xo = doc.dget(&res, "XObject");
+            let Some(Obj::Ref(n)) = doc.resolve(xo).get(&name) else {
+                return;
+            };
+            let Some(x) = doc.latest(*n) else { return };
+            if doc.dget(&x.value, "Subtype").name() == Some("Form") {
+                found |= depth >= 4 || paints_geometry(doc, x, &res, depth + 1);
+            }
+        }
+        _ => {}
+    });
+    found
+}
+
+/// The decoded content of a page (its streams, one after the other), or why it cannot be read.
+fn contents(doc: &Doc, page: &Entry) -> std::result::Result<Vec<u8>, String> {
+    let Some(c) = page.value.get("Contents") else {
+        return Err("the page has no content".to_owned());
+    };
     let mut data = Vec::new();
+    let mut why: Option<String> = None;
     let mut add = |o: &Obj| {
         if let Obj::Ref(n) = o {
             if let Some(d) = doc.latest(*n).and_then(|e| doc.stream_data(e)) {
+                if let Some(p) = &d.problem {
+                    why.get_or_insert(format!("content stream {n}: {p}"));
+                }
+                if let Some(s) = &d.stopped_at {
+                    why.get_or_insert(format!(
+                        "content stream {n} has the filter {s}, which is not decoded"
+                    ));
+                }
                 data.extend_from_slice(&d.data);
                 data.push(b'\n');
             }
@@ -303,7 +881,10 @@ fn contents(doc: &Doc, page: &Entry) -> Option<Vec<u8>> {
         },
         _ => {}
     }
-    Some(data)
+    match why {
+        Some(w) => Err(w),
+        None => Ok(data),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -329,16 +910,33 @@ struct Pixels {
     lossy: Option<Lossy>,
 }
 
-/// The tolerance and the blocks of a JPEG, from the first value of its quantisation tables and the
-/// largest sampling factors in the markers of the file.
-fn jpeg_lossy(data: &[u8]) -> Option<Lossy> {
-    if data.get(..2)? != [0xFF, 0xD8] {
-        return None;
+/// The most that the check lets a JPEG be off in a flat block, in levels of 255. A flat block is
+/// off by at most half a quantisation step of its DC coefficient divided by 8, widened for the
+/// colour conversion and the rounding (see [`jpeg_lossy`]); 16 stands for a DC step of 80, about
+/// quality 10 of libjpeg, below which a scan is too coarse for any check to separate what was
+/// there from what the codec made of it. The light gray of a faint stamp is 40 levels from white,
+/// so 16 still tells it from a blank block. A JPEG that needs more is "could not check".
+const JPEG_TOLERANCE_CAP: u8 = 16;
+
+/// The tolerance and the blocks of a JPEG, from the first value of the quantisation tables that
+/// its components use and the largest sampling factors in the markers of the file. A table that no
+/// component uses says nothing about the image and is not read. The error is from the file under
+/// test, so it is capped at [`JPEG_TOLERANCE_CAP`]: a JPEG that would need more is refused, with
+/// the reason.
+fn jpeg_lossy(data: &[u8]) -> std::result::Result<Lossy, String> {
+    if data.get(..2) != Some(&[0xFF, 0xD8]) {
+        return Err("it does not start like a JPEG".to_owned());
     }
+    let unreadable = || {
+        "its marker segments cannot be read, so its quantisation tables are not known".to_owned()
+    };
     let mut i = 2;
-    let mut steps: Vec<u16> = Vec::new();
+    // The first (DC) entry of each table, by table number; a table that is defined twice counts
+    // with the larger one.
+    let mut steps: [Option<u16>; 4] = [None; 4];
     let (mut hmax, mut vmax) = (1usize, 1usize);
-    let mut sof = false;
+    // The tables that the components select.
+    let mut used: Vec<usize> = Vec::new();
     while i + 4 <= data.len() {
         if data[i] != 0xFF {
             i += 1;
@@ -349,61 +947,82 @@ fn jpeg_lossy(data: &[u8]) -> Option<Lossy> {
             i += 1;
             continue;
         }
+        // Markers without a segment, and the bytes of the entropy coded data that look like one.
         if m == 0x00 || m == 0x01 || (0xD0..=0xD7).contains(&m) {
             i += 2;
             continue;
         }
-        if m == 0xD9 || m == 0xDA {
+        if m == 0xD9 {
             break;
         }
         let len = usize::from(data[i + 2]) << 8 | usize::from(data[i + 3]);
         if len < 2 {
-            return None;
+            return Err(unreadable());
         }
-        let seg = data.get(i + 4..i + 2 + len)?;
+        let seg = data.get(i + 4..i + 2 + len).ok_or_else(unreadable)?;
         match m {
             0xDB => {
                 let mut p = 0;
                 while p < seg.len() {
                     let wide = seg[p] >> 4 != 0;
+                    let id = usize::from(seg[p] & 15);
                     p += 1;
                     let size = if wide { 2 } else { 1 };
-                    if p + 64 * size > seg.len() {
-                        return None;
+                    if p + 64 * size > seg.len() || id > 3 {
+                        return Err(unreadable());
                     }
-                    steps.push(if wide {
+                    let first = if wide {
                         u16::from(seg[p]) << 8 | u16::from(seg[p + 1])
                     } else {
                         u16::from(seg[p])
-                    });
+                    };
+                    steps[id] = Some(steps[id].map_or(first, |s| s.max(first)));
                     p += 64 * size;
                 }
             }
             0xC0..=0xC2 => {
-                let n = usize::from(*seg.get(5)?);
+                let n = usize::from(*seg.get(5).ok_or_else(unreadable)?);
                 for c in 0..n {
-                    let hv = *seg.get(6 + c * 3 + 1)?;
+                    let hv = *seg.get(6 + c * 3 + 1).ok_or_else(unreadable)?;
+                    let table = usize::from(*seg.get(6 + c * 3 + 2).ok_or_else(unreadable)?);
                     hmax = hmax.max(usize::from(hv >> 4));
                     vmax = vmax.max(usize::from(hv & 15));
+                    if !used.contains(&table) {
+                        used.push(table);
+                    }
                 }
-                sof = true;
             }
             _ => {}
         }
         i += 2 + len;
     }
-    if !sof || steps.is_empty() {
-        return None;
+    if used.is_empty() {
+        return Err("it has no frame header, so its quantisation tables are not known".to_owned());
+    }
+    let mut step = 0u16;
+    for t in used {
+        match steps.get(t).copied().flatten() {
+            Some(s) => step = step.max(s),
+            None => {
+                return Err(format!(
+                    "a component uses the quantisation table {t}, which it does not define"
+                ))
+            }
+        }
     }
     // A flat block has one coefficient, the DC value; quantising it is off by half a step, and the
     // pixel value is one eighth of the coefficient. The colour conversion adds the error of the
     // colour components to the one of the luma (a factor of 1.8 at most), and 2 more levels are
     // rounding.
-    let step = f64::from(*steps.iter().max()?);
-    let tolerance = (step / 16.0 * 2.8 + 2.0).ceil().min(255.0) as u8;
+    let tolerance = (f64::from(step) / 16.0 * 2.8 + 2.0).ceil();
+    if tolerance > f64::from(JPEG_TOLERANCE_CAP) {
+        return Err(format!(
+            "its quantisation tables are so coarse that a flat block may be off by {tolerance} levels, more than the {JPEG_TOLERANCE_CAP} that can be told from content"
+        ));
+    }
     let (hmax, vmax) = (hmax.clamp(1, 4), vmax.clamp(1, 4));
-    Some(Lossy {
-        tolerance,
+    Ok(Lossy {
+        tolerance: tolerance as u8,
         mcu: (8 * hmax, 8 * vmax),
         spread: (
             if hmax > 1 { hmax } else { 0 },
@@ -522,13 +1141,9 @@ fn decode_image(
                 if data.len() < w * h * ncomp {
                     return Err("the JPEG data is shorter than the image".to_owned());
                 }
-                // A JPEG whose tables cannot be read is judged by the widest blocks and a loose
-                // tolerance, never by none.
-                let lossy = jpeg_lossy(&decoded.data).unwrap_or(Lossy {
-                    tolerance: 16,
-                    mcu: (16, 16),
-                    spread: (2, 2),
-                });
+                // A JPEG whose tables cannot be read, or whose tables are too coarse, cannot be
+                // judged: it is refused, with the reason.
+                let lossy = jpeg_lossy(&decoded.data)?;
                 Ok(Pixels {
                     w,
                     h,
@@ -590,14 +1205,43 @@ fn decode_mask(doc: &Doc, dict: &Obj, key: &str) -> Option<std::result::Result<P
 // ---------------------------------------------------------------------------------------------
 // The image check.
 
-/// An image with the pixels that its codec changes near an edge: the render check leaves out the
-/// part of the image that lies in the region and outside `safe`.
+/// The samples of a lossy image that were compared: the blocks that lie wholly inside the region.
+/// The render check leaves out the rest of the image, where the codec has changed the pixels near
+/// the edge of what was blanked.
+struct Checked {
+    /// Nothing of the image was compared (it could not be decoded): the render check leaves out
+    /// all of it, and the problem that was reported says so.
+    none: bool,
+    /// The window of the image that the region can touch.
+    col0: usize,
+    row0: usize,
+    cols: usize,
+    rows: usize,
+    bits: Vec<bool>,
+}
+
+impl Checked {
+    /// Whether the sample was compared. A sample outside the window is under no pixel of the
+    /// region, so it is not left out.
+    fn has(&self, col: usize, row: usize) -> bool {
+        if self.none {
+            return false;
+        }
+        if col < self.col0 || row < self.row0 {
+            return true;
+        }
+        let (c, r) = (col - self.col0, row - self.row0);
+        c >= self.cols || r >= self.rows || self.bits[r * self.cols + c]
+    }
+}
+
+/// A lossy image under a region, for the render check: where it is, which of its samples were
+/// compared, and how far a rendered pixel of it may be from the others.
 struct Zone {
-    /// The bounds of the placed image, in points.
-    bbox: [f64; 4],
-    /// The blocks that lie wholly in the region, in points (`None`: none, or not axis aligned).
-    safe: Option<[f64; 4]>,
-    /// How far a rendered pixel may be from the others.
+    ctm: M,
+    w: usize,
+    h: usize,
+    checked: Checked,
     tolerance: u8,
 }
 
@@ -615,19 +1259,34 @@ fn bounds(points: &[(f64, f64)]) -> [f64; 4] {
 struct Scan {
     covered: usize,
     differing: usize,
-    /// For a lossy image: the part that was looked at, in points.
-    safe: Option<[f64; 4]>,
+    /// The region is over more samples than the check keeps track of.
+    too_large: bool,
+    /// For a lossy image: the part that was looked at.
+    checked: Option<Checked>,
 }
 
-/// The samples of `px` (drawn with `ctm`) whose whole square lies inside `rect`, and how many of
-/// them differ from the first by more than `tolerance`. For a JPEG whose region names its fill,
-/// the samples are compared with the fill, within what the quantisation of a flat block allows.
+/// The middle value of each component of the samples.
+fn median(samples: &[&[u8]], ncomp: usize) -> Vec<u8> {
+    (0..ncomp)
+        .map(|c| {
+            let mut v: Vec<u8> = samples.iter().map(|s| s[c]).collect();
+            let mid = v.len() / 2;
+            *v.select_nth_unstable(mid).1
+        })
+        .collect()
+}
+
+/// The samples of `px` (drawn with `ctm`, which may turn it) whose whole square lies inside `rect`,
+/// and how many of them differ from the others by more than `tolerance`: from the middle value of
+/// all of them, or, for a JPEG whose region names its fill, from the fill. A JPEG is looked at
+/// only where a whole block, with the samples that take colour from it, lies inside the region.
 fn scan(px: &Pixels, ctm: &M, rect: [f64; 4], tolerance: u8, fill: Option<[u8; 3]>) -> Scan {
     let [rx0, ry0, rx1, ry1] = rect;
     let mut out = Scan {
         covered: 0,
         differing: 0,
-        safe: None,
+        too_large: false,
+        checked: None,
     };
     let Some(inv) = invert(ctm) else { return out };
     let uv: Vec<(f64, f64)> = [(rx0, ry0), (rx1, ry0), (rx0, ry1), (rx1, ry1)]
@@ -637,9 +1296,17 @@ fn scan(px: &Pixels, ctm: &M, rect: [f64; 4], tolerance: u8, fill: Option<[u8; 3
     let [u0, v0, u1, v1] = bounds(&uv);
     let (w, h) = (px.w as f64, px.h as f64);
     let col0 = ((u0 * w).floor().max(0.0)) as usize;
-    let col1 = ((u1 * w).ceil().min(w)) as usize;
+    let col1 = (((u1 * w).ceil().min(w)) as usize).min(px.w);
     let row0 = (((1.0 - v1) * h).floor().max(0.0)) as usize;
-    let row1 = (((1.0 - v0) * h).ceil().min(h)) as usize;
+    let row1 = (((1.0 - v0) * h).ceil().min(h) as usize).min(px.h);
+    if col1 <= col0 || row1 <= row0 {
+        return out;
+    }
+    let (cols, rows) = (col1 - col0, row1 - row0);
+    if cols.saturating_mul(rows) > MAX_IMAGE_SAMPLES {
+        out.too_large = true;
+        return out;
+    }
     let eps = 1e-3;
     let inside = |col: usize, row: usize| -> bool {
         let (cx0, cx1) = (col as f64 / w, (col + 1) as f64 / w);
@@ -651,20 +1318,11 @@ fn scan(px: &Pixels, ctm: &M, rect: [f64; 4], tolerance: u8, fill: Option<[u8; 3
                 x >= rx0 - eps && x <= rx1 + eps && y >= ry0 - eps && y <= ry1 + eps
             })
     };
-    // The samples that lie inside, as a box.
-    let (mut c0, mut c1, mut r0, mut r1) = (usize::MAX, 0usize, usize::MAX, 0usize);
-    for row in row0..row1.min(px.h) {
-        for col in col0..col1.min(px.w) {
-            if inside(col, row) {
-                c0 = c0.min(col);
-                c1 = c1.max(col + 1);
-                r0 = r0.min(row);
-                r1 = r1.max(row + 1);
-            }
+    let mut ins = vec![false; cols * rows];
+    for r in 0..rows {
+        for c in 0..cols {
+            ins[r * cols + c] = inside(col0 + c, row0 + r);
         }
-    }
-    if c0 == usize::MAX {
-        return out;
     }
     let mut tol = i32::from(tolerance);
     // The fill as samples of this image (red, green, blue, or the gray of it).
@@ -678,77 +1336,144 @@ fn scan(px: &Pixels, ctm: &M, rect: [f64; 4], tolerance: u8, fill: Option<[u8; 3
                 ]),
                 _ => None,
             });
-    if let Some(l) = &px.lossy {
-        // Leave out the blocks that straddle the edge of the region, and the samples next to
-        // them that take colour from them. At the edge of the image there is no neighbour.
-        if !axis_aligned(ctm) {
-            return out;
-        }
-        let shrink = |lo: usize, hi: usize, size: usize, spread: usize, total: usize| {
-            let lo2 = if lo == 0 {
-                0
-            } else {
-                (lo + spread).div_ceil(size) * size
-            };
-            let hi2 = if hi == total {
-                total
-            } else {
-                hi.saturating_sub(spread) / size * size
-            };
-            (lo2, hi2)
-        };
-        (c0, c1) = shrink(c0, c1, l.mcu.0, l.spread.0, px.w);
-        (r0, r1) = shrink(r0, r1, l.mcu.1, l.spread.1, px.h);
-        if c1 <= c0 || r1 <= r0 {
-            return out;
-        }
-        let corners: Vec<(f64, f64)> = [
-            (c0 as f64 / w, 1.0 - r0 as f64 / h),
-            (c1 as f64 / w, 1.0 - r0 as f64 / h),
-            (c0 as f64 / w, 1.0 - r1 as f64 / h),
-            (c1 as f64 / w, 1.0 - r1 as f64 / h),
-        ]
-        .iter()
-        .map(|(u, v)| apply(ctm, *u, *v))
-        .collect();
-        out.safe = Some(bounds(&corners));
-        // With the fill named, each sample is off from it by the tolerance; without it, two
-        // samples are each off by the tolerance, in opposite directions.
-        tol = tol.max(i32::from(l.tolerance) * if expected.is_some() { 1 } else { 2 });
-    }
-    let mut reference: Option<&[u8]> = expected.as_deref();
-    for row in r0..r1 {
-        for col in c0..c1 {
-            if !inside(col, row) {
-                continue;
-            }
-            out.covered += 1;
-            let s = &px.data[(row * px.w + col) * px.ncomp..][..px.ncomp];
-            match reference {
-                None => reference = Some(s),
-                Some(r) => {
-                    if r.iter()
-                        .zip(s)
-                        .any(|(a, b)| i32::from(a.abs_diff(*b)) > tol)
-                    {
-                        out.differing += 1;
-                    }
+    let sel: Vec<bool> = match &px.lossy {
+        None => ins,
+        Some(l) => {
+            // The blocks that lie wholly inside the region, with the samples next to them that
+            // take colour from them (at the edge of the image there is no neighbour). The blocks
+            // are in the grid of the image, so a turned image is looked at the same way.
+            let stride = cols + 1;
+            let mut sum = vec![0u32; stride * (rows + 1)];
+            for r in 0..rows {
+                for c in 0..cols {
+                    sum[(r + 1) * stride + c + 1] = u32::from(ins[r * cols + c])
+                        + sum[r * stride + c + 1]
+                        + sum[(r + 1) * stride + c]
+                        - sum[r * stride + c];
                 }
             }
+            let count = |x0: usize, y0: usize, x1: usize, y1: usize| -> usize {
+                // The samples of the window in [x0, x1) x [y0, y1), image coordinates.
+                let (a, b, c, d) = (x0 - col0, y0 - row0, x1 - col0, y1 - row0);
+                (sum[d * stride + c] + sum[b * stride + a]
+                    - sum[b * stride + c]
+                    - sum[d * stride + a]) as usize
+            };
+            let (mw, mh) = l.mcu;
+            let (sx, sy) = l.spread;
+            // A block is clean when all of it lies inside the region. A block that the edge of
+            // the region cuts has the ringing of the codec all over it, and the colour of its
+            // samples spreads into the samples next to it.
+            let (blocks_x, blocks_y) = (px.w.div_ceil(mw), px.h.div_ceil(mh));
+            let (first_bx, first_by) = (col0 / mw, row0 / mh);
+            let (nbx, nby) = (
+                (col1 - 1) / mw + 1 - first_bx,
+                (row1 - 1) / mh + 1 - first_by,
+            );
+            let mut clean = vec![false; nbx * nby];
+            for j in 0..nby {
+                for i in 0..nbx {
+                    let (bx, by) = (first_bx + i, first_by + j);
+                    let (x0, x1) = (bx * mw, ((bx + 1) * mw).min(px.w));
+                    let (y0, y1) = (by * mh, ((by + 1) * mh).min(px.h));
+                    clean[j * nbx + i] = x0 >= col0
+                        && y0 >= row0
+                        && x1 <= col1
+                        && y1 <= row1
+                        && count(x0, y0, x1, y1) == (x1 - x0) * (y1 - y0);
+                }
+            }
+            let is_clean = |bx: usize, by: usize| -> bool {
+                if bx >= blocks_x || by >= blocks_y {
+                    return true;
+                }
+                bx >= first_bx
+                    && by >= first_by
+                    && bx - first_bx < nbx
+                    && by - first_by < nby
+                    && clean[(by - first_by) * nbx + bx - first_bx]
+            };
+            let mut sel = vec![false; cols * rows];
+            for r in 0..rows {
+                for c in 0..cols {
+                    let (x, y) = (col0 + c, row0 + r);
+                    let (bx, by) = (x / mw, y / mh);
+                    if !is_clean(bx, by) {
+                        continue;
+                    }
+                    // Every block that the colour of this sample comes from must be clean.
+                    let (bx0, bx1) = (x.saturating_sub(sx) / mw, (x + sx).min(px.w - 1) / mw);
+                    let (by0, by1) = (y.saturating_sub(sy) / mh, (y + sy).min(px.h - 1) / mh);
+                    sel[r * cols + c] = (by0..=by1).all(|j| (bx0..=bx1).all(|i| is_clean(i, j)));
+                }
+            }
+            tol = tol.max(i32::from(l.tolerance));
+            sel
+        }
+    };
+    let mut samples: Vec<&[u8]> = Vec::new();
+    for r in 0..rows {
+        for c in 0..cols {
+            if sel[r * cols + c] {
+                samples.push(&px.data[((row0 + r) * px.w + col0 + c) * px.ncomp..][..px.ncomp]);
+            }
         }
     }
+    out.covered = samples.len();
+    if px.lossy.is_some() {
+        out.checked = Some(Checked {
+            none: false,
+            col0,
+            row0,
+            cols,
+            rows,
+            bits: sel,
+        });
+    }
+    if samples.is_empty() {
+        return out;
+    }
+    let reference = expected.unwrap_or_else(|| median(&samples, px.ncomp));
+    out.differing = samples
+        .iter()
+        .filter(|s| {
+            reference
+                .iter()
+                .zip(**s)
+                .any(|(a, b)| i32::from(a.abs_diff(*b)) > tol)
+        })
+        .count();
     out
 }
 
-/// Looks at the image of a placement and its masks. Returns the zone to leave out of the render
-/// check when the image is lossy.
+/// The size of an image that is stored as a JPEG.
+fn jpeg_size(doc: &Doc, image: &Source, dict: Option<&Obj>) -> Option<(usize, usize)> {
+    let Source::Object(_) = image else {
+        return None;
+    };
+    let dict = dict?;
+    let filter = match doc.dget(dict, "Filter") {
+        Obj::Name(n) => Some(n.as_str()),
+        Obj::Array(a) => a.last().and_then(|x| doc.resolve(x).name()),
+        _ => None,
+    };
+    if !matches!(filter, Some("DCTDecode" | "DCT")) {
+        return None;
+    }
+    let w = usize::try_from(doc.dget(dict, "Width").int()?).ok()?;
+    let h = usize::try_from(doc.dget(dict, "Height").int()?).ok()?;
+    (w > 0 && h > 0).then_some((w, h))
+}
+
+/// Looks at the image of a placement and its masks. Returns the lossy images, for the render check
+/// to leave out the pixels that their codec changed near the edge.
 fn check_placement(
     doc: &Doc,
     region: &Region,
     ri: usize,
     pl: &Placement,
     rep: &mut Report,
-) -> Option<Zone> {
+) -> Vec<Zone> {
     let [rx0, ry0, rx1, ry1] = region.rect;
     let rect = [rx0.min(rx1), ry0.min(ry1), rx0.max(rx1), ry0.max(ry1)];
     let corners = [
@@ -759,7 +1484,7 @@ fn check_placement(
     ];
     let bbox = bounds(&corners);
     if bbox[2] <= rect[0] || bbox[0] >= rect[2] || bbox[3] <= rect[1] || bbox[1] >= rect[3] {
-        return None;
+        return Vec::new();
     }
     let who = match &pl.image {
         Source::Object(n) => format!("image object {n}"),
@@ -769,11 +1494,13 @@ fn check_placement(
     let mut image_dict: Option<Obj> = None;
     let decoded = match &pl.image {
         Source::Object(n) => {
-            let e = doc.latest(*n)?;
+            let Some(e) = doc.latest(*n) else {
+                return Vec::new();
+            };
             let Some(d) = doc.stream_data(e) else {
                 rep.problems
                     .push(format!("images: {place}: the image has no data"));
-                return None;
+                return Vec::new();
             };
             image_dict = Some(e.value.clone());
             decode_image(doc, &e.value, &d)
@@ -799,7 +1526,26 @@ fn check_placement(
             rep.problems.push(format!(
                 "images: {place} lies over a redaction region and could not be checked: {why}"
             ));
-            return None;
+            // A JPEG that cannot be judged is reported once, as "could not check": the render
+            // check leaves out its pixels, which the codec has changed by an amount that is not
+            // known.
+            return match jpeg_size(doc, &pl.image, image_dict.as_ref()) {
+                Some((w, h)) => vec![Zone {
+                    ctm: pl.ctm,
+                    w,
+                    h,
+                    checked: Checked {
+                        none: true,
+                        col0: 0,
+                        row0: 0,
+                        cols: 0,
+                        rows: 0,
+                        bits: Vec::new(),
+                    },
+                    tolerance: 0,
+                }],
+                None => Vec::new(),
+            };
         }
     };
     let mut sets: Vec<(&str, Pixels)> = vec![("the image", px)];
@@ -812,33 +1558,41 @@ fn check_placement(
                     rep.problems.push(format!(
                         "images: {place} lies over a redaction region and could not be checked: {why}"
                     ));
-                    return None;
+                    return Vec::new();
                 }
             }
         }
     }
     let own = region.tolerance.unwrap_or(0);
-    let mut zone: Option<Zone> = None;
-    for (name, p) in &sets {
+    let mut zones: Vec<Zone> = Vec::new();
+    for (name, p) in sets {
         // The fill is the colour of the image; a mask holds opacities.
-        let fill = if *name == "the image" {
+        let fill = if name == "the image" {
             region.fill
         } else {
             None
         };
-        let r = scan(p, &pl.ctm, rect, own, fill);
-        if let (Some(l), None) = (&p.lossy, &zone) {
-            zone = Some(Zone {
-                bbox,
-                safe: r.safe,
-                tolerance: own.max(l.tolerance.saturating_mul(2)),
-            });
+        let r = scan(&p, &pl.ctm, rect, own, fill);
+        if r.too_large {
+            rep.problems.push(format!(
+                "images: {place}: the region is over more than {MAX_IMAGE_SAMPLES} samples of {name}, which is more than the check keeps track of"
+            ));
+            continue;
         }
-        // One sample is one value whether or not it was redacted. Without the fill colour to
-        // compare with, a region over fewer than two whole samples cannot be checked.
-        if r.covered < 2 && region.fill.is_none() {
+        if let Some(l) = &p.lossy {
+            // A JPEG is compared only where a whole block lies inside the region, and what
+            // lies outside those blocks is left out of the render check: with no block inside,
+            // nothing of it is checked, whether or not the region names its fill.
+            if r.covered == 0 {
+                rep.problems.push(format!(
+                    "images: {place}: {name} is a JPEG that lies over the region, and no whole block of it ({} x {} samples, with the neighbours that take colour from it) lies inside the region, so it cannot be told from the rounding of the codec; make the region cover whole blocks, or store the image without loss",
+                    l.mcu.0, l.mcu.1
+                ));
+            }
+        } else if r.covered < 2 && region.fill.is_none() {
+            // One sample is one value whether or not it was redacted.
             rep.problem(format!(
-                "images: {place}: the region holds {} whole sample(s) of {name}, and one value cannot be told from an image that was not redacted; name the fill colour of the region",
+                "images: {place}: the region holds {} whole sample(s) of {name}, and one value cannot be told from an image that was not redacted; name the fill colour of the region, so that the render is compared with it",
                 r.covered
             ));
         }
@@ -854,8 +1608,17 @@ fn check_placement(
                 form: None,
             });
         }
+        if let (Some(l), Some(checked)) = (&p.lossy, r.checked) {
+            zones.push(Zone {
+                ctm: pl.ctm,
+                w: p.w,
+                h: p.h,
+                checked,
+                tolerance: l.tolerance,
+            });
+        }
     }
-    zone
+    zones
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1099,54 +1862,83 @@ fn check_render(
         return;
     }
     let (lo_x, hi_x, lo_y, hi_y) = (lo_x as usize, hi_x as usize, lo_y as usize, hi_y as usize);
-    // Pixels of a lossy image that its codec changes near an edge are left out.
-    type Skip = ([f64; 4], Option<[f64; 4]>);
-    let skip: Vec<Skip> = zones
+    // Where each lossy image is in the render: device pixel -> position in the unit square of the
+    // image.
+    let to_unit: Vec<Option<M>> = zones
         .iter()
-        .map(|z| (dev(z.bbox), z.safe.map(dev)))
+        .map(|z| {
+            let at = |u: f64, v: f64| {
+                let (x, y) = apply(&z.ctm, u, v);
+                map(x, y)
+            };
+            let (o, ex, ey) = (at(0.0, 0.0), at(1.0, 0.0), at(0.0, 1.0));
+            invert(&[ex.0 - o.0, ex.1 - o.1, ey.0 - o.0, ey.1 - o.1, o.0, o.1])
+        })
         .collect();
-    let inside = |b: &[f64; 4], x: f64, y: f64| x >= b[0] && x <= b[2] && y >= b[1] && y <= b[3];
-    let tolerance = region.tolerance.map(i32::from).unwrap_or_else(|| {
-        zones
-            .iter()
-            .map(|z| i32::from(z.tolerance))
-            .max()
-            .unwrap_or(0)
-    });
-    let mut reference: Option<[u8; 3]> = region.fill;
-    let (mut checked, mut differing) = (0usize, 0usize);
-    let mut first_bad: Option<(usize, usize)> = None;
+    let own = region.tolerance.map_or(0, i32::from);
+    // The pixels to compare, and how far each may be from the others: a pixel of a JPEG may be off
+    // by what its codec makes of a flat block, and a pixel of anything else by the tolerance of the
+    // region. The pixels of a JPEG outside the blocks that were compared (the codec changes those
+    // near the edge of what was blanked) are left out.
+    let mut kept: Vec<(usize, usize, i32)> = Vec::new();
     for y in lo_y..hi_y {
         for x in lo_x..hi_x {
             let (cx, cy) = (x as f64 + 0.5, y as f64 + 0.5);
-            let left_out = skip.iter().any(|(bb, safe)| {
-                inside(bb, cx, cy) && !safe.as_ref().is_some_and(|s| inside(s, cx, cy))
-            });
-            if left_out {
-                continue;
-            }
-            let px = &img.rgb[(y * img.w + x) * 3..][..3];
-            checked += 1;
-            match reference {
-                None => reference = Some([px[0], px[1], px[2]]),
-                Some(r) => {
-                    if r.iter()
-                        .zip(px)
-                        .any(|(a, b)| i32::from(a.abs_diff(*b)) > tolerance)
-                    {
-                        differing += 1;
-                        first_bad.get_or_insert((x, y));
-                    }
+            let mut tol = own;
+            let mut left_out = false;
+            for (z, inv) in zones.iter().zip(&to_unit) {
+                let Some(inv) = inv else { continue };
+                let (u, v) = apply(inv, cx, cy);
+                if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+                    continue;
                 }
+                let col = ((u * z.w as f64) as usize).min(z.w - 1);
+                let row = (((1.0 - v) * z.h as f64) as usize).min(z.h - 1);
+                if z.checked.has(col, row) {
+                    tol = tol.max(i32::from(z.tolerance));
+                } else {
+                    left_out = true;
+                }
+            }
+            if !left_out {
+                kept.push((x, y, tol));
             }
         }
     }
-    if checked == 0 {
+    if kept.is_empty() {
         rep.problems.push(format!(
             "images: {place}: the region lies over a JPEG image whose blocks all straddle its edge, so no pixel of it can be told from the rounding of the codec"
         ));
         return;
     }
+    let reference: [u8; 3] = region.fill.unwrap_or_else(|| {
+        let mut channels: [Vec<u8>; 3] = Default::default();
+        for &(x, y, _) in &kept {
+            let p = &img.rgb[(y * img.w + x) * 3..][..3];
+            for (c, v) in channels.iter_mut().zip(p) {
+                c.push(*v);
+            }
+        }
+        let mid = |v: &mut Vec<u8>| {
+            let m = v.len() / 2;
+            *v.select_nth_unstable(m).1
+        };
+        let [r, g, b] = &mut channels;
+        [mid(r), mid(g), mid(b)]
+    });
+    let (mut differing, mut first_bad) = (0usize, None);
+    for &(x, y, tol) in &kept {
+        let px = &img.rgb[(y * img.w + x) * 3..][..3];
+        if reference
+            .iter()
+            .zip(px)
+            .any(|(a, b)| i32::from(a.abs_diff(*b)) > tol)
+        {
+            differing += 1;
+            first_bad.get_or_insert((x, y));
+        }
+    }
+    let checked = kept.len();
     if differing > 0 {
         let what = if region.fill.is_some() {
             "the fill colour"
@@ -1166,6 +1958,58 @@ fn check_render(
             form: None,
         });
     }
+}
+
+/// Whether two rectangles overlap (they do not when they only touch).
+fn overlaps(a: &[f64; 4], b: &[f64; 4]) -> bool {
+    a[2] > b[0] && a[0] < b[2] && a[3] > b[1] && a[1] < b[3]
+}
+
+/// Geometry that is painted inside a redaction region is in the file whatever its colour, clip,
+/// transparency, blend mode or visibility: a reader that shows it later (a layer turned on, the
+/// fill taken away) shows what was to be redacted. The only geometry allowed there is the box that
+/// redacts: the fill of one rectangle that is the region, within [`BOX_TOLERANCE`], in the fill
+/// colour of the region (or, when the region names none, in any one device colour).
+fn check_paints(paints: &[Painted], region: &Region, ri: usize, rep: &mut Report) {
+    let [rx0, ry0, rx1, ry1] = region.rect;
+    let rect = [rx0.min(rx1), ry0.min(ry1), rx0.max(rx1), ry0.max(ry1)];
+    let is_the_box = |p: &Painted| -> bool {
+        let Some(r) = p.rect else { return false };
+        let same_place = r
+            .iter()
+            .zip(&rect)
+            .all(|(a, b)| (a - b).abs() <= BOX_TOLERANCE);
+        let colour = match (p.colour, region.fill) {
+            (Colour::Rgb(c), Some(f)) => c.iter().zip(&f).all(|(a, b)| a.abs_diff(*b) <= 2),
+            (Colour::Rgb(_), None) => true,
+            (Colour::Other, _) => false,
+        };
+        same_place && colour
+    };
+    let found: Vec<&Painted> = paints
+        .iter()
+        .filter(|p| overlaps(&p.bbox, &rect) && !is_the_box(p))
+        .collect();
+    let Some(first) = found.first() else { return };
+    let mut kinds: Vec<&str> = found.iter().map(|p| p.kind).collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    rep.hits.push(Hit {
+        layer: Layer::Images,
+        subject: Subject::Rule(format!(
+            "painted geometry inside a redaction region: {} object(s) ({}) are painted there, and stay in the file whatever their colour, clip, transparency or visibility; the first is in {} and reaches from ({:.1}, {:.1}) to ({:.1}, {:.1}) points",
+            found.len(),
+            kinds.join(", "),
+            first.place,
+            first.bbox[0],
+            first.bbox[1],
+            first.bbox[2],
+            first.bbox[3]
+        )),
+        offset: None,
+        location: format!("page {}, region {}", region.page, ri + 1),
+        form: None,
+    });
 }
 
 /// Checks the regions against the pages of the normalised copy of a file. `bytes` is that copy.
@@ -1188,16 +2032,24 @@ pub fn check(ctx: &Ctx, bytes: &[u8], rep: &mut Report) -> Result<()> {
             ));
             continue;
         };
-        let mut w = Walker {
-            doc: &doc,
-            out: Vec::new(),
-            problems: Vec::new(),
+        // Nothing is painted outside the media box.
+        let media = numbers(inherited(&doc, page, "MediaBox"), &doc);
+        let container = if media.len() == 4 {
+            [
+                media[0].min(media[2]),
+                media[1].min(media[3]),
+                media[0].max(media[2]),
+                media[1].max(media[3]),
+            ]
+        } else {
+            [f64::MIN, f64::MIN, f64::MAX, f64::MAX]
         };
+        let mut w = Walker::new(&doc, container);
         match contents(&doc, page) {
-            Some(data) => w.content(&data, &doc.resolve(res).clone(), IDENTITY, 0),
-            None => w.problems.push("the page has no content".into()),
+            Ok(data) => w.content(&data, &doc.resolve(res).clone(), IDENTITY, 0),
+            Err(why) => w.problem(why),
         }
-        annotations(&mut w, page);
+        annotations(&mut w, page, container);
         for p in w.problems.drain(..) {
             rep.problems
                 .push(format!("images: page {}: {p}", region.page));
@@ -1205,8 +2057,20 @@ pub fn check(ctx: &Ctx, bytes: &[u8], rep: &mut Report) -> Result<()> {
         let zones: Vec<Zone> = w
             .out
             .iter()
-            .filter_map(|pl| check_placement(&doc, region, ri, pl, rep))
+            .flat_map(|pl| check_placement(&doc, region, ri, pl, rep))
             .collect();
+        check_paints(&w.paints, region, ri, rep);
+        for (rect, sub) in &w.bare {
+            let [rx0, ry0, rx1, ry1] = region.rect;
+            let region_rect = [rx0.min(rx1), ry0.min(ry1), rx0.max(rx1), ry0.max(ry1)];
+            if overlaps(rect, &region_rect) {
+                rep.problem(format!(
+                    "images: page {}, region {}: a {sub} annotation with no appearance stream lies over the region; a viewer draws it from its own entries, which this check does not place, so what it draws was not checked",
+                    region.page,
+                    ri + 1
+                ));
+            }
+        }
         check_render(
             ctx,
             &doc,
@@ -1222,35 +2086,92 @@ pub fn check(ctx: &Ctx, bytes: &[u8], rep: &mut Report) -> Result<()> {
     Ok(())
 }
 
-fn annotations(w: &mut Walker, page: &Entry) {
+/// The streams of an appearance, in every state: `/N`, `/R` and `/D` hold a stream or a dictionary
+/// of streams (one per state, nested as deep as a file makes it).
+fn appearance_streams(doc: &Doc, v: &Obj, out: &mut Vec<u32>, depth: usize) {
+    if depth > 4 {
+        return;
+    }
+    match v {
+        Obj::Ref(n) => match doc.latest(*n) {
+            Some(e) if e.stream.is_some() => {
+                if !out.contains(n) {
+                    out.push(*n);
+                }
+            }
+            Some(e) => appearance_streams(doc, &e.value, out, depth + 1),
+            None => {}
+        },
+        Obj::Dict(d) => d
+            .iter()
+            .for_each(|(_, x)| appearance_streams(doc, x, out, depth + 1)),
+        Obj::Array(a) => a
+            .iter()
+            .for_each(|x| appearance_streams(doc, x, out, depth + 1)),
+        _ => {}
+    }
+}
+
+/// The annotations that draw something of their own, and that a viewer draws from their entries
+/// (`/InkList`, `/L`, `/Vertices`, `/QuadPoints`) when they have no appearance stream.
+const DRAWN_BY_VIEWER: [&str; 12] = [
+    "Ink",
+    "Line",
+    "Square",
+    "Circle",
+    "Polygon",
+    "PolyLine",
+    "Stamp",
+    "Highlight",
+    "Underline",
+    "Squiggly",
+    "StrikeOut",
+    "Caret",
+];
+
+/// Walks every form that a viewer can draw for an annotation: all states of the normal, rollover
+/// and down appearances, and the icons of a widget (`/MK /I`, `/RI`, `/IX`), each fitted to the
+/// rectangle of the annotation as a viewer does.
+fn annotations(w: &mut Walker, page: &Entry, container: [f64; 4]) {
     let doc = w.doc;
     let Obj::Array(annots) = doc.dget(&page.value, "Annots") else {
         return;
     };
     for a in annots {
         let ad = doc.resolve(a);
+        let mut forms: Vec<u32> = Vec::new();
+        if let Some(ap) = ad.get("AP").map(|x| doc.resolve(x)) {
+            for state in ["N", "R", "D"] {
+                if let Some(s) = ap.get(state) {
+                    appearance_streams(doc, s, &mut forms, 0);
+                }
+            }
+        }
+        if let Some(mk) = ad.get("MK").map(|x| doc.resolve(x)) {
+            for icon in ["I", "RI", "IX"] {
+                if let Some(s) = mk.get(icon) {
+                    appearance_streams(doc, s, &mut forms, 0);
+                }
+            }
+        }
         let rect = ad.get("Rect").map(|r| numbers(r, doc)).unwrap_or_default();
-        if rect.len() != 4 {
+        if forms.is_empty() {
+            // No appearance stream: a viewer draws these from their own entries.
+            let sub = doc.dget(ad, "Subtype").name().unwrap_or("");
+            if DRAWN_BY_VIEWER.contains(&sub) && rect.len() == 4 {
+                let r = [
+                    rect[0].min(rect[2]),
+                    rect[1].min(rect[3]),
+                    rect[0].max(rect[2]),
+                    rect[1].max(rect[3]),
+                ];
+                w.bare.push((r, sub.to_owned()));
+            }
             continue;
         }
-        let Some(ap) = ad.get("AP").map(|x| doc.resolve(x)) else {
+        if rect.len() != 4 {
+            w.problem("an annotation with an appearance has no /Rect, so where a viewer draws it is not known".to_owned());
             continue;
-        };
-        let mut forms: Vec<u32> = Vec::new();
-        match ap.get("N") {
-            Some(Obj::Ref(n)) => match doc.latest(*n) {
-                Some(e) if e.stream.is_some() => forms.push(*n),
-                Some(e) => forms.extend(e.value.entries().iter().filter_map(|(_, v)| match v {
-                    Obj::Ref(k) => Some(*k),
-                    _ => None,
-                })),
-                None => {}
-            },
-            Some(Obj::Dict(d)) => forms.extend(d.iter().filter_map(|(_, v)| match v {
-                Obj::Ref(k) => Some(*k),
-                _ => None,
-            })),
-            _ => {}
         }
         for n in forms {
             let Some(e) = doc.latest(n) else { continue };
@@ -1260,6 +2181,9 @@ fn annotations(w: &mut Walker, page: &Entry) {
                 .map(|b| numbers(b, doc))
                 .unwrap_or_default();
             if bbox.len() != 4 {
+                w.problem(format!(
+                    "the appearance form {n} has no /BBox, so where a viewer draws it is not known"
+                ));
                 continue;
             }
             let m = e
@@ -1291,7 +2215,10 @@ fn annotations(w: &mut Walker, page: &Entry) {
                 .get("Resources")
                 .map(|r| doc.resolve(r).clone())
                 .unwrap_or(Obj::Null);
+            w.container = container;
+            w.trail.push("an annotation appearance".to_owned());
             w.xobject_form(n, &res, a_m);
+            w.trail.pop();
         }
     }
 }
@@ -1395,7 +2322,66 @@ mod tests {
         assert_eq!(l.tolerance, 3);
         // A coarser table allows more.
         assert!(jpeg_lossy(&jpeg_head(80, 0x22)).unwrap().tolerance > 10);
-        assert!(jpeg_lossy(b"not a jpeg").is_none());
+        assert!(jpeg_lossy(b"not a jpeg").is_err());
+    }
+
+    /// A DQT segment for the table `id` with this first value, 8 or 16 bits wide.
+    fn dqt(id: u8, first: u16, wide: bool) -> Vec<u8> {
+        let mut seg = vec![id | if wide { 0x10 } else { 0 }];
+        for i in 0..64 {
+            let v = if i == 0 { first } else { 1 };
+            if wide {
+                seg.extend(v.to_be_bytes());
+            } else {
+                seg.push(v as u8);
+            }
+        }
+        let mut out = vec![0xFF, 0xDB];
+        out.extend(u16::try_from(seg.len() + 2).unwrap().to_be_bytes());
+        out.extend(seg);
+        out
+    }
+
+    #[test]
+    fn only_the_tables_that_a_component_uses_count() {
+        let head = jpeg_head(8, 0x11);
+        let base = jpeg_lossy(&head).unwrap().tolerance;
+        for table in [dqt(3, 255, false), dqt(3, 65535, true), dqt(1, 255, false)] {
+            let mut v = head[..2].to_vec();
+            v.extend(&table);
+            v.extend(&head[2..]);
+            assert_eq!(jpeg_lossy(&v).unwrap().tolerance, base);
+        }
+        // A table that a component uses and the file does not define.
+        let mut v = head[..2].to_vec();
+        v.extend(&head[2 + 69..]);
+        assert!(jpeg_lossy(&v).unwrap_err().contains("does not define"));
+        // The table that is used decides, 16 bits or not, and a later definition of it counts.
+        let mut v = head[..2].to_vec();
+        v.extend(dqt(0, 40, true));
+        v.extend(&head[2 + 69..]);
+        assert_eq!(jpeg_lossy(&v).unwrap().tolerance, 9);
+        // A scan header, some entropy coded bytes, and then the definition.
+        let mut late = head[..head.len() - 2].to_vec();
+        late.extend([
+            0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00, 0x12, 0x34,
+        ]);
+        late.extend(dqt(0, 40, false));
+        assert_eq!(jpeg_lossy(&late).unwrap().tolerance, 9);
+    }
+
+    #[test]
+    fn a_tolerance_above_the_cap_is_refused() {
+        let at = |q0: u8| {
+            let mut v = vec![0xFF, 0xD8];
+            v.extend(dqt(0, u16::from(q0), false));
+            v.extend(&jpeg_head(0, 0x11)[2 + 69..]);
+            jpeg_lossy(&v)
+        };
+        // 80 / 16 * 2.8 + 2 = 16: the most that is accepted.
+        assert_eq!(at(80).unwrap().tolerance, JPEG_TOLERANCE_CAP);
+        assert!(at(81).unwrap_err().contains("so coarse"));
+        assert!(at(255).is_err());
     }
 
     #[test]

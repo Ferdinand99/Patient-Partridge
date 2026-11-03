@@ -2,7 +2,7 @@
 //! The structure layer has its own file.
 
 use std::cell::OnceCell;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
@@ -461,8 +461,8 @@ struct Pass<'c, 'r> {
     resolvers: Vec<Resolver>,
     /// The characters that the streams of the current buffer draw.
     drawn: Vec<BTreeSet<char>>,
-    /// The content streams of the current buffer, found from its structure.
-    roles: Vec<HashSet<u32>>,
+    /// What the structure of the current buffer says its streams are.
+    roles: Vec<roles::Roles>,
 }
 
 impl Pass<'_, '_> {
@@ -494,25 +494,36 @@ impl Pass<'_, '_> {
         let mut maybe: BTreeSet<usize> = BTreeSet::new();
         for variant in &dec.variants {
             if let Some(d) = self.drawn.last_mut() {
-                d.extend(textdec::chars_of(variant));
+                d.extend(textdec::chars_of(&variant.text));
             }
-            if on {
-                let r = self.ctx.set.search_decoded_wild(variant);
+            if !on {
+                continue;
+            }
+            // The text in the order of the stream, and in the order of the page: a run that was
+            // drawn first can be read last.
+            let mut texts: Vec<(&[char], &str)> = vec![(&variant.text, "")];
+            if let Some(o) = &variant.ordered {
+                texts.push((o, " (in the order of the page)"));
+            }
+            for (text, how) in texts {
+                let r = self.ctx.set.search_decoded_wild(text);
                 for h in r.hits {
                     found.insert(h.needle);
                     push(
                         self.rep,
                         Layer::Decode,
                         &h,
-                        format!("{place}, read through its fonts"),
+                        format!("{place}, read through its fonts{how}"),
                     );
                 }
-                maybe.extend(r.possible);
+                // A code that a font cannot map may hide a phrase. That is "could not check",
+                // unless another reading of the same font dictionaries leaves no code unmapped.
+                if !variant.cleared {
+                    maybe.extend(r.possible);
+                }
             }
         }
-        // A code that a font cannot map may hide a phrase. That is "could not check", unless some
-        // way to read the fonts leaves no code unmapped.
-        if on && !dec.has_complete_reading {
+        if on {
             for i in maybe.difference(&found) {
                 self.rep.problem(format!(
                     "decode: text in {place} may hold {} behind codes that its fonts cannot map, so it was not checked for it",
@@ -527,7 +538,7 @@ impl Visitor for Pass<'_, '_> {
     fn begin(&mut self, doc: &Doc, _within: &str) {
         self.resolvers.push(Resolver::new(doc));
         self.drawn.push(BTreeSet::new());
-        self.roles.push(roles::content_streams(doc));
+        self.roles.push(roles::of(doc));
     }
 
     fn stream(&mut self, c: &Carved) {
@@ -571,7 +582,7 @@ impl Visitor for Pass<'_, '_> {
             && !c.is_image
             && c.decoded.stopped_at.is_none()
         {
-            let no_roles = HashSet::new();
+            let no_roles = roles::Roles::default();
             match roles::classify(c, self.roles.last().unwrap_or(&no_roles)) {
                 Kind::Content => self.decode_data(c.doc, c.entry, &c.decoded.data, &place),
                 Kind::Other => self.rep.note(format!(

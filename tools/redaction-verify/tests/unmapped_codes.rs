@@ -282,3 +282,115 @@ fn fonts_without_an_encoding_that_read_alike_do_not_multiply() {
     let r = cli(&file(&o), Some(&spec()), &[], &[]);
     assert_eq!(r.code, 0, "{}", r.out);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Another reading clears a gap only when it reads the same font.
+
+/// A file with an orphan stream (object 30) that shows the phrase, as glyph names that tell
+/// nothing, with the font named `name`. Page 1 has a Type 3 font with numbered glyph names under
+/// `/F3`; page 2 has Helvetica under the same name, or the same Type 3 font again.
+fn two_fonts_one_name(name: &str, second_page_font: bool) -> Bytes {
+    let (names, shown) = fonts::type3_for(65, NEEDLE, numbered);
+    let mut o = Objs::new();
+    o.insert(1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec());
+    o.insert(
+        2,
+        b"<< /Type /Pages /Kids [3 0 R 44 0 R] /Count 2 >>".to_vec(),
+    );
+    let page = |font: u32, contents: u32| {
+        format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents {contents} 0 R \
+             /Resources << /Font << /F3 {font} 0 R >> >> >>"
+        )
+        .into_bytes()
+    };
+    o.insert(3, page(20, 4));
+    o.insert(
+        4,
+        stream_obj("", b"BT /F3 12 Tf 72 700 Td (AB) Tj ET", true),
+    );
+    o.insert(44, page(if second_page_font { 5 } else { 20 }, 45));
+    o.insert(
+        45,
+        stream_obj("", b"BT /F3 12 Tf 72 700 Td (Page two) Tj ET", true),
+    );
+    o.insert(
+        5,
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+            .to_vec(),
+    );
+    o.insert(20, fonts::type3_font(65, &names, 22, None));
+    o.insert(22, stream_obj("", b"500 0 d0 0 0 400 400 re f", false));
+    let mut text = format!("BT /{name} 12 Tf 72 600 Td (").into_bytes();
+    text.extend(&shown[1..shown.len() - 1]);
+    text.extend(b") Tj ET");
+    o.insert(30, stream_obj("", &text, true));
+    file(&o)
+}
+
+#[test]
+fn a_reading_with_another_font_does_not_clear_a_gap() {
+    // The only font that the name can mean is the Type 3 font: could not check.
+    let r = cli(
+        &two_fonts_one_name("F3", false),
+        Some(&scrubbed_spec()),
+        &[],
+        &[],
+    );
+    assert_not_checked(&r, "may hold text #0");
+    // The name is also Helvetica on page 2, which reads the same codes as letters without a gap:
+    // that is another font, so it does not make the Type 3 reading certain.
+    let r = cli(
+        &two_fonts_one_name("F3", true),
+        Some(&scrubbed_spec()),
+        &[],
+        &[],
+    );
+    assert_not_checked(&r, "may hold text #0");
+    // A name that is no resource anywhere: every font of the file is tried, and one of them is the
+    // Type 3 font.
+    let r = cli(
+        &two_fonts_one_name("FX", true),
+        Some(&scrubbed_spec()),
+        &[],
+        &[],
+    );
+    assert_not_checked(&r, "may hold text #0");
+}
+
+// ---------------------------------------------------------------------------------------------
+// A map into the private use area says nothing about the glyph.
+
+fn private_use(c: char) -> String {
+    char::from_u32(0xF000 + c as u32).unwrap().to_string()
+}
+
+fn pua_page(shown: &str, hidden: bool) -> Bytes {
+    let probe = Fx::new(b"");
+    let ops = format!("BT /F2 12 Tf 72 600 Td {} Tj ET\n", probe.show(shown));
+    let mut fx = if hidden {
+        Fx::new(BENIGN).hidden(ops.as_bytes())
+    } else {
+        Fx::new(&[BENIGN, ops.as_bytes()].concat())
+    };
+    fx.maps_to = Some(private_use);
+    fx.build()
+}
+
+#[test]
+fn a_map_into_the_private_use_area_is_could_not_check() {
+    for hidden in [true, false] {
+        let r = cli(&pua_page(NEEDLE, hidden), Some(&spec()), &[], &[]);
+        assert_not_checked(&r, "may hold text #0");
+        let r = cli(
+            &pua_page(NEEDLE, hidden),
+            Some(&spec()),
+            &["--only", "decode"],
+            &[],
+        );
+        assert_not_checked(&r, "behind codes that its fonts cannot map");
+    }
+    // Text that is too short to hold the phrase hides nothing.
+    let r = cli(&pua_page("Ola", true), Some(&spec()), &[], &[]);
+    assert_eq!(r.code, 0, "{}", r.out);
+}

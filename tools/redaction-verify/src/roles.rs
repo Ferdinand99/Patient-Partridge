@@ -1,17 +1,39 @@
 //! What a stream is, found from the structure of the file and not from its bytes: a content stream
 //! (a page's `/Contents`, a form XObject, a tiling pattern, an appearance stream, the glyph
-//! procedure of a Type 3 font), an image, a font program, or data of another kind.
+//! procedure of a Type 3 font), an image, a font program, a character map, an ICC profile, or
+//! data of another kind.
 //!
-//! A stream that nothing points to (an orphan, a leftover of an old save) has no role. It is read
-//! as content when it parses as content: the operators outside strings are PDF operators. The
-//! bytes inside a string do not count, because a string may hold any byte. A stream that has
-//! showing operators and does not parse as content is a problem, never a pass.
+//! The role comes first. A stream that the structure makes content is always decoded as content,
+//! whatever bytes or keys it has. A stream that the structure makes a font program, a character
+//! map, an ICC profile or other data is data. Only a stream that nothing points to (an orphan, a
+//! leftover of an old save) has no role, and only then is it judged by what it looks like: its
+//! dictionary and its first bytes may say what it is, and otherwise it is read as content when it
+//! parses as content (the operators outside strings are PDF operators; the bytes inside a string
+//! do not count, because a string may hold any byte). An orphan that shows strings and does not
+//! parse as content is a problem, never a pass.
 
 use std::collections::HashSet;
 
 use crate::carve::{self, Carved};
 use crate::content::{for_each_op, shown};
 use crate::pdfobj::{Doc, Obj};
+
+/// What the structure of a buffer says its streams are.
+#[derive(Debug, Default)]
+pub struct Roles {
+    /// The object numbers of the content streams.
+    pub content: HashSet<u32>,
+    /// The object numbers of font programs, character maps, ICC profiles, metadata and other data.
+    pub data: HashSet<u32>,
+}
+
+/// The roles that the structure of the buffer gives.
+pub fn of(doc: &Doc) -> Roles {
+    Roles {
+        content: content_streams(doc),
+        data: data_streams(doc),
+    }
+}
 
 /// The object numbers of the streams that the structure of the buffer makes content streams.
 pub fn content_streams(doc: &Doc) -> HashSet<u32> {
@@ -24,8 +46,73 @@ pub fn content_streams(doc: &Doc) -> HashSet<u32> {
             out.insert(e.num);
         }
         walk(doc, &e.value, 0, &mut out);
+        // The icons of a widget are forms that a viewer draws in its place.
+        if let Some(mk) = e.value.get("MK") {
+            for key in ["I", "RI", "IX"] {
+                if let Some(icon) = doc.resolve(mk).get(key) {
+                    refs_of(doc, icon, &mut out, 0);
+                }
+            }
+        }
     }
     out
+}
+
+/// Dictionary keys whose values are streams of data, not content.
+const DATA_KEYS: [&str; 10] = [
+    "FontFile",
+    "FontFile2",
+    "FontFile3",
+    "ToUnicode",
+    "CIDToGIDMap",
+    "CIDSet",
+    "Metadata",
+    "JBIG2Globals",
+    "Function",
+    "EF",
+];
+
+/// The object numbers of the streams that the structure of the buffer makes data: font programs,
+/// character maps (`/ToUnicode`, a stream that `/Encoding` names), ICC profiles (`[/ICCBased n 0
+/// R]`), metadata, embedded files and functions.
+pub fn data_streams(doc: &Doc) -> HashSet<u32> {
+    let mut out = HashSet::new();
+    for e in doc.entries() {
+        walk_data(doc, &e.value, 0, &mut out);
+    }
+    out
+}
+
+fn walk_data(doc: &Doc, o: &Obj, depth: usize, out: &mut HashSet<u32>) {
+    if depth > 10 {
+        return;
+    }
+    match o {
+        Obj::Dict(d) => {
+            for (k, v) in d {
+                if DATA_KEYS.contains(&k.as_str()) {
+                    refs_of(doc, v, out, 0);
+                } else if k == "Encoding" {
+                    // A character map is a stream; the encoding of a simple font is a dictionary.
+                    if let Obj::Ref(n) = v {
+                        if doc.latest(*n).is_some_and(|e| e.stream.is_some()) {
+                            out.insert(*n);
+                        }
+                    }
+                }
+                walk_data(doc, v, depth + 1, out);
+            }
+        }
+        Obj::Array(a) => {
+            if a.first().and_then(Obj::name) == Some("ICCBased") {
+                if let Some(Obj::Ref(n)) = a.get(1) {
+                    out.insert(*n);
+                }
+            }
+            a.iter().for_each(|x| walk_data(doc, x, depth + 1, out));
+        }
+        _ => {}
+    }
 }
 
 /// The object numbers a value points to: a reference, an array of references, a reference to an
@@ -185,14 +272,56 @@ fn survey(data: &[u8]) -> (usize, usize, usize) {
     (total, known, showing)
 }
 
-/// The kind of a carved stream. `roles` is [`content_streams`] of the buffer it was found in.
-pub fn classify(c: &Carved, roles: &HashSet<u32>) -> Kind {
+/// Whether the bytes are a character map: after white space and comments, it starts with
+/// `/CIDInit` (the resource header of every `ToUnicode` map and embedded CMap).
+fn starts_like_a_cmap(data: &[u8]) -> bool {
+    let mut i = 0;
+    while i < data.len() {
+        match data[i] {
+            b if crate::strings::is_space(b) => i += 1,
+            b'%' => {
+                while i < data.len() && data[i] != b'\n' && data[i] != b'\r' {
+                    i += 1;
+                }
+            }
+            _ => break,
+        }
+    }
+    data[i..].starts_with(b"/CIDInit")
+}
+
+/// Whether the bytes are an ICC profile: the signature `acsp` at byte 36, and the size that the
+/// header gives in its first four bytes is the size of the data.
+fn is_icc_profile(data: &[u8]) -> bool {
+    data.len() >= 128
+        && &data[36..40] == b"acsp"
+        && u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize == data.len()
+}
+
+/// The kind of a carved stream. `roles` is [`of`] the buffer it was found in.
+///
+/// The structure decides first: a stream with a content role is content, a stream with a data role
+/// is data. Only a stream with no role is looked at: its dictionary, its first bytes, and last of
+/// all its operators.
+pub fn classify(c: &Carved, roles: &Roles) -> Kind {
     if c.is_image {
         return Kind::Image;
     }
     let dict = c.dict;
     let ty = carve::name_value(dict, "/Type");
     let sub = carve::name_value(dict, "/Subtype");
+    let numbered = c.obj.map(|(n, _)| n);
+    if numbered.is_some_and(|n| roles.content.contains(&n))
+        || sub.as_deref() == Some("Form")
+        || carve::key_pos(dict, "/PatternType").is_some()
+    {
+        return Kind::Content;
+    }
+    if numbered.is_some_and(|n| roles.data.contains(&n)) {
+        return Kind::Data;
+    }
+    // No role: an orphan.
+    let data = &c.decoded.data;
     if ty.as_deref().is_some_and(|t| {
         matches!(
             t,
@@ -210,24 +339,11 @@ pub fn classify(c: &Carved, roles: &HashSet<u32>) -> Kind {
         ]
         .iter()
         .any(|k| carve::key_pos(dict, k).is_some())
+        || is_icc_profile(data)
+        || starts_like_a_cmap(data)
+        || data.iter().all(|b| crate::strings::is_space(*b))
     {
         return Kind::Data;
-    }
-    let data = &c.decoded.data;
-    let head = &data[..data.len().min(4096)];
-    // An ICC profile has "acsp" at byte 36; a character map says what it is.
-    if (data.len() >= 40 && &data[36..40] == b"acsp") || head.windows(9).any(|w| w == b"begincmap")
-    {
-        return Kind::Data;
-    }
-    if data.iter().all(|b| crate::strings::is_space(*b)) {
-        return Kind::Data;
-    }
-    let by_role = c.obj.is_some_and(|(n, _)| roles.contains(&n))
-        || sub.as_deref() == Some("Form")
-        || carve::key_pos(dict, "/PatternType").is_some();
-    if by_role {
-        return Kind::Content;
     }
     let (total, known, showing) = survey(data);
     let looks_like_content = total > 0 && known * 10 >= total * 6;
@@ -251,6 +367,35 @@ mod tests {
         data.extend(b") Tj ET\n");
         let (total, known, showing) = survey(&data);
         assert_eq!((total, known, showing), (5, 5, 1));
+    }
+
+    #[test]
+    fn a_character_map_is_told_by_its_header_and_not_by_a_word_in_its_text() {
+        assert!(starts_like_a_cmap(
+            b"/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap"
+        ));
+        assert!(starts_like_a_cmap(
+            b"%!PS-Adobe-3.0 Resource-CMap\n%%Title: x\n\n/CIDInit /ProcSet findresource begin"
+        ));
+        // Page content that shows the word.
+        assert!(!starts_like_a_cmap(
+            b"BT /F1 12 Tf 72 720 Td (How begincmap works) Tj ET"
+        ));
+        assert!(!starts_like_a_cmap(b"q Q /CIDInit"));
+    }
+
+    #[test]
+    fn an_icc_profile_has_its_signature_and_its_size() {
+        let mut profile = vec![0u8; 200];
+        profile[..4].copy_from_slice(&200u32.to_be_bytes());
+        profile[36..40].copy_from_slice(b"acsp");
+        assert!(is_icc_profile(&profile));
+        // The signature in a comment of a content stream is not a profile.
+        let mut text = vec![b'x'; 200];
+        text[36..40].copy_from_slice(b"acsp");
+        assert!(!is_icc_profile(&text));
+        profile[..4].copy_from_slice(&100u32.to_be_bytes());
+        assert!(!is_icc_profile(&profile));
     }
 
     #[test]

@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
-use crate::content::{for_each_op, shown, Op, ShownItem, WORD_SPACE};
+use crate::content::{for_each_op, mul, shown, Matrix, Op, ShownItem, IDENTITY, WORD_SPACE};
 use crate::fonts::{self, Mapper, GAP};
 use crate::pdfobj::{Doc, Entry, Obj};
 
@@ -26,33 +26,125 @@ pub enum Piece {
     },
     /// A word space, a new line or the end of a text object.
     Sep,
+    /// The text position moved (a new text object, `Td`, `TD`, `T*`, `Tm`, `'`, `"`): where the
+    /// next string starts on the page, after the matrix of the page, and the size of the text.
+    /// Hundredths of a point.
+    Pos {
+        x: i64,
+        y: i64,
+        size: i64,
+    },
 }
 
-/// The strings that a content stream shows, with the font that was selected for each.
+/// The graphics state that the text position depends on.
+#[derive(Clone)]
+struct TextState {
+    ctm: Matrix,
+    font: String,
+    size: f64,
+    leading: f64,
+}
+
+fn hundredths(v: f64) -> i64 {
+    if v.is_finite() {
+        (v * 100.0).round().clamp(-1e15, 1e15) as i64
+    } else {
+        0
+    }
+}
+
+/// The strings that a content stream shows, with the font that was selected for each, and where
+/// each run of text starts on the page.
 pub fn pieces(data: &[u8]) -> Vec<Piece> {
     let mut out = Vec::new();
-    let mut font = String::new();
-    let mut stack: Vec<String> = Vec::new();
+    let mut gs = TextState {
+        ctm: IDENTITY,
+        font: String::new(),
+        size: 0.0,
+        leading: 0.0,
+    };
+    let mut stack: Vec<TextState> = Vec::new();
+    let (mut tm, mut tlm) = (IDENTITY, IDENTITY);
+    let at = |tm: &Matrix, gs: &TextState| -> Piece {
+        let m = mul(tm, &gs.ctm);
+        let scale = (m[0] * m[3] - m[1] * m[2]).abs().sqrt();
+        Piece::Pos {
+            x: hundredths(m[4]),
+            y: hundredths(m[5]),
+            size: hundredths(gs.size.abs() * scale),
+        }
+    };
     for_each_op(data, &mut |op: &Op| match op.name {
-        b"q" => stack.push(font.clone()),
+        b"q" => stack.push(gs.clone()),
         b"Q" => {
-            if let Some(f) = stack.pop() {
-                font = f;
+            if let Some(s) = stack.pop() {
+                gs = s;
+            }
+        }
+        b"cm" => {
+            let n = op.nums();
+            if n.len() == 6 {
+                gs.ctm = mul(&[n[0], n[1], n[2], n[3], n[4], n[5]], &gs.ctm);
             }
         }
         b"Tf" => {
             if let Some(n) = op.name_arg() {
-                font = n.iter().map(|b| char::from(*b)).collect();
+                gs.font = n.iter().map(|b| char::from(*b)).collect();
+            }
+            if let Some(s) = op.nums().last() {
+                gs.size = *s;
             }
         }
-        b"BT" | b"ET" | b"Td" | b"TD" | b"T*" | b"Tm" => out.push(Piece::Sep),
+        b"TL" => {
+            if let Some(l) = op.nums().last() {
+                gs.leading = *l;
+            }
+        }
+        b"BT" => {
+            tm = IDENTITY;
+            tlm = IDENTITY;
+            out.push(Piece::Sep);
+            out.push(at(&tm, &gs));
+        }
+        b"ET" => out.push(Piece::Sep),
+        b"Tm" => {
+            let n = op.nums();
+            if n.len() == 6 {
+                tlm = [n[0], n[1], n[2], n[3], n[4], n[5]];
+                tm = tlm;
+            }
+            out.push(Piece::Sep);
+            out.push(at(&tm, &gs));
+        }
+        b"Td" | b"TD" | b"T*" => {
+            let n = op.nums();
+            let (tx, ty) = match op.name {
+                b"T*" => (0.0, -gs.leading),
+                _ if n.len() == 2 => (n[0], n[1]),
+                _ => (0.0, 0.0),
+            };
+            if op.name == b"TD" {
+                gs.leading = -ty;
+            }
+            tlm = mul(&[1.0, 0.0, 0.0, 1.0, tx, ty], &tlm);
+            tm = tlm;
+            out.push(Piece::Sep);
+            out.push(at(&tm, &gs));
+        }
         _ => {
             if let Some(items) = shown(op) {
+                // `'` and `"` move to the next line first.
+                if matches!(op.name, b"'" | b"\"") {
+                    tlm = mul(&[1.0, 0.0, 0.0, 1.0, 0.0, -gs.leading], &tlm);
+                    tm = tlm;
+                    out.push(Piece::Sep);
+                    out.push(at(&tm, &gs));
+                }
                 out.push(Piece::Sep);
                 for it in items {
                     match it {
                         ShownItem::Str(bytes) => out.push(Piece::Show {
-                            font: font.clone(),
+                            font: gs.font.clone(),
                             bytes,
                         }),
                         ShownItem::Kern(k) if k <= WORD_SPACE => out.push(Piece::Sep),
@@ -63,6 +155,82 @@ pub fn pieces(data: &[u8]) -> Vec<Piece> {
         }
     });
     out
+}
+
+/// A run of text that starts at one place on the page.
+struct Group {
+    x: i64,
+    y: i64,
+    size: i64,
+    text: Vec<char>,
+}
+
+fn push_space(text: &mut Vec<char>) {
+    if text.last().is_some_and(|c| *c != ' ') {
+        text.push(' ');
+    }
+}
+
+/// The order of the runs of text as a reader sees them: by line from the top (runs whose starts are
+/// less than a third of a line apart are on one line), and by position along the line.
+fn reading_order(groups: &[Group]) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..groups.len()).collect();
+    idx.sort_by(|a, b| {
+        groups[*b]
+            .y
+            .cmp(&groups[*a].y)
+            .then(groups[*a].x.cmp(&groups[*b].x))
+    });
+    let mut lines: Vec<Vec<usize>> = Vec::new();
+    for i in idx {
+        match lines.last_mut() {
+            Some(line) => {
+                let first = &groups[line[0]];
+                let tolerance = (first.size.max(groups[i].size) / 3).max(100);
+                if (first.y - groups[i].y).abs() <= tolerance {
+                    line.push(i);
+                } else {
+                    lines.push(vec![i]);
+                }
+            }
+            None => lines.push(vec![i]),
+        }
+    }
+    for line in &mut lines {
+        line.sort_by_key(|i| (groups[*i].x, *i));
+    }
+    lines.concat()
+}
+
+/// The runs of text in reading order, joined with a space; `None` when that is the order of the
+/// stream (the search of the stream order has read it already).
+fn ordered_text(groups: &[Group]) -> Option<Vec<char>> {
+    let live: Vec<&Group> = groups
+        .iter()
+        .filter(|g| g.text.iter().any(|c| *c != ' '))
+        .collect();
+    if live.len() < 2 {
+        return None;
+    }
+    let owned: Vec<Group> = live
+        .iter()
+        .map(|g| Group {
+            x: g.x,
+            y: g.y,
+            size: g.size,
+            text: Vec::new(),
+        })
+        .collect();
+    let order = reading_order(&owned);
+    if order.iter().enumerate().all(|(i, o)| i == *o) {
+        return None;
+    }
+    let mut text: Vec<char> = Vec::new();
+    for i in order {
+        push_space(&mut text);
+        text.extend(live[i].text.iter().copied());
+    }
+    Some(text)
 }
 
 /// Which fonts a content stream may use, found in the objects of one buffer.
@@ -179,8 +347,10 @@ impl Resolver {
         }
     }
 
-    /// The ways to read the strings that a stream shows with the font of resource name `name`.
-    pub fn mappers_for(&self, doc: &Doc, entry: Option<&Entry>, name: &str) -> Vec<Mapper> {
+    /// The ways to read the strings that a stream shows with the font of resource name `name`, each
+    /// with the identity of the font dictionary it reads. Readings with the same identity are
+    /// readings of one font (the assumed encoding, read both ways).
+    pub fn mappers_for(&self, doc: &Doc, entry: Option<&Entry>, name: &str) -> Vec<(u64, Mapper)> {
         let mut dicts: Vec<Obj> = Vec::new();
         if let Some(e) = entry {
             if let Some(res) = e.value.get("Resources") {
@@ -199,22 +369,43 @@ impl Resolver {
         if cands.is_empty() {
             cands = self.by_name.get(name).cloned().unwrap_or_default();
         }
-        let mut maps: Vec<Mapper> = cands.iter().flat_map(|c| self.maps_of(doc, c)).collect();
+        let tagged = |objs: &[Obj]| -> Vec<(u64, Mapper)> {
+            objs.iter()
+                .flat_map(|c| {
+                    let id = identity(c);
+                    self.maps_of(doc, c).into_iter().map(move |m| (id, m))
+                })
+                .collect()
+        };
+        let mut maps = tagged(&cands);
         if maps.is_empty() {
-            maps = self
-                .all_fonts
-                .iter()
-                .flat_map(|n| self.maps_of(doc, &Obj::Ref(*n)))
-                .collect();
+            let all: Vec<Obj> = self.all_fonts.iter().map(|n| Obj::Ref(*n)).collect();
+            maps = tagged(&all);
         }
         if maps.is_empty() {
+            // No font at all: one unknown font, read three ways.
             maps = vec![
                 Mapper::Table(Rc::new(fonts::table(fonts::Base::Standard))),
                 Mapper::Table(Rc::new(fonts::table(fonts::Base::WinAnsi))),
                 Mapper::Table(Rc::new(fonts::table(fonts::Base::MacRoman))),
-            ];
+            ]
+            .into_iter()
+            .map(|m| (0, m))
+            .collect();
         }
         maps
+    }
+}
+
+/// Which font dictionary a candidate is: the object number, or a hash of an inline dictionary.
+fn identity(font: &Obj) -> u64 {
+    match font {
+        Obj::Ref(n) => u64::from(*n) + 1,
+        other => {
+            let mut h = DefaultHasher::new();
+            format!("{other:?}").hash(&mut h);
+            h.finish() | 1 << 63
+        }
     }
 }
 
@@ -238,20 +429,29 @@ const MAX_COMBINATIONS: usize = 256;
 /// The most characters that all the ways to read one stream may have together.
 const MAX_CHARS: usize = 8_000_000;
 
+/// One way to read the fonts of a stream.
+pub struct Variant {
+    /// The text in the order of the stream (separators as spaces, unknown characters as GAP).
+    pub text: Vec<char>,
+    /// The same text with its runs sorted by position on the page (lines from the top, then from
+    /// the left). `None` when that is the order of the stream.
+    pub ordered: Option<Vec<char>>,
+    /// Another reading of the same fonts leaves no code unmapped, so the gaps of this one are not
+    /// in doubt. A reading that uses another font dictionary does not count: when the font in use
+    /// is not known, a reading that could hold the phrase is the unsure case.
+    pub cleared: bool,
+}
+
 /// The text of a stream in each way the fonts allow.
 pub struct Decoded {
-    /// One text per way to read the fonts (separators as spaces, unknown characters as GAP).
-    pub variants: Vec<Vec<char>>,
+    pub variants: Vec<Variant>,
     /// Why some text could not be read.
     pub problems: Vec<String>,
-    /// Some way to read the fonts gives a text with no unknown character. Where there is none,
-    /// a phrase may hide behind the characters that a font cannot map.
-    pub has_complete_reading: bool,
 }
 
 /// Reads the pieces of a stream.
 pub fn decode(doc: &Doc, res: &Resolver, entry: Option<&Entry>, pieces: &[Piece]) -> Decoded {
-    let mut maps: BTreeMap<&str, Vec<Mapper>> = BTreeMap::new();
+    let mut maps: BTreeMap<&str, Vec<(u64, Mapper)>> = BTreeMap::new();
     for p in pieces {
         if let Piece::Show { font, .. } = p {
             maps.entry(font.as_str())
@@ -259,9 +459,9 @@ pub fn decode(doc: &Doc, res: &Resolver, entry: Option<&Entry>, pieces: &[Piece]
         }
     }
     let mut problems = Vec::new();
-    let mut usable: Vec<(&str, Vec<&Mapper>)> = Vec::new();
+    let mut usable: Vec<(&str, Vec<(u64, &Mapper)>)> = Vec::new();
     for (name, ms) in &maps {
-        for m in ms {
+        for (_, m) in ms {
             if let Some(why) = m.unknown() {
                 let msg = format!("font /{name}: {why}");
                 if !problems.contains(&msg) {
@@ -279,15 +479,15 @@ pub fn decode(doc: &Doc, res: &Resolver, entry: Option<&Entry>, pieces: &[Piece]
             })
             .collect();
         let mut seen: Vec<u64> = Vec::new();
-        let mut distinct: Vec<&Mapper> = Vec::new();
-        for m in ms.iter().filter(|m| m.unknown().is_none()) {
+        let mut distinct: Vec<(u64, &Mapper)> = Vec::new();
+        for (id, m) in ms.iter().filter(|(_, m)| m.unknown().is_none()) {
             let mut h = DefaultHasher::new();
             for s in &strings {
                 m.decode(s).hash(&mut h);
             }
             if !seen.contains(&h.finish()) {
                 seen.push(h.finish());
-                distinct.push(m);
+                distinct.push((*id, m));
             }
         }
         usable.push((name, distinct));
@@ -299,15 +499,15 @@ pub fn decode(doc: &Doc, res: &Resolver, entry: Option<&Entry>, pieces: &[Piece]
         .iter()
         .try_fold(1usize, |a, c| a.checked_mul(*c))
         .unwrap_or(usize::MAX);
-    // Each way is a text of its own in memory.
+    // Each way is two texts in memory: in the order of the stream and in reading order.
     let size: usize = pieces
         .iter()
         .map(|p| match p {
             Piece::Show { bytes, .. } => bytes.len() + 1,
-            Piece::Sep => 1,
+            Piece::Sep | Piece::Pos { .. } => 1,
         })
         .sum();
-    let allowed = (MAX_CHARS / size.max(1)).clamp(1, MAX_COMBINATIONS);
+    let allowed = (MAX_CHARS / 2 / size.max(1)).clamp(1, MAX_COMBINATIONS);
     let n = if combinations > allowed {
         problems.push(format!(
             "its fonts can be read in {} ways, and only {allowed} were tried",
@@ -321,43 +521,77 @@ pub fn decode(doc: &Doc, res: &Resolver, entry: Option<&Entry>, pieces: &[Piece]
     } else {
         combinations
     };
-    let mut variants = Vec::with_capacity(n);
-    let mut has_complete_reading = false;
+    // (text, ordered text, font dictionaries read, gaps)
+    type Reading = (Vec<char>, Option<Vec<char>>, Vec<u64>, usize);
+    let mut readings: Vec<Reading> = Vec::with_capacity(n);
     for k in 0..n {
         // The candidate of each font in this combination (a number system with one digit per font).
         let mut rest = k;
         let mut pick: HashMap<&str, Option<&Mapper>> = HashMap::new();
+        let mut which: Vec<u64> = Vec::new();
         for ((name, ms), c) in usable.iter().zip(&counts) {
-            pick.insert(*name, ms.get(rest % c).copied());
+            let chosen = ms.get(rest % c);
+            pick.insert(*name, chosen.map(|(_, m)| *m));
+            which.push(chosen.map_or(0, |(id, _)| *id));
             rest /= c;
         }
         let mut text: Vec<char> = Vec::new();
+        let mut groups = vec![Group {
+            x: 0,
+            y: 0,
+            size: 0,
+            text: Vec::new(),
+        }];
         let mut gaps = 0usize;
         for p in pieces {
             match p {
                 Piece::Sep => {
-                    if text.last().is_some_and(|c| *c != ' ') {
-                        text.push(' ');
+                    push_space(&mut text);
+                    if let Some(g) = groups.last_mut() {
+                        push_space(&mut g.text);
                     }
                 }
+                Piece::Pos { x, y, size } => groups.push(Group {
+                    x: *x,
+                    y: *y,
+                    size: *size,
+                    text: Vec::new(),
+                }),
                 Piece::Show { font, bytes } => {
                     let chars = match pick.get(font.as_str()).copied().flatten() {
                         Some(m) => m.decode(bytes),
                         None => vec![GAP; bytes.len()],
                     };
                     gaps += chars.iter().filter(|c| **c == GAP).count();
+                    if let Some(g) = groups.last_mut() {
+                        g.text.extend(chars.iter().copied());
+                    }
                     text.extend(chars);
                 }
             }
         }
-        has_complete_reading |= gaps == 0 && problems.is_empty();
-        variants.push(text);
+        readings.push((text, ordered_text(&groups), which, gaps));
     }
-    Decoded {
-        variants,
-        problems,
-        has_complete_reading,
-    }
+    let complete = |gaps: usize| gaps == 0 && problems.is_empty();
+    let complete_fonts: Vec<Vec<u64>> = readings
+        .iter()
+        .filter(|r| complete(r.3))
+        .map(|r| r.2.clone())
+        .collect();
+    let cleared: Vec<bool> = readings
+        .iter()
+        .map(|r| complete_fonts.contains(&r.2))
+        .collect();
+    let variants = readings
+        .into_iter()
+        .zip(cleared)
+        .map(|((text, ordered, _, _), cleared)| Variant {
+            text,
+            ordered,
+            cleared,
+        })
+        .collect();
+    Decoded { variants, problems }
 }
 
 /// All characters (not white space, not GAP) of a text, for the font check.
@@ -377,14 +611,67 @@ mod tests {
         let p = pieces(b"BT /F1 12 Tf [(Ola)-333(Nordmann)] TJ /F2 12 Tf (x) Tj ET");
         let shown: Vec<_> = p
             .iter()
-            .map(|x| match x {
-                Piece::Show { font, bytes } => format!("{font}:{}", String::from_utf8_lossy(bytes)),
-                Piece::Sep => "_".into(),
+            .filter_map(|x| match x {
+                Piece::Show { font, bytes } => {
+                    Some(format!("{font}:{}", String::from_utf8_lossy(bytes)))
+                }
+                Piece::Sep => Some("_".into()),
+                Piece::Pos { .. } => None,
             })
             .collect();
         assert_eq!(
             shown,
             ["_", "_", "F1:Ola", "_", "F1:Nordmann", "_", "F2:x", "_"]
+        );
+    }
+
+    #[test]
+    fn the_text_position_follows_the_matrices() {
+        let p = pieces(b"q 2 0 0 2 10 20 cm BT /F1 12 Tf 14 TL 5 6 Td (a) Tj T* (b) Tj ET Q");
+        let at: Vec<(i64, i64, i64)> = p
+            .iter()
+            .filter_map(|x| match x {
+                Piece::Pos { x, y, size } => Some((*x, *y, *size)),
+                _ => None,
+            })
+            .collect();
+        // BT: the origin of the page matrix; Td: (5, 6) scaled by 2 and moved; T*: 14 lower, which
+        // is 28 points on the page.
+        assert_eq!(at, [(1000, 2000, 0), (2000, 3200, 2400), (2000, 400, 2400)]);
+    }
+
+    #[test]
+    fn runs_are_read_in_position_order_when_that_differs_from_the_stream() {
+        let groups = |runs: &[(i64, i64, &str)]| -> Vec<Group> {
+            runs.iter()
+                .map(|(x, y, t)| Group {
+                    x: *x * 100,
+                    y: *y * 100,
+                    size: 1200,
+                    text: t.chars().collect(),
+                })
+                .collect()
+        };
+        let text = |g: &[Group]| ordered_text(g).map(|t| t.into_iter().collect::<String>());
+        // The surname is drawn first, to the right of the first name.
+        assert_eq!(
+            text(&groups(&[(110, 600, "Nordmann"), (72, 600, "Ola")])),
+            Some("Ola Nordmann".to_owned())
+        );
+        // A run a little above on the same line stays on the line.
+        assert_eq!(
+            text(&groups(&[(110, 602, "Nordmann"), (72, 600, "Ola")])),
+            Some("Ola Nordmann".to_owned())
+        );
+        // Lines from the top.
+        assert_eq!(
+            text(&groups(&[(72, 500, "second"), (72, 600, "first")])),
+            Some("first second".to_owned())
+        );
+        // Already in order: nothing new to read.
+        assert_eq!(
+            text(&groups(&[(72, 600, "Ola"), (110, 600, "Nordmann")])),
+            None
         );
     }
 }
