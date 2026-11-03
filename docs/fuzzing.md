@@ -36,7 +36,7 @@ PDFium is the prebuilt library from `pdfium.lock.json` (checked against its SHA-
 - Memory errors inside PDFium are found only when they crash the process (a signal, or an abort from an out-of-memory). AddressSanitizer does not check the library's own reads and writes.
 - A PDF that makes PDFium use huge amounts of memory, or hang, ends the fuzz run too. In the app that only ends the engine process of one tab. Such inputs are still worth a look; see "A crash was found" below.
 
-The target checks that the engine code around PDFium (page sizes, text, links, outline, search, bitmap sizes, the limits of the answers) behaves on hostile files, and it is a cheap crash search of PDFium. It does not replace PDFium's own fuzzing. It is also no substitute for a sandbox: the engine is not sandboxed by the operating system yet (see the README), so a bug in PDFium that is not a crash is not found here and is not contained.
+The target checks that the engine code around PDFium (page sizes, text, links, outline, search, bitmap sizes, the limits of the answers) behaves on hostile files, and it is a cheap crash search of PDFium. It does not replace PDFium's own fuzzing. It is also no substitute for a sandbox: the engine is not sandboxed by the operating system yet (see [security.md](security.md)), so a bug in PDFium that is not a crash is not found here and is not contained.
 
 ## Requirements
 
