@@ -889,18 +889,22 @@ pub fn run() {
             app.manage(PositionStore(Mutex::new(Positions::load(positions_file))));
             // The saved signatures are in the local data folder, which does not roam with a Windows
             // profile (the app data folder does), so "kept on this computer only" holds. A file that
-            // an earlier version left in the app data folder is moved here once. On macOS and Linux
-            // both folders are the same one and nothing moves.
+            // an earlier version left in the app data folder is moved here at the start (again at the
+            // next start if that did not work, and removed once the new file is there). On macOS and
+            // Linux both folders are the same one and nothing moves.
             let signatures_file = app
                 .path()
                 .app_local_data_dir()
                 .ok()
                 .map(|dir| dir.join("signatures.json"));
-            if let (Some(to), Ok(earlier)) = (&signatures_file, app.path().app_data_dir()) {
-                sigmarks::move_earlier_file(&earlier.join("signatures.json"), to);
-            }
-            app.manage(SignatureMarkStore(Mutex::new(SignatureMarks::load(
+            let earlier_signatures = app
+                .path()
+                .app_data_dir()
+                .ok()
+                .map(|dir| dir.join("signatures.json"));
+            app.manage(SignatureMarkStore(Mutex::new(SignatureMarks::load_moving(
                 signatures_file,
+                earlier_signatures,
             ))));
             app.manage(Engine(Arc::new(EnginePool::new(
                 engine_config(app),
