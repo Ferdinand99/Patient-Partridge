@@ -1,0 +1,26 @@
+[package]
+name = "redaction-verify"
+version = "0.0.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+repository = "https://github.com/Ferdinand99/Patient-Partridge"
+publish = false
+description = "Independent check that redacted content is gone from a saved PDF. Test and CI tool, not shipped with the app."
+
+# A workspace of its own: the app's `cargo test --workspace` (Windows, macOS) must not need qpdf and
+# Poppler, and nothing here ends up in the app or in THIRD-PARTY-NOTICES.
+[workspace]
+
+[lib]
+name = "redaction_verify"
+path = "src/lib.rs"
+
+[[bin]]
+name = "redaction-verify"
+path = "src/main.rs"
+
+[dependencies]
+flate2 = "=1.1.10"
+sha2 = "=0.11.1"
+serde_json = "=1.0.154"
+tempfile = "=3.27.0"
