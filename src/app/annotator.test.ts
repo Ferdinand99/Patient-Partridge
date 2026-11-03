@@ -365,14 +365,42 @@ describe("changing and removing", () => {
     t.host.answer = "cancel";
     await t.annotator.removeSelected();
     expect(t.host.asked).toEqual(["Delete this annotation?"]);
-    // The words say when it does come back: a step back over a change of the pages loads an older copy.
-    expect(t.host.details[0]).toMatch(/Undo cannot bring it back/);
-    expect(t.host.details[0]).toMatch(/change to the pages made before it/);
+    // The words say what is true: Undo cannot, Redo is cleared, a step back over a delete, a move or
+    // added pages loads an older copy, and a turn or a crop never does.
+    const words = t.host.details[0];
+    expect(words).toMatch(/Undo cannot bring it back/);
+    expect(words).toMatch(/clears Redo/);
+    expect(words).toMatch(/delete, a move or added pages that you made before it loads the document as it was then/);
+    expect(words).toMatch(/a turn or a crop never does/);
     expect(t.calls).toEqual([]);
     t.host.answer = "delete";
     await t.annotator.removeSelected();
     expect(t.calls).toEqual(["remove 0 8"]);
     expect(t.history.dirty).toBe(true);
+  });
+
+  it("clears what could be made again when an annotation is deleted for good, and keeps what can be taken back", async () => {
+    const drawing = annotation({
+      id: 8,
+      kind: "ink",
+      can: { editText: true, recolour: false, move: false, remove: true, restore: false, locked: false },
+    });
+    const t = setup([drawing]);
+    const log: string[] = [];
+    t.history.push({ label: "first", undo: () => void log.push("undo first"), redo: () => void log.push("redo first") });
+    t.history.push({ label: "second", undo: () => void log.push("undo second"), redo: () => void log.push("redo second") });
+    await t.history.undo();
+    expect(t.history.canRedo).toBe(true);
+    t.annotator.select(0, 8);
+    t.host.answer = "delete";
+    await t.annotator.removeSelected();
+    // Redo has nothing to make again; Undo still takes back the edit before the delete.
+    expect(t.history.canRedo).toBe(false);
+    expect(await t.history.redo()).toBe(false);
+    expect(t.history.canUndo).toBe(true);
+    await t.history.undo();
+    expect(log).toEqual(["undo second", "undo first"]);
+    expect(t.history.canRedo).toBe(true);
   });
 
   it("recolours a picked highlight when a colour is chosen, once, and not for the same colour", async () => {

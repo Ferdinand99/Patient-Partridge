@@ -234,7 +234,7 @@ const opsOf = (app: App) => (app as unknown as { pageOps: PageOps }).pageOps;
 const activeOf = (app: App) =>
   (
     app as unknown as {
-      active: { annotator: AnnotatorLike; view: { pageCount: number; invalidatePage(page: number): void }; history: { canUndo: boolean } };
+      active: { annotator: AnnotatorLike; view: { pageCount: number; invalidatePage(page: number): void }; history: { canUndo: boolean; canRedo: boolean } };
     }
   ).active;
 const notices = () => document.querySelectorAll(".notice");
@@ -256,6 +256,104 @@ function slowDelete(pages: ReturnType<typeof fakePages>) {
   pages.pagesDelete.mockImplementationOnce(() => new Promise<PagesChanged>((r) => (finish = r)));
   return { finish: (c: PagesChanged = changed(2, 7)) => finish(c) };
 }
+
+describe("after an annotation of the file is deleted for good", () => {
+  const forever = {
+    id: 3,
+    kind: "other" as const,
+    can: { editText: false, recolour: false, move: false, remove: true, restore: false, locked: false },
+    rect: [10, 10, 40, 40] as [number, number, number, number],
+    color: [0, 0, 0, 255] as [number, number, number, number],
+    text: "",
+    author: "",
+  };
+
+  async function open() {
+    const pages = fakePages();
+    const m = make({ withAnnotations: true, pages: pages as unknown as PageToolsApi });
+    m.annotationCalls.listAnnotations.mockResolvedValue([forever]);
+    await m.app.openPath("/docs/form.pdf");
+    await flush();
+    (m.app as unknown as { setAnnotating(open: boolean): void }).setAnnotating(true);
+    activeOf(m.app).view.invalidatePage(0);
+    await flush();
+    return { ...m, pages };
+  }
+
+  async function deleteForGood(m: Awaited<ReturnType<typeof open>>) {
+    activeOf(m.app).annotator.select(0, 3);
+    const removing = activeOf(m.app).annotator.removeSelected();
+    await flush();
+    document.querySelector<HTMLElement>(".notice .btn-primary")?.click();
+    await removing;
+    await flush();
+  }
+
+  it("cannot be brought back by Redo of a page change that was taken back before", async () => {
+    const m = await open();
+    await opsOf(m.app).remove([2]);
+    await flush();
+    await dismiss();
+    keyOn(document.body, "z", { ctrlKey: true });
+    await flush();
+    expect(m.pages.pagesRestore).toHaveBeenCalledTimes(1);
+    expect(activeOf(m.app).history.canRedo).toBe(true);
+
+    await deleteForGood(m);
+    expect(m.annotationCalls.removeAnnotation).toHaveBeenCalledTimes(1);
+    expect(activeOf(m.app).history.canRedo).toBe(false);
+    keyOn(document.body, "y", { ctrlKey: true });
+    await flush();
+    // Nothing was made again: no copy was loaded a second time, and nothing else was changed.
+    expect(m.pages.pagesRestore).toHaveBeenCalledTimes(1);
+    expect(m.pages.pagesDelete).toHaveBeenCalledTimes(1);
+    expect(m.annotationCalls.restoreAnnotation).not.toHaveBeenCalled();
+  });
+
+  const steps: [string, (m: Awaited<ReturnType<typeof open>>) => Promise<unknown>][] = [
+    ["a delete", (m) => opsOf(m.app).remove([2])],
+    ["a move", (m) => opsOf(m.app).reorder([1, 0, 2], [1])],
+    ["added pages", (m) => opsOf(m.app).insertBlank(1, 612, 792)],
+  ];
+  for (const [name, change] of steps) {
+    it(`still has Undo of ${name} made before it load the document as it was then`, async () => {
+      const m = await open();
+      await change(m);
+      await flush();
+      await dismiss();
+      await deleteForGood(m);
+      expect(m.pages.pagesRestore).not.toHaveBeenCalled();
+      keyOn(document.body, "z", { ctrlKey: true });
+      await flush();
+      expect(m.pages.pagesRestore).toHaveBeenCalledTimes(1);
+      // The annotation is not brought back by a call of its own: it is in the copy that was loaded.
+      expect(m.annotationCalls.restoreAnnotation).not.toHaveBeenCalled();
+      // And what was taken back can be made again, as it was after the delete of the annotation.
+      expect(activeOf(m.app).history.canRedo).toBe(true);
+    });
+  }
+
+  it("does not load a copy when a turn or a crop made before it is taken back", async () => {
+    const m = await open();
+    await opsOf(m.app).rotate([0], 1);
+    await flush();
+    await dismiss();
+    await opsOf(m.app).crop([1], [10, 10, 10, 10]);
+    await flush();
+    await dismiss();
+    await deleteForGood(m);
+    for (let i = 0; i < 2; i++) {
+      keyOn(document.body, "z", { ctrlKey: true });
+      await flush();
+    }
+    expect(m.pages.pagesRestore).not.toHaveBeenCalled();
+    expect(m.pages.pagesRotate).toHaveBeenCalledTimes(2);
+    expect(m.pages.pagesSetBoxes).toHaveBeenCalledTimes(1);
+    expect(m.annotationCalls.restoreAnnotation).not.toHaveBeenCalled();
+    // Taking them back left the annotation deleted: the only call about it is the delete.
+    expect(m.annotationCalls.removeAnnotation).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe("while a page tool works on the document", () => {
   it("holds the annotation tools and the fields, and says why", async () => {

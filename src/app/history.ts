@@ -109,6 +109,18 @@ export class EditHistory {
   }
 
   /**
+   * Forgets what could be made again, without recording an edit. For a change that no edit can take
+   * back: what was taken back before it must not be made again over it. When the saved file was one
+   * of the states that could be made again, nothing matches it any more.
+   */
+  dropRedo(): void {
+    if (this.busy) throw new Error("an undo or redo is still running");
+    if (this.pos === this.edits.length) return;
+    this.edits.length = this.pos;
+    this.changed();
+  }
+
+  /**
    * Takes back the last edit. False when there is nothing to take back or another undo or redo
    * is still running. When the edit fails to undo, the error is passed on and the history stays
    * where it was.

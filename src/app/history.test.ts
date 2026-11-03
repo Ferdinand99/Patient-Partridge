@@ -248,3 +248,64 @@ describe("EditHistory: the state a save wrote", () => {
     expect(h.revision).toBe(saved);
   });
 });
+
+describe("EditHistory: dropRedo", () => {
+  it("forgets what could be made again and keeps what can be taken back", async () => {
+    const h = new EditHistory();
+    const { state, apply } = counter();
+    apply(h, "one", 1);
+    apply(h, "two", 10);
+    await h.undo();
+    expect(h.canRedo).toBe(true);
+    const listener = vi.fn();
+    h.onChange(listener);
+    h.dropRedo();
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(h.canRedo).toBe(false);
+    expect(h.redoLabel).toBeNull();
+    expect(await h.redo()).toBe(false);
+    expect(state.value).toBe(1);
+    expect(h.canUndo).toBe(true);
+    expect(h.undoLabel).toBe("one");
+    // The next edit goes on from where the document is.
+    apply(h, "three", 100);
+    expect(h.undoLabel).toBe("three");
+    expect(h.canRedo).toBe(false);
+  });
+
+  it("does nothing, and says nothing, when there is nothing to make again", () => {
+    const h = new EditHistory();
+    const { apply } = counter();
+    apply(h, "one", 1);
+    const listener = vi.fn();
+    h.onChange(listener);
+    h.dropRedo();
+    expect(listener).not.toHaveBeenCalled();
+    expect(h.canUndo).toBe(true);
+  });
+
+  it("leaves the document counting as changed when the saved file was a state that could be made again", async () => {
+    const h = new EditHistory();
+    const { apply } = counter();
+    apply(h, "one", 1);
+    apply(h, "two", 10);
+    h.markSaved();
+    await h.undo();
+    expect(h.dirty).toBe(true);
+    h.dropRedo();
+    expect(h.dirty).toBe(true);
+    await h.undo();
+    expect(h.dirty).toBe(true);
+  });
+
+  it("is refused while an undo is running", async () => {
+    const h = new EditHistory();
+    let release!: () => void;
+    h.push({ label: "slow", undo: () => new Promise<void>((r) => (release = r)), redo: () => undefined });
+    const running = h.undo();
+    expect(() => h.dropRedo()).toThrow(/still running/);
+    release();
+    await running;
+    expect(h.canRedo).toBe(true);
+  });
+});

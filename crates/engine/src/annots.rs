@@ -1257,8 +1257,12 @@ unsafe fn blank(bindings: &dyn PdfiumLibraryBindings, annotation: FPDF_ANNOTATIO
 /// the author, the rich text and the subject (also of pop-ups). A save leaves out the dictionaries
 /// of a loaded file that nothing refers to any more, but writes those made in this session as
 /// objects nobody refers to, so the words of a note written in this session would stay in the file
-/// with a page that was deleted. Form fields are not touched (the form refers to them, and the page
-/// tools deal with them), and neither are links.
+/// with a page that was deleted. That is not only the notes the engine made: when a page is drawn,
+/// PDFium turns an annotation that the file holds as a dictionary inside the page's array into an
+/// object of its own, which is one made in this session too, and nothing tells that one from an
+/// annotation that came as an object. So every annotation of the pages that go is looked at. Form
+/// fields are not touched (the form refers to them, and the page tools deal with them), and
+/// neither are links.
 ///
 /// An annotation that a page which stays also reaches is left alone, whether the two pages share
 /// the dictionary, share the `/Annots` array, or are the same page listed twice: its words belong
@@ -1324,8 +1328,11 @@ pub fn scrub_pages(
     done
 }
 
-/// How many pages with annotations of the pages that go are open at once in [`scrub_pages`].
-const SCRUB_GROUP: usize = 16;
+/// How many pages with annotations of the pages that go are open at once in [`scrub_pages`]. Every
+/// group looks at each page that stays once, so the pages that stay are read about
+/// `ceil(annotated pages that go / SCRUB_GROUP)` times; a page that is open takes the memory of its
+/// content, which is why the group is not every page that goes.
+const SCRUB_GROUP: usize = 128;
 
 /// Overwrites the annotations of some open pages that go, except those that a page which stays
 /// lists too, and closes the annotations and the pages.

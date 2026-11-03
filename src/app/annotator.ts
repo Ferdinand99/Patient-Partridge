@@ -806,7 +806,10 @@ export class Annotator implements AnnotLayerEvents {
         // Undo cannot bring this back, so there is no edit to take back: an entry whose undo is
         // always refused would stop every earlier edit from being undone. The document counts as
         // changed until it is saved. What was done to it before is skipped when it is undone.
+        // What could be made again goes: a copy of the document kept for a step forward may still
+        // hold the annotation, and making that step would put it back without being asked.
         this.gone.add(`${page}:${id}`);
+        this.history.dropRedo();
         this.history.markUnsaved();
       }
       this.host.announce(`${kindName(a.kind)} deleted.`);
@@ -879,7 +882,8 @@ export class Annotator implements AnnotLayerEvents {
  */
 function deleteWarning(kind: Annotation["kind"]): string {
   const base =
-    "This annotation came with the file, and Undo cannot bring it back. Only taking back a change to the pages made before it can, because that loads the document as it was then. " +
+    "This annotation came with the file, and Undo cannot bring it back. Deleting it also clears Redo. " +
+    "Taking back a delete, a move or added pages that you made before it loads the document as it was then, with the annotation in it; taking back a turn or a crop never does. " +
     "If you delete it and save, the new file does not hold its comment or author. " +
     "This is not redaction: copies and backups made before the save still hold the text.";
   return kind === "other" ? `${base} The words of a text box can stay in the saved file.` : base;
