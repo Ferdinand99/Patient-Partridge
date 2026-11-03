@@ -31,7 +31,7 @@
 //! loads one and keeps the state it leaves, so that the same step can be redone. Rotating and
 //! cropping are taken back by the app with the opposite change and need no snapshot.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::os::raw::{c_int, c_ulong};
 use std::time::{Duration, Instant};
 
@@ -408,29 +408,19 @@ fn usable(b: &[f32; 4]) -> bool {
 
 /// The part of the page that is shown: the crop box inside the media box, in page coordinates, as
 /// `[left, bottom, right, top]`. `None` when the page has no size that can be worked with.
+///
+/// The boxes are those the page is drawn with. A page that has no media box or crop box of its own
+/// takes them from the nodes above it, and PDFium's calls for the media box and the crop box read
+/// the page's own dictionary only: they do not see an inherited box, and a reader that falls back
+/// to a Letter page for a missing media box gets the wrong page. The call for the bounding box of
+/// the page gives the part that is shown, with the boxes of the nodes above taken in and the crop
+/// box cut down to the media box.
 fn visible_box(page: &PdfPage<'_>) -> Option<[f32; 4]> {
-    let media = page
+    let shown = page
         .boundaries()
-        .media()
+        .bounding()
         .ok()
-        .map(|b| rect_of(&b.bounds))
-        .unwrap_or([0.0, 0.0, 612.0, 792.0]);
-    let shown = match page.boundaries().crop().ok().map(|b| rect_of(&b.bounds)) {
-        Some(crop) => {
-            let both = [
-                crop[0].max(media[0]),
-                crop[1].max(media[1]),
-                crop[2].min(media[2]),
-                crop[3].min(media[3]),
-            ];
-            if both[0] < both[2] && both[1] < both[3] {
-                both
-            } else {
-                media
-            }
-        }
-        None => media,
-    };
+        .map(|b| rect_of(&b.bounds))?;
     usable(&shown).then_some(shown)
 }
 
@@ -1013,14 +1003,21 @@ fn changed_with(
 /// under a parent field keeps the value its parent holds. The default value, the tooltip and the
 /// appearance of the fields on the page are cleared as well (see [`clear_widget_text`]). The text
 /// a tag holds for the page (its alternative text) is out of reach and stays in the file.
-fn clear_form_fields(document: &PdfDocument<'_>, index: u32) -> u32 {
+///
+/// `shared` holds the places of the widgets of the page that a page which stays lists too. They are
+/// not touched and not counted: the field they belong to is on show on a page that remains, with
+/// its value and its look.
+fn clear_form_fields(document: &PdfDocument<'_>, index: u32, shared: Option<&HashSet<i32>>) -> u32 {
     let fields = {
         let Ok(page) = document.pages().get(index as PdfPageIndex) else {
             return 0;
         };
         let mut fields = 0;
-        for mut annotation in page.annotations().iter() {
+        for (position, mut annotation) in page.annotations().iter().enumerate() {
             if let Some(field) = annotation.as_form_field_mut() {
+                if shared.is_some_and(|set| set.contains(&(position as i32))) {
+                    continue;
+                }
                 fields += 1;
                 if let Some(text) = field.as_text_field_mut() {
                     let _ = text.set_value("");
@@ -1029,7 +1026,7 @@ fn clear_form_fields(document: &PdfDocument<'_>, index: u32) -> u32 {
         }
         fields
     };
-    clear_widget_text(document, index);
+    clear_widget_text(document, index, shared);
     fields
 }
 
@@ -1042,7 +1039,8 @@ const OBJECT_STRING: i32 = 3;
 /// appearance (the picture of what was typed, which holds the text as drawing instructions): the
 /// default value, the tooltip, the value of fields other than text fields when it is a string, the
 /// rich text value. Fields grouped under a parent keep what the parent holds, which is out of reach.
-fn clear_widget_text(document: &PdfDocument<'_>, index: u32) {
+/// The widgets named in `shared` (see [`clear_form_fields`]) are left as they are.
+fn clear_widget_text(document: &PdfDocument<'_>, index: u32, shared: Option<&HashSet<i32>>) {
     let Some(handle) = raw_document(document) else {
         return;
     };
@@ -1060,7 +1058,8 @@ fn clear_widget_text(document: &PdfDocument<'_>, index: u32) {
             if annotation.is_null() {
                 continue;
             }
-            if bindings.FPDFAnnot_GetSubtype(annotation) == SUBTYPE_WIDGET {
+            let left_alone = shared.is_some_and(|set| set.contains(&position));
+            if !left_alone && bindings.FPDFAnnot_GetSubtype(annotation) == SUBTYPE_WIDGET {
                 for key in ["V", "DV", "TU", "RV"] {
                     if bindings.FPDFAnnot_HasKey(annotation, key) != 0
                         && bindings.FPDFAnnot_GetValueType(annotation, key) == OBJECT_STRING
@@ -1171,8 +1170,12 @@ fn delete(
         // The words of the notes and other annotations of the pages go as well, except those of an
         // annotation that a page which stays also shows.
         crate::annots::scrub_pages(document, &sorted, count as u32, &mut || pace.tick(progress));
+        // A form field that a page which stays also lists is left as it is.
+        let shared = crate::annots::shared_widgets(document, &sorted, count as u32, &mut || {
+            pace.tick(progress)
+        });
         for &index in &sorted {
-            form_fields += clear_form_fields(document, index);
+            form_fields += clear_form_fields(document, index, shared.get(&index));
             pace.step(progress);
         }
         for (i, &index) in sorted.iter().rev().enumerate() {
@@ -1650,6 +1653,9 @@ fn insert_blank(
                 page.boundaries_mut()
                     .set_crop(pdf_rect(&wanted))
                     .map_err(|_| failed("PDFium could not set the box of the new page"))?;
+                if visible_box(&page).is_none_or(|shown| shown != wanted) {
+                    return Err(failed("the new page is not the size that was asked for"));
+                }
             }
         }
         let now = page_sizes(document);
@@ -2030,7 +2036,7 @@ pub fn warm_up(pdfium: &'static Pdfium, source: &PdfDocument<'_>) {
         .pages_mut()
         .create_page_at_index(PdfPagePaperSize::a4(), 0);
     let _ = move_pages(&fresh, &[1], 0);
-    clear_widget_text(&fresh, 0);
+    clear_widget_text(&fresh, 0, None);
     drop_copied_signatures(&fresh);
     if let Ok(mut page) = fresh.pages().get(0) {
         page.set_rotation(PdfPageRenderRotation::Degrees90);

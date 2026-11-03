@@ -1280,52 +1280,58 @@ pub fn scrub_pages(
     };
     let bindings = document.bindings();
     let mut done = 0;
-    // SAFETY: `handle` is the live document's; every page and annotation handle is opened here and
-    // closed before the function returns (an annotation before the page it came from), and PDFium
-    // only gets handles it gave out.
+    // SAFETY: `handle` is the live document's; every page and annotation handle is opened and
+    // closed inside `walk_groups`, and PDFium only gets handles it gave out.
     unsafe {
-        // The pages with annotations to overwrite are kept open a few at a time: a page that has
-        // none is closed at once (a page with a lot on it takes memory while it is open).
-        let mut pages: Vec<FPDF_PAGE> = Vec::new();
-        let mut found: Vec<(FPDF_ANNOTATION, bool)> = Vec::new();
-        for &index in deleted {
-            let page = bindings.FPDF_LoadPage(handle, index as c_int);
-            if page.is_null() {
-                continue;
-            }
-            let before = found.len();
-            let count = bindings.FPDFPage_GetAnnotCount(page).max(0);
-            for position in 0..count {
-                let annotation = bindings.FPDFPage_GetAnnot(page, position);
-                if annotation.is_null() {
-                    continue;
+        walk_groups(
+            bindings,
+            handle,
+            (deleted, total),
+            Listed::Notes,
+            tick,
+            &mut |found| {
+                for entry in found.iter().filter(|entry| !entry.shared) {
+                    blank(bindings, entry.annotation);
+                    done += 1;
                 }
-                let subtype = bindings.FPDFAnnot_GetSubtype(annotation) as u32;
-                if subtype == SUBTYPE_WIDGET || subtype == SUBTYPE_LINK {
-                    bindings.FPDFPage_CloseAnnot(annotation);
-                } else {
-                    found.push((annotation, false));
-                }
-            }
-            if found.len() > before {
-                pages.push(page);
-            } else {
-                bindings.FPDF_ClosePage(page);
-            }
-            tick();
-            if pages.len() >= SCRUB_GROUP {
-                done += scrub_group(
-                    bindings,
-                    handle,
-                    (deleted, total),
-                    (std::mem::take(&mut pages), std::mem::take(&mut found)),
-                    tick,
-                );
-            }
-        }
-        done += scrub_group(bindings, handle, (deleted, total), (pages, found), tick);
+            },
+        );
     }
     done
+}
+
+/// The widgets of the pages that go that a page which stays also lists, as the positions in the
+/// list of annotations of the page that goes, for each page that goes. A widget like that is a
+/// form field that a page which remains shows, with its value and its look, so whoever clears the
+/// fields of the pages that go leaves these alone. `total` and `deleted` are as for
+/// [`scrub_pages`], and so is `tick`.
+pub fn shared_widgets(
+    document: &PdfDocument<'_>,
+    deleted: &[u32],
+    total: u32,
+    tick: &mut dyn FnMut(),
+) -> HashMap<u32, HashSet<i32>> {
+    let mut shared: HashMap<u32, HashSet<i32>> = HashMap::new();
+    let Some(handle) = raw_document(document) else {
+        return shared;
+    };
+    let bindings = document.bindings();
+    // SAFETY: as in `scrub_pages`.
+    unsafe {
+        walk_groups(
+            bindings,
+            handle,
+            (deleted, total),
+            Listed::Widgets,
+            tick,
+            &mut |found| {
+                for entry in found.iter().filter(|entry| entry.shared) {
+                    shared.entry(entry.page).or_default().insert(entry.position);
+                }
+            },
+        );
+    }
+    shared
 }
 
 /// How many pages with annotations of the pages that go are open at once in [`scrub_pages`]. Every
@@ -1334,20 +1340,112 @@ pub fn scrub_pages(
 /// content, which is why the group is not every page that goes.
 const SCRUB_GROUP: usize = 128;
 
-/// Overwrites the annotations of some open pages that go, except those that a page which stays
-/// lists too, and closes the annotations and the pages.
+/// Which annotations of the pages that go a walk looks at.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Listed {
+    /// Everything but form fields and links.
+    Notes,
+    /// Form fields.
+    Widgets,
+}
+
+/// An open annotation of a page that goes.
+struct Found {
+    annotation: FPDF_ANNOTATION,
+    /// The index of the page that goes, and the place of the annotation in its list.
+    page: u32,
+    position: i32,
+    /// True when a page that stays lists the same annotation.
+    shared: bool,
+}
+
+/// Looks at the annotations of the pages that go, a few pages at a time, finds out which of them
+/// a page that stays also lists, and hands each group to `each`. The annotations and the pages are
+/// closed when `each` has returned.
+///
+/// # Safety
+/// `handle` must be the live document of `bindings`.
+unsafe fn walk_groups(
+    bindings: &dyn PdfiumLibraryBindings,
+    handle: FPDF_DOCUMENT,
+    (deleted, total): (&[u32], u32),
+    kind: Listed,
+    tick: &mut dyn FnMut(),
+    each: &mut dyn FnMut(&[Found]),
+) {
+    // The pages with annotations to look at are kept open a few at a time: a page that has none is
+    // closed at once (a page with a lot on it takes memory while it is open).
+    let mut pages: Vec<FPDF_PAGE> = Vec::new();
+    let mut found: Vec<Found> = Vec::new();
+    for &index in deleted {
+        let page = bindings.FPDF_LoadPage(handle, index as c_int);
+        if page.is_null() {
+            continue;
+        }
+        let before = found.len();
+        let count = bindings.FPDFPage_GetAnnotCount(page).max(0);
+        for position in 0..count {
+            let annotation = bindings.FPDFPage_GetAnnot(page, position);
+            if annotation.is_null() {
+                continue;
+            }
+            let subtype = bindings.FPDFAnnot_GetSubtype(annotation) as u32;
+            let wanted = match kind {
+                Listed::Notes => subtype != SUBTYPE_WIDGET && subtype != SUBTYPE_LINK,
+                Listed::Widgets => subtype == SUBTYPE_WIDGET,
+            };
+            if wanted {
+                found.push(Found {
+                    annotation,
+                    page: index,
+                    position,
+                    shared: false,
+                });
+            } else {
+                bindings.FPDFPage_CloseAnnot(annotation);
+            }
+        }
+        if found.len() > before {
+            pages.push(page);
+        } else {
+            bindings.FPDF_ClosePage(page);
+        }
+        tick();
+        if pages.len() >= SCRUB_GROUP {
+            finish_group(
+                bindings,
+                handle,
+                (deleted, total),
+                (std::mem::take(&mut pages), std::mem::take(&mut found)),
+                tick,
+                each,
+            );
+        }
+    }
+    finish_group(
+        bindings,
+        handle,
+        (deleted, total),
+        (pages, found),
+        tick,
+        each,
+    );
+}
+
+/// Marks the open annotations of some open pages that go that a page which stays lists too, hands
+/// them to `each`, and closes the annotations and the pages.
 ///
 /// # Safety
 /// `handle` must be the live document of `bindings`, `pages` open pages of it and `found` open
 /// annotations that belong to those pages.
-unsafe fn scrub_group(
+unsafe fn finish_group(
     bindings: &dyn PdfiumLibraryBindings,
     handle: FPDF_DOCUMENT,
     (deleted, total): (&[u32], u32),
-    (pages, mut found): (Vec<FPDF_PAGE>, Vec<(FPDF_ANNOTATION, bool)>),
+    (pages, mut found): (Vec<FPDF_PAGE>, Vec<Found>),
     tick: &mut dyn FnMut(),
-) -> usize {
-    let mut done = 0;
+    each: &mut dyn FnMut(&[Found]),
+) {
     // A page that stays and lists the same dictionary keeps it.
     if !found.is_empty() {
         for index in 0..total {
@@ -1358,31 +1456,27 @@ unsafe fn scrub_group(
             if page.is_null() {
                 // A page that cannot be read cannot be shown to leave an annotation alone.
                 for entry in found.iter_mut() {
-                    entry.1 = true;
+                    entry.shared = true;
                 }
                 break;
             }
-            for entry in found.iter_mut().filter(|entry| !entry.1) {
-                entry.1 = bindings.FPDFPage_GetAnnotIndex(page, entry.0) >= 0;
+            for entry in found.iter_mut().filter(|entry| !entry.shared) {
+                entry.shared = bindings.FPDFPage_GetAnnotIndex(page, entry.annotation) >= 0;
             }
             bindings.FPDF_ClosePage(page);
             tick();
-            if found.iter().all(|entry| entry.1) {
+            if found.iter().all(|entry| entry.shared) {
                 break;
             }
         }
     }
-    for (annotation, shared) in found {
-        if !shared {
-            blank(bindings, annotation);
-            done += 1;
-        }
-        bindings.FPDFPage_CloseAnnot(annotation);
+    each(&found);
+    for entry in found {
+        bindings.FPDFPage_CloseAnnot(entry.annotation);
     }
     for page in pages {
         bindings.FPDF_ClosePage(page);
     }
-    done
 }
 
 /// Takes the annotation at `position` off the page, with the popup it owns, after overwriting

@@ -1062,3 +1062,62 @@ pub fn turned_root_pdf() -> Vec<u8> {
     ];
     assemble(&objects, "")
 }
+
+/// One page of 400 by 1000 points whose size comes from the page tree: the page has no media box
+/// of its own, the node above it holds it. A page this tall is bigger than the Letter page that a
+/// reader falls back to when it finds no size.
+pub fn inherited_media_box_pdf() -> Vec<u8> {
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 400 1000] >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>"
+            .to_vec(),
+        stream_object("", "BT /F1 24 Tf 20 960 Td (TOP-OF-PAGE) Tj ET"),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+    ];
+    assemble(&objects, "")
+}
+
+/// One page of 300 by 200 points with a media box of its own, under a node that shows only the
+/// part from 50,50 to 250,150 (200 by 100 points) through a crop box the page inherits.
+pub fn inherited_crop_box_pdf() -> Vec<u8> {
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 /CropBox [50 50 250 150] >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>"
+            .to_vec(),
+        stream_object("", "BT /F1 24 Tf 60 90 Td (INHERITED-CROP) Tj ET"),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+    ];
+    assemble(&objects, "")
+}
+
+/// What `shared_widget_pdf` holds in its one field: the typed value, and the text of its look.
+pub const SHARED_WIDGET_VALUE: &str = "SHARED-WIDGET-VALUE";
+pub const SHARED_WIDGET_LOOK: &str = "SHARED-WIDGET-LOOK";
+
+/// Two pages that list the same widget annotation: a text field with a value and a look, one
+/// object that both pages name in `/Annots`.
+pub fn shared_widget_pdf() -> Vec<u8> {
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R /AcroForm 7 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 200 100] >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /Contents 5 0 R /Annots [6 0 R] /Resources << /Font << /F1 8 0 R >> >> >>"
+            .to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /Contents 5 0 R /Annots [6 0 R] /Resources << /Font << /F1 8 0 R >> >> >>"
+            .to_vec(),
+        stream_object("", "BT /F1 12 Tf 10 80 Td (PAGE) Tj ET"),
+        format!(
+            "<< /Type /Annot /Subtype /Widget /FT /Tx /T (name) /V ({SHARED_WIDGET_VALUE}) \
+             /Rect [10 10 190 40] /F 4 /DA (/F1 14 Tf 0 g) /AP << /N 9 0 R >> >>"
+        )
+        .into_bytes(),
+        b"<< /Fields [6 0 R] /DA (/F1 14 Tf 0 g) /DR << /Font << /F1 8 0 R >> >> >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        hex_stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 180 30] /Resources << /Font << /F1 8 0 R >> >>",
+            &format!("BT /F1 14 Tf 2 10 Td ({SHARED_WIDGET_LOOK}) Tj ET"),
+        ),
+    ];
+    assemble(&objects, "")
+}
