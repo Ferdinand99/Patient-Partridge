@@ -5,10 +5,12 @@
 //! message, and the round-trip targets compare what comes out with what went in. The messages
 //! that go past a limit on purpose are in `caps`.
 
+mod author;
 mod caps;
 mod pages;
 mod signatures;
 
+pub use author::*;
 pub use caps::*;
 pub use pages::*;
 pub use signatures::*;
@@ -134,7 +136,7 @@ fn arb_strokes(u: &mut Unstructured) -> Result<Vec<Vec<[f32; 2]>>> {
 /// A request that the encoder writes without cutting anything.
 pub fn arb_request(u: &mut Unstructured) -> Result<Request> {
     let id: u32 = u.arbitrary()?;
-    let body = match u.int_in_range(0..=26u8)? {
+    let body = match u.int_in_range(0..=27u8)? {
         0 => RequestBody::Hello {
             protocol_version: u.arbitrary()?,
         },
@@ -290,7 +292,8 @@ pub fn arb_request(u: &mut Unstructured) -> Result<Request> {
                 u.int_in_range(0..=MAX_UNIX_TIME)?
             },
         },
-        _ => RequestBody::Pages(arb_pages_request(u)?),
+        26 => RequestBody::Pages(arb_pages_request(u)?),
+        _ => RequestBody::Author(arb_author_request(u)?),
     };
     Ok(Request { id, body })
 }
@@ -335,7 +338,7 @@ fn arb_annot(u: &mut Unstructured) -> Result<(AnnotInfo, AnnotInfo)> {
 
 pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
     let id: u32 = u.arbitrary()?;
-    let (sent, expected) = match u.int_in_range(0..=22u8)? {
+    let (sent, expected) = match u.int_in_range(0..=23u8)? {
         0 => {
             let b = ResponseBody::Hello {
                 protocol_version: u.arbitrary()?,
@@ -591,8 +594,12 @@ pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
             };
             (b.clone(), b)
         }
-        _ => {
+        22 => {
             let b = ResponseBody::Pages(arb_pages_response(u)?);
+            (b.clone(), b)
+        }
+        _ => {
+            let b = ResponseBody::Author(arb_author_response(u)?);
             (b.clone(), b)
         }
     };

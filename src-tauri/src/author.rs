@@ -366,7 +366,9 @@ mod tests {
                 ..DesignProps::default()
             },
         };
-        let json = serde_json::to_value(widget_out(w)).unwrap();
+        // As the window gets it: text, read again.
+        let text = serde_json::to_string(&widget_out(w)).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(json["kind"], "radio");
         assert_eq!(json["name"], "a <b>");
         assert_eq!(json["export"], "<script>");

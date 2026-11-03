@@ -534,9 +534,14 @@ fn what_is_not_ours_is_listed_but_left_alone() {
 
 #[test]
 fn encrypted_and_xfa_documents_are_refused() {
-    let enc = String::from_utf8_lossy(&kit::simple_pdf(1))
-        .replace("/Root 1 0 R", "/Root 1 0 R /Encrypt 9 0 R")
-        .into_bytes();
+    // The trailer comes after the table, so a word added to it moves no object.
+    let mut enc = kit::simple_pdf(1);
+    let at = enc
+        .windows(11)
+        .position(|w| w == b"/Root 1 0 R")
+        .expect("a root")
+        + 11;
+    enc.splice(at..at, b" /Encrypt 9 0 R".iter().copied());
     match Author::new(enc, geo(0)) {
         Err(AuthorError::Unsupported(m)) => assert!(m.contains("encrypted"), "{m}"),
         other => panic!("{:?}", other.err()),
@@ -581,5 +586,123 @@ fn damaged_bytes_are_refused_and_never_panic() {
                 let _ = a.finish();
             }
         }
+    }
+}
+
+fn number_at(bytes: &[u8], from: usize) -> (usize, usize) {
+    let end = bytes[from..]
+        .iter()
+        .position(|b| !b.is_ascii_digit())
+        .expect("a number")
+        + from;
+    (
+        std::str::from_utf8(&bytes[from..end])
+            .unwrap()
+            .parse()
+            .unwrap(),
+        end,
+    )
+}
+
+/// The update that was appended to `original`: the bytes before it are untouched, the last line
+/// names a table, the table lists objects that are where it says they are, and the trailer names
+/// the table that was there before.
+fn assert_well_formed(original: &[u8], out: &[u8], previous_table: &str) {
+    assert!(
+        out.starts_with(original),
+        "the bytes it was given were changed"
+    );
+    assert!(out.ends_with(b"%%EOF\n"));
+    let at = out
+        .windows(10)
+        .rposition(|w| w == b"startxref\n")
+        .expect("startxref");
+    let (table, _) = number_at(out, at + 10);
+    assert!(table >= original.len() && table < at);
+    assert!(out[table..].starts_with(b"xref\n"));
+    let mut i = table + 5;
+    let mut seen = 0;
+    while !out[i..].starts_with(b"trailer\n") {
+        let (_, e) = number_at(out, i);
+        let (count, e) = number_at(out, e + 1);
+        i = e + 1;
+        for _ in 0..count {
+            let entry = &out[i..i + 20];
+            assert!(entry.ends_with(b" n \n"));
+            let offset: usize = std::str::from_utf8(&entry[..10]).unwrap().parse().unwrap();
+            let generation: u32 = std::str::from_utf8(&entry[11..16])
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(offset >= original.len() && offset < table);
+            let (number, e) = number_at(out, offset);
+            assert!(
+                out[e..].starts_with(format!(" {generation} obj\n").as_bytes()),
+                "object {number}"
+            );
+            assert!(out[offset..table].windows(7).any(|w| w == b"endobj\n"));
+            i += 20;
+            seen += 1;
+        }
+    }
+    assert!(seen > 0, "an update with no object");
+    let trailer = String::from_utf8_lossy(&out[i..at]).into_owned();
+    assert!(
+        trailer.contains(&format!("/Prev {previous_table}")),
+        "{trailer}"
+    );
+}
+
+#[test]
+fn what_is_appended_is_a_well_formed_update_for_every_kind_of_change() {
+    for bytes in [
+        kit::simple_pdf(2),
+        kit::forms_pdf(),
+        kit::forms_many_pdf(25),
+        kit::turned_pdf(),
+    ] {
+        let previous = {
+            let at = bytes
+                .windows(10)
+                .rposition(|w| w == b"startxref\n")
+                .unwrap();
+            number_at(&bytes, at + 10).0
+        };
+        let mut a = Author::new(bytes.clone(), geo(1)).unwrap();
+        for (name, kind) in [
+            ("t", DesignKind::Text),
+            ("c", DesignKind::Checkbox),
+            ("co", DesignKind::Combo),
+            ("l", DesignKind::List),
+            ("s", DesignKind::Signature),
+        ] {
+            let mut f = field(&format!("new {name}"), kind);
+            f.widgets[0].rect = [10.0 + 20.0 * name.len() as f32, 20.0, 90.0, 40.0];
+            a.apply(&[AuthorOp::Add(f)]).unwrap();
+        }
+        let second = usize::from(a.page_count() > 1) as u32;
+        a.apply(&[
+            AuthorOp::Move {
+                name: "new t".into(),
+                widget: 0,
+                page: second,
+                rect: [20.0, 20.0, 120.0, 40.0],
+            },
+            AuthorOp::Remove {
+                name: "new c".into(),
+            },
+            AuthorOp::Update {
+                name: "new l".into(),
+                new_name: "renamed".into(),
+                props: DesignProps {
+                    choices: vec!["x".into(), "y".into()],
+                    ..DesignProps::default()
+                },
+                exports: vec![],
+            },
+        ])
+        .unwrap();
+        let out = a.finish().unwrap();
+        assert_well_formed(&bytes, &out.bytes, &previous.to_string());
     }
 }

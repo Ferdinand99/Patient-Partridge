@@ -42,6 +42,7 @@ pub fn check_request_caps(request: &Request) {
             assert!(*len as usize <= MAX_SAVE_CHUNK, "piece of {len} bytes");
         }
         RequestBody::Pages(request) => crate::pages::check_pages_request_caps(request),
+        RequestBody::Author(request) => crate::author::check_author_request_caps(request),
         RequestBody::SetFormField { name, value, .. } => {
             assert!(name.len() <= MAX_FORM_NAME, "field name of {} bytes", name.len());
             match value {
@@ -120,6 +121,7 @@ pub fn check_response_caps(response: &Response) {
             assert!(pages.len() <= MAX_PAGES, "{} pages", pages.len());
         }
         ResponseBody::Pages(response) => crate::pages::check_pages_response_caps(response),
+        ResponseBody::Author(response) => crate::author::check_author_response_caps(response),
         ResponseBody::Closed
         | ResponseBody::DocInfo { .. }
         | ResponseBody::Progress { .. }

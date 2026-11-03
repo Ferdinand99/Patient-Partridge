@@ -111,9 +111,9 @@ impl EngineClient {
             |body| match body {
                 ResponseBody::Author(AuthorResponse::Widgets { items })
                     if items.len() <= MAX_LISTED_WIDGETS
-                        && items
-                            .iter()
-                            .all(|w| w.widget < w.widgets.max(1) && w.rect.iter().all(|v| v.is_finite())) =>
+                        && items.iter().all(|w| {
+                            w.widget < w.widgets.max(1) && w.rect.iter().all(|v| v.is_finite())
+                        }) =>
                 {
                     Ok(items)
                 }
@@ -137,5 +137,64 @@ impl EngineClient {
             },
             accept_changed,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use partridge_protocol::{DesignKind, DesignProps};
+
+    fn field(name: &str) -> DesignField {
+        DesignField {
+            name: name.into(),
+            kind: DesignKind::Text,
+            props: DesignProps::default(),
+            widgets: vec![DesignWidget {
+                page: 0,
+                rect: [1.0, 2.0, 30.0, 40.0],
+                export: String::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn a_batch_the_protocol_carries_whole_is_let_through() {
+        let ops = vec![
+            AuthorOp::Add(field("a")),
+            AuthorOp::Remove { name: "a".into() },
+        ];
+        assert!(ops_ok(&ops).is_ok());
+        assert!(ops_ok(&[]).is_ok());
+    }
+
+    #[test]
+    fn what_the_encoder_would_cut_is_refused_before_it_is_sent() {
+        let too_many: Vec<AuthorOp> = (0..=MAX_AUTHOR_OPS)
+            .map(|i| AuthorOp::Remove {
+                name: format!("f{i}"),
+            })
+            .collect();
+        assert!(ops_ok(&too_many).is_err());
+        assert!(ops_ok(&[AuthorOp::Add(field(&"n".repeat(MAX_FORM_NAME + 1)))]).is_err());
+        let mut long_tip = field("a");
+        long_tip.props.tooltip = "t".repeat(MAX_FORM_TOOLTIP + 1);
+        assert!(ops_ok(&[AuthorOp::Add(long_tip)]).is_err());
+        let mut many_choices = field("a");
+        many_choices.props.choices = vec!["c".into(); MAX_FORM_OPTIONS + 1];
+        assert!(ops_ok(&[AuthorOp::Add(many_choices)]).is_err());
+        let mut wide = field("a");
+        wide.widgets = vec![wide.widgets[0].clone(); MAX_AUTHOR_WIDGETS + 1];
+        assert!(ops_ok(&[AuthorOp::Add(wide)]).is_err());
+        let mut not_a_number = field("a");
+        not_a_number.widgets[0].rect[0] = f32::NAN;
+        assert!(ops_ok(&[AuthorOp::Add(not_a_number)]).is_err());
+        assert!(ops_ok(&[AuthorOp::Move {
+            name: "a".into(),
+            widget: 0,
+            page: 0,
+            rect: [0.0, 0.0, f32::INFINITY, 1.0],
+        }])
+        .is_err());
     }
 }

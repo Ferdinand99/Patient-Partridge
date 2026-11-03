@@ -3,6 +3,8 @@
 //! document from bytes, to save it, and to look at a page drawn, and a file the engine reads that a
 //! test can make fail, change or slow down while the document is open.
 
+pub mod designer;
+
 use std::fs::File;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

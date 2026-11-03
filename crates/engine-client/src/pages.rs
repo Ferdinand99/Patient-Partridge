@@ -111,12 +111,7 @@ impl EngineClient {
         what: &str,
         op: impl FnOnce(u32) -> PagesRequest,
     ) -> Result<PagesChanged, ClientError> {
-        self.call(
-            doc,
-            what,
-            |doc| RequestBody::Pages(op(doc)),
-            accept_changed,
-        )
+        self.call(doc, what, |doc| RequestBody::Pages(op(doc)), accept_changed)
     }
 
     /// Removes pages (counted from 0).

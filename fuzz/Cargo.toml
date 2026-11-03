@@ -71,6 +71,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "form_author"
+path = "fuzz_targets/form_author.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "signature_check"
 path = "fuzz_targets/signature_check.rs"
 test = false
