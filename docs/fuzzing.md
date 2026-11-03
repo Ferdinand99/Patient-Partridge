@@ -83,6 +83,21 @@ Run it again after the protocol or the generator changes, and commit what change
 
 A 60 second run finds shallow bugs only. Run the targets for much longer by hand (hours, in the background) before a release.
 
+### Long runs of the engine target
+
+The engine target keeps one engine in one process for the whole run, and PDFium (or its Rust wrapper) keeps some memory after a document with annotations is closed: about 15 to 20 KiB for each stamp, about 3 KiB for each highlight or note, nothing for a document that is only opened and closed. Under AddressSanitizer, with a corpus that adds annotations to every file, the process grows by roughly 60 KiB per execution, and a run of several hours ends with `out-of-memory` at `-rss_limit_mb` even though no single input needs much. The app does not behave this way: it starts a new engine process for each document, so this memory goes away when the document is closed.
+
+For runs longer than about an hour, stop and start the process again every 20 to 30 minutes, with the same corpus folder, so that the memory starts from zero each time:
+
+```sh
+cd fuzz
+for i in $(seq 1 12); do
+  cargo fuzz run engine_open_render corpus/engine_open_render seeds/engine_open_render --     -dict=dictionaries/pdf.dict -max_len=100000 -timeout=30 -rss_limit_mb=3072     -malloc_limit_mb=3072 -max_total_time=1800 || break
+done
+```
+
+The loop stops at the first run that ends with a finding.
+
 ## A crash was found
 
 1. Download the artifact, or take the file from `fuzz/artifacts/<target>/`. From the `fuzz` folder, reproduce it: `cargo fuzz run <target> artifacts/<target>/crash-...`.
@@ -92,6 +107,8 @@ A 60 second run finds shallow bugs only. Run the targets for much longer by hand
    - Engine bugs: a test in `crates/engine/tests/` that writes the minimized PDF to a temporary file and runs it through the engine as the target does. A small input can be put in the test as a byte string; a larger one in a new `crates/engine/tests/data/` folder (keep it small).
 4. Also add the minimized input to the matching `fuzz/seeds/<target>/` folder, so that the CI run replays it. The seed generator removes nothing from that folder, but it must be able to write it again: add the file to `make-seeds` if it should survive a full regeneration.
 5. A crash that is only memory use or time from a hostile PDF in PDFium itself (an abort from out-of-memory, `timeout` or `out-of-memory` reports) cannot be fixed here. The engine runs in its own process, with a memory limit (enforced by the system on Linux and Windows, and by a watch of the app on macOS), so the app survives it. Report it to the PDFium build's upstream and note it in the pull request.
+
+   Before that, replay the file alone (`cargo fuzz run <target> <file> -- -runs=1 -print_final_stats=1`) and read `peak_rss_mb`. If it is small, the input is not what ran out of memory: the process grew over the run (see "Long runs of the engine target"), and the file is only the one that happened to be running when the limit was crossed. Such a report needs no fix and no seed.
 
 ## Adding a target
 
