@@ -28,6 +28,13 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check
+      # The redaction verifier has a workspace of its own (tools/redaction-verify). It is a test
+      # tool and does not ship, but its dependencies are held to the same rules.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check
+          manifest-path: tools/redaction-verify/Cargo.toml
+          arguments: --config deny.toml
 
   npm:
     name: npm audit (packages that ship in the app)

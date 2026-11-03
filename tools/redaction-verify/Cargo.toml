@@ -1,0 +1,43 @@
+[package]
+name = "redaction-verify"
+version = "0.0.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+repository = "https://github.com/Ferdinand99/Patient-Partridge"
+publish = false
+description = "Independent check that redacted content is gone from a saved PDF. Test and CI tool, not shipped with the app."
+
+# A workspace of its own: the app's `cargo test --workspace` (Windows, macOS) must not need qpdf and
+# Poppler, and nothing here ends up in the app or in THIRD-PARTY-NOTICES.
+[workspace]
+
+[lib]
+name = "redaction_verify"
+path = "src/lib.rs"
+
+[[bin]]
+name = "redaction-verify"
+path = "src/main.rs"
+
+# Draws one page with PDFium for the x-ray render. It is a program of its own, so that a PDFium that
+# crashes or hangs on a crafted file ends one render ("could not check") and not the verifier.
+[[bin]]
+name = "redaction-verify-pdfium"
+path = "src/pdfium_helper.rs"
+
+[dependencies]
+flate2 = "=1.1.10"
+sha2 = "=0.11.1"
+serde_json = "=1.0.154"
+tempfile = "=3.27.0"
+jpeg-decoder = { version = "=0.3.2", default-features = false }
+unicode-normalization = "=0.1.26"
+
+# The second renderer of the x-ray check. The same crate, version and PDFium build as the engine of
+# the app (pdfium.lock.json); the library itself is fetched by scripts/fetch-pdfium.mjs.
+pdfium-render = { version = "=0.9.5", default-features = false, features = ["pdfium_8125"] }
+
+# A job object ends a tool and everything that it started, on Windows (already in the lock file
+# through tempfile).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", default-features = false, features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
