@@ -45,6 +45,11 @@ pub fn pdfimages(args: &[&OsStr]) -> Result<Output, Error> {
     run("PDFIMAGES", "pdfimages", args)
 }
 
+/// Poppler's renderer. It draws the pages that the redacted regions are checked on.
+pub fn pdftoppm(args: &[&OsStr]) -> Result<Output, Error> {
+    run("PDFTOPPM", "pdftoppm", args)
+}
+
 /// Versions of the tools, for the report.
 pub fn versions() -> Vec<String> {
     let mut out = Vec::new();

@@ -103,6 +103,16 @@ pub struct BufHit {
     pub form: Form,
 }
 
+/// The result of reading decoded text.
+#[derive(Debug, Clone, Default)]
+pub struct DecodedSearch {
+    /// The phrases that were found.
+    pub hits: Vec<BufHit>,
+    /// The needles that were not found but may be in the text behind characters that a font
+    /// could not tell.
+    pub possible: Vec<usize>,
+}
+
 /// The texts to look for, ready in every encoding.
 #[derive(Debug, Clone)]
 pub struct NeedleSet {
@@ -237,6 +247,60 @@ pub fn find_wild(hay: &[char], pat: &[char]) -> Vec<usize> {
         }
     }
     out
+}
+
+/// How many characters one code that a font cannot map may stand for, at most (a ligature such as
+/// "ffi" is one code and three characters; a code that draws nothing is none).
+pub const GAP_SPAN: usize = 3;
+
+/// Whether `pat` could be in `hay`, if every [`crate::fonts::GAP`] stood for 0 to [`GAP_SPAN`]
+/// characters of the pattern. It is false when there is no gap. This is what decides between
+/// "the text does not hold the phrase" and "the text may hold it, but a font hides it".
+pub fn could_match(hay: &[char], pat: &[char]) -> bool {
+    if pat.is_empty() {
+        return false;
+    }
+    let p = pat.len();
+    // A match that uses a gap lies near it: look at the stretches around the gaps.
+    let mut windows: Vec<(usize, usize)> = Vec::new();
+    for (g, c) in hay.iter().enumerate() {
+        if *c != crate::fonts::GAP {
+            continue;
+        }
+        let (lo, hi) = (g.saturating_sub(p), (g + p + 1).min(hay.len()));
+        match windows.last_mut() {
+            Some(w) if lo <= w.1 => w.1 = w.1.max(hi),
+            _ => windows.push((lo, hi)),
+        }
+    }
+    let mut state = vec![false; p + 1];
+    let mut next = vec![false; p + 1];
+    for (lo, hi) in windows {
+        state.iter_mut().for_each(|x| *x = false);
+        for &h in &hay[lo..hi] {
+            next.iter_mut().for_each(|x| *x = false);
+            next[0] = true;
+            for j in 0..p {
+                if !(state[j] || j == 0) {
+                    continue;
+                }
+                if h == crate::fonts::GAP {
+                    for k in 0..=GAP_SPAN {
+                        if j + k <= p {
+                            next[j + k] = true;
+                        }
+                    }
+                } else if pat[j] == h {
+                    next[j + 1] = true;
+                }
+            }
+            if next[p] {
+                return true;
+            }
+            std::mem::swap(&mut state, &mut next);
+        }
+    }
+    false
 }
 
 /// The text of rich text or XML: tags taken out (replaced by `gap`), entities decoded.
@@ -476,23 +540,35 @@ impl NeedleSet {
     /// is a character the font could not tell. Compared with white space folded and with it
     /// taken out, both sides normalised.
     pub fn search_decoded(&self, text: &[char]) -> Vec<BufHit> {
+        self.search_decoded_wild(text).hits
+    }
+
+    /// Like [`NeedleSet::search_decoded`], and it also says which needles the text may hold
+    /// behind characters that a font could not tell: no hit, but a phrase that would fit if the
+    /// gaps were the right letters. The caller must not call such a text clean.
+    pub fn search_decoded_wild(&self, text: &[char]) -> DecodedSearch {
         let marker = '\u{E000}';
         let joined: String = text
             .iter()
             .map(|c| if *c == crate::fonts::GAP { marker } else { *c })
             .collect();
-        let folded: Vec<char> = fold_norm(&joined)
-            .chars()
-            .map(|c| if c == marker { crate::fonts::GAP } else { c })
-            .collect();
-        let stripped: Vec<char> = strip_norm(&joined.replace(marker, "")).chars().collect();
+        let back = |s: String| -> Vec<char> {
+            s.chars()
+                .map(|c| if c == marker { crate::fonts::GAP } else { c })
+                .collect()
+        };
+        let folded = back(fold_norm(&joined));
+        let stripped = back(strip_norm(&joined));
         let mut out = Vec::new();
+        let mut possible = Vec::new();
         for e in &self.entries {
             let hits = [
                 find_wild(&folded, &e.folded_chars),
                 find_wild(&stripped, &e.stripped_chars),
             ];
+            let mut found = false;
             for off in hits.into_iter().flatten() {
+                found = true;
                 out.push(BufHit {
                     needle: e.index,
                     offset: off,
@@ -502,10 +578,19 @@ impl NeedleSet {
                     },
                 });
             }
+            if !found
+                && (could_match(&folded, &e.folded_chars)
+                    || could_match(&stripped, &e.stripped_chars))
+            {
+                possible.push(e.index);
+            }
         }
         out.sort();
         out.dedup_by_key(|h| h.needle);
-        out
+        DecodedSearch {
+            hits: out,
+            possible,
+        }
     }
 
     /// Searches rich text or XML (`/RC`, XMP): the text with the markup taken out and the
@@ -645,6 +730,60 @@ mod more_tests {
         assert_eq!(find_wild(&hay, &pat), vec![3]);
         let blind = vec![GAP; 12];
         assert!(find_wild(&blind, &pat).is_empty());
+    }
+
+    #[test]
+    fn a_phrase_that_may_hide_behind_gaps_is_possible_not_found() {
+        let set = NeedleSet::new(&[(0, "Ola Nordmann")], Features::default());
+        let text = |s: &str| -> Vec<char> { s.chars().collect() };
+        // All twelve letters unknown: it could be there.
+        let blind = vec![GAP; 12];
+        assert!(set.search_decoded_wild(&blind).hits.is_empty());
+        assert_eq!(set.search_decoded_wild(&blind).possible, [0]);
+        // Two unknown letters after text that does not agree: it cannot be there.
+        assert!(set
+            .search_decoded_wild(&[text("Quarterly report "), vec![GAP, GAP]].concat())
+            .possible
+            .is_empty());
+        // Letters that are known and agree, with gaps for the rest, fit the phrase. (Gaps for
+        // most of it: with half the letters known it is a hit.)
+        let mut some = text("xy");
+        some.extend([GAP; 9]);
+        some.extend(text("ann"));
+        let r = set.search_decoded_wild(&some);
+        assert!(r.hits.is_empty());
+        assert_eq!(r.possible, [0]);
+        let r = set.search_decoded_wild(&text("Ola N\u{FFFD}\u{FFFD}\u{FFFD}mann"));
+        assert_eq!(r.hits.len(), 1);
+        // The same without any gap is no match at all.
+        assert!(set
+            .search_decoded_wild(&text("Ola Nordman"))
+            .possible
+            .is_empty());
+        // A found phrase is a hit, not a possibility.
+        let r = set.search_decoded_wild(&text("x Ola Nordmann y"));
+        assert_eq!(r.hits.len(), 1);
+        assert!(r.possible.is_empty());
+        // White space between letters does not matter, and gaps count in the stripped form too.
+        let mut spaced = text("O l a ");
+        spaced.extend([GAP; 9]);
+        assert_eq!(set.search_decoded_wild(&spaced).possible, [0]);
+    }
+
+    #[test]
+    fn a_gap_counts_in_the_text_with_the_white_space_taken_out() {
+        // Letters set one by one, one of them unknown: only the form without spaces fits.
+        let set = NeedleSet::new(&[(0, "Ola Nordmann")], Features::default());
+        let hay: Vec<char> = "O l a N o r \u{FFFD} m a n n".chars().collect();
+        assert_eq!(set.search_decoded(&hay).len(), 1);
+    }
+
+    #[test]
+    fn a_gap_may_stand_for_a_ligature() {
+        let set = NeedleSet::new(&[(0, "office")], Features::default());
+        // "of" + one unknown code (ffi) + "ce".
+        let r = set.search_decoded_wild(&"of\u{FFFD}ce".chars().collect::<Vec<_>>());
+        assert_eq!(r.possible, [0]);
     }
 
     #[test]

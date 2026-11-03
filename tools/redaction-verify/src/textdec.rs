@@ -229,12 +229,22 @@ fn inherited(doc: &Doc, e: &Entry) -> Option<Obj> {
     None
 }
 
+/// The most ways to read one stream that are tried (every combination of the candidate fonts of
+/// the names it uses). More than that is "could not check".
+const MAX_COMBINATIONS: usize = 256;
+
+/// The most characters that all the ways to read one stream may have together.
+const MAX_CHARS: usize = 8_000_000;
+
 /// The text of a stream in each way the fonts allow.
 pub struct Decoded {
     /// One text per way to read the fonts (separators as spaces, unknown characters as GAP).
     pub variants: Vec<Vec<char>>,
     /// Why some text could not be read.
     pub problems: Vec<String>,
+    /// Some way to read the fonts gives a text with no unknown character. Where there is none,
+    /// a phrase may hide behind the characters that a font cannot map.
+    pub has_complete_reading: bool,
 }
 
 /// Reads the pieces of a stream.
@@ -247,7 +257,7 @@ pub fn decode(doc: &Doc, res: &Resolver, entry: Option<&Entry>, pieces: &[Piece]
         }
     }
     let mut problems = Vec::new();
-    let mut usable: BTreeMap<&str, Vec<&Mapper>> = BTreeMap::new();
+    let mut usable: Vec<(&str, Vec<&Mapper>)> = Vec::new();
     for (name, ms) in &maps {
         for m in ms {
             if let Some(why) = m.unknown() {
@@ -257,14 +267,49 @@ pub fn decode(doc: &Doc, res: &Resolver, entry: Option<&Entry>, pieces: &[Piece]
                 }
             }
         }
-        usable.insert(name, ms.iter().filter(|m| m.unknown().is_none()).collect());
+        usable.push((name, ms.iter().filter(|m| m.unknown().is_none()).collect()));
     }
-    let n = usable.values().map(Vec::len).max().unwrap_or(1).max(1);
+    // Every combination of the candidates of the fonts: with shared resource names in an object
+    // that nothing refers to, any font of that name may be the one in use.
+    let counts: Vec<usize> = usable.iter().map(|(_, m)| m.len().max(1)).collect();
+    let combinations = counts
+        .iter()
+        .try_fold(1usize, |a, c| a.checked_mul(*c))
+        .unwrap_or(usize::MAX);
+    // Each way is a text of its own in memory.
+    let size: usize = pieces
+        .iter()
+        .map(|p| match p {
+            Piece::Show { bytes, .. } => bytes.len() + 1,
+            Piece::Sep => 1,
+        })
+        .sum();
+    let allowed = (MAX_CHARS / size.max(1)).clamp(1, MAX_COMBINATIONS);
+    let n = if combinations > allowed {
+        problems.push(format!(
+            "its fonts can be read in {} ways, and only {allowed} were tried",
+            if combinations == usize::MAX {
+                "too many".to_owned()
+            } else {
+                combinations.to_string()
+            }
+        ));
+        allowed
+    } else {
+        combinations
+    };
     let mut variants = Vec::with_capacity(n);
-    let mut readable = false;
+    let mut has_complete_reading = false;
     for k in 0..n {
+        // The candidate of each font in this combination (a number system with one digit per font).
+        let mut rest = k;
+        let mut pick: HashMap<&str, Option<&Mapper>> = HashMap::new();
+        for ((name, ms), c) in usable.iter().zip(&counts) {
+            pick.insert(*name, ms.get(rest % c).copied());
+            rest /= c;
+        }
         let mut text: Vec<char> = Vec::new();
-        let (mut gaps, mut total) = (0usize, 0usize);
+        let mut gaps = 0usize;
         for p in pieces {
             match p {
                 Piece::Sep => {
@@ -273,27 +318,23 @@ pub fn decode(doc: &Doc, res: &Resolver, entry: Option<&Entry>, pieces: &[Piece]
                     }
                 }
                 Piece::Show { font, bytes } => {
-                    let ms = &usable[font.as_str()];
-                    let chars = if ms.is_empty() {
-                        vec![GAP; bytes.len()]
-                    } else {
-                        ms[k % ms.len()].decode(bytes)
+                    let chars = match pick.get(font.as_str()).copied().flatten() {
+                        Some(m) => m.decode(bytes),
+                        None => vec![GAP; bytes.len()],
                     };
-                    total += chars.len();
                     gaps += chars.iter().filter(|c| **c == GAP).count();
                     text.extend(chars);
                 }
             }
         }
-        if total == 0 || gaps * 2 <= total {
-            readable = true;
-        }
+        has_complete_reading |= gaps == 0 && problems.is_empty();
         variants.push(text);
     }
-    if !readable && problems.is_empty() {
-        problems.push("a font maps most of the codes it is used with to nothing".to_owned());
+    Decoded {
+        variants,
+        problems,
+        has_complete_reading,
     }
-    Decoded { variants, problems }
 }
 
 /// All characters (not white space, not GAP) of a text, for the font check.

@@ -12,11 +12,39 @@
 //! | `decode`    | the text that every content stream shows, read through the fonts of the file      |
 //! | `text`      | what Poppler `pdftotext` reads from the pages                                     |
 //! | `structure` | the decoded strings, names and keys of the document, XMP, and forbidden keys      |
-//! | `images`    | hashes of every image, and the pixels under the redacted regions                  |
+//! | `images`    | hashes of every image, and the redacted regions (rendered, and image by image)   |
 //! | `fonts`     | traces of removed text that stay in a subset font (only when asked for)           |
 //!
 //! Texts are searched as plain bytes, UTF-16 (both byte orders), inside hex strings and escaped
 //! strings, and joined over the operators of one text object.
+//!
+//! The rule above all others: when the check is not sure, it says "could not check" (a problem,
+//! exit status 2), never "clean". A code that a font cannot map, a stream that may be content and
+//! cannot be read, a region too small to render, a mask that cannot be decoded: each is a problem.
+//!
+//! A redacted region is checked twice. The page is rendered by Poppler (`pdftoppm`, an
+//! independent renderer) at [`RENDER_DPI`], and every pixel whose whole square lies inside the
+//! region must have the fill colour of the region (or, when the spec names none, one colour), with
+//! a margin of [`RENDER_MARGIN`] device pixels at the edge left out for anti-aliasing. Then every
+//! image under the region is decoded, with its soft mask and mask, and the samples whose whole
+//! square lies inside the region must be one value. The pixels the region only partly covers are
+//! not looked at by the image check, and the blocks of a JPEG that straddle the edge are not
+//! either. A region too small to leave one pixel after the margin is a problem, and so is a region
+//! over fewer than two whole samples of an image when the spec does not name the fill colour (one
+//! sample is one value, redacted or not).
+//!
+//! Content streams are found from the structure of the file (the contents of a page, forms,
+//! appearances, patterns, Type 3 glyph procedures); a stream that nothing refers to is read as
+//! content when its operators are content operators, whatever bytes its strings hold. A stream
+//! that is neither an image, a font program nor content is listed as a note and checked by the
+//! byte layers only.
+//!
+//! Known limits. A font with no way to Unicode (a composite font without a `ToUnicode` map, an
+//! embedded symbolic font without an encoding, the glyph numbers of a font program) makes the text
+//! shown with it "could not check": the font program is not parsed. A code of a simple font or a
+//! `ToUnicode` map that has no character is read as a gap of up to three characters, and a text
+//! that a gap could turn into a phrase is "could not check" too. Images drawn through a tiling
+//! pattern are seen by the render only, and say so.
 //!
 //! It never calls PDFium and uses no PDF library of the app: the check stays independent of the
 //! code under test. Values to search for are never printed unless asked for; a hit names the
@@ -32,6 +60,7 @@ pub mod fonts;
 mod layers;
 pub mod pdfobj;
 mod regions;
+pub mod roles;
 pub mod search;
 pub mod strings;
 mod structure;
@@ -170,8 +199,15 @@ pub struct Spec {
     pub regions: Vec<Region>,
 }
 
+/// The resolution of the render that checks a region.
+pub const RENDER_DPI: u32 = 144;
+
+/// The device pixels at the edge of a region that the render check leaves out: the edge of a fill
+/// is anti-aliased, and the position of the region can be off by a fraction of a pixel.
+pub const RENDER_MARGIN: usize = 2;
+
 /// A rectangle on a page, in the default user space of the page (points, y up), under which the
-/// pixels of every image must be blank.
+/// pixels of every image must be blank and the rendered page must be the fill colour.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Region {
     /// The page, counted from 1.
@@ -179,8 +215,11 @@ pub struct Region {
     /// `[x0, y0, x1, y1]`.
     pub rect: [f64; 4],
     /// How far a covered pixel may differ from the others, per colour component. The default is
-    /// 0, and a small value for an image stored with a lossy codec.
+    /// 0, and a value derived from the quantisation tables for an image stored as JPEG.
     pub tolerance: Option<u8>,
+    /// The colour the redaction was painted with (red, green, blue). When it is given, the
+    /// rendered pixels must have it; when it is not, they must be of one colour.
+    pub fill: Option<[u8; 3]>,
 }
 
 /// The document-level places that a redaction scrub empties (`/Info` counts as empty when it has
@@ -251,7 +290,8 @@ impl Spec {
     /// Reads a spec from JSON:
     /// `{"text": [..], "metadata": [..], "fields": [..], "bookmarks": [..], "attachments": [..],
     /// "image_sha256": [..], "forbidden_keys": [..], "scrubbed": true, "single_revision": true,
-    /// "regions": [{"page": 1, "rect": [x0, y0, x1, y1], "tolerance": 0}]}`.
+    /// "regions": [{"page": 1, "rect": [x0, y0, x1, y1], "tolerance": 0, "fill": [0, 0, 0]}]}`.
+    /// A fill may also be written `"#RRGGBB"`.
     pub fn from_json(json: &str) -> Result<Spec> {
         let v: serde_json::Value =
             serde_json::from_str(json).map_err(|e| Error(format!("the spec is not JSON: {e}")))?;
@@ -299,6 +339,17 @@ impl Spec {
             }
         }
         Ok(spec)
+    }
+
+    /// A needle named by kind, position and a short digest, as a hit names it (never its value).
+    pub fn label(&self, i: usize) -> String {
+        self.needles.get(i).map_or_else(
+            || format!("needle {i}"),
+            |n| {
+                let digest = carve::sha256_hex(n.value.as_bytes());
+                format!("{} #{i} [sha256 {}]", n.kind.name(), &digest[..8])
+            },
+        )
     }
 
     fn validate(&self) -> Result<()> {
@@ -404,6 +455,9 @@ pub struct Report {
     /// Things that stopped a layer from giving a full answer (a file that qpdf cannot read, a
     /// tool that failed). A report with a problem is not clean.
     pub problems: Vec<String>,
+    /// Things worth knowing that do not change the answer: a stream that is neither an image, a
+    /// font nor content, which only the byte layers looked at.
+    pub notes: Vec<String>,
     pub layers_run: Vec<Layer>,
     /// The tools that did the work, with their versions.
     pub tools: Vec<String>,
@@ -415,6 +469,14 @@ impl Report {
         let m = msg.into();
         if self.problems.len() < 100 && !self.problems.contains(&m) {
             self.problems.push(m);
+        }
+    }
+
+    /// Adds a note once.
+    pub fn note(&mut self, msg: impl Into<String>) {
+        let m = msg.into();
+        if self.notes.len() < 100 && !self.notes.contains(&m) {
+            self.notes.push(m);
         }
     }
 
@@ -481,6 +543,9 @@ impl Report {
         for p in &self.problems {
             out.push_str(&format!("PROBLEM {p}\n"));
         }
+        for n in &self.notes {
+            out.push_str(&format!("NOTE {n}\n"));
+        }
         if self.is_clean() {
             out.push_str(&format!(
                 "clean: nothing found in {}\n",
@@ -541,6 +606,7 @@ pub fn verify(pdf: &Path, spec: &Spec, opts: &Options) -> Result<Report> {
         set: &set,
         password,
         qdf: std::cell::OnceCell::new(),
+        revisions: std::cell::OnceCell::new(),
     };
     let mut report = Report {
         tools: tools::versions(),
@@ -548,6 +614,16 @@ pub fn verify(pdf: &Path, spec: &Spec, opts: &Options) -> Result<Report> {
     };
     layers::run(&ctx, &mut report)?;
     Ok(report)
+}
+
+/// `RRGGBB` or `#RRGGBB`.
+pub fn parse_fill(h: &str) -> Option<[u8; 3]> {
+    let h = h.strip_prefix('#').unwrap_or(h);
+    if h.len() != 6 || !h.is_ascii() {
+        return None;
+    }
+    let c = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok();
+    Some([c(0)?, c(2)?, c(4)?])
 }
 
 fn regions_from_json(val: &serde_json::Value) -> Result<Vec<Region>> {
@@ -573,10 +649,27 @@ fn regions_from_json(val: &serde_json::Value) -> Result<Vec<Region>> {
                 None => None,
                 Some(t) => Some(u8::try_from(t.as_u64().ok_or_else(bad)?).map_err(|_| bad())?),
             };
+            let fill = match o.get("fill") {
+                None => None,
+                Some(serde_json::Value::String(h)) => Some(parse_fill(h).ok_or_else(bad)?),
+                Some(serde_json::Value::Array(a)) => {
+                    let v: Vec<u8> = a
+                        .iter()
+                        .map(|n| {
+                            n.as_u64()
+                                .and_then(|n| u8::try_from(n).ok())
+                                .ok_or_else(bad)
+                        })
+                        .collect::<Result<_>>()?;
+                    Some(<[u8; 3]>::try_from(v).map_err(|_| bad())?)
+                }
+                Some(_) => return Err(bad()),
+            };
             Ok(Region {
                 page: page as usize,
                 rect,
                 tolerance,
+                fill,
             })
         })
         .collect()

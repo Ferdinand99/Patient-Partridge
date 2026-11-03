@@ -8,7 +8,8 @@
 //!   --forbid-key /Key      a key that must be absent or empty
 //!   --scrubbed             forbid the keys a redaction scrub empties, and more than one revision
 //!   --single-revision      one %%EOF and one startxref
-//!   --only L,L / --skip L,L   layers: raw, qdf, carve, text, structure, images
+//!   --only L,L / --skip L,L   layers: raw, qdf, carve, decode, text, structure, images, fonts
+//!   --region P:X0,Y0,X1,Y1[:TOL[:RRGGBB]]   a redacted rectangle of page P, and the colour it was filled with
 //!   --show-values          print the values of hit needles (default: kind, position, digest)
 //! ```
 //!
@@ -34,9 +35,9 @@ fn layers(list: &str) -> Result<Vec<Layer>, String> {
         .collect()
 }
 
-/// `PAGE:X0,Y0,X1,Y1` or `PAGE:X0,Y0,X1,Y1:TOLERANCE`.
+/// `PAGE:X0,Y0,X1,Y1`, with `:TOLERANCE` and `:RRGGBB` (the fill colour) after it if wanted.
 fn region(s: &str) -> Result<Region, String> {
-    let bad = || format!("--region wants PAGE:X0,Y0,X1,Y1[:TOLERANCE], not \"{s}\"");
+    let bad = || format!("--region wants PAGE:X0,Y0,X1,Y1[:TOLERANCE[:RRGGBB]], not \"{s}\"");
     let mut parts = s.split(':');
     let page: usize = parts.next().and_then(|p| p.parse().ok()).ok_or_else(bad)?;
     let rect: Vec<f64> = parts
@@ -47,13 +48,18 @@ fn region(s: &str) -> Result<Region, String> {
         .collect::<Result<_, _>>()?;
     let rect: [f64; 4] = rect.try_into().map_err(|_| bad())?;
     let tolerance = match parts.next() {
-        None => None,
+        None | Some("") => None,
         Some(t) => Some(t.parse().map_err(|_| bad())?),
+    };
+    let fill = match parts.next() {
+        None => None,
+        Some(h) => Some(redaction_verify::parse_fill(h).ok_or_else(bad)?),
     };
     Ok(Region {
         page,
         rect,
         tolerance,
+        fill,
     })
 }
 

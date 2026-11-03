@@ -13,8 +13,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 
+use common::hard_cases::*;
 use common::jpeg::*;
-use common::review::*;
 use common::*;
 
 const SPEC: &str = r#"{"text":["Ola Nordmann"]}"#;
@@ -487,10 +487,22 @@ fn an_image_codec_that_is_not_decoded_over_a_region_is_a_problem() {
     );
     let r = cli(&with_image(jpx.clone()).build(), Some(TOP_HALF), &[], &[]);
     assert_could_not_check(&r, "JPXDecode");
-    // The same image far from the region needs no decoding.
+    // The same image far from the region needs no decoding by the image check. Poppler cannot
+    // draw it either, and says so: the render of the page is not to be trusted, so that is a
+    // problem of its own (and the only one).
     let far = r#"{"regions":[{"page":1,"rect":[300,300,400,400]}]}"#;
     let r = cli(&with_image(jpx).build(), Some(far), &[], &[]);
-    assert_eq!(r.code, 0, "{}", r.out);
+    assert_eq!(r.code, 2, "{}", r.out);
+    assert!(
+        r.problems().iter().all(|p| !p.contains("JPXDecode")),
+        "{}",
+        r.out
+    );
+    assert!(
+        r.problems().iter().any(|p| p.contains("pdftoppm reported")),
+        "{}",
+        r.out
+    );
 }
 
 #[test]
@@ -584,4 +596,145 @@ fn a_region_in_a_file_without_pages_is_a_problem() {
     let spec = r#"{"regions":[{"page":1,"rect":[0,0,10,10]}]}"#;
     let r = cli(&file(&o), Some(spec), &["--only", "images"], &[]);
     assert_could_not_check(&r, "no pages were found");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The render of a region.
+
+const REGION_SPEC: &str = r#"{"regions":[{"page":1,"rect":[72,400,172,500]}]}"#;
+
+/// A stand-in for pdftoppm that writes a line to stderr and then runs the real program.
+fn pdftoppm_with_stderr(dir: &Dir, line: &str) -> PathBuf {
+    let script = format!(
+        "#!/bin/sh\necho \"{line}\" >&2\nexec {} \"$@\"\n",
+        real("pdftoppm")
+    );
+    let p = dir.0.path().join("pdftoppm-stand-in");
+    std::fs::write(&p, script).unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
+
+#[test]
+fn a_render_that_cannot_run_is_an_error() {
+    let r = only(
+        "images",
+        &clean(),
+        REGION_SPEC,
+        &[("PDFTOPPM", "/nonexistent/pdftoppm")],
+    );
+    assert_eq!(r.code, 2, "{}", r.out);
+    assert!(r.out.contains("cannot run"), "{}", r.out);
+}
+
+#[test]
+fn a_render_that_fails_is_a_problem() {
+    let r = only(
+        "images",
+        &clean(),
+        REGION_SPEC,
+        &[("PDFTOPPM", "/bin/false")],
+    );
+    assert_could_not_check(&r, "the render check could not be done: pdftoppm failed");
+    let ok = only("images", &clean(), REGION_SPEC, &[]);
+    assert_eq!(ok.code, 0, "{}", ok.out);
+}
+
+#[test]
+fn poppler_errors_while_drawing_a_page_are_a_problem_even_with_exit_status_0() {
+    let dir = Dir::new();
+    let p = pdftoppm_with_stderr(&dir, "Syntax Error: stand-in");
+    let r = only(
+        "images",
+        &clean(),
+        REGION_SPEC,
+        &[("PDFTOPPM", p.to_str().unwrap())],
+    );
+    assert_could_not_check(&r, "pdftoppm reported: Syntax Error: stand-in");
+}
+
+#[test]
+fn a_render_that_is_not_the_size_of_the_page_is_a_problem() {
+    // A stand-in that asks for another resolution than the verifier does.
+    let dir = Dir::new();
+    let script = format!(
+        "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = 144 ]; then a=72; fi\n  set -- \"$@\" \"$a\"\n  shift\ndone\nexec {} \"$@\"\n",
+        real("pdftoppm")
+    );
+    let p = dir.0.path().join("pdftoppm-other-dpi");
+    std::fs::write(&p, script).unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let r = only(
+        "images",
+        &clean(),
+        REGION_SPEC,
+        &[("PDFTOPPM", p.to_str().unwrap())],
+    );
+    assert_could_not_check(&r, "could not place the region");
+}
+
+#[test]
+fn a_mask_that_cannot_be_read_over_a_region_is_a_problem() {
+    let image = |mask: &str| {
+        with_image(stream_obj(
+            &format!(
+                "/Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceRGB \
+                 /BitsPerComponent 8 {mask}"
+            ),
+            &[7u8; 12],
+            true,
+        ))
+        .build()
+    };
+    // Object 5 is a font dictionary, not a stream. (A reference to nothing is dropped by qpdf from
+    // the copy that the check reads, and Poppler reports it when it draws the page.)
+    let r = cli(&image("/SMask 5 0 R"), Some(TOP_HALF), &[], &[]);
+    assert_could_not_check(&r, "its /SMask is not a stream");
+    let r = cli(&image("/Mask 5 0 R"), Some(TOP_HALF), &[], &[]);
+    assert_could_not_check(&r, "its /Mask is not a stream");
+    let r = cli(&image("/SMask 77 0 R"), Some(TOP_HALF), &[], &[]);
+    assert_eq!(r.code, 2, "{}", r.out);
+    // A colour key is a function of the samples, and needs nothing more.
+    let r = cli(&image("/Mask [0 0 0 0 0 0]"), Some(TOP_HALF), &[], &[]);
+    assert_eq!(r.code, 0, "{}", r.out);
+}
+
+#[test]
+fn a_page_that_is_turned_by_an_odd_angle_is_a_problem() {
+    let mut fx = Fx::new(BENIGN);
+    fx.page_extra.push_str(" /Rotate 45");
+    let r = cli(&fx.build(), Some(REGION_SPEC), &[], &[]);
+    assert_could_not_check(&r, "turned by 45 degrees");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Object streams of an encrypted file.
+
+#[test]
+fn an_object_stream_of_an_encrypted_file_that_no_table_lists_is_a_problem() {
+    let dir = Dir::new();
+    let mut encrypted = encrypt_keep(&dir, &clean(), "");
+    // After the last %%EOF: no cross-reference table lists it, so qpdf cannot decrypt what it holds.
+    encrypted.extend_from_slice(
+        b"\n99 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length 12 >>\nstream\n7 0 << /A 1 >>\nendstream\nendobj\n",
+    );
+    let r = only("carve", &encrypted, SPEC, &[]);
+    assert_could_not_check(&r, "not reached");
+    // The same through the qdf layer, which reads the same copies.
+    let r = only("qdf", &encrypted, SPEC, &[]);
+    assert_could_not_check(&r, "not reached");
+}
+
+#[test]
+fn an_object_stream_that_the_table_uses_is_no_problem_in_an_encrypted_file() {
+    let dir = Dir::new();
+    let packed = object_stream_file(
+        b"/Title (Quarterly report)",
+        b"BT /F1 12 Tf 72 720 Td (x) Tj ET",
+    );
+    let encrypted = encrypt_keep(&dir, &packed, "");
+    for layer in ["carve", "qdf", "decode"] {
+        let r = only(layer, &encrypted, SPEC, &[]);
+        assert_eq!(r.code, 0, "{layer}\n{}", r.out);
+    }
 }

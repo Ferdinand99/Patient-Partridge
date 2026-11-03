@@ -11,7 +11,7 @@ mod common;
 
 use std::collections::BTreeSet;
 
-use common::review::*;
+use common::hard_cases::*;
 use common::*;
 
 fn text_spec(s: &str) -> String {
@@ -446,13 +446,255 @@ fn cases() -> Vec<Case> {
         "an encrypted file with a stream that nothing refers to",
         encrypt_keep(&dir, &g1, ""),
         scrubbed_spec(NEEDLE),
-        Leak(&["carve", "decode"]),
+        Leak(&["qdf", "carve", "decode"]),
     ));
     v.push(case(
         "a stream that is cut at the word endstream",
         endstream_in_data(),
-        spec,
+        spec.clone(),
         Leak(&["qdf"]),
+    ));
+
+    // I11: a string outside the streams, in a revision of an encrypted file that was replaced.
+    let old_info = |title: &[u8]| {
+        let plain = Doc {
+            info: Some([b"/Title (".as_slice(), title, b") /Producer (x)"].concat()),
+            ..Doc::bare()
+        }
+        .build();
+        let encrypted = encrypt_plain_objects(&dir, &plain);
+        append_empty_object(&encrypted, "Info")
+    };
+    v.push(case(
+        "an encrypted file whose old revision has the phrase in its document information",
+        old_info(NEEDLE.as_bytes()),
+        spec.clone(),
+        Leak(&["qdf"]),
+    ));
+    v.push(case(
+        "an encrypted file whose old revision has another title",
+        old_info(b"Ola Norman"),
+        spec.clone(),
+        Clean,
+    ));
+
+    // C3: glyph numbers that are small numbers, written as raw bytes in literal strings. A
+    // content stream that is full of control bytes is content all the same.
+    let low = fonts::codes(3, 1, NEEDLE);
+    let low_font = || {
+        let mut fx = Fx::new(BENIGN);
+        fx.extra
+            .insert(8, packed("", &fonts::cmap(&fonts::bfchar(&low))));
+        fx
+    };
+    let raw_lines: Bytes = ["Nora dam", "an old man", NEEDLE, "Norma lad"]
+        .iter()
+        .enumerate()
+        .flat_map(|(i, t)| {
+            let mut l = format!("BT /F2 12 Tf 72 {} Td ", 600 - 14 * i).into_bytes();
+            l.extend(fonts::raw_literal(&low, t));
+            l.extend(b" Tj ET\n");
+            l
+        })
+        .collect();
+    assert!(
+        raw_lines.iter().filter(|b| **b < 9).count() * 20 > raw_lines.len(),
+        "the content is binary"
+    );
+    v.push(case(
+        "CID codes as raw bytes in literal strings, hidden",
+        low_font().hidden(&raw_lines).build(),
+        spec.clone(),
+        Leak(&["decode"]),
+    ));
+    let mut fx = low_font();
+    fx.extra.insert(13, stream_obj("", &raw_lines, true));
+    v.push(case(
+        "CID codes as raw bytes in an object that nothing refers to",
+        fx.build(),
+        scrubbed_spec(NEEDLE),
+        Leak(&["decode"]),
+    ));
+    v.push(case(
+        "CID codes as raw bytes in literal strings, drawn",
+        {
+            let mut fx = Fx::new(&[BENIGN, &raw_lines].concat());
+            fx.extra
+                .insert(8, packed("", &fonts::cmap(&fonts::bfchar(&low))));
+            fx.build()
+        },
+        spec.clone(),
+        Leak(&["decode", "text"]),
+    ));
+    let octal = [
+        b"BT /F2 12 Tf 72 600 Td ".as_slice(),
+        &fonts::octal_literal(&low, NEEDLE),
+        b" Tj ET\n",
+    ]
+    .concat();
+    v.push(case(
+        "CID codes as octal escapes, hidden",
+        low_font().hidden(&octal).build(),
+        spec.clone(),
+        Leak(&["decode"]),
+    ));
+    let near_raw: Bytes = [
+        b"BT /F2 12 Tf 72 600 Td ".as_slice(),
+        &fonts::raw_literal(&low, "Ola Norman"),
+        b" Tj ET\n",
+    ]
+    .concat();
+    v.push(case(
+        "CID codes as raw bytes that spell a near miss",
+        low_font().hidden(&near_raw).build(),
+        spec.clone(),
+        Clean,
+    ));
+    // A stream of binary data that is no content: only the byte layers look at it.
+    let junk: Bytes = (0..3000u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8)
+        .collect();
+    let mut fx = Fx::new(BENIGN);
+    fx.extra.insert(13, stream_obj("", &junk, false));
+    v.push(case(
+        "a stream of binary data that is neither image, font nor content",
+        fx.build(),
+        scrubbed_spec(NEEDLE),
+        Clean,
+    ));
+
+    // I8: a single code inside a range of a character map.
+    let over = |c: char| -> u16 { 0x0100 + c as u16 };
+    let over_table: Vec<(u16, char)> = fonts::codes(0, 1, NEEDLE)
+        .into_iter()
+        .map(|(_, c)| (over(c), c))
+        .collect();
+    let range = "1 beginbfrange\n<0100> <01FF> <0000>\nendbfrange\n";
+    let single = "1 beginbfchar\n<0130> <0030>\nendbfchar\n";
+    let over_font = |body: String| {
+        let mut fx = Fx::new(BENIGN);
+        fx.extra.insert(8, packed("", &fonts::cmap(&body)));
+        fx
+    };
+    let over_ops = format!(
+        "BT /F2 12 Tf 72 600 Td {} Tj ET\n",
+        fonts::hex_codes(&over_table, NEEDLE)
+    )
+    .into_bytes();
+    v.push(case(
+        "a code inside a range of the character map, hidden",
+        over_font(format!("{single}{range}"))
+            .hidden(&over_ops)
+            .build(),
+        spec.clone(),
+        Leak(&["decode"]),
+    ));
+    v.push(case(
+        "a code inside a range of the character map, the range comes later",
+        over_font(format!("{range}{single}"))
+            .hidden(&over_ops)
+            .build(),
+        spec.clone(),
+        Leak(&["decode"]),
+    ));
+    v.push(case(
+        "a code inside a range of the character map, drawn",
+        {
+            let mut fx = over_font(format!("{single}{range}"));
+            fx.content = [BENIGN, &over_ops].concat();
+            fx.build()
+        },
+        spec.clone(),
+        Leak(&["decode", "text"]),
+    ));
+
+    // I7: Type 3 fonts, which name their glyphs.
+    let proc = stream_obj("", b"500 0 d0 0 0 400 400 re f", false);
+    let t3 = |names: &[String], tu: Option<Bytes>| {
+        let mut fx = Fx::new(BENIGN);
+        fx.extra
+            .insert(6, fonts::type3_font(65, names, 20, tu.as_ref().map(|_| 8)));
+        fx.extra.insert(20, proc.clone());
+        if let Some(tu) = tu {
+            fx.extra.insert(8, stream_obj("", &tu, true));
+        }
+        fx
+    };
+    let std_name = |_: usize, c: char| {
+        if c == ' ' {
+            "space".to_owned()
+        } else {
+            c.to_string()
+        }
+    };
+    let (names, shown) = fonts::type3_for(65, NEEDLE, std_name);
+    let t3_ops = [b"BT /F2 12 Tf 72 600 Td ".as_slice(), &shown, b" Tj ET\n"].concat();
+    v.push(case(
+        "Type 3 font with standard glyph names, hidden",
+        t3(&names, None).hidden(&t3_ops).build(),
+        spec.clone(),
+        Leak(&["decode"]),
+    ));
+    let (gnames, gshown) = fonts::type3_for(65, NEEDLE, |i, _| format!("g{}", i + 3));
+    let g_ops = [b"BT /F2 12 Tf 72 600 Td ".as_slice(), &gshown, b" Tj ET\n"].concat();
+    let tu_table: Vec<(u16, char)> = fonts::codes(65, 1, NEEDLE);
+    let tu = fonts::cmap_one_byte(&fonts::bfchar_width(&tu_table, 2));
+    v.push(case(
+        "Type 3 font with numbered glyph names and a character map, hidden",
+        t3(&gnames, Some(tu)).hidden(&g_ops).build(),
+        spec.clone(),
+        Leak(&["decode"]),
+    ));
+
+    // m12: two resource names, each the name of two fonts of the file, in a stream that nothing
+    // refers to. The phrase is in the first font of the first name and the second font of the
+    // second name: a pair that reading all the first fonts, then all the second ones, never makes.
+    let a_true = fonts::codes(0x0101, 7, "Ola ");
+    let b_true = fonts::codes(0x0301, 5, "Nordmann");
+    let scramble = |t: &[(u16, char)], by: &str| -> Vec<(u16, char)> {
+        t.iter()
+            .zip(by.chars().cycle())
+            .map(|((code, _), c)| (*code, c))
+            .collect()
+    };
+    let mut objs = Objs::new();
+    objs.insert(1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec());
+    objs.insert(
+        2,
+        b"<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>".to_vec(),
+    );
+    let page_of = |f1: u32, f2: u32, contents: u32| {
+        format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents {contents} 0 R \
+             /Resources << /Font << /F1 {f1} 0 R /F2 {f2} 0 R >> >> >>"
+        )
+        .into_bytes()
+    };
+    objs.insert(3, page_of(10, 20, 4));
+    objs.insert(4, stream_obj("", b"q Q", false));
+    objs.insert(5, page_of(30, 40, 6));
+    objs.insert(6, stream_obj("", b"q Q", false));
+    for (base, name, table) in [
+        (10, "AAAAAA+First", a_true.clone()),
+        (20, "BBBBBB+Third", scramble(&b_true, "xyzwvutsrq")),
+        (30, "CCCCCC+Second", scramble(&a_true, "wxyz")),
+        (40, "DDDDDD+Fourth", b_true.clone()),
+    ] {
+        for (n, b) in fonts::cid_font(base, name, &table) {
+            objs.insert(n, b);
+        }
+    }
+    let pair = format!(
+        "BT /F1 12 Tf {} Tj /F2 12 Tf {} Tj ET\n",
+        fonts::hex_codes(&a_true, "Ola "),
+        fonts::hex_codes(&b_true, "Nordmann")
+    );
+    objs.insert(50, stream_obj("", pair.as_bytes(), true));
+    v.push(case(
+        "a pair of fonts that only one combination of the candidates reads",
+        file(&objs),
+        scrubbed_spec(NEEDLE),
+        Leak(&["decode"]),
     ));
 
     // Clean files, one near each fix.

@@ -3,8 +3,9 @@
 //! the code under test cannot make a fixture look clean.
 #![allow(dead_code)]
 
+pub mod fonts;
+pub mod hard_cases;
 pub mod jpeg;
-pub mod review;
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -764,6 +765,93 @@ pub fn encrypt_keep(dir: &Dir, bytes: &[u8], user: &str) -> Bytes {
         .expect("qpdf runs");
     assert!(status.success(), "qpdf --encrypt failed");
     std::fs::read(out).unwrap()
+}
+
+/// Encrypts a file like [`encrypt`], with the objects written one by one (no object streams), so
+/// that the strings of a revision are separate encrypted values and can be replaced by an update.
+pub fn encrypt_plain_objects(dir: &Dir, bytes: &[u8]) -> Bytes {
+    let input = dir.put("plain-for-encrypt.pdf", bytes);
+    let out = dir.0.path().join("encrypted-plain-objects.pdf");
+    let status = Command::new("qpdf")
+        .args([
+            "--object-streams=disable",
+            "--encrypt",
+            "",
+            "owner-secret",
+            "256",
+            "--",
+        ])
+        .arg(&input)
+        .arg(&out)
+        .status()
+        .expect("qpdf runs");
+    assert!(status.success(), "qpdf --encrypt failed");
+    std::fs::read(out).unwrap()
+}
+
+/// The file with an incremental update that replaces the object that the trailer names `key` (such
+/// as `/Info`, which qpdf has renumbered) by an empty dictionary (a
+/// string-free object, so that nothing in the update needs encrypting). The trailer keeps `/Root`,
+/// `/Info`, `/Encrypt` and `/ID` of the file. The old object stays in the file, as an editor that
+/// saves incrementally leaves it.
+pub fn append_empty_object(file: &[u8], key: &str) -> Bytes {
+    use redaction_verify::pdfobj::{parse, Obj};
+    let at = file
+        .windows(7)
+        .rposition(|w| w == b"trailer")
+        .expect("a trailer");
+    let (trailer, _) = parse(file, at + 7).expect("a trailer dictionary");
+    let Some(Obj::Ref(num)) = trailer.get(key) else {
+        panic!("the trailer has no /{key}");
+    };
+    let reference = |key: &str| match trailer.get(key) {
+        Some(Obj::Ref(n)) => format!(" /{key} {n} 0 R"),
+        _ => String::new(),
+    };
+    let id = match trailer.get("ID") {
+        Some(Obj::Array(a)) => {
+            let hex: Vec<String> = a
+                .iter()
+                .filter_map(|x| match x {
+                    Obj::Str(b) => Some(format!(
+                        "<{}>",
+                        b.iter().map(|c| format!("{c:02x}")).collect::<String>()
+                    )),
+                    _ => None,
+                })
+                .collect();
+            format!(" /ID [{}]", hex.join(" "))
+        }
+        _ => String::new(),
+    };
+    let size = trailer.get("Size").and_then(Obj::int).expect("a size");
+    let sx = file
+        .windows(9)
+        .rposition(|w| w == b"startxref")
+        .expect("startxref");
+    let prev: String = String::from_utf8_lossy(&file[sx + 9..])
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    let mut out = file.to_vec();
+    if !out.ends_with(b"\n") {
+        out.push(b'\n');
+    }
+    let off = out.len();
+    out.extend(format!("{num} 0 obj\n<< >>\nendobj\n").into_bytes());
+    let xref = out.len();
+    out.extend(format!("xref\n{num} 1\n{off:010} 00000 n \n").into_bytes());
+    out.extend(
+        format!(
+            "trailer\n<< /Size {size}{}{}{}{id} /Prev {prev} >>\nstartxref\n{xref}\n%%EOF\n",
+            reference("Root"),
+            reference("Info"),
+            reference("Encrypt"),
+        )
+        .into_bytes(),
+    );
+    out
 }
 
 /// What the command line printed and returned.

@@ -2,7 +2,7 @@
 //! The structure layer has its own file.
 
 use std::cell::OnceCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
@@ -10,6 +10,7 @@ use tempfile::NamedTempFile;
 
 use crate::carve::{self, Carved, Visitor};
 use crate::pdfobj::{Doc, Entry, Obj};
+use crate::roles::{self, Kind};
 use crate::search::{find_all, BufHit, NeedleSet};
 use crate::textdec::{self, Resolver};
 use crate::tools;
@@ -25,6 +26,16 @@ pub struct Ctx<'a> {
     pub password: Option<NamedTempFile>,
     /// The copy of the file that qpdf normalised, or why there is none.
     pub qdf: OnceCell<std::result::Result<Vec<u8>, String>>,
+    /// The revisions of an encrypted file, decrypted.
+    pub revisions: OnceCell<Revisions>,
+}
+
+/// The revisions of an encrypted file, each decrypted by qpdf as a whole (strings outside streams
+/// too). `copies` is `None` for a file that is not encrypted: the byte layers read it as it is.
+pub struct Revisions {
+    pub copies: Option<Vec<(String, Vec<u8>)>>,
+    /// What stopped some revision from being read.
+    pub problems: Vec<String>,
 }
 
 impl Ctx<'_> {
@@ -46,7 +57,7 @@ impl Ctx<'_> {
     }
 
     /// The arguments that give a Poppler tool the password.
-    fn poppler_password(&self) -> Vec<OsString> {
+    pub fn poppler_password(&self) -> Vec<OsString> {
         match &self.opts.password {
             Some(p) => vec![OsString::from("-upw"), OsString::from(p)],
             None => Vec::new(),
@@ -144,7 +155,7 @@ pub fn run(ctx: &Ctx, rep: &mut Report) -> Result<()> {
         pdfimages(ctx, rep)?;
         if !ctx.spec.regions.is_empty() {
             match ctx.qdf_copy() {
-                Ok(bytes) => crate::regions::check(bytes, &ctx.spec.regions, rep),
+                Ok(bytes) => crate::regions::check(ctx, bytes, rep)?,
                 Err(why) => rep.problems.push(format!(
                     "images: the regions were not checked, because {why}"
                 )),
@@ -205,6 +216,24 @@ fn qdf(ctx: &Ctx, rep: &mut Report) {
             "qpdf-normalised copy, text object".into(),
         );
     }
+    // An encrypted file keeps its old revisions encrypted, and the copy above is the last one.
+    // Each revision is decrypted as a whole, so the strings outside streams (an old /Info, an old
+    // annotation text, a field value) are searched too.
+    if let Some(copies) = &revisions(ctx, rep).copies {
+        for (label, bytes) in copies {
+            for h in ctx.set.search(bytes, &[]) {
+                push(rep, Layer::Qdf, &h, format!("{label}qpdf-normalised"));
+            }
+            for h in ctx.set.search_split(bytes) {
+                push(
+                    rep,
+                    Layer::Qdf,
+                    &h,
+                    format!("{label}qpdf-normalised, text object"),
+                );
+            }
+        }
+    }
 }
 
 fn first_line(s: &str) -> &str {
@@ -216,19 +245,35 @@ fn first_line(s: &str) -> &str {
 // copies that qpdf decrypts: one for the file, and one for each earlier revision (the file cut
 // after each `%%EOF`). Objects that nothing refers to stay in the copies.
 
+/// The decrypted copies, made once. `copies` is `None` when the file is not encrypted.
+fn revisions<'c>(ctx: &'c Ctx, rep: &mut Report) -> &'c Revisions {
+    let r = ctx.revisions.get_or_init(|| {
+        let mut r = Report::default();
+        let copies = decrypted_copies(ctx, &mut r);
+        Revisions {
+            copies,
+            problems: r.problems,
+        }
+    });
+    for p in &r.problems {
+        rep.problem(p.clone());
+    }
+    r
+}
+
 /// `None` when the file is not encrypted (it is carved as it is), else the decrypted copies.
 fn decrypted_copies(ctx: &Ctx, rep: &mut Report) -> Option<Vec<(String, Vec<u8>)>> {
     let enc = match ctx.qpdf(&[OsStr::new("--show-encryption"), ctx.path.as_os_str()]) {
         Ok(o) => o,
         Err(e) => {
-            rep.problems.push(format!("carve: {e}"));
+            rep.problems.push(format!("revisions: {e}"));
             return Some(Vec::new());
         }
     };
     let out = String::from_utf8_lossy(&enc.stdout).into_owned();
     if enc.status != 0 && enc.status != 3 {
         rep.problems.push(format!(
-            "carve: qpdf could not open the file to see whether it is encrypted (exit {}): {}",
+            "revisions: qpdf could not open the file to see whether it is encrypted (exit {}): {}",
             enc.status,
             first_line(&enc.stderr)
         ));
@@ -240,7 +285,7 @@ fn decrypted_copies(ctx: &Ctx, rep: &mut Report) -> Option<Vec<(String, Vec<u8>)
     let dir = match tempfile::tempdir() {
         Ok(d) => d,
         Err(e) => {
-            rep.problems.push(format!("carve: {e}"));
+            rep.problems.push(format!("revisions: {e}"));
             return Some(Vec::new());
         }
     };
@@ -275,7 +320,7 @@ fn decrypted_copies(ctx: &Ctx, rep: &mut Report) -> Option<Vec<(String, Vec<u8>)
         let output = dir.path().join(format!("rev{i}-out.pdf"));
         if std::fs::write(&input, &ctx.data[..*end]).is_err() {
             rep.problems
-                .push("carve: cannot write a temporary file".into());
+                .push("revisions: cannot write a temporary file".into());
             continue;
         }
         let r = ctx.qpdf(&[
@@ -292,15 +337,16 @@ fn decrypted_copies(ctx: &Ctx, rep: &mut Report) -> Option<Vec<(String, Vec<u8>)
                 }
             }
             Ok(r) => rep.problems.push(format!(
-                "carve: qpdf could not decrypt the file for the {} (exit {}): {}. It was not checked.",
+                "revisions: qpdf could not decrypt the file for the {} (exit {}): {}. It was not checked.",
                 what,
                 r.status,
                 first_line(&r.stderr)
             )),
-            Err(e) => rep.problems.push(format!("carve: {e}")),
+            Err(e) => rep.problems.push(format!("revisions: {e}")),
         }
     }
-    // A stream that qpdf does not reach cannot be decrypted without its object number.
+    // A stream that qpdf does not reach cannot be decrypted without its object number. An object
+    // stream is reached when some object of the cross-reference table is stored in it.
     let mut reached: BTreeSet<u32> = BTreeSet::new();
     for (_, b) in &copies {
         for p in find_all(b, b"%% Original object ID: ") {
@@ -317,17 +363,55 @@ fn decrypted_copies(ctx: &Ctx, rep: &mut Report) -> Option<Vec<(String, Vec<u8>)
             }
         }
     }
-    let lost: Vec<u32> = carve::find_streams(ctx.data)
+    let streams = carve::find_streams(ctx.data);
+    let is_objstm =
+        |s: &carve::Stream| carve::name_value(&s.dict, "/Type").is_some_and(|t| t == "ObjStm");
+    let mut objstm_reached: BTreeSet<u32> = BTreeSet::new();
+    let mut xref_listed = true;
+    if streams.iter().any(is_objstm) {
+        for i in 0..ends.len() {
+            let input = dir.path().join(format!("rev{i}.pdf"));
+            match ctx.qpdf(&[OsStr::new("--show-xref"), input.as_os_str()]) {
+                Ok(r) if r.status == 0 || r.status == 3 => {
+                    for line in String::from_utf8_lossy(&r.stdout).lines() {
+                        if let Some((_, rest)) = line.split_once("; stream = ") {
+                            let digits: String =
+                                rest.chars().take_while(char::is_ascii_digit).collect();
+                            if let Ok(n) = digits.parse() {
+                                objstm_reached.insert(n);
+                            }
+                        }
+                    }
+                }
+                _ => xref_listed = false,
+            }
+        }
+        if !xref_listed {
+            rep.problems.push(
+                "revisions: qpdf could not list which object streams the cross-reference tables use, so the object streams of this encrypted file were not checked"
+                    .into(),
+            );
+        }
+    }
+    let lost: Vec<u32> = streams
         .iter()
         .filter(|s| {
-            !carve::name_value(&s.dict, "/Type").is_some_and(|t| t == "XRef" || t == "ObjStm")
+            let ty = carve::name_value(&s.dict, "/Type");
+            ty.as_deref() != Some("XRef")
         })
-        .filter_map(|s| s.obj.map(|o| o.0))
-        .filter(|n| !reached.contains(n))
+        .filter_map(|s| {
+            let n = s.obj?.0;
+            let gone = if is_objstm(s) {
+                xref_listed && !objstm_reached.contains(&n)
+            } else {
+                !reached.contains(&n)
+            };
+            gone.then_some(n)
+        })
         .collect();
     if !lost.is_empty() && !copies.is_empty() {
         rep.problems.push(format!(
-            "carve: the file is encrypted and {} stream object(s) (such as {}) are not reached through any cross-reference table, so they cannot be decrypted and were not checked",
+            "revisions: the file is encrypted and {} stream object(s) (such as {}) are not reached through any cross-reference table, so they cannot be decrypted and were not checked",
             lost.len(),
             lost[0]
         ));
@@ -339,7 +423,7 @@ fn decrypted_copies(ctx: &Ctx, rep: &mut Report) -> Option<Vec<(String, Vec<u8>)
 // The pass over the streams: carve, decode, images (hashes) and fonts.
 
 fn carve_pass(ctx: &Ctx, rep: &mut Report) {
-    let sources = decrypted_copies(ctx, rep);
+    let revs = revisions(ctx, rep);
     let image_needles: Vec<(usize, &str)> = ctx
         .spec
         .needles
@@ -355,13 +439,14 @@ fn carve_pass(ctx: &Ctx, rep: &mut Report) {
         prefix: String::new(),
         resolvers: Vec::new(),
         drawn: Vec::new(),
+        roles: Vec::new(),
     };
-    match sources {
+    match &revs.copies {
         None => carve::carve(ctx.data, &mut pass),
         Some(copies) => {
             for (label, bytes) in copies {
-                pass.prefix = label;
-                carve::carve(&bytes, &mut pass);
+                pass.prefix.clone_from(label);
+                carve::carve(bytes, &mut pass);
             }
         }
     }
@@ -376,41 +461,8 @@ struct Pass<'c, 'r> {
     resolvers: Vec<Resolver>,
     /// The characters that the streams of the current buffer draw.
     drawn: Vec<BTreeSet<char>>,
-}
-
-/// Streams that hold fonts, images, metadata, cross-reference data and other things that are not
-/// content streams.
-fn is_content_candidate(c: &Carved) -> bool {
-    if c.is_image || c.decoded.stopped_at.is_some() {
-        return false;
-    }
-    let ty = carve::name_value(c.dict, "/Type");
-    if ty
-        .as_deref()
-        .is_some_and(|t| matches!(t, "XRef" | "ObjStm" | "Metadata" | "EmbeddedFile"))
-    {
-        return false;
-    }
-    let sub = carve::name_value(c.dict, "/Subtype");
-    if sub
-        .as_deref()
-        .is_some_and(|t| matches!(t, "Type1C" | "CIDFontType0C" | "OpenType" | "XML"))
-    {
-        return false;
-    }
-    if ["/Length1", "/Length2", "/Length3"]
-        .iter()
-        .any(|k| carve::key_pos(c.dict, k).is_some())
-    {
-        return false;
-    }
-    // Content streams are text.
-    let head = &c.decoded.data[..c.decoded.data.len().min(4096)];
-    let binary = head
-        .iter()
-        .filter(|b| **b < 9 || (13 < **b && **b < 32))
-        .count();
-    binary * 20 <= head.len()
+    /// The content streams of the current buffer, found from its structure.
+    roles: Vec<HashSet<u32>>,
 }
 
 impl Pass<'_, '_> {
@@ -438,12 +490,16 @@ impl Pass<'_, '_> {
                 ));
             }
         }
+        let mut found: BTreeSet<usize> = BTreeSet::new();
+        let mut maybe: BTreeSet<usize> = BTreeSet::new();
         for variant in &dec.variants {
             if let Some(d) = self.drawn.last_mut() {
                 d.extend(textdec::chars_of(variant));
             }
             if on {
-                for h in self.ctx.set.search_decoded(variant) {
+                let r = self.ctx.set.search_decoded_wild(variant);
+                for h in r.hits {
+                    found.insert(h.needle);
                     push(
                         self.rep,
                         Layer::Decode,
@@ -451,6 +507,17 @@ impl Pass<'_, '_> {
                         format!("{place}, read through its fonts"),
                     );
                 }
+                maybe.extend(r.possible);
+            }
+        }
+        // A code that a font cannot map may hide a phrase. That is "could not check", unless some
+        // way to read the fonts leaves no code unmapped.
+        if on && !dec.has_complete_reading {
+            for i in maybe.difference(&found) {
+                self.rep.problem(format!(
+                    "decode: text in {place} may hold {} behind codes that its fonts cannot map, so it was not checked for it",
+                    self.ctx.spec.label(*i)
+                ));
             }
         }
     }
@@ -460,6 +527,7 @@ impl Visitor for Pass<'_, '_> {
     fn begin(&mut self, doc: &Doc, _within: &str) {
         self.resolvers.push(Resolver::new(doc));
         self.drawn.push(BTreeSet::new());
+        self.roles.push(roles::content_streams(doc));
     }
 
     fn stream(&mut self, c: &Carved) {
@@ -499,8 +567,25 @@ impl Visitor for Pass<'_, '_> {
                 });
             }
         }
-        if (ctx.on(Layer::Decode) || ctx.on(Layer::Fonts)) && is_content_candidate(c) {
-            self.decode_data(c.doc, c.entry, &c.decoded.data, &place);
+        if (ctx.on(Layer::Decode) || ctx.on(Layer::Fonts))
+            && !c.is_image
+            && c.decoded.stopped_at.is_none()
+        {
+            let no_roles = HashSet::new();
+            match roles::classify(c, self.roles.last().unwrap_or(&no_roles)) {
+                Kind::Content => self.decode_data(c.doc, c.entry, &c.decoded.data, &place),
+                Kind::Other => self.rep.note(format!(
+                    "{place} is neither an image, a font nor a content stream: only the byte layers checked it"
+                )),
+                Kind::Unsure(why) => {
+                    if ctx.on(Layer::Decode) {
+                        self.rep.problem(format!(
+                            "decode: {place} may be a content stream, but {why}, so its text was not checked"
+                        ));
+                    }
+                }
+                Kind::Image | Kind::Data => {}
+            }
         }
     }
 
@@ -545,6 +630,7 @@ impl Visitor for Pass<'_, '_> {
         }
         self.resolvers.pop();
         self.drawn.pop();
+        self.roles.pop();
     }
 }
 

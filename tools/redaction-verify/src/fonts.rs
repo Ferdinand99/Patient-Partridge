@@ -457,12 +457,23 @@ fn units(bytes: &[u8]) -> Vec<u16> {
         .collect()
 }
 
+/// What a run of codes maps to: the codes `lo..` map to `base`, with the last UTF-16 unit of `base`
+/// raised by the distance from `lo`. A run is cut when a later definition covers part of it, but
+/// the distance is always counted from the code where the definition began.
+#[derive(Debug, Clone)]
+struct Run {
+    end: u32,
+    lo: u32,
+    base: Vec<u16>,
+}
+
 /// A `ToUnicode` map: code space ranges and character mappings.
 #[derive(Debug, Default)]
 pub struct CMap {
     spaces: Vec<(usize, u32, u32)>,
-    /// (code length, first code) -> (last code, UTF-16 of the first code)
-    map: BTreeMap<(usize, u32), (u32, Vec<u16>)>,
+    /// (code length, first code of the run) -> the run. The runs of one code length never
+    /// overlap: a later `bfchar` or `bfrange` replaces the codes it covers, and only those.
+    map: BTreeMap<(usize, u32), Run>,
 }
 
 impl CMap {
@@ -490,7 +501,7 @@ impl CMap {
                         (toks.get(i), toks.get(i + 1))
                     {
                         let code = be(src);
-                        cm.map.insert((src.len(), code), (code, units(dst)));
+                        cm.put(src.len(), code, code, units(dst));
                         i += 2;
                     }
                 }
@@ -502,16 +513,16 @@ impl CMap {
                         i += 2;
                         match toks.get(i) {
                             Some(Tok::Hex(dst)) => {
-                                if b >= a {
-                                    cm.map.insert((l, a), (b, units(dst)));
-                                }
+                                cm.put(l, a, b, units(dst));
                                 i += 1;
                             }
                             Some(Tok::Open) => {
                                 i += 1;
                                 let mut code = a;
                                 while let Some(Tok::Hex(dst)) = toks.get(i) {
-                                    cm.map.insert((l, code), (code, units(dst)));
+                                    if code <= b {
+                                        cm.put(l, code, code, units(dst));
+                                    }
                                     code = code.wrapping_add(1);
                                     i += 1;
                                 }
@@ -529,18 +540,61 @@ impl CMap {
         cm
     }
 
+    /// Defines the codes `a..=b` of length `len`. Where they were defined before, the new
+    /// definition wins, for those codes only.
+    fn put(&mut self, len: usize, a: u32, b: u32, base: Vec<u16>) {
+        if b < a {
+            return;
+        }
+        let start = self
+            .map
+            .range(..(len, a))
+            .next_back()
+            .map_or((len, a), |(k, _)| *k);
+        let start = if start.0 == len { start } else { (len, a) };
+        let hit: Vec<(u32, Run)> = self
+            .map
+            .range(start..=(len, b))
+            .filter(|(k, r)| k.0 == len && r.end >= a)
+            .map(|(k, r)| (k.1, r.clone()))
+            .collect();
+        for (first, run) in hit {
+            self.map.remove(&(len, first));
+            if first < a {
+                self.map.insert(
+                    (len, first),
+                    Run {
+                        end: a - 1,
+                        ..run.clone()
+                    },
+                );
+            }
+            if run.end > b {
+                self.map.insert((len, b + 1), run);
+            }
+        }
+        self.map.insert(
+            (len, a),
+            Run {
+                end: b,
+                lo: a,
+                base,
+            },
+        );
+    }
+
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
 
     fn lookup(&self, len: usize, code: u32) -> Option<Vec<u16>> {
-        let (&(l, lo), (hi, base)) = self.map.range(..=(len, code)).next_back()?;
-        if l != len || code > *hi {
+        let (&(l, _), run) = self.map.range(..=(len, code)).next_back()?;
+        if l != len || code > run.end {
             return None;
         }
-        let mut u = base.clone();
+        let mut u = run.base.clone();
         if let Some(last) = u.last_mut() {
-            *last = last.wrapping_add((code - lo) as u16);
+            *last = last.wrapping_add((code - run.lo) as u16);
         }
         Some(u)
     }
@@ -588,15 +642,14 @@ impl CMap {
     /// sequence). Ranges are cut at 70000 codes.
     pub fn entries(&self) -> Vec<(u32, char)> {
         let mut out = Vec::new();
-        for (&(len, lo), (hi, base)) in &self.map {
-            for code in lo..=(*hi).min(lo.saturating_add(70_000)) {
+        for (&(len, first), run) in &self.map {
+            for code in first..=run.end.min(first.saturating_add(70_000)) {
                 if let Some(u) = self.lookup(len, code) {
                     if let Some(Ok(c)) = char::decode_utf16(u).next() {
                         out.push((code, c));
                     }
                 }
             }
-            let _ = base;
         }
         out
     }
@@ -770,8 +823,19 @@ pub fn mappers(doc: &Doc, font: &Obj) -> Vec<Mapper> {
     let _ = explicit;
     for b in bases {
         let mut t: Vec<Option<char>> = b.map_or_else(|| vec![None; 256], table);
+        if b.is_some() {
+            // The control codes of a Latin encoding draw nothing: they separate, they hide no
+            // letter. (A font that names its glyphs itself keeps them unmapped.)
+            for c in (0..0x20usize).chain(std::iter::once(0x7F)) {
+                t[c] = t[c].or(Some(' '));
+            }
+        }
         for (code, name) in &diffs {
-            t[usize::from(*code)] = glyph_char(name);
+            t[usize::from(*code)] = if name == ".notdef" {
+                Some(' ')
+            } else {
+                glyph_char(name)
+            };
         }
         out.push(Mapper::Table(Rc::new(t)));
     }
@@ -866,6 +930,45 @@ mod tests {
         assert_eq!(glyph_char("Euro"), Some('€'));
         assert_eq!(glyph_char("a.alt"), Some('a'));
         assert_eq!(glyph_char("g23"), None);
+    }
+
+    fn at(cm: &CMap, code: u32) -> Option<String> {
+        cm.lookup(2, code).map(|u| String::from_utf16_lossy(&u))
+    }
+
+    #[test]
+    fn a_later_char_inside_a_range_changes_that_code_only() {
+        // The range maps 0100.. to 0030.. (so 0130 is '`'); the char maps 0130 to 'Z'.
+        let range = "1 beginbfrange <0100> <01FF> <0030> endbfrange";
+        let single = "1 beginbfchar <0130> <005A> endbfchar";
+        // The char comes later: it wins for its code, and the range still holds the codes around it.
+        let cm = CMap::parse(format!("{range} {single}").as_bytes());
+        assert_eq!(at(&cm, 0x0100).as_deref(), Some("0"));
+        assert_eq!(at(&cm, 0x012F).as_deref(), Some("_"));
+        assert_eq!(at(&cm, 0x0130).as_deref(), Some("Z"));
+        assert_eq!(at(&cm, 0x0131).as_deref(), Some("a"));
+        assert_eq!(at(&cm, 0x01FF).as_deref(), Some("\u{12F}"));
+        assert_eq!(at(&cm, 0x0200), None);
+        // The range comes later: it wins over the char.
+        let cm = CMap::parse(format!("{single} {range}").as_bytes());
+        assert_eq!(at(&cm, 0x0130).as_deref(), Some("`"));
+        assert_eq!(at(&cm, 0x0131).as_deref(), Some("a"));
+        assert_eq!(at(&cm, 0x0100).as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn a_range_cut_by_two_chars_keeps_its_three_parts() {
+        let cm = CMap::parse(
+            b"1 beginbfrange <0000> <00FF> <0100> endbfrange \
+              2 beginbfchar <0010> <0041> <0020> <0042> endbfchar",
+        );
+        assert_eq!(at(&cm, 0x000F).as_deref(), Some("\u{10F}"));
+        assert_eq!(at(&cm, 0x0010).as_deref(), Some("A"));
+        assert_eq!(at(&cm, 0x0011).as_deref(), Some("\u{111}"));
+        assert_eq!(at(&cm, 0x0020).as_deref(), Some("B"));
+        assert_eq!(at(&cm, 0x0021).as_deref(), Some("\u{121}"));
+        assert_eq!(at(&cm, 0x00FF).as_deref(), Some("\u{1FF}"));
+        assert_eq!(cm.entries().len(), 256);
     }
 
     #[test]

@@ -508,7 +508,7 @@ fn with_the_expected_layers_off_nothing_is_found() {
 #[test]
 fn these_layers_are_the_only_one_for_some_leak() {
     // For each of these layers there is a file that no other layer sees: remove the layer and a
-    // real leak goes through. The other layers have such files in `review.rs`.
+    // real leak goes through. The other layers have such files in `hard_cases.rs`.
     for layer in [Layer::Raw, Layer::Carve, Layer::Structure, Layer::Images] {
         let sole = cases().into_iter().any(|c| c.layers == [layer]);
         assert!(sole, "no leak in the tests is found by {layer} alone");
