@@ -9,12 +9,16 @@ mod author;
 mod caps;
 mod marks;
 mod pages;
+mod sign;
+mod sign_seeds;
 mod signatures;
 
 pub use author::*;
 pub use caps::*;
 pub use marks::*;
 pub use pages::*;
+pub use sign::*;
+pub use sign_seeds::write_sign_seeds;
 pub use signatures::*;
 
 use std::io::{self, Read};
@@ -138,7 +142,7 @@ fn arb_strokes(u: &mut Unstructured) -> Result<Vec<Vec<[f32; 2]>>> {
 /// A request that the encoder writes without cutting anything.
 pub fn arb_request(u: &mut Unstructured) -> Result<Request> {
     let id: u32 = u.arbitrary()?;
-    let body = match u.int_in_range(0..=29u8)? {
+    let body = match u.int_in_range(0..=30u8)? {
         0 => RequestBody::Hello {
             protocol_version: u.arbitrary()?,
         },
@@ -318,6 +322,7 @@ pub fn arb_request(u: &mut Unstructured) -> Result<Request> {
                 coordinate(u)?,
             ],
         },
+        29 => RequestBody::Sign(arb_sign_request(u)?),
         _ => RequestBody::Author(arb_author_request(u)?),
     };
     Ok(Request { id, body })
@@ -363,7 +368,7 @@ fn arb_annot(u: &mut Unstructured) -> Result<(AnnotInfo, AnnotInfo)> {
 
 pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
     let id: u32 = u.arbitrary()?;
-    let (sent, expected) = match u.int_in_range(0..=23u8)? {
+    let (sent, expected) = match u.int_in_range(0..=24u8)? {
         0 => {
             let b = ResponseBody::Hello {
                 protocol_version: u.arbitrary()?,
@@ -624,6 +629,10 @@ pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
         }
         22 => {
             let b = ResponseBody::Pages(arb_pages_response(u)?);
+            (b.clone(), b)
+        }
+        23 => {
+            let b = ResponseBody::Sign(arb_sign_response(u)?);
             (b.clone(), b)
         }
         _ => {

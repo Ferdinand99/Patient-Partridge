@@ -1010,6 +1010,9 @@ fn main() {
             .unwrap_or_else(|| "seeds".to_string()),
     );
 
+    // Signing with a certificate: messages, certificate files and files that PDFium wrote.
+    partridge_fuzz::write_sign_seeds(&dir);
+
     // Decoders: one valid message of every kind.
     for (name, request) in requests().into_iter().chain(author_requests()) {
         write(&dir, "protocol_request_decode", name, &request.encode());
