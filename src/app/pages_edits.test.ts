@@ -562,6 +562,48 @@ describe("Undo and Redo over page changes, annotations and form fields", () => {
     expect(activeOf(app).history.canUndo).toBe(true);
   });
 
+  it("does not take a page change back while a field holds text the document refused, and says so", async () => {
+    const pages = fakePages();
+    const { app, api } = make({ withAnnotations: true, pages: pages as unknown as PageToolsApi });
+    await app.openPath("/docs/form.pdf");
+    await flush();
+    await opsOf(app).remove([1]);
+    await flush();
+    await dismiss();
+    api.setFormField.mockRejectedValueOnce({ code: "invalid_request", message: "too long" });
+    const input = field(0) as HTMLInputElement;
+    input.value = "x".repeat(40);
+    change(input);
+    await flush();
+    await dismiss();
+    const refused = () => (activeOf(app) as unknown as { view: { hasRefusedFormInput: boolean } }).view.hasRefusedFormInput;
+    expect(refused()).toBe(true);
+
+    keyOn(document.body, "z", { ctrlKey: true });
+    await flush();
+    await flush();
+    // The same words as for a tool that does not begin; the document and the box are as they were.
+    const text = [...notices()].map((n) => n.textContent).join(" ");
+    expect(text).toContain("A field has text that could not be added");
+    expect(text).toContain("were not changed");
+    await dismiss();
+    expect(pages.pagesRestore).not.toHaveBeenCalled();
+    expect(refused()).toBe(true);
+    expect((field(0) as HTMLInputElement).value).toBe("x".repeat(40));
+    expect(activeOf(app).history.canUndo).toBe(true);
+    expect(opsOf(app).busy).toBe(false);
+    expect(activeOf(app).annotator.isHeld).toBe(false);
+
+    // Once the text is put back (Escape in the box), the step is taken.
+    keyOn(field(0), "Escape");
+    await flush();
+    expect(refused()).toBe(false);
+    keyOn(document.body, "z", { ctrlKey: true });
+    await flush();
+    await flush();
+    expect(pages.pagesRestore).toHaveBeenCalledTimes(1);
+  });
+
   it("says which way the history cannot go, in the words of the failure", () => {
     const gone = { code: "snapshot_gone", message: "" };
     expect(undoFailure(gone, "undo", "a.pdf", 0).detail).not.toContain("before it in the history");

@@ -27,7 +27,7 @@ import { zoomLabel, type ZoomMode } from "../viewer/zoom";
 import { FindBar } from "./find";
 import type { PageToolsApi } from "../lib/pagesapi";
 import { describePageError } from "../lib/pageerrors";
-import { PageOps, type PageHost } from "./pageops";
+import { PageOps, REFUSED_FIELD_CODE, type PageHost } from "./pageops";
 import { PagePanel, type PagePanelHost } from "./pagepanel";
 import { Annotator, CLEAN_REFUSALS, annotationNotice, type AnnotatorApi } from "./annotator";
 import { AnnotBar } from "./annotbar";
@@ -443,6 +443,7 @@ export class App {
           if (tab) await this.documentLost(tab, error);
         },
         settle: (doc) => this.settleBeforePages(doc),
+        keepsRefusedText: (doc) => this.keepRefusedText(doc),
         pickFiles: () => deps.pickFiles(),
         announce: (text) => this.announcePages(text),
         layer: this.noticeLayer,
@@ -519,11 +520,18 @@ export class App {
     await tab.view.flushForms().catch(() => undefined);
     await tab.annotator?.flush();
     if (!this.tabs.includes(tab)) return false;
-    if (tab.view.hasRefusedFormInput) {
-      await this.tellRefusedField(tab, "pages");
-      return false;
-    }
-    return true;
+    return this.keepRefusedText(doc);
+  }
+
+  /**
+   * False, after saying why, when a field of the document holds text the engine refused: the pages
+   * of a tool, or of a step back or forward, would replace the field and the text with it.
+   */
+  private async keepRefusedText(doc: number): Promise<boolean> {
+    const tab = this.tabs.find((t) => t.doc === doc);
+    if (!tab || !tab.view.hasRefusedFormInput) return true;
+    await this.tellRefusedField(tab, "pages");
+    return false;
   }
 
   private announcePages(text: string): void {
@@ -1900,6 +1908,8 @@ export class App {
       await (tab.annotator ? tab.annotator.sequenced(run) : run());
     } catch (e) {
       const error = toAppError(e);
+      // A field holds text that was refused: the reader was told, and the history stays where it was.
+      if (error.code === REFUSED_FIELD_CODE) return;
       // The engine of the document was lost: the tab is closed (by the page tools, which told the
       // user what that means for the changes that were not saved, or here, as for any other change).
       if (isEngineLost(error)) {

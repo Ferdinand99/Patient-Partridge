@@ -45,6 +45,11 @@ export interface PageHost {
    * why, when the tool must not begin.
    */
   settle?(doc: number): Promise<boolean>;
+  /**
+   * Asked before a step back or forward changes the pages: resolves with false, after saying why,
+   * when text a field refused would be lost with the pages it was typed on.
+   */
+  keepsRefusedText?(doc: number): Promise<boolean>;
   /** The system's dialog for picking PDF files; empty when it is cancelled. */
   pickFiles(): Promise<string[]>;
   /** Says something to a screen reader. */
@@ -67,6 +72,9 @@ export interface OpResult {
 }
 
 const OK = [{ id: "ok", label: "OK", primary: true }];
+
+/** The code of the quiet refusal of a step back or forward while a field holds refused text. */
+export const REFUSED_FIELD_CODE = "refused_field";
 
 /** How a tool runs: whether the user may stop it, and whether the box waits for a dialog. */
 interface RunOptions {
@@ -456,6 +464,12 @@ export class PageOps {
    * that the caller knows there is nothing more to say about it.
    */
   private async exclusive<T>(doc: number, work: () => Promise<T>): Promise<T> {
+    if (this.working) throw { code: "busy", message: "another page tool is working" };
+    // The new pages replace the layer of the form, and with it the text a field refused. The reader
+    // was told why the step did not happen, so the caller has nothing more to say.
+    if (this.host.keepsRefusedText && !(await this.host.keepsRefusedText(doc))) {
+      throw { code: REFUSED_FIELD_CODE, message: "a field holds text that was refused" };
+    }
     if (this.working) throw { code: "busy", message: "another page tool is working" };
     this.setWorking(true, doc);
     try {

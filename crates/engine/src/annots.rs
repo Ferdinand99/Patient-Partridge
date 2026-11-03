@@ -1253,39 +1253,83 @@ unsafe fn blank(bindings: &dyn PdfiumLibraryBindings, annotation: FPDF_ANNOTATIO
     }
 }
 
-/// Overwrites the text of every annotation of a page that is about to be deleted: the comment, the
-/// author, the rich text and the subject (also of pop-ups). A save leaves out the dictionaries of a
-/// loaded file that nothing refers to any more, but writes those made in this session as objects
-/// nobody refers to, so the words of a note written in this session would stay in the file with a
-/// page that was deleted. Form fields are not touched (the form refers to them, and the page tools
-/// deal with them), and neither are links. Returns how many annotations were overwritten.
-pub fn scrub_page(document: &PdfDocument<'_>, page_index: u32) -> usize {
+/// Overwrites the text of every annotation of the pages that are about to be deleted: the comment,
+/// the author, the rich text and the subject (also of pop-ups). A save leaves out the dictionaries
+/// of a loaded file that nothing refers to any more, but writes those made in this session as
+/// objects nobody refers to, so the words of a note written in this session would stay in the file
+/// with a page that was deleted. Form fields are not touched (the form refers to them, and the page
+/// tools deal with them), and neither are links.
+///
+/// An annotation that a page which stays also reaches is left alone, whether the two pages share
+/// the dictionary, share the `/Annots` array, or are the same page listed twice: its words belong
+/// to a page that remains. `total` is the number of pages the document has now; `deleted` holds
+/// the indices that go. Returns how many annotations were overwritten.
+pub fn scrub_pages(document: &PdfDocument<'_>, deleted: &[u32], total: u32) -> usize {
     let Some(handle) = raw_document(document) else {
         return 0;
     };
     let bindings = document.bindings();
     let mut done = 0;
-    // SAFETY: `handle` is the live document's; the page and every annotation handle are opened and
-    // closed here, and PDFium only gets handles it gave out.
+    // SAFETY: `handle` is the live document's; every page and annotation handle is opened here and
+    // closed before the function returns (an annotation before the page it came from), and PDFium
+    // only gets handles it gave out.
     unsafe {
-        let page = bindings.FPDF_LoadPage(handle, page_index as c_int);
-        if page.is_null() {
-            return 0;
-        }
-        let count = bindings.FPDFPage_GetAnnotCount(page).max(0);
-        for position in 0..count {
-            let annotation = bindings.FPDFPage_GetAnnot(page, position);
-            if annotation.is_null() {
+        // The annotations of the deleted pages, with the page each one was read from.
+        let mut pages: Vec<FPDF_PAGE> = Vec::new();
+        let mut found: Vec<(FPDF_ANNOTATION, bool)> = Vec::new();
+        for &index in deleted {
+            let page = bindings.FPDF_LoadPage(handle, index as c_int);
+            if page.is_null() {
                 continue;
             }
-            let subtype = bindings.FPDFAnnot_GetSubtype(annotation) as u32;
-            if subtype != SUBTYPE_WIDGET && subtype != SUBTYPE_LINK {
+            pages.push(page);
+            let count = bindings.FPDFPage_GetAnnotCount(page).max(0);
+            for position in 0..count {
+                let annotation = bindings.FPDFPage_GetAnnot(page, position);
+                if annotation.is_null() {
+                    continue;
+                }
+                let subtype = bindings.FPDFAnnot_GetSubtype(annotation) as u32;
+                if subtype == SUBTYPE_WIDGET || subtype == SUBTYPE_LINK {
+                    bindings.FPDFPage_CloseAnnot(annotation);
+                } else {
+                    found.push((annotation, false));
+                }
+            }
+        }
+        // A page that stays and lists the same dictionary keeps it.
+        if !found.is_empty() {
+            for index in 0..total {
+                if deleted.contains(&index) {
+                    continue;
+                }
+                let page = bindings.FPDF_LoadPage(handle, index as c_int);
+                if page.is_null() {
+                    // A page that cannot be read cannot be shown to leave an annotation alone.
+                    for entry in found.iter_mut() {
+                        entry.1 = true;
+                    }
+                    break;
+                }
+                for entry in found.iter_mut().filter(|entry| !entry.1) {
+                    entry.1 = bindings.FPDFPage_GetAnnotIndex(page, entry.0) >= 0;
+                }
+                bindings.FPDF_ClosePage(page);
+                if found.iter().all(|entry| entry.1) {
+                    break;
+                }
+            }
+        }
+        for (annotation, shared) in found {
+            if !shared {
                 blank(bindings, annotation);
                 done += 1;
             }
             bindings.FPDFPage_CloseAnnot(annotation);
         }
-        bindings.FPDF_ClosePage(page);
+        for page in pages {
+            bindings.FPDF_ClosePage(page);
+        }
     }
     done
 }

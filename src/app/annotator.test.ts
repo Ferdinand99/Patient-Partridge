@@ -105,9 +105,10 @@ function setup(initial: Annotation[] = []) {
   };
   const popovers = document.createElement("div");
   document.body.append(popovers);
-  const host: AnnotatorHost & { asked: string[]; told: string[]; failures: unknown[]; answer: string } = {
+  const host: AnnotatorHost & { asked: string[]; details: string[]; told: string[]; failures: unknown[]; answer: string } = {
     popovers,
     asked: [],
+    details: [],
     told: [],
     failures: [],
     answer: "delete",
@@ -116,6 +117,7 @@ function setup(initial: Annotation[] = []) {
     },
     ask(options) {
       this.asked.push(options.title);
+      this.details.push(options.detail);
       return Promise.resolve({ button: this.answer });
     },
     failed(error) {
@@ -363,6 +365,9 @@ describe("changing and removing", () => {
     t.host.answer = "cancel";
     await t.annotator.removeSelected();
     expect(t.host.asked).toEqual(["Delete this annotation?"]);
+    // The words say when it does come back: a step back over a change of the pages loads an older copy.
+    expect(t.host.details[0]).toMatch(/Undo cannot bring it back/);
+    expect(t.host.details[0]).toMatch(/change to the pages made before it/);
     expect(t.calls).toEqual([]);
     t.host.answer = "delete";
     await t.annotator.removeSelected();

@@ -298,6 +298,39 @@ fn a_change_of_the_pages_does_not_leave_the_form_environment_or_the_annotation_r
 }
 
 #[test]
+fn a_move_of_pages_drops_what_the_record_kept_of_removed_annotations() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let doc = open(e, &kit::forms_multipage_pdf(false), None).unwrap();
+    // A note is taken off page 1, and the record keeps what it takes to put it back there by its id.
+    let first = note(e, doc, 0, "FIRST");
+    remove(e, doc, 0, first.id);
+    assert!(list(e, doc, 0).is_empty());
+    // Page 1 and page 2 change places. The ids and the notes that could be put back belonged to the
+    // pages as they were: only the record being dropped keeps the note from coming back, by the
+    // old id, onto the page that is first now.
+    pages_op(
+        e,
+        PagesRequest::Reorder {
+            doc,
+            order: vec![1, 0, 2],
+        },
+    );
+    assert_eq!(
+        error_code(ask(
+            e,
+            RequestBody::RestoreAnnot {
+                doc,
+                page: 0,
+                id: first.id
+            }
+        )),
+        ErrorCode::AnnotationRefused
+    );
+    assert!(list(e, doc, 0).is_empty());
+}
+
+#[test]
 fn a_turn_or_a_crop_does_not_touch_the_record_of_the_annotations() {
     let mut guard = engine();
     let e = &mut guard.0;

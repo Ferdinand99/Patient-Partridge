@@ -520,6 +520,34 @@ test.describe("pages from other files", () => {
     await expect(page.locator("#tool-pen")).toHaveAttribute("aria-pressed", "true");
   });
 
+  test("while a change runs, the fields of a form wait and say why, and work again when it is done", async ({ page }) => {
+    const doc = await openDoc(page, "/docs/form-ten.pdf");
+    // The page that is on screen after picking the fourth page has the field, as every page has.
+    const field = page.getByRole("textbox", { name: "Full name" }).first();
+    const layer = page.locator(".form-layer").first();
+    await expect(field).toBeVisible();
+    await expect(layer).toHaveJSProperty("inert", false);
+    await press(page, 3);
+    await page.evaluate(() => ((window as unknown as { __E2E__: Stand }).__E2E__.pages.delay = 1500));
+    await page.keyboard.press("Delete");
+    await expect(page.locator(".busy-box")).toBeVisible();
+    // The fields take no pointer and no key, and the bar says why.
+    await expect(layer).toHaveJSProperty("inert", true);
+    await expect(page.locator(".form-bar-text")).toContainText("The fields wait until that is done");
+    await field.click({ force: true });
+    await expect(field).not.toBeFocused();
+    await page.evaluate(() => ((window as unknown as { __E2E__: Stand }).__E2E__.pages.delay = 0));
+    await expect.poll(async () => (await labels(page, doc)).length, { timeout: 8000 }).toBe(3);
+    await answerNote(page, /What a delete leaves/);
+    // The pages are laid out again, the form is read again and the fields take text again.
+    await expect(page.locator(".form-layer").first()).toHaveJSProperty("inert", false);
+    await expect(page.locator(".form-bar:not([hidden])")).toHaveCount(0);
+    await field.fill("Ada");
+    await field.press("Tab");
+    await expect.poll(async () => (await calls(page, "set_form_field")).length).toBe(1);
+    expect((await calls(page, "set_form_field"))[0]).toMatchObject({ doc, name: "fullname", value: { kind: "text", text: "Ada" } });
+  });
+
   test("while a change runs, the other tabs, the keys and the menu answer, and the other document is saved and closed", async ({
     page,
   }) => {

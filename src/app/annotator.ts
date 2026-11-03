@@ -879,7 +879,8 @@ export class Annotator implements AnnotLayerEvents {
  */
 function deleteWarning(kind: Annotation["kind"]): string {
   const base =
-    "This annotation came with the file, and Undo cannot bring it back. If you delete it and save, the new file does not hold its comment or author. " +
+    "This annotation came with the file, and Undo cannot bring it back. Only taking back a change to the pages made before it can, because that loads the document as it was then. " +
+    "If you delete it and save, the new file does not hold its comment or author. " +
     "This is not redaction: copies and backups made before the save still hold the text.";
   return kind === "other" ? `${base} The words of a text box can stay in the saved file.` : base;
 }

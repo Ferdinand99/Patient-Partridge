@@ -1160,10 +1160,11 @@ fn delete(
     let result = (|| {
         let document = engine.docs.get_mut(&doc).ok_or_else(gone)?;
         let mut pace = Pace::new();
+        // The words of the notes and other annotations of the pages go as well, except those of an
+        // annotation that a page which stays also shows.
+        crate::annots::scrub_pages(document, &sorted, count as u32);
         for &index in &sorted {
             form_fields += clear_form_fields(document, index);
-            // The words of the notes and other annotations of the page go as well.
-            crate::annots::scrub_page(document, index);
             pace.step(progress);
         }
         for (i, &index) in sorted.iter().rev().enumerate() {

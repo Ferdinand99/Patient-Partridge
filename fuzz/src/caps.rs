@@ -472,7 +472,7 @@ const PAGE_TEXT_AT_CAP: usize = 11;
 const SAVE_PIECE_OVER: usize = 17;
 const SAVE_PIECE_AT_CAP: usize = 18;
 /// The three cases of the page tools that are 800 KB, 320 KB and 800 KB.
-const PAGES_BIG: [usize; 3] = [26, 27, 28];
+const PAGES_BIG: [usize; 3] = [37, 38, 39];
 
 /// A response that is valid except for one thing, which is one over a cap. Two cases sit exactly
 /// at a cap instead (the biggest page text, the widest bitmap) and must be accepted. Returns a
