@@ -62,6 +62,21 @@ describe("describeError: saving", () => {
   });
 });
 
+describe("describeError: a save that ran out of memory", () => {
+  it("says there was not enough memory, not that the document is too big", () => {
+    const d = describeError(
+      { code: "save_too_large", message: "there was not enough memory to finish saving the document" },
+      "atlas.pdf",
+    );
+    expect(d.detail).toContain("not enough memory");
+    expect(d.detail).toContain('"atlas.pdf"');
+    expect(d.detail).toContain("was not changed");
+    expect(`${d.title} ${d.detail}`).not.toMatch(/too big|512 MiB/);
+    const big = describeError({ code: "save_too_large", message: "the document is too big to be saved" }, "atlas.pdf");
+    expect(big.detail).toContain("512 MiB");
+  });
+});
+
 describe("describeError: a save that took too long", () => {
   it("says the time ran out, that the file is as it was and that the changes are lost, and counts as a lost engine", () => {
     const error = { code: "save_took_too_long", message: "it was still working" };

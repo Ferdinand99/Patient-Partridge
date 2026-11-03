@@ -33,6 +33,8 @@ struct Capped {
     bytes: Vec<u8>,
     limit: usize,
     overflowed: bool,
+    /// The buffer could not grow although the document is within the limit.
+    no_memory: bool,
     since_progress: usize,
     /// Called with the number of bytes written, about every MiB. The pointer lives only as long
     /// as the call to `serialise_up_to` that made it (see there).
@@ -53,7 +55,7 @@ impl Write for Capped {
         // A buffer that cannot grow is a failed save, not an engine that aborts and takes the
         // changes of the document with it.
         if self.bytes.try_reserve(data.len()).is_err() {
-            self.overflowed = true;
+            self.no_memory = true;
             return Err(io::Error::other("no memory for the saved document"));
         }
         self.bytes.extend_from_slice(data);
@@ -70,6 +72,17 @@ impl Write for Capped {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+/// The failure for a document that could not be written out whole: it passed the limit, or the
+/// buffer for it could not grow (the same code, and words that say which it was).
+fn too_large(passed_limit: bool) -> Failure {
+    let words = if passed_limit {
+        "the document is too big to be saved"
+    } else {
+        "there was not enough memory to finish saving the document"
+    };
+    (ErrorCode::SaveTooLarge, words.to_string())
 }
 
 /// Writes the document out as PDFium would write a copy of it, with every change made so far.
@@ -96,15 +109,13 @@ pub fn serialise_up_to(
         bytes: Vec::new(),
         limit,
         overflowed: false,
+        no_memory: false,
         since_progress: 0,
         progress,
     };
     let result = document.save_to_writer(&mut out);
-    if out.overflowed {
-        return Err((
-            ErrorCode::SaveTooLarge,
-            "the document is too big to be saved".to_string(),
-        ));
+    if out.overflowed || out.no_memory {
+        return Err(too_large(out.overflowed));
     }
     if result.is_err() {
         return Err((
@@ -274,5 +285,21 @@ pub fn fingerprint(document: &PdfDocument<'_>, progress: &mut dyn FnMut(u32)) ->
         pages: pages.len() as u32,
         failed,
         digest,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_save_that_ran_out_of_memory_does_not_say_the_document_is_too_big() {
+        let (code, words) = too_large(false);
+        assert_eq!(code, ErrorCode::SaveTooLarge);
+        assert!(words.contains("not enough memory"), "{words}");
+        assert!(!words.contains("too big"), "{words}");
+        let (code, words) = too_large(true);
+        assert_eq!(code, ErrorCode::SaveTooLarge);
+        assert!(words.contains("too big"), "{words}");
     }
 }
