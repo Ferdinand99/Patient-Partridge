@@ -24,24 +24,25 @@ use pdfium_render::prelude::*;
 use source::{GuardedReader, SourceFile, SourceGuard};
 
 pub mod annots;
-#[cfg(unix)]
-pub mod fds;
 pub mod fonts;
 pub mod form_actions;
 pub mod forms;
-pub mod limits;
 pub mod pages;
 pub mod pagetree;
-pub mod sandbox;
 pub mod save;
 pub mod sigcheck;
 pub mod sigmark;
 pub mod signatures;
 pub mod source;
 pub mod startup;
-pub mod stdio;
 mod sysfontinfo;
 pub mod text;
+
+// The sandbox, the memory limit and the clean start-up live in a crate of their own, because the
+// signer uses them too.
+#[cfg(unix)]
+pub use partridge_sandbox::fds;
+pub use partridge_sandbox::{limits, sandbox, stdio};
 
 /// Command line of the engine.
 #[derive(Debug, Default, PartialEq, Eq)]

@@ -1,6 +1,6 @@
 # The Windows sandbox of the PDF engine
 
-Every document is read by an engine process of its own. On Windows the app starts that process (`crates/engine-client/src/spawn/windows.rs` and `windows/container.rs`) with the layers below, and the engine checks them when it starts (`crates/engine/src/sandbox/windows.rs`). A release build refuses to open a document if the AppContainer token or any other layer it controls is missing. The one answer it does not insist on is the answer of the network to its test attempts (see "When the network block is not proved").
+Every document is read by an engine process of its own. On Windows the app starts that process (`crates/engine-client/src/spawn/windows.rs` and `windows/container.rs`) with the layers below, and the engine checks them when it starts (`crates/sandbox/src/sandbox/windows.rs`). A release build refuses to open a document if the AppContainer token or any other layer it controls is missing. The one answer it does not insist on is the answer of the network to its test attempts (see "When the network block is not proved").
 
 | Layer | What it does |
 |---|---|
