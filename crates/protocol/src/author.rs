@@ -329,14 +329,12 @@ fn get_props(r: &mut Reader<'_>) -> Result<DesignProps, ProtocolError> {
         return Err(ProtocolError::UnknownValue((flags >> 8) as u8));
     }
     let max_len = r.u32()?;
-    let font_size = {
-        let v = r.f32()?;
-        if v.is_finite() && v >= 0.0 {
-            v
-        } else {
-            0.0
-        }
-    };
+    // A request has exactly one encoding, so a size that the encoder would change is refused here
+    // instead of being quietly changed.
+    let font_size = r.f32()?;
+    if !font_size.is_finite() || font_size.is_sign_negative() && font_size != 0.0 {
+        return Err(ProtocolError::InvalidLength);
+    }
     let default_value = r.string_max(MAX_FORM_VALUE)?;
     let count = r.u32()? as usize;
     if count > MAX_FORM_OPTIONS || count > r.remaining() / CHOICE_MIN {

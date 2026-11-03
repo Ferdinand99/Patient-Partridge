@@ -261,6 +261,20 @@ fn the_decoder_refuses_what_is_over_a_cap_or_not_known() {
     bytes[flags_at + 1] = 0x80;
     assert!(Request::decode(&bytes).is_err());
 
+    // A font size that the encoder would change is refused, so that a request has one encoding.
+    for bad in [f32::NAN, f32::INFINITY, -1.0, -1.0e-36] {
+        let mut bytes = apply_bytes(AuthorOp::Update {
+            name: "n".into(),
+            new_name: "n".into(),
+            props: DesignProps::default(),
+            exports: vec![],
+        });
+        // The flags are two bytes, the longest text 4 bytes, then the size.
+        let size_at = flags_at + 2 + 4;
+        bytes[size_at..size_at + 4].copy_from_slice(&bad.to_le_bytes());
+        assert!(Request::decode(&bytes).is_err(), "{bad}");
+    }
+
     // An answer with more widgets than it can hold.
     let mut bytes = Response {
         id: 1,
