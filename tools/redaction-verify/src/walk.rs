@@ -2,23 +2,33 @@
 //! complete graphics state, that turns everything that paints into events with a bounding box on
 //! the page.
 //!
-//! The graphics state has the stack of `q` and `Q` (the matrix, the clip, the colours, the line,
-//! and the text state: font, size, character and word spacing, horizontal scale, leading, rise and
-//! render mode), the text and line matrices of `BT .. ET`, and the path that is being built. The
-//! interpreter follows forms (with `/Matrix` and `/BBox`), the groups of soft masks, annotation
-//! appearances and tiling patterns, and reads inline images. It does not depend on what is visible:
-//! a render mode that draws nothing, optional content that is off, a transparency of 0, a white
-//! colour and a clip that cuts everything away still count.
+//! The rule above all others: what the walk does not fully understand is "could not check", never
+//! a pass. It does not try to model every quirk of a reader; it refuses to judge.
 //!
-//! Every event (a glyph of any font, the fill or stroke of a path, a clip path, a shading) goes to
-//! one place, [`Walker::emit`], which tests it against the regions of the page when it happens and
-//! keeps what meets one. So nothing is dropped when a page has a lot of content. A page that needs
-//! more steps or more time than the budget is "could not check", never a pass.
+//! The graphics state has the stack of `q` and `Q` (the matrix, the clip, the colours, the line, the
+//! dash pattern, and the text state: font, size, character and word spacing, horizontal scale,
+//! leading, rise and render mode), the text and line matrices of `BT .. ET`, and the path that is
+//! being built. The interpreter follows forms (with `/Matrix` and `/BBox`), the groups of soft
+//! masks, annotation appearances and the glyph procedures of Type 3 fonts, and reads inline images.
+//! A tiling pattern is not followed: a fill with a pattern is the fill, and what the pattern draws
+//! is looked at only for images. It does not depend on what is visible: a render mode that draws
+//! nothing, optional content that is off, a transparency of 0, a white colour and a clip that cuts
+//! everything away still count.
 //!
-//! The box of a glyph is conservative. Its height is the bounding box of the font (the full em
-//! when the font has none that is plausible); its width is the advance of the glyph where the font
-//! gives widths, and the bounding box of the font where it does not. Where a width is not known
-//! the position of every later glyph of the string is an interval, and the boxes cover it.
+//! Every event (a glyph of any font, the fill or stroke of a path, a clip path, a shading, and what
+//! a Type 3 glyph paints) goes to one place, [`Walker::emit`], which tests it against the regions of
+//! the page when it happens and keeps what meets one. So nothing is dropped when a page has a lot
+//! of content. A page that needs more steps or more time than the budget, and the work that fonts,
+//! patterns and glyph procedures need when they are read, is "could not check".
+//!
+//! A glyph of a known place counts when the centre of its cell is inside a region. The cell is the
+//! larger of what the font says (the advance, the bounding box) and one em square from the origin,
+//! at the font size, scaled by the horizontal scale and the matrices, because a font that a file
+//! describes can say anything. The standard fonts that a file does not describe use the widths of
+//! the tool and have no floor across. A glyph whose place is not known (an interval of positions)
+//! counts when its whole box meets the region. The ink of a glyph that straddles the edge, with
+//! less than half of its cell inside, is not counted: this is the one place where the check is not
+//! strict, and the engine must remove glyphs by the same rule.
 //!
 //! Some geometry carries no information about what was under a region, and is allowed:
 //! - the box that redacts: a fill of a single rectangle that is the region (within a pixel of the
@@ -26,7 +36,8 @@
 //! - a fill of a single rectangle in one device colour that contains the whole region (a page
 //!   background, the shading of a table cell);
 //! - a straight horizontal or vertical line, or a thin rectangle, at most 2 points thick, that
-//!   crosses the whole region from one side to the other (the rules of a table);
+//!   crosses the whole region from one side to the other (the rules of a table), when it is solid,
+//!   has no constant alpha or blend mode and no clip ends at the region on its own axis;
 //! - a clip path that is one rectangle that contains the whole region.
 //!
 //! All of these must be painted with no clip that cuts into the region and with no soft mask,

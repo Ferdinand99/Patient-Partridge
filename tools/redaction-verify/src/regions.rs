@@ -18,8 +18,8 @@
 //!    is a leak whatever its colour, clip, transparency, blend mode, render mode or optional
 //!    content, except geometry that carries nothing about what was under the region (the box that
 //!    redacts, a fill of one colour that contains the region, a rule that crosses it). What a
-//!    viewer cannot show now can be shown later. The glyphs of ordinary fonts are leaks when the
-//!    spec has no text to look for: the text layers cover them otherwise.
+//!    viewer cannot show now can be shown later. A glyph counts when the centre of its cell is
+//!    inside the region, in every spec. What the walk does not fully understand is a problem.
 //!
 //! Where the check cannot be done (a codec that is not decoded, a mask that cannot be read, a
 //! region too small to leave a pixel after the margin, a render that fails, content whose bounds

@@ -2,9 +2,9 @@
 //! uses a PDF library of the app, so a bug in the code under test cannot hide in the check.
 //!
 //! Every call has a time limit, and all the calls for one file share a budget. A tool that runs
-//! over is killed with everything it started (its process group on Unix, its process tree on
-//! Windows; a process that leaves the group on its own is out of reach), and the check ends with an
-//! error (exit status 2): a file that was not fully checked is never reported clean.
+//! over is killed with everything it started (its process group on Unix, a job object on Windows;
+//! a process that starts a session of its own is out of reach), and the check ends with an error
+//! (exit status 2): a file that was not fully checked is never reported clean.
 
 use std::cell::RefCell;
 use std::ffi::OsStr;

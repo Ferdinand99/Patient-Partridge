@@ -37,18 +37,21 @@
 //!    JPEG with no such block under the region, or with quantisation tables so coarse that a flat
 //!    block may be off by more than 12 levels of 255, is "could not check".
 //! 3. The geometry. One interpreter walks the content of the page with a complete graphics state
-//!    (the stack of `q` and `Q`, the matrix, the clip, the colours, the text state, the text and
-//!    line matrices), through forms, soft mask groups, every state of every annotation appearance
-//!    and the icons of a widget. Every painting event is placed on the page: a glyph of any font, a
-//!    path that is filled or stroked, a clip path, a shading. One that meets the region is a leak,
-//!    whatever its colour, clip, transparency, blend mode, render mode or optional content: it is in
-//!    the file, and shows when the box over it goes or the layer is turned on. The glyphs of
-//!    ordinary fonts count when the spec has no text to look for. Geometry that carries nothing
-//!    about what was under the region is allowed: the box that redacts, a fill of one rectangle in
-//!    one device colour that holds the whole region, a rule at most 2 points thick that crosses it,
-//!    and a clip that is one rectangle that holds it (see `walk`). Where the bounds of something
-//!    cannot be computed, or the walk needs more than its budget of steps or time, that is "could
-//!    not check".
+//!    (the stack of `q` and `Q`, the matrix, the clip, the colours, the dash pattern, the text
+//!    state, the text and line matrices), through forms, soft mask groups, every state of every
+//!    annotation appearance, the icons of a widget and the glyph procedures of Type 3 fonts. Every
+//!    painting event is placed on the page: a glyph of any font, a path that is filled or stroked,
+//!    a clip path, a shading. One that meets the region is a leak, whatever its colour, clip,
+//!    transparency, blend mode, render mode or optional content: it is in the file, and shows when
+//!    the box over it goes or the layer is turned on. A glyph counts when the centre of its cell is
+//!    inside the region, in every spec; the ink of a glyph that straddles the edge is not counted
+//!    (the one place where the check is not strict). Geometry that carries nothing about what was
+//!    under the region is allowed: the box that redacts, a fill of one rectangle in one device
+//!    colour that holds the whole region, a solid rule at most 2 points thick that crosses it, and
+//!    a clip that is one rectangle that holds it (see `walk`). What the walk does not fully
+//!    understand (a token that a strict reader refuses, a name that cannot be found, vertical
+//!    writing, bounds that cannot be computed, a walk that needs more than its budget of steps or
+//!    time) is "could not check".
 //!
 //! Content streams are found from the structure of the file: the contents of a page, forms,
 //! appearances, patterns, Type 3 glyph procedures. A stream with such a role is always decoded as
@@ -79,14 +82,13 @@
 //! - Geometry in objects that no page draws (an orphan form, a pattern that is not used) is not
 //!   placed, because nothing says where it would be. The text of those objects is read.
 //! - Geometry is placed by its bounds, and bounds err on the side of a leak: a curve is bounded by
-//!   its control points, a stroke by the widest line a viewer draws, a glyph by the bounding box of
-//!   its font (the full em where the font has none), so text that ends at the edge of a region can
-//!   meet it. A line a few points from a region can be a leak. A font with no widths gives
-//!   intervals for the places of its glyphs, and wider boxes.
-//! - A tool that leaves its process group by itself is out of reach of the time limit: only the
-//!   tool and the processes in its group (its tree on Windows) are stopped.
-//! - Images drawn through a tiling pattern or by Type 3 glyphs are seen by the render only, and
-//!   the check says so.
+//!   its control points, a stroke of straight segments by the segments and the widest line a viewer
+//!   draws, a glyph by its cell (see above), so text on the line next to a word can meet a region.
+//!   A line a few points from a region can be a leak. A font with no widths gives intervals for the
+//!   places of its glyphs, and the whole box counts.
+//! - A tool that starts a session of its own (`setsid` on Unix) is out of reach of the time limit;
+//!   the tool and the processes in its group (a job object on Windows) are stopped.
+//! - Images drawn through a tiling pattern are seen by the render only, and the check says so.
 //!
 //! It never calls PDFium and uses no PDF library of the app: the check stays independent of the
 //! code under test. Values to search for are never printed unless asked for; a hit names the
