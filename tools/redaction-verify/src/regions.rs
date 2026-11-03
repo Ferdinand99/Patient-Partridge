@@ -18,8 +18,9 @@
 //!    is a leak whatever its colour, clip, transparency, blend mode, render mode or optional
 //!    content, except geometry that carries nothing about what was under the region (the box that
 //!    redacts, a fill of one colour that contains the region, a rule that crosses it). What a
-//!    viewer cannot show now can be shown later. A glyph counts when the centre of its cell is
-//!    inside the region, in every spec. What the walk does not fully understand is a problem.
+//!    viewer cannot show now can be shown later. A glyph counts when its cell overlaps the region
+//!    with positive area, in every spec. What the walk does not fully understand, what is outside
+//!    the strict profile ([`crate::profile`]), is a problem.
 //!
 //! Where the check cannot be done (a codec that is not decoded, a mask that cannot be read, a
 //! region too small to leave a pixel after the margin, a render that fails, content whose bounds
@@ -41,9 +42,10 @@ use crate::carve;
 use crate::content::apply;
 use crate::layers::Ctx;
 use crate::pdfobj::{Doc, Entry, Obj};
+use crate::profile::exact_numbers;
 use crate::tools;
 use crate::walk::{
-    bounds, matrix_of, numbers, overlaps, Budget, Found, Placement, Source, Target, Walker, M,
+    bounds, matrix_of, overlaps, Budget, Found, Placement, Source, Target, Walker, M,
 };
 use crate::{Hit, Layer, Region, Report, Result, Subject, RENDER_DPI, RENDER_MARGIN};
 
@@ -932,10 +934,9 @@ struct Geometry {
 }
 
 fn geometry(doc: &Doc, page: &Entry) -> std::result::Result<Geometry, String> {
-    let mb = numbers(inherited(doc, page, "MediaBox"), doc);
-    if mb.len() != 4 {
-        return Err("the page has no MediaBox".to_owned());
-    }
+    let Some(mb) = exact_numbers(inherited(doc, page, "MediaBox"), doc, 4) else {
+        return Err("the page has no MediaBox of four numbers".to_owned());
+    };
     let media = [
         mb[0].min(mb[2]),
         mb[1].min(mb[3]),
@@ -1224,16 +1225,19 @@ pub fn check(ctx: &Ctx, bytes: &[u8], rep: &mut Report) -> Result<()> {
     for (page_no, ris) in by_page {
         let (page, res) = &pages[page_no - 1];
         // Nothing is painted outside the media box.
-        let media = numbers(inherited(&doc, page, "MediaBox"), &doc);
-        let container = if media.len() == 4 {
-            [
+        let container = match exact_numbers(inherited(&doc, page, "MediaBox"), &doc, 4) {
+            Some(media) => [
                 media[0].min(media[2]),
                 media[1].min(media[3]),
                 media[0].max(media[2]),
                 media[1].max(media[3]),
-            ]
-        } else {
-            [f64::MIN, f64::MIN, f64::MAX, f64::MAX]
+            ],
+            None => {
+                rep.problems.push(format!(
+                    "images: page {page_no}: the page has no MediaBox of four numbers, so where it paints is not known"
+                ));
+                [f64::MIN, f64::MIN, f64::MAX, f64::MAX]
+            }
         };
         let targets: Vec<Target> = ris
             .iter()
@@ -1422,6 +1426,10 @@ fn annotations(w: &mut Walker, page: &Entry, container: [f64; 4], page_res: &Obj
     let Obj::Array(annots) = doc.dget(&page.value, "Annots") else {
         return;
     };
+    let page_rotate = inherited(doc, page, "Rotate")
+        .int()
+        .unwrap_or(0)
+        .rem_euclid(360);
     let need_app = matches!(doc.dget(acro, "NeedAppearances"), Obj::Bool(true));
     let fallback = if page_res.is_dict() && !page_res.entries().is_empty() {
         page_res.clone()
@@ -1445,8 +1453,41 @@ fn annotations(w: &mut Walker, page: &Entry, container: [f64; 4], page_res: &Obj
                 }
             }
         }
-        let rect = ad.get("Rect").map(|r| numbers(r, doc)).unwrap_or_default();
+        let rect = match ad.get("Rect") {
+            None => Vec::new(),
+            Some(r) => {
+                let Some(v) = exact_numbers(r, doc, 4) else {
+                    w.problem("an annotation has a /Rect that is not four numbers, so where a viewer draws it is not known".to_owned());
+                    continue;
+                };
+                v
+            }
+        };
         let sub = doc.dget(ad, "Subtype").name().unwrap_or("");
+        // An annotation with the NoRotate flag is drawn turned back against the page, about a
+        // corner of its rectangle, and where that is, is not placed: it is "could not check" when
+        // the rectangle widened by its longer side on every side meets a region (the appearance
+        // lies inside it however it is turned).
+        if doc.dget(ad, "F").int().unwrap_or(0) & 16 != 0
+            && page_rotate != 0
+            && (!forms.is_empty() || DRAWN_BY_VIEWER.contains(&sub))
+        {
+            let near = match rect.as_slice() {
+                [a, b, c, d] => {
+                    let r = normalised([*a, *b, *c, *d]);
+                    let m = (r[2] - r[0]).max(r[3] - r[1]);
+                    let reach = [r[0] - m, r[1] - m, r[2] + m, r[3] + m];
+                    w.targets.iter().any(|t| overlaps(&reach, &t.rect))
+                }
+                _ => true,
+            };
+            if near {
+                w.problem(format!(
+                    "a {sub} annotation with the NoRotate flag lies near a redaction region on a page that is turned by {page_rotate} degrees, and a viewer turns it back about a corner of its rectangle, so where it is drawn is not known"
+                ));
+                continue;
+            }
+        }
         let text = has_entry_text(doc, ad, 0);
         // A widget that a viewer draws again from its value.
         let blank = forms.iter().all(|n| blank_form(doc, *n));
@@ -1488,21 +1529,24 @@ fn annotations(w: &mut Walker, page: &Entry, container: [f64; 4], page_res: &Obj
         }
         for n in forms {
             let Some(e) = doc.latest(n) else { continue };
-            let bbox = e
-                .value
-                .get("BBox")
-                .map(|b| numbers(b, doc))
-                .unwrap_or_default();
-            if bbox.len() != 4 {
+            let Some(bbox) = e.value.get("BBox").and_then(|b| exact_numbers(b, doc, 4)) else {
                 w.problem(format!(
-                    "the appearance form {n} has no /BBox, so where a viewer draws it is not known"
+                    "the appearance form {n} has no /BBox of four numbers, so where a viewer draws it is not known"
                 ));
                 continue;
-            }
-            let m = e
-                .value
-                .get("Matrix")
-                .map_or(crate::content::IDENTITY, |m| matrix_of(m, doc));
+            };
+            let m = match e.value.get("Matrix") {
+                None => crate::content::IDENTITY,
+                Some(m) => {
+                    let Some(m) = matrix_of(m, doc) else {
+                        w.problem(format!(
+                            "the appearance form {n} has a /Matrix that is not six numbers, so where a viewer draws it is not known"
+                        ));
+                        continue;
+                    };
+                    m
+                }
+            };
             let pts = [
                 apply(&m, bbox[0], bbox[1]),
                 apply(&m, bbox[2], bbox[1]),

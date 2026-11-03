@@ -114,6 +114,8 @@ pub struct Fx {
     pub maps_to: Option<fn(char) -> String>,
     /// Name the fonts as subsets (`ABCDEF+..`).
     pub subset: bool,
+    /// Put this TrueType program in the file for the Type0 font (object 40).
+    pub program: Option<Bytes>,
 }
 
 impl Fx {
@@ -129,6 +131,7 @@ impl Fx {
             to_unicode: true,
             maps_to: None,
             subset: true,
+            program: None,
         }
     }
 
@@ -197,14 +200,22 @@ impl Fx {
             None => Box::new(|c| c.to_string()),
         };
         o.insert(8, packed("", &cmap(&self.cid_text, &*map)));
+        let file = if self.program.is_some() {
+            " /FontFile2 40 0 R"
+        } else {
+            ""
+        };
         o.insert(
             9,
             format!(
                 "<< /Type /FontDescriptor /FontName /{base} /Flags 32 /FontBBox [0 -200 1000 900] \
-                 /ItalicAngle 0 /Ascent 900 /Descent -200 /CapHeight 700 /StemV 80 >>"
+                 /ItalicAngle 0 /Ascent 900 /Descent -200 /CapHeight 700 /StemV 80{file} >>"
             )
             .into_bytes(),
         );
+        if let Some(p) = &self.program {
+            o.insert(40, stream_obj(&format!("/Length1 {}", p.len()), p, true));
+        }
         for (n, b) in &self.extra {
             o.insert(*n, b.clone());
         }

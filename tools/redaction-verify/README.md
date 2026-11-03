@@ -63,35 +63,94 @@ A region (`{"page": 1, "rect": [x0, y0, x1, y1], "fill": "#000000"}`) must pass 
    JPEG that cannot be judged (no whole block under the region, or tables too coarse) is "could not
    check".
 3. The geometry. One interpreter walks the content of the page with a complete graphics state (the
-   stack of `q` and `Q`, the matrix, the clip, the colours, the dash pattern, the text state with
-   spacing, scale, leading, rise and font, the text and line matrices) and follows forms (with
-   `/Matrix` and `/BBox`), soft mask groups, every state of every annotation appearance, the icons
-   of widgets and the glyph procedures of Type 3 fonts. Every painting event is placed on the page:
-   a glyph of any font, the fill or stroke of a path, a clip path, a shading, and what a Type 3
-   glyph paints. One that meets the region is a leak whatever its colour, clip, transparency, blend
-   mode, render mode or optional content.
+   stack of `q` and `Q`, the matrix, the clip, the colours, the dash pattern, the miter limit, the text
+   state with spacing, scale, leading, rise and font, the text and line matrices) and follows forms
+   (with `/Matrix` and `/BBox`), soft mask groups, every state of every annotation appearance, the
+   icons of widgets and the glyph procedures of Type 3 fonts. Every painting event of a page inside
+   the strict profile (below) is placed on the page: a glyph of any font, the fill or stroke of a
+   path, a clip path, a shading, and what a Type 3 glyph paints. One that meets the region is a leak
+   whatever its colour, clip, transparency, blend mode, render mode or optional content.
 
-   The rule above all: what the walk does not fully understand is "could not check", never a pass.
-   It does not try to model every quirk of a reader; it refuses to judge. That covers a number that
-   a strict reader does not accept (`1+19000`, `110.-0`, `1e5`), a name with a bad escape, a string
-   that does not end, a name that cannot be found (a `Do`, `gs`, font, pattern or shading), an
-   inline image whose end is in doubt, vertical writing, a Type 3 font that has no widths, no glyph
-   names or a procedure that cannot be read, and a walk that needs more steps or time than its
-   budget.
+   **The strict profile.** The geometry check gives exit status 0 only when every page, with the
+   forms, appearances, patterns, soft mask groups and Type 3 procedures that it draws, lies inside
+   a profile that the tool understands fully. What is outside it is "could not check", never a
+   pass: the tool does not try to model what other readers do with a feature, it leaves the feature
+   out. The profile is one module, `src/profile.rs`, and this section:
 
-   - **Text.** A glyph is placed from the advance of each glyph (`/Widths`, or `/W` and `/DW`, or
-     the standard font tables) and counts when **the centre of its cell is inside the region**, in
-     every spec, whatever text the spec looks for. The cell is the larger of what the font says
-     (the advance, the bounding box) and one em square from the glyph origin at the font size,
-     scaled by the horizontal scale and the matrices; a font that the file describes can say
-     anything about its metrics. The standard fonts that a file does not describe have no floor
-     across, because their widths are the tables of the tool. Where the place of a glyph is not
-     known (an interval of positions), the whole box counts.
-     **The ink of a glyph that straddles the edge of the region, with less than half of its cell
-     inside, is not counted.** This is the one place where the check is not strict: a page can hide
-     the part of such a glyph that is outside the region, and the part inside is under the box. The
-     engine must remove glyphs by the same rule (a glyph whose cell centre is in the region goes),
-     so that the two agree.
+   - **Operators.** Every operator is one of the specification (Table A.1) and has exactly the
+     number and the types of operands that the specification gives: finite numbers, whole numbers
+     where one is wanted (`j`, `J`, `Tr`), a `TJ` that shows only strings and numbers. An operator
+     with more operands is read by Poppler from its last ones, and by others from its first, so it
+     is refused; so is an unknown operator, unless it is between `BX` and `EX`. The text layers read
+     the operands the same way. A number that a strict reader does not accept (`1+19000`, `110.-0`,
+     `1e5`), a name with a bad escape and a string that does not end are refused too.
+   - **Matrices and boxes.** A `/Matrix`, `/BBox`, `/Rect`, `/MediaBox` and `/FontMatrix` is exactly
+     six (a matrix) or four (a box) finite numbers. A form has a `/BBox`.
+   - **Fonts.** Text is shown only with
+     - one of the standard fonts (Helvetica and Arial, Times, Courier) that the file does not
+       embed, whose `/Encoding` is absent, `WinAnsiEncoding` or `MacRomanEncoding` (a name; no
+       `/Differences`, no base encoding), and whose `/Widths`, if it has any, are within 1 % of the
+       standard widths for every code from 32 to 126 and fit `/FirstChar`..`/LastChar`. A code
+       outside 32 to 126 of such a font with `/Widths` is refused; with none, the tool places it
+       by an interval (the widths of the 14 fonts are what Poppler uses);
+     - a simple font (Type 1, MMType1, TrueType) whose program is in the file (TrueType, OpenType,
+       CFF or Type 1) and whose bounding box the tool reads, with `/Widths` of exactly
+       `/LastChar - /FirstChar + 1` numbers; a shown code outside that range, and a width outside
+       0.01 to 3 em (the space may be 0), are refused. For a TrueType program every width must be
+       the advance of some glyph of the program (2 %);
+     - a composite font (Type 0) with the encoding `Identity-H` as a name, one descendant whose
+       program is in the file, and, for a TrueType program, a width (`/W`, `/DW`) that is the
+       advance of the glyph of the code (through `/CIDToGIDMap`);
+     - a Type 3 font whose `/FontMatrix` has no rotation or skew, whose `/Widths` fit
+       `/FirstChar`..`/LastChar`, and in which every shown code is named by `/Differences` and has
+       a procedure that is walked.
+
+     A font that is not embedded and not a standard font (also Symbol and ZapfDingbats), a program
+     that the tool cannot read, an `/Encoding` that is a stream or a name other than `Identity-H`
+     (every vertical map, a `/WMode` of 1 in the font or in a character map), and a width that
+     disagrees with the program are refused. The box of the program (the `head` table, the
+     `FontBBox` of a CFF or Type 1 program) must lie within 0.5 em above and below the cell of a
+     glyph (the ascent and descent, see below) and within 1.2 em left of the origin and right of
+     the widest advance: ink that is farther from its cell than that is refused.
+   - **Annotations.** An annotation with the NoRotate flag on a page that is turned is refused when
+     its rectangle, widened on every side by its longer side, meets a region (a viewer turns it back
+     about a corner of its rectangle).
+   - **Strokes.** The miter limit is the real one. A miter limit above 10, and a dash pattern on a
+     path with joins (a rectangle, a polyline, a curve), are refused when the stroke is near a
+     region.
+   - **Budget.** A walk that needs more steps (`--walk-steps`, default 100 000 000) or time
+     (`--walk-budget`, default 120 s) than its budget is refused, and so is the work that fonts,
+     patterns, font programs and glyph procedures need when they are read.
+
+   **The glyph rule** is the contract between this check and the redaction engine, and it is the
+   same in every spec. The cell of a glyph is
+
+   - across: from the glyph origin along the baseline by the width of the glyph times the font size
+     times the horizontal scale (`Tz`). Character and word spacing (`Tc`, `Tw`) and kerning move the
+     next glyph, not the cell;
+   - up and down: from the descent to the ascent of the font, in em times the font size, with the
+     rise (`Ts`). For a standard font these are -0.25 and 0.97 em. For an embedded font they are
+     the `/Descent` and `/Ascent` of its descriptor, held within the box of the font program (the
+     box itself where the descriptor has none). For a Type 3 font they are the vertical extent of
+     its `/FontBBox`, or -0.2 to 1.0 em without one;
+   - moved by the text matrix and the matrix of the page; the bounds of the cell on the page are the
+     bounds of its four corners.
+
+   **A glyph is under a region when its cell overlaps the region with positive area**: it reaches
+   more than 0.01 point into the region both across and up and down. A glyph whose cell only
+   touches the region, or ends where the region starts to within that, is not under it. A space is
+   a glyph like any other. A glyph of a known place that is under a region is a leak, whatever the
+   spec looks for. Where the width of a glyph is not known (a code of a standard font that the
+   tables do not have), the place is an interval and the widest cell it can have counts.
+
+   **The engine must remove every glyph whose cell overlaps the region by this rule**, and no more
+   is needed: the glyph before a word that ends where the region starts stays (a word box that is
+   the region exactly), and the space before a word stays only when the region does not reach into
+   it (with a region 1 point larger than the word, the spaces next to the word and the end of a
+   narrow letter overlap it, and go with the word). The rule is the same for the glyphs of a
+   neighbouring line whose cell reaches the region. The ink of a glyph that is outside its cell is
+   not counted, within the limits of the profile above.
+
    - An annotation that a viewer draws from its entries (`/Contents`, `/RC`, the value of a field)
      because it has no appearance stream is a leak when it has text and lies over the region, and
      "could not check" when it has none. A widget is drawn again from its value when the form says
@@ -107,10 +166,7 @@ A region (`{"page": 1, "rect": [x0, y0, x1, y1], "fill": "#000000"}`) must pass 
      mode, and is not clipped to the region on its own axis; a clip path that is one rectangle that
      holds the region. A clip that is anything else is geometry that meets the region. A subpath of
      one point is a zero-length segment: the dot of a round or square cap is geometry.
-   - Nothing is dropped. Every event is tested against the regions as it happens. A page that needs
-     more than `--walk-steps` steps (operators, glyphs, and what is read for a font, a pattern or a
-     glyph procedure; default 100 000 000) or more than `--walk-budget` seconds (default 120) is
-     "could not check".
+   - Nothing is dropped. Every event is tested against the regions as it happens.
 
 Name the fill colour: without it a region over one image sample, or a box of any colour, cannot be
 told from a region that was not redacted.
@@ -118,25 +174,25 @@ told from a region that was not redacted.
 ## Known limits
 
 - A composite font without `ToUnicode`, an embedded symbolic font without an encoding, and a Type 3
-  font whose glyph names are not glyph names make the text shown with them "could not check": the
-  font program is not parsed. A real file with such a font cannot be the input of a redaction test.
+  font whose glyph names are not glyph names make the text shown with them "could not check" in the
+  text layers: the font program is not parsed for characters. A real file with such a font cannot be
+  the input of a redaction test.
 - A `ToUnicode` map into a private use area (U+E000 to U+F8FF, planes 15 and 16) says nothing about
   the glyph and is read as unmapped.
 - A phrase over the text of a page and the text of a form it draws, or over two annotation
   appearances, is not joined. A word that one glyph of a Type 3 font draws is a gap of at most three
   characters.
-- The ink of a glyph that straddles the edge of a region is not counted (see Regions, Text). Beyond
-  that, bounds err on the side of a leak: a curve is bounded by its control points, a stroke of
-  straight segments by the segments and the widest line a viewer draws, and a text on the line
-  next to a word can meet the region when its cell does.
-- A simple font with no `/Widths` is placed with the widths of the standard font that its name stands
-  for (Helvetica, Arial, Times, Courier), within 1.5 %. A font that is not in the tables (Symbol,
-  ZapfDingbats, anything else without widths) gives intervals and boxes that can be much wider than
-  the text, and the whole box counts. The space of a font that is not in the file draws nothing and
-  is no event.
-- Vertical writing is "could not check", whenever such text is shown on a page with a region: the
-  advance, the position vector (`/W2`, `/DW2`) and the spacing differ from horizontal text, and
-  they are not placed.
+- The cell of a glyph is its advance box and the ascent and descent of its font. The ink of a glyph
+  that lies outside its cell is not counted, but the profile bounds how far it can be (the box of the
+  font program, 0.5 em above and below the cell, 1.2 em across). A text on the line next to a word
+  can meet the region when its cell does.
+- The widths of a simple font are checked against the program only as a set, and only for a
+  TrueType program (every width is the advance of some glyph): the code is not followed to its glyph.
+  The widths of a CFF or Type 1 program are not read, and are the word of the file within 0.01 to 3
+  em. A composite font with a CFF program is placed by its `/W` as the file gives it.
+- Geometry is placed by its bounds, and bounds err on the side of a leak: a curve is bounded by its
+  control points, a stroke of straight segments by the segments and the widest line a viewer draws.
+  A line a few points from a region can be a leak.
 - A rule that crosses a region still says where it is on one axis. The exception is limited to
   solid, opaque rules that no clip ends at the region on the rule's own axis.
 - Geometry in objects that no page draws is not placed. The geometry that a tiling pattern paints

@@ -1394,21 +1394,31 @@ fn with_text_needle(spec: &str) -> String {
 
 const TXT_IN: &[u8] = b"BT /F1 12 Tf 80 420 Td (Ola Nordmann) Tj ET\n";
 
-/// A Helvetica whose widths are known: A and B are 1000 wide, everything else 500.
-fn wide_font() -> Bytes {
-    let widths: String = (32..=66)
-        .map(|c| if c >= 65 { "1000 " } else { "500 " })
+/// A simple TrueType font whose program is in the file (it takes the place of /F1): A and B are
+/// 1000 wide, every other code from 32 to 126 is 500, and the cell of a glyph is from 0.2 em below the
+/// baseline to 0.9 em above it.
+fn wide_font() -> Vec<(u32, Bytes)> {
+    let widths: Vec<u16> = (32..=126)
+        .map(|c| if c == 65 || c == 66 { 1000 } else { 500 })
         .collect();
-    format!(
-        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding \
-         /FirstChar 32 /LastChar 66 /Widths [{widths}] >>"
-    )
-    .into_bytes()
+    let mut objs = fonts::embedded_simple(
+        60,
+        32,
+        &widths,
+        (900, -200),
+        [0, -200, 1000, 900],
+        &[500, 1000],
+    );
+    let font = objs[0].1.clone();
+    objs.push((5, font));
+    objs
 }
 
 fn with_wide_font(content: &str) -> Bytes {
     let mut fx = Fx::new(&[BENIGN, content.as_bytes()].concat());
-    fx.extra.insert(5, wide_font());
+    for (n, b) in wide_font() {
+        fx.extra.insert(n, b);
+    }
     fx.build()
 }
 
@@ -1419,6 +1429,12 @@ fn text_under_a_region_is_a_leak_in_every_font() {
     let cid = Fx::new(b"").show("Ola Nordmann");
     let cid_text = format!("BT /F2 12 Tf 80 420 Td {cid} Tj ET\n").into_bytes();
     for (font, text) in [("Helvetica", TXT_IN.to_vec()), ("CID", cid_text)] {
+        // The composite font has its program in the file: the strict profile takes no other.
+        let drawn = |content: &[u8], _res: &str| {
+            let mut fx = Fx::new(&[BENIGN, content].concat());
+            fx.program = Some(fonts::cid_program());
+            fx.build()
+        };
         // Under the box that redacts it: the text is still there.
         check(
             &format!("{font} text under the box"),
@@ -1434,7 +1450,7 @@ fn text_under_a_region_is_a_leak_in_every_font() {
             Leak(&[PAINTED_MESSAGE, GLYPH_MESSAGE], &[]),
         );
         // A text needle in the spec changes nothing for the glyphs under the region: the text layers
-        // look for the needle only, and a part of it (nd1: Ola of Ola Nordmann) is not the needle.
+        // look for the needle only, and a part of it (Ola of Ola Nordmann) is not the needle.
         check(
             &format!("{font} text under the box, a text needle in the spec"),
             &drawn(&[text.as_slice(), BOX].concat(), ""),
@@ -1595,8 +1611,8 @@ fn the_glyphs_of_a_text_are_placed_one_by_one() {
 
 #[test]
 fn a_standard_font_without_widths_is_placed_by_the_widths_of_the_standard_font() {
-    // Helvetica A is 667 wide: at 20 points the cells of the glyphs are 13.3 wide, the fourth ends at
-    // 73.4 and its centre is at 66.7; the fifth has its centre at 80.
+    // Helvetica A is 667 wide: at 20 points the cells of the glyphs are 13.34 wide, so the third
+    // ends at 60.0 and the fourth reaches 1.34 points into the region that starts at 72.
     let page = |content: &str, font: &str| {
         let mut fx = Fx::new(&[BENIGN, content.as_bytes()].concat());
         fx.extra.insert(
@@ -1607,43 +1623,72 @@ fn a_standard_font_without_widths_is_placed_by_the_widths_of_the_standard_font()
     };
     let leak = || Leak(&[PAINTED_MESSAGE, GLYPH_MESSAGE], &[]);
     no_geometry(
-        "four glyphs: the fourth only reaches over the edge",
-        &page("BT /F1 20 Tf 20 420 Td (AAAA) Tj ET\n", "Helvetica"),
+        "three glyphs end at 60",
+        &page("BT /F1 20 Tf 20 420 Td (AAA) Tj ET\n", "Helvetica"),
         &white_region(),
     );
     check(
-        "the fifth has its centre in the region",
-        &page("BT /F1 20 Tf 20 420 Td (AAAAA) Tj ET\n", "Helvetica"),
+        "the fourth overlaps the region",
+        &page("BT /F1 20 Tf 20 420 Td (AAAA) Tj ET\n", "Helvetica"),
         &white_region(),
         leak(),
     );
-    // Times A is 722 wide, Courier is 600: the same text ends elsewhere.
+    // Courier A is 600 wide: the same text ends elsewhere.
     no_geometry(
-        "Courier: four glyphs, the cell of the fourth ends at 68",
+        "Courier: four glyphs end at 68",
         &page("BT /F1 20 Tf 20 420 Td (AAAA) Tj ET\n", "Courier"),
         &white_region(),
     );
     check(
-        "Courier: the fifth has its centre in the region",
+        "Courier: the fifth overlaps the region",
         &page("BT /F1 20 Tf 20 420 Td (AAAAA) Tj ET\n", "Courier"),
         &white_region(),
         leak(),
     );
-    // A font that is not a standard font and has no widths: any glyph may be anywhere in an
-    // interval, so the third glyph may reach the region.
-    check(
-        "a font of unknown widths",
+    // A font that is not a standard font and is not in the file: nothing says where its glyphs
+    // are, and the profile does not take it.
+    let r = cli(
         &page("BT /F1 20 Tf 20 420 Td (AAA) Tj ET\n", "Mystery"),
-        &white_region(),
-        leak(),
+        Some(&white_region()),
+        &[],
+        &[],
     );
-    // The space of a font that is not in the file draws nothing: here it lies over the region
-    // and the letter before it does not.
-    no_geometry(
+    assert_eq!(r.code, 2, "{}", r.out);
+    assert!(
+        r.problems()
+            .iter()
+            .any(|p| p.contains("not embedded and not one of the standard fonts")),
+        "{}",
+        r.out
+    );
+    // A space is a glyph like any other: this one lies over the region.
+    check(
         "a space over the region",
         &page("BT /F1 12 Tf 66 420 Td (x ) Tj ET\n", "Helvetica"),
         &white_region(),
+        leak(),
     );
+    // x is 6.000 wide and the space 3.336: this space ends at 72.000, where the region starts, and
+    // does not overlap it.
+    no_geometry(
+        "a space that ends where the region starts",
+        &page("BT /F1 12 Tf 62.664 420 Td (x ) Tj ET\n", "Helvetica"),
+        &white_region(),
+    );
+    // The cell is 0.97 em above the baseline and 0.25 em below it: 19.4 and 5 points at 20 points.
+    for (what, y, leaks) in [
+        ("the cell ends where the region starts", 380.6, false),
+        ("the cell reaches 0.4 points into the region", 381.0, true),
+        ("the cell starts where the region ends", 455.0, false),
+        ("the cell reaches 1 point into the region", 454.0, true),
+    ] {
+        let bytes = page(&format!("BT /F1 20 Tf 80 {y} Td (A) Tj ET\n"), "Helvetica");
+        if leaks {
+            check(what, &bytes, &white_region(), leak());
+        } else {
+            no_geometry(what, &bytes, &white_region());
+        }
+    }
 }
 
 #[test]
@@ -1932,12 +1977,15 @@ fn a_clip_path_is_geometry() {
 
 /// The line `Contact: Ola Nordmann, Storgata 1` with `Nordmann,` taken out and the rest kept where
 /// it was, and the box on the word.
+///
+/// `Contact: Ola ` is 70.032 points wide at 12 points and `Nordmann,` is 59.352, so the word is
+/// from 142.032 to 201.384, and the kept text ends and starts exactly there.
 const KEPT: &[u8] = b"BT /F1 12 Tf 72 420 Td (Contact: Ola ) Tj ET\n\
-                      BT /F1 12 Tf 190 420 Td (Storgata 1) Tj ET\n";
-const CR_BOX: &[u8] = b"0 g 138 416 50 16 re f\n";
+                      BT /F1 12 Tf 201.384 420 Td ( Storgata 1) Tj ET\n";
+const CR_BOX: &[u8] = b"0 g 142.032 416 59.352 16 re f\n";
 
 fn word_spec() -> String {
-    r##"{"text":["Nordmann"],"regions":[{"page":1,"rect":[138,416,188,432],"fill":"#000000"}]}"##
+    r##"{"text":["Nordmann"],"regions":[{"page":1,"rect":[142.032,416,201.384,432],"fill":"#000000"}]}"##
         .to_owned()
 }
 
@@ -1991,7 +2039,7 @@ fn geometry_that_carries_nothing_about_the_region_is_not_a_leak() {
     // Whatever is not one of these is a leak.
     check(
         "a shading that only reaches into the region",
-        &page(b"0.9 g 100 410 40 28 re f 0 g\n", b""),
+        &page(b"0.9 g 100 410 50 28 re f 0 g\n", b""),
         &spec,
         Leak(&[PAINTED_MESSAGE], &[]),
     );
@@ -2278,7 +2326,7 @@ fn an_inline_image_whose_end_is_in_doubt_is_could_not_check() {
 // counted whatever the spec holds.
 
 #[test]
-fn text_under_a_region_counts_in_every_spec_and_by_the_centre_of_its_cell() {
+fn text_under_a_region_counts_in_every_spec_by_the_overlap_of_its_cell() {
     // The spec has the text that was removed (Nordmann) and the box; Ola is still under it.
     let spec = r##"{"text":["Nordmann"],"regions":[{"page":1,"rect":[72,400,122,450],"fill":"#000000"}]}"##;
     let ola = drawn(
@@ -2297,92 +2345,122 @@ fn text_under_a_region_counts_in_every_spec_and_by_the_centre_of_its_cell() {
         &black_region(),
         Leak(&[PAINTED_MESSAGE, GLYPH_MESSAGE], &[]),
     );
-    // The page after a correct redaction of the word, with the neighbours kept and the box on it.
+    // The page after a correct redaction of the word, with the neighbours kept and the box on it:
+    // the text before ends where the region starts (72.000), the text after starts past its end.
     check(
         "the neighbours of the word",
-        &{
-            drawn(
+        &drawn(
             &[
-                b"BT /F1 12 Tf 2 420 Td (Contact: Ola ) Tj ET BT /F1 12 Tf 126 420 Td (Storgata) Tj ET\n"
+                b"BT /F1 12 Tf 1.968 420 Td (Contact: Ola ) Tj ET BT /F1 12 Tf 126 420 Td (Storgata) Tj ET\n"
                     .as_slice(),
                 BOX,
             ]
             .concat(),
             "",
-        )
-        },
+        ),
         spec,
         Clean,
     );
-    // A glyph counts when the centre of its cell is in the region. The ink of a glyph that has
-    // less than half of its cell inside is not counted: the check is not strict there, and the
-    // engine has to remove by the same rule.
-    let helv = |at: u32| {
+    // A glyph is under the region when its cell overlaps it with positive area: it is not when it
+    // ends where the region starts.
+    let helv = |at: f64| {
         drawn(
             format!("BT /F1 20 Tf {at} 420 Td (A) Tj ET\n").as_bytes(),
             "",
         )
     };
-    check("centre just outside", &helv(55), &white_region(), Clean);
     check(
-        "centre just inside",
-        &helv(66),
+        "cell ends before the region",
+        &helv(58.0),
+        &white_region(),
+        Clean,
+    );
+    check(
+        "cell reaches into the region",
+        &helv(59.0),
+        &white_region(),
+        Leak(&[PAINTED_MESSAGE, GLYPH_MESSAGE], &[]),
+    );
+    // The ink of the glyph is almost all outside the region, but its cell overlaps it by a
+    // sliver: the glyph is under the region.
+    check(
+        "the cell overlaps by a sliver",
+        &helv(58.67),
         &white_region(),
         Leak(&[PAINTED_MESSAGE, GLYPH_MESSAGE], &[]),
     );
 }
 
 #[test]
-fn glyph_cells_do_not_trust_the_metrics_of_the_file() {
-    // Helvetica that is not embedded, with a descriptor that says the glyphs are 0.02 em tall, and
-    // widths that say 778: the glyph is one em square at least. O at 80 points from y 380 reaches
-    // up to y 440, its centre is at 420.
+fn the_metrics_of_a_standard_font_are_not_the_word_of_the_file() {
+    // Helvetica that is not embedded: its cell is the one of the tool, whatever the descriptor
+    // says, and widths that are not the standard widths make the font "could not check".
     let font = |descriptor: &str, widths: &str, at: &str| {
         let mut fx = Fx::new(
             &[
                 BENIGN,
-                format!(
-                    "BT /F1 80 Tf {at} Td (O) Tj ET
-"
-                )
-                .as_bytes(),
+                format!("BT /F1 80 Tf {at} Td (O) Tj ET\n").as_bytes(),
             ]
             .concat(),
         );
+        let widths = if widths.is_empty() {
+            String::new()
+        } else {
+            format!(" /FirstChar 32 /LastChar 126 /Widths [{widths}]")
+        };
         fx.extra.insert(
             5,
             format!(
-                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding \
-                 /FirstChar 32 /LastChar 126 /Widths [{widths}]{descriptor} >>"
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding\
+                 {widths}{descriptor} >>"
             )
             .into_bytes(),
         );
         fx.extra.insert(
             61,
-            b"<< /Type /FontDescriptor /FontName /Helvetica /Flags 32 /FontBBox [0 0 20 20] \
+            b"<< /Type /FontDescriptor /FontName /Helvetica /Flags 32 /FontBBox [0 -4000 1000 1000] \
               /ItalicAngle 0 /Ascent 718 /Descent -207 /CapHeight 718 /StemV 88 >>"
                 .to_vec(),
         );
         fx.build()
     };
+    let helvetica = redaction_verify::stdfonts::for_name("Helvetica").unwrap();
+    let std_widths: String = (32..=126u32)
+        .map(|c| format!("{} ", (helvetica.width(c, false).unwrap() * 1000.0).round()))
+        .collect();
+    let could_not = |what: &str, bytes: &[u8]| {
+        // The ink is over the region, so the render may find it too: a leak, or could not check.
+        let r = cli(bytes, Some(&white_region()), &[], &[]);
+        assert!(r.code == 1 || r.code == 2, "{what}\n{}", r.out);
+        assert!(
+            r.problems()
+                .iter()
+                .any(|p| p.contains("outside the strict profile")),
+            "{what}\n{}",
+            r.out
+        );
+    };
+    // The glyph is 80 points: O at (75, 380) has its cell from y 360 to y 457.6, over the region.
+    check(
+        "a descriptor box that is 5 em tall changes nothing",
+        &font(" /FontDescriptor 61 0 R", "", "75 380"),
+        &white_region(),
+        Leak(&[PAINTED_MESSAGE, GLYPH_MESSAGE], &[]),
+    );
+    check(
+        "the standard widths in the file",
+        &font("", &std_widths, "75 380"),
+        &white_region(),
+        Leak(&[PAINTED_MESSAGE, GLYPH_MESSAGE], &[]),
+    );
     let w778 = "778 ".repeat(95);
     let w1 = "1 ".repeat(95);
-    check(
-        "a descriptor box of 0.02 em",
-        &font(" /FontDescriptor 61 0 R", &w778, "75 380"),
-        &white_region(),
-        Leak(&[PAINTED_MESSAGE, GLYPH_MESSAGE], &[]),
-    );
-    check(
-        "widths of one unit",
-        &font("", &w1, "75 380"),
-        &white_region(),
-        Leak(&[PAINTED_MESSAGE, GLYPH_MESSAGE], &[]),
-    );
-    // Far from the region the same fonts are no business of it.
+    could_not("widths of 778", &font("", &w778, "75 380"));
+    could_not("widths of one unit", &font("", &w1, "75 380"));
+    // Far from the region the same font is no business of it.
     check(
         "the same far away",
-        &font(" /FontDescriptor 61 0 R", &w778, "400 380"),
+        &font(" /FontDescriptor 61 0 R", "", "400 380"),
         &white_region(),
         Clean,
     );
@@ -2644,7 +2722,7 @@ fn a_widget_that_a_viewer_draws_again_from_its_value_shows_the_value() {
 #[test]
 fn vertical_writing_is_could_not_check() {
     // A composite font (obj 6) with this encoding, and this text shown with it.
-    let page = |encoding: &str, at: &str, cmap: Option<&str>| {
+    let page = |encoding: &str, at: &str, cmap: Option<&str>, font_extra: &str| {
         let mut fx = Fx::new(
             &[
                 BENIGN,
@@ -2653,17 +2731,18 @@ fn vertical_writing_is_could_not_check() {
             ]
             .concat(),
         );
+        fx.program = Some(fonts::cid_program());
         fx.extra.insert(
             6,
             format!(
                 "<< /Type /Font /Subtype /Type0 /BaseFont /DejaVuSans /Encoding {encoding} \
-                 /DescendantFonts [7 0 R] /ToUnicode 8 0 R >>"
+                 /DescendantFonts [7 0 R] /ToUnicode 8 0 R{font_extra} >>"
             )
             .into_bytes(),
         );
         if let Some(dict) = cmap {
             fx.extra.insert(
-                9,
+                10,
                 stream_obj(
                     dict,
                     b"/CIDInit /ProcSet findresource begin begincmap endcmap end",
@@ -2674,44 +2753,47 @@ fn vertical_writing_is_could_not_check() {
         fx.build()
     };
     for (what, bytes) in [
-        ("Identity-V", page("/Identity-V", "97 300", None)),
+        ("Identity-V", page("/Identity-V", "97 300", None, "")),
         (
             "Identity-V far from the region",
-            page("/Identity-V", "400 700", None),
+            page("/Identity-V", "400 700", None, ""),
         ),
         (
             "an embedded character map that says WMode 1",
-            page("9 0 R", "97 300", Some("/Type /CMap /CMapName /X /WMode 1")),
+            page(
+                "10 0 R",
+                "97 300",
+                Some("/Type /CMap /CMapName /X /WMode 1"),
+                "",
+            ),
+        ),
+        (
+            "a character map whose program says WMode 1 and whose dictionary does not",
+            page("10 0 R", "97 300", Some("/Type /CMap /CMapName /X"), ""),
+        ),
+        (
+            "a writing mode in the font dictionary",
+            page("/Identity-H", "97 300", None, " /WMode 1"),
         ),
     ] {
         let r = cli(&bytes, Some(&black_region()), &[], &[]);
         assert_eq!(r.code, 2, "{what}\n{}", r.out);
         assert!(
-            r.problems().iter().any(|p| p.contains("vertical writing")),
+            r.problems()
+                .iter()
+                .any(|p| p.contains("outside the strict profile")),
             "{what}\n{}",
             r.out
         );
     }
-    // Horizontal text in the same font is not said to be vertical.
-    for (what, bytes) in [
-        ("Identity-H", page("/Identity-H", "400 700", None)),
-        (
-            "a character map that says WMode 0",
-            page(
-                "9 0 R",
-                "400 700",
-                Some("/Type /CMap /CMapName /X /WMode 0"),
-            ),
-        ),
-    ] {
-        let r = cli(&bytes, Some(&black_region()), &[], &[]);
-        assert!(
-            !r.problems().iter().any(|p| p.contains("vertical writing")),
-            "{what}
-{}",
-            r.out
-        );
-    }
+    // Horizontal text in the same font is not refused.
+    let r = cli(
+        &page("/Identity-H", "400 700", None, ""),
+        Some(&black_region()),
+        &[],
+        &[],
+    );
+    assert_eq!(r.code, 0, "Identity-H\n{}", r.out);
 }
 
 #[test]

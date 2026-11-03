@@ -509,7 +509,7 @@ impl Pass<'_, '_> {
         }
         if self.ctx.on(Layer::Decode) && crate::content::has_bad_operand(data) {
             self.rep.problem(format!(
-                "decode: {place} has an operand that is not a clean PDF token (a number with a stray sign or letter, a name with a bad escape, a string that does not end), and a viewer may read it differently, so the text may not have been read as it is drawn"
+                "decode: {place} has an operand that is not a clean PDF token (a number with a stray sign or letter, a name with a bad escape, a string that does not end), or an operator with other operands than the specification gives it (readers differ on those), and a viewer may read it differently, so the text may not have been read as it is drawn"
             ));
         }
         let pieces = textdec::pieces(data);

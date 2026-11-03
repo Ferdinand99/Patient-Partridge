@@ -1,12 +1,15 @@
-//! The widths of the standard fonts that a file may use without describing them: Helvetica and
-//! Arial, Times, and Courier, in their four styles. A simple font that has no `/Widths` is one of
-//! the 14 standard fonts, and a viewer places its glyphs with these widths. They are in thousandths
-//! of an em, for the codes 32 to 126 (the same in every Latin encoding). The region check uses them
-//! to place text, with a small tolerance (see [`SLACK`]); a code outside the table, and the fonts
-//! that are not in it (Symbol, ZapfDingbats), have no width here and are placed by an interval.
+//! The widths of the standard fonts that a file may use without embedding them: Helvetica and
+//! Arial, Times, and Courier, in their four styles. A viewer places the glyphs of such a font with
+//! these widths. They are in thousandths of an em, for the codes 32 to 126. Two codes differ with
+//! the encoding: 39 and 96 are the quotesingle and the grave in `WinAnsiEncoding` and
+//! `MacRomanEncoding`, and the quoteright and the quoteleft in `StandardEncoding`, which is the
+//! encoding of a font that has none. The region check uses the tables to place text, with a small
+//! tolerance (see [`crate::profile::STD_TOLERANCE`]); a code outside the table, and the fonts that
+//! are not in it (Symbol, ZapfDingbats), have no width here.
 
-/// How far a width of the tables may be from the one a viewer uses, as a fraction.
-pub const SLACK: f64 = 0.015;
+/// The vertical extent of the cell of a glyph of a standard font, in em: below the baseline and
+/// above it. It holds the font bounding boxes of all 14 standard fonts.
+pub const CELL_Y: [f64; 2] = [-0.25, 0.97];
 
 const HELVETICA: [u16; 95] = [
     278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278, 556, 556, 556,
@@ -61,15 +64,20 @@ const TIMES_BOLD_ITALIC: [u16; 95] = [
 pub enum Std {
     /// Courier in any style: every glyph is 600 wide.
     Courier,
-    Table(&'static [u16; 95]),
+    /// The widths of the codes 32 to 126, and the width of the quoteright and the quoteleft.
+    Table(&'static [u16; 95], u16),
 }
 
 impl Std {
-    /// The width of the glyph for a code, in em, if the table has it.
-    pub fn width(self, code: u32) -> Option<f64> {
+    /// The width of the glyph for a code, in em, if the table has it. `standard` is whether the
+    /// encoding is `StandardEncoding` (a font with no `/Encoding`).
+    pub fn width(self, code: u32, standard: bool) -> Option<f64> {
         match self {
             Std::Courier => (32..=255).contains(&code).then_some(0.6),
-            Std::Table(t) => {
+            Std::Table(t, quote) => {
+                if standard && (code == 39 || code == 96) {
+                    return Some(f64::from(quote) / 1000.0);
+                }
                 let i = usize::try_from(code.checked_sub(32)?).ok()?;
                 t.get(i).map(|w| f64::from(*w) / 1000.0)
             }
@@ -94,14 +102,21 @@ pub fn for_name(base_font: &str) -> Option<Std> {
     if n.contains("courier") {
         Some(Std::Courier)
     } else if n.contains("helvetica") || n.starts_with("arial") {
-        Some(Std::Table(if bold { &HELVETICA_BOLD } else { &HELVETICA }))
+        Some(if bold {
+            Std::Table(&HELVETICA_BOLD, 278)
+        } else {
+            Std::Table(&HELVETICA, 222)
+        })
     } else if n.contains("times") {
-        Some(Std::Table(match (bold, italic) {
-            (false, false) => &TIMES,
-            (true, false) => &TIMES_BOLD,
-            (false, true) => &TIMES_ITALIC,
-            (true, true) => &TIMES_BOLD_ITALIC,
-        }))
+        Some(Std::Table(
+            match (bold, italic) {
+                (false, false) => &TIMES,
+                (true, false) => &TIMES_BOLD,
+                (false, true) => &TIMES_ITALIC,
+                (true, true) => &TIMES_BOLD_ITALIC,
+            },
+            333,
+        ))
     } else {
         None
     }
@@ -113,21 +128,35 @@ mod tests {
 
     #[test]
     fn names_stand_for_their_tables() {
-        assert_eq!(for_name("Helvetica").unwrap().width(65), Some(0.667));
+        assert_eq!(for_name("Helvetica").unwrap().width(65, false), Some(0.667));
         assert_eq!(
-            for_name("ABCDEF+Arial-BoldMT").unwrap().width(65),
+            for_name("ABCDEF+Arial-BoldMT").unwrap().width(65, false),
             Some(0.722)
         );
-        assert_eq!(for_name("Times-Roman").unwrap().width(109), Some(0.778));
         assert_eq!(
-            for_name("TimesNewRomanPS-ItalicMT").unwrap().width(65),
+            for_name("Times-Roman").unwrap().width(109, false),
+            Some(0.778)
+        );
+        assert_eq!(
+            for_name("TimesNewRomanPS-ItalicMT")
+                .unwrap()
+                .width(65, false),
             Some(0.611)
         );
-        assert_eq!(for_name("Courier-Oblique").unwrap().width(200), Some(0.6));
+        assert_eq!(
+            for_name("Courier-Oblique").unwrap().width(200, false),
+            Some(0.6)
+        );
         assert_eq!(for_name("Symbol"), None);
         assert_eq!(for_name("ZapfDingbats"), None);
         // Outside the table.
-        assert_eq!(for_name("Helvetica").unwrap().width(200), None);
+        assert_eq!(for_name("Helvetica").unwrap().width(200, false), None);
+        // The quote codes follow the encoding.
+        let h = for_name("Helvetica").unwrap();
+        assert_eq!(h.width(39, false), Some(0.191));
+        assert_eq!(h.width(39, true), Some(0.222));
+        assert_eq!(h.width(96, false), Some(0.333));
+        assert_eq!(h.width(96, true), Some(0.222));
     }
 
     #[test]

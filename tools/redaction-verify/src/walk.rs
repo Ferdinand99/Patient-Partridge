@@ -3,32 +3,35 @@
 //! the page.
 //!
 //! The rule above all others: what the walk does not fully understand is "could not check", never
-//! a pass. It does not try to model every quirk of a reader; it refuses to judge.
+//! a pass. It does not try to model every quirk of a reader; it refuses to judge. What it
+//! understands is the strict profile of [`crate::profile`]: operators with exactly the operands of
+//! the specification, matrices and boxes of exactly six or four numbers, a short list of fonts
+//! (the standard ones with the standard metrics, fonts whose program is in the file and agrees
+//! with their widths), horizontal writing, and strokes with a miter limit of at most 10.
 //!
 //! The graphics state has the stack of `q` and `Q` (the matrix, the clip, the colours, the line, the
-//! dash pattern, and the text state: font, size, character and word spacing, horizontal scale,
-//! leading, rise and render mode), the text and line matrices of `BT .. ET`, and the path that is
-//! being built. The interpreter follows forms (with `/Matrix` and `/BBox`), the groups of soft
-//! masks, annotation appearances and the glyph procedures of Type 3 fonts, and reads inline images.
-//! A tiling pattern is not followed: a fill with a pattern is the fill, and what the pattern draws
-//! is looked at only for images. It does not depend on what is visible: a render mode that draws
-//! nothing, optional content that is off, a transparency of 0, a white colour and a clip that cuts
-//! everything away still count.
+//! dash pattern, the miter limit, and the text state: font, size, character and word spacing,
+//! horizontal scale, leading, rise and render mode), the text and line matrices of `BT .. ET`, and
+//! the path that is being built. The interpreter follows forms (with `/Matrix` and `/BBox`), the
+//! groups of soft masks, annotation appearances and the glyph procedures of Type 3 fonts, and reads
+//! inline images. A tiling pattern is not followed: a fill with a pattern is the fill, and what the
+//! pattern draws is looked at only for images. It does not depend on what is visible: a render mode
+//! that draws nothing, optional content that is off, a transparency of 0, a white colour and a clip
+//! that cuts everything away still count.
 //!
 //! Every event (a glyph of any font, the fill or stroke of a path, a clip path, a shading, and what
 //! a Type 3 glyph paints) goes to one place, [`Walker::emit`], which tests it against the regions of
 //! the page when it happens and keeps what meets one. So nothing is dropped when a page has a lot
 //! of content. A page that needs more steps or more time than the budget, and the work that fonts,
-//! patterns and glyph procedures need when they are read, is "could not check".
+//! patterns, font programs and glyph procedures need when they are read, is "could not check".
 //!
-//! A glyph of a known place counts when the centre of its cell is inside a region. The cell is the
-//! larger of what the font says (the advance, the bounding box) and one em square from the origin,
-//! at the font size, scaled by the horizontal scale and the matrices, because a font that a file
-//! describes can say anything. The standard fonts that a file does not describe use the widths of
-//! the tool and have no floor across. A glyph whose place is not known (an interval of positions)
-//! counts when its whole box meets the region. The ink of a glyph that straddles the edge, with
-//! less than half of its cell inside, is not counted: this is the one place where the check is not
-//! strict, and the engine must remove glyphs by the same rule.
+//! The glyph rule, which the redaction engine must follow: the cell of a glyph is its advance box
+//! across (from the origin by the width of the glyph times the size and `Tz`) and the ascent and
+//! descent of its font up and down (within the box of the font program), moved by the text matrix
+//! and the matrix of the page; the event is the bounds of the cell on the page. A glyph is under a
+//! region when its cell overlaps the region with positive area (more than [`GLYPH_OVERLAP`] along
+//! each axis), in every spec. A glyph whose width is not known (a code of a standard font that the
+//! tables do not have) is an interval of places, and the widest cell it can have counts.
 //!
 //! Some geometry carries no information about what was under a region, and is allowed:
 //! - the box that redacts: a fill of a single rectangle that is the region (within a pixel of the
@@ -50,7 +53,10 @@ use std::time::{Duration, Instant};
 use crate::content::{
     apply, for_each_op_while, mul, shown, Matrix, Op, Operand, ShownItem, IDENTITY,
 };
+use crate::fontprog::Program;
 use crate::pdfobj::{Doc, Entry, Obj};
+use crate::profile::{self, exact_numbers};
+use crate::stdfonts::Std;
 use crate::{RENDER_DPI, RENDER_MARGIN};
 
 pub type M = Matrix;
@@ -98,29 +104,25 @@ pub fn bounds(points: &[(f64, f64)]) -> [f64; 4] {
     [x0, y0, x1, y1]
 }
 
-pub fn matrix_of(o: &Obj, doc: &Doc) -> M {
-    match doc.resolve(o) {
-        Obj::Array(a) if a.len() == 6 => {
-            let mut m = IDENTITY;
-            for (i, x) in a.iter().enumerate() {
-                m[i] = doc.resolve(x).num().unwrap_or(m[i]);
-            }
-            m
-        }
-        _ => IDENTITY,
-    }
-}
-
-pub fn numbers(o: &Obj, doc: &Doc) -> Vec<f64> {
-    doc.resolve(o)
-        .array()
-        .map(|a| a.iter().filter_map(|x| doc.resolve(x).num()).collect())
-        .unwrap_or_default()
+/// A `/Matrix`: exactly six finite numbers (see [`crate::profile`]); anything else is `None`.
+pub fn matrix_of(o: &Obj, doc: &Doc) -> Option<M> {
+    exact_numbers(o, doc, 6).map(|v| [v[0], v[1], v[2], v[3], v[4], v[5]])
 }
 
 /// Whether two rectangles overlap (they do not when they only touch).
 pub fn overlaps(a: &[f64; 4], b: &[f64; 4]) -> bool {
     a[2] > b[0] && a[0] < b[2] && a[3] > b[1] && a[1] < b[3]
+}
+
+/// The least that the cell of a glyph must reach into a region, along each axis, to overlap it
+/// with positive area, in points. Positions are sums of widths in floating point, and a region is
+/// a rounded number: a cell that ends where the region starts, to within this, does not overlap.
+pub const GLYPH_OVERLAP: f64 = 0.01;
+
+/// Whether the cell of a glyph and a region overlap with positive area (see [`GLYPH_OVERLAP`]).
+fn cell_overlaps(cell: &[f64; 4], region: &[f64; 4]) -> bool {
+    cell[2].min(region[2]) - cell[0].max(region[0]) > GLYPH_OVERLAP
+        && cell[3].min(region[3]) - cell[1].max(region[1]) > GLYPH_OVERLAP
 }
 
 /// Whether `outer` holds `inner`, give or take `tol`.
@@ -234,9 +236,9 @@ struct Event {
     dashed: bool,
     /// The state has a constant alpha below 1 or a blend mode other than Normal.
     translucent: bool,
-    /// A glyph whose place is known: it counts when the centre of its cell is inside a region.
-    /// Every other event counts when its box meets the region.
-    centre: bool,
+    /// Why the event is outside the strict profile (see [`crate::profile`]): near a region, it is
+    /// "could not check".
+    unsupported: Option<&'static str>,
 }
 
 /// The graphics state.
@@ -417,12 +419,12 @@ fn segment_meets(s: &[f64; 4], r: &[f64; 4]) -> bool {
 }
 
 /// The text object: the text matrix and the line matrix, and how far the position has moved
-/// since the matrix was set, as intervals because the width of a glyph is not always known.
+/// along the line since the matrix was set, as an interval because the width of a glyph of a
+/// standard font is only known to the tolerance of the tables, and not at all for some codes.
 struct Text {
     tm: M,
     tlm: M,
     ax: [f64; 2],
-    ay: [f64; 2],
 }
 
 impl Text {
@@ -431,7 +433,6 @@ impl Text {
             tm: IDENTITY,
             tlm: IDENTITY,
             ax: [0.0; 2],
-            ay: [0.0; 2],
         }
     }
 
@@ -439,7 +440,6 @@ impl Text {
         self.tlm = m;
         self.tm = m;
         self.ax = [0.0; 2];
-        self.ay = [0.0; 2];
     }
 
     fn move_by(&mut self, tx: f64, ty: f64) {
@@ -455,42 +455,52 @@ enum FontKind {
     Type3,
 }
 
+/// How the codes of a composite font reach the glyphs of its TrueType program.
+enum CidToGid {
+    Identity,
+    Map(Vec<u16>),
+}
+
 /// A font, as far as the position and the size of its glyphs need. All sizes are in em: the units
 /// of the text space for a font size of 1.
 pub struct Font {
     kind: FontKind,
     /// Type 3: the glyph procedure of each code that has one (object numbers), the matrix of the
-    /// glyph space, the resources of the font, and what stops the procedures from being placed.
+    /// glyph space, and the resources of the font.
     procs: HashMap<u32, u32>,
     t3_matrix: M,
     t3_res: Option<Obj>,
+    /// Why text shown with this font is outside the strict profile: it cannot be placed.
     problem: Option<String>,
-    /// The bounding box of the glyphs, if the font has a plausible one.
-    bbox: Option<[f64; 4]>,
+    /// The vertical extent of the cell of a glyph, in em: from below the baseline to above it.
+    cell_y: [f64; 2],
     first: i64,
+    last: i64,
     widths: Vec<f64>,
     have_widths: bool,
-    missing: Option<f64>,
     dw: f64,
     w_map: HashMap<u32, f64>,
-    /// The widest glyph that the font says.
-    max_w: f64,
-    /// Composite font whose codes are two bytes each (the identity encodings and the two-byte
-    /// predefined ones); another encoding is read byte by byte, with widths that are not known.
+    /// Composite font with `Identity-H`: every code is two bytes. A string of any other font is
+    /// read byte by byte.
     two_byte: bool,
-    vertical: bool,
-    /// A standard font that the file does not describe: its widths are the ones of the tables.
-    std: Option<crate::stdfonts::Std>,
-    /// The font program is in the file. A font that is not draws a space as nothing.
-    embedded: bool,
+    /// A standard font that the file does not embed: its widths are the ones of the tables, and
+    /// whether its encoding is `StandardEncoding`.
+    std: Option<Std>,
+    std_standard: bool,
+    /// The embedded program (the advances of a TrueType program are compared with the widths of
+    /// the file), and how a composite font reaches its glyphs.
+    program: Option<Rc<Program>>,
+    cid_to_gid: CidToGid,
 }
 
-/// The box of a glyph when the font has none that is plausible: the em square with room for
-/// descenders and accents.
-const EM_BOX: [f64; 4] = [-0.1, -0.3, 1.1, 1.1];
-
-/// The narrowest and widest advance that a glyph of a font with no widths may have, in em.
+/// The narrowest and widest advance that a glyph of a standard font that has no widths may have, in
+/// em (the widths that a viewer takes from its own copy of the font).
 const ADVANCE_RANGE: [f64; 2] = [0.15, 1.05];
+
+/// How far an advance of a TrueType program may be from the width in the file.
+fn advance_tolerance(w: f64) -> f64 {
+    (profile::ADVANCE_TOLERANCE * w.abs()).max(profile::ADVANCE_ABS)
+}
 
 impl Font {
     fn plain() -> Font {
@@ -500,53 +510,109 @@ impl Font {
             t3_matrix: [0.001, 0.0, 0.0, 0.001, 0.0, 0.0],
             t3_res: None,
             problem: None,
-            bbox: None,
+            cell_y: crate::stdfonts::CELL_Y,
             first: 0,
+            last: -1,
             widths: Vec::new(),
             have_widths: false,
-            missing: None,
             dw: 1.0,
             w_map: HashMap::new(),
-            max_w: ADVANCE_RANGE[1],
             two_byte: false,
-            vertical: false,
             std: None,
-            embedded: false,
+            std_standard: false,
+            program: None,
+            cid_to_gid: CidToGid::Identity,
         }
     }
 
-    fn glyph_box(&self) -> [f64; 4] {
-        self.bbox.unwrap_or(EM_BOX)
+    /// A font that the strict profile does not take: text shown with it is "could not check".
+    fn refused(why: String) -> Font {
+        Font {
+            problem: Some(why),
+            ..Font::plain()
+        }
     }
 
-    /// The width of the glyph for a code, in em, if the font says.
-    fn width(&self, code: u32, whole_code: bool) -> Option<f64> {
+    /// The declared width of a code of a simple or Type 3 font, if it is in `/Widths`.
+    fn declared(&self, code: u32) -> Option<f64> {
+        if i64::from(code) > self.last {
+            return None;
+        }
+        let i = usize::try_from(i64::from(code) - self.first).ok()?;
+        self.widths.get(i).copied()
+    }
+
+    /// The width of the glyph for a code, in em: `Ok(Some(w))` when it is known, `Ok(None)` when
+    /// a standard font has no width for it in the tables (the glyph is placed by an interval), and
+    /// an error when the width is outside the strict profile.
+    fn width(&self, code: u32, whole_code: bool) -> Result<Option<f64>, String> {
         match self.kind {
             FontKind::Cid => {
-                if self.two_byte && whole_code {
-                    Some(self.w_map.get(&code).copied().unwrap_or(self.dw))
-                } else {
-                    None
+                if !(self.two_byte && whole_code) {
+                    return Err(
+                        "a string of the composite font ends in the middle of a code".to_owned(),
+                    );
                 }
-            }
-            _ => {
-                if !self.have_widths {
-                    return self.std.and_then(|s| s.width(code));
+                let w = self.w_map.get(&code).copied().unwrap_or(self.dw);
+                if !(0.0..=profile::MAX_WIDTH).contains(&w) {
+                    return Err(format!(
+                        "the width {w} em of the code {code} is not a width"
+                    ));
                 }
-                let i = i64::from(code) - self.first;
-                let w = usize::try_from(i).ok().and_then(|i| self.widths.get(i));
-                Some(w.copied().or(self.missing).unwrap_or(0.0))
+                if let Some(adv) = self.program.as_ref().and_then(|p| p.advances.as_ref()) {
+                    let gid = match &self.cid_to_gid {
+                        CidToGid::Identity => Some(code as usize),
+                        CidToGid::Map(m) => m.get(code as usize).map(|g| usize::from(*g)),
+                    };
+                    let a = gid.and_then(|g| adv.get(g)).ok_or_else(|| {
+                        format!("the code {code} has no glyph in the font program")
+                    })?;
+                    if (w - a).abs() > advance_tolerance(*a) {
+                        return Err(format!(
+                            "the width {w} em of the code {code} is not the advance {a:.3} em of its glyph in the font program"
+                        ));
+                    }
+                }
+                Ok(Some(w))
             }
-        }
-    }
-
-    /// How far a width of this font may be from the one that a viewer uses, as a fraction: the
-    /// tables of the standard fonts are not the file's own numbers.
-    fn slack(&self) -> f64 {
-        if self.kind == FontKind::Simple && !self.have_widths && self.std.is_some() {
-            crate::stdfonts::SLACK
-        } else {
-            0.0
+            FontKind::Type3 => self
+                .declared(code)
+                .map(Some)
+                .ok_or_else(|| format!("the code {code} is outside /FirstChar../LastChar")),
+            FontKind::Simple => {
+                let declared = self.declared(code);
+                if let Some(std) = self.std {
+                    if !self.have_widths {
+                        return Ok(std.width(code, self.std_standard));
+                    }
+                    // Widths in the file were checked against the tables for the codes 32 to 126
+                    // when the font was read; a code outside them cannot be checked.
+                    return match declared {
+                        Some(w) if (32..=126).contains(&code) => Ok(Some(w)),
+                        _ => Err(format!(
+                            "the code {code} of a standard font with /Widths is outside the codes 32 to 126 that the standard metrics check"
+                        )),
+                    };
+                }
+                let Some(w) = declared else {
+                    return Err(format!("the code {code} is outside /FirstChar../LastChar"));
+                };
+                let least = if code == 32 { 0.0 } else { profile::MIN_WIDTH };
+                if !(least..=profile::MAX_WIDTH).contains(&w) {
+                    return Err(format!(
+                        "the width {w} em of the code {code} is not a width"
+                    ));
+                }
+                let advance_ok = self.program.as_ref().is_none_or(|p| {
+                    w == 0.0 || p.advances.is_none() || p.has_advance_near(w, advance_tolerance)
+                });
+                if !advance_ok {
+                    return Err(format!(
+                        "the width {w} em of the code {code} is not the advance of any glyph of the font program"
+                    ));
+                }
+                Ok(Some(w))
+            }
         }
     }
 
@@ -582,10 +648,13 @@ pub struct Walker<'a, 'd> {
     /// Where in the file the walk is, for the places in messages.
     trail: Vec<String>,
     fonts: HashMap<u32, Rc<Font>>,
+    /// The embedded font programs read so far, by object number.
+    programs: HashMap<u32, Result<Rc<Program>, String>>,
     /// The decoded glyph procedures of Type 3 fonts, by object number.
     procs: HashMap<u32, Option<Rc<Vec<u8>>>>,
-    /// Whether a tiling pattern draws an image, by object number.
-    patterns: HashMap<u32, bool>,
+    /// Whether a tiling pattern draws an image, and why its content is outside the strict
+    /// profile, by object number.
+    patterns: HashMap<u32, (bool, Option<String>)>,
     /// Annotations that a viewer draws from their own entries (an ink path, a line) because they
     /// have no appearance stream: their rectangle and subtype.
     pub bare: Vec<([f64; 4], String)>,
@@ -607,6 +676,9 @@ struct Frame<'r> {
     text: Text,
     pending_clip: bool,
     text_clip: bool,
+    /// How deep the compatibility sections (`BX` .. `EX`) are: an unknown operator is allowed in
+    /// one.
+    compat: usize,
 }
 
 impl<'a, 'd> Walker<'a, 'd> {
@@ -626,6 +698,7 @@ impl<'a, 'd> Walker<'a, 'd> {
             container,
             trail: Vec::new(),
             fonts: HashMap::new(),
+            programs: HashMap::new(),
             procs: HashMap::new(),
             patterns: HashMap::new(),
             bare: Vec::new(),
@@ -691,7 +764,7 @@ impl<'a, 'd> Walker<'a, 'd> {
     /// Whether `e` is geometry that carries nothing about the region `t`.
     fn is_free(&self, e: &Event, t: &Target) -> bool {
         match e.class {
-            // A glyph of a known place counts by its centre (see emit_segs), the others by their box.
+            // A glyph counts by its cell (see emit_segs), in every spec.
             Class::Glyph => false,
             Class::Shading => false,
             Class::Clip => matches!(e.shape, Shape::Rect(r) if holds(&r, &t.rect, BOX_TOLERANCE)),
@@ -751,16 +824,15 @@ impl<'a, 'd> Walker<'a, 'd> {
         }
         for i in 0..self.targets.len() {
             let t = self.targets[i].clone();
-            if !overlaps(&e.bbox, &t.rect) {
+            // A glyph is under a region when its cell overlaps it with positive area; every other
+            // event when its box meets it.
+            let meets = if e.class == Class::Glyph {
+                cell_overlaps(&e.bbox, &t.rect)
+            } else {
+                overlaps(&e.bbox, &t.rect)
+            };
+            if !meets {
                 continue;
-            }
-            // A glyph of a known place is in the region when the centre of its cell is. The ink of a
-            // glyph that straddles the edge, with less than half of its cell inside, is not counted.
-            if e.class == Class::Glyph && e.centre {
-                let (cx, cy) = ((e.bbox[0] + e.bbox[2]) / 2.0, (e.bbox[1] + e.bbox[3]) / 2.0);
-                if cx < t.rect[0] || cx > t.rect[2] || cy < t.rect[1] || cy > t.rect[3] {
-                    continue;
-                }
             }
             if !segs.is_empty() {
                 let wide = [
@@ -772,6 +844,13 @@ impl<'a, 'd> Walker<'a, 'd> {
                 if !segs.iter().any(|s| segment_meets(s, &wide)) {
                     continue;
                 }
+            }
+            if let Some(why) = e.unsupported {
+                self.problem(format!(
+                    "{why} in {} lies near a redaction region, so what it paints there is not known",
+                    self.place()
+                ));
+                continue;
             }
             if self.is_free(&e, &t) {
                 continue;
@@ -808,17 +887,19 @@ impl<'a, 'd> Walker<'a, 'd> {
         let width = gs.line_width.abs() * scale;
         // How far the ink of a stroke reaches from the path.
         let mut reach = 0.0;
+        let mut unsupported = None;
         if stroke {
             // The widest line a viewer draws: a hairline is one device pixel, a join may reach
-            // the miter limit (at most 10 times the half width).
+            // the miter limit times the half width. A limit above the profile's is refused when the
+            // stroke is near a region, and its reach is the real one.
             let half = width.max(0.5) / 2.0;
             let joins = path.pts.len() > 2;
-            reach = half
-                * if joins {
-                    gs.miter.clamp(1.5, 10.0)
-                } else {
-                    1.5
-                };
+            if gs.miter > profile::MAX_MITER {
+                unsupported = Some("a stroke with a miter limit above 10");
+            } else if joins && gs.dashed {
+                unsupported = Some("a dashed stroke of a path with joins");
+            }
+            reach = half * if joins { gs.miter.max(1.5) } else { 1.5 };
             bbox = [
                 bbox[0] - reach,
                 bbox[1] - reach,
@@ -865,7 +946,7 @@ impl<'a, 'd> Walker<'a, 'd> {
                 smask: gs.smask,
                 dashed: gs.dashed,
                 translucent: gs.translucent,
-                centre: false,
+                unsupported,
             },
             segs,
             reach,
@@ -897,7 +978,7 @@ impl<'a, 'd> Walker<'a, 'd> {
             smask: gs.smask,
             dashed: gs.dashed,
             translucent: gs.translucent,
-            centre: false,
+            unsupported: None,
         });
         let g = &mut f.gs;
         g.clip_box = [
@@ -917,11 +998,14 @@ impl<'a, 'd> Walker<'a, 'd> {
         let sh = self.doc.dget(self.doc.dget(f.res, "Shading"), &name);
         let mut bbox = self.container;
         if sh.is_dict() {
-            let b = sh
-                .get("BBox")
-                .map(|b| numbers(b, self.doc))
-                .unwrap_or_default();
-            if b.len() == 4 {
+            if let Some(b) = sh.get("BBox") {
+                let Some(b) = exact_numbers(b, self.doc, 4) else {
+                    self.problem(format!(
+                        "the shading /{name} in {} has a /BBox that is not four numbers, so where it paints is not known",
+                        self.place()
+                    ));
+                    return;
+                };
                 let pts = [
                     apply(&gs.ctm, b[0], b[1]),
                     apply(&gs.ctm, b[2], b[1]),
@@ -949,7 +1033,7 @@ impl<'a, 'd> Walker<'a, 'd> {
             smask: gs.smask,
             dashed: gs.dashed,
             translucent: gs.translucent,
-            centre: false,
+            unsupported: None,
         });
     }
 
@@ -969,10 +1053,29 @@ impl<'a, 'd> Walker<'a, 'd> {
             text: Text::new(),
             pending_clip: false,
             text_clip: false,
+            compat: 0,
         };
         for_each_op_while(data, &mut |op: &Op| {
             if !self.tick(1) {
                 return false;
+            }
+            // The strict profile: the operators of the specification, with the operands that it
+            // gives them. What does not fit is not executed, and is "could not check".
+            if profile::is_known(op.name) {
+                if let Some(why) = profile::operand_problem(op) {
+                    self.problem(format!(
+                        "{why} in {}, and readers differ on such an operator, so the content was not checked",
+                        self.place()
+                    ));
+                    return !self.aborted;
+                }
+            } else if f.compat == 0 {
+                self.problem(format!(
+                    "the operator {} in {} is not one of the operators of the specification, so what it does is not known",
+                    String::from_utf8_lossy(op.name),
+                    self.place()
+                ));
+                return !self.aborted;
             }
             if op.inline_unsure {
                 self.problem(format!(
@@ -1125,6 +1228,8 @@ impl<'a, 'd> Walker<'a, 'd> {
                     self.malformed("a path operator");
                 }
             }
+            b"BX" => f.compat += 1,
+            b"EX" => f.compat = f.compat.saturating_sub(1),
             b"h" => close_path(&mut f.path),
             b"W" | b"W*" => f.pending_clip = true,
             b"f" | b"F" | b"f*" => self.painted(f, Class::Fill),
@@ -1345,79 +1450,69 @@ impl<'a, 'd> Walker<'a, 'd> {
     }
 
     /// Shown text: every glyph is an event at its place. The position follows the text matrix, the
-    /// advance of each glyph, the spacing, the scale and the kerning of a `TJ`. Where the width of
-    /// a glyph is not known, the position is an interval, and the box covers it.
+    /// advance of each glyph, the spacing, the scale and the kerning of a `TJ`.
     ///
-    /// The cell of a glyph is the larger of what the font says (the advance, the bounding box) and
-    /// a floor that does not depend on the file: one em square from the origin, at the font size,
-    /// scaled by the horizontal scale and the matrices. A font that the file describes can say
-    /// anything about its metrics, and a viewer that does not embed the font uses its own. The
-    /// standard fonts that the file does not describe have the widths of the standard tables, which
-    /// are not the word of the file, so their cells have no floor across.
+    /// The cell of a glyph is its advance box across, from the origin by the width of the glyph
+    /// (scaled by the horizontal scale and the font size), and from the descent to the ascent of
+    /// the font vertically (within the box of the font program), through the text matrix and the
+    /// matrix of the page. The event is the bounds of that cell on the page; a glyph is under a
+    /// region when its cell overlaps it with positive area (see [`GLYPH_OVERLAP`]). Where a
+    /// standard font has no width for a code, the position is an interval and the cell is the
+    /// widest it can be. Text shown with a font outside the strict profile is "could not check".
     fn show(&mut self, f: &mut Frame, items: &[ShownItem]) {
-        let font = f.gs.font.clone().unwrap_or_else(|| Rc::new(Font::plain()));
+        let Some(font) = f.gs.font.clone() else {
+            self.problem(format!(
+                "text is shown in {} with no font selected, so where it is drawn is not known",
+                self.place()
+            ));
+            return;
+        };
         let gs = f.gs.clone();
         let (size, h) = (gs.size, gs.scale);
         if (4..=7).contains(&gs.render) {
             f.text_clip = true;
         }
-        if font.vertical {
-            self.problem(format!(
-                "text in {} is set in a vertical writing mode, which this check does not place (the advance, the position vector and the spacing differ), so where it is drawn is not known",
-                self.place()
-            ));
-        }
         if let Some(why) = &font.problem {
             self.problem(format!("text in {}: {why}", self.place()));
+            return;
         }
-        let floor_x = !(font.kind == FontKind::Simple && !font.have_widths && font.std.is_some());
-        let declared = font.glyph_box();
-        let (cell_y0, cell_y1) = (declared[1].min(0.0), declared[3].max(1.0));
-        let (cell_x0, cell_x1) = (declared[0].min(0.0), declared[2].max(1.0));
+        let (cell_y0, cell_y1) = (font.cell_y[0], font.cell_y[1]);
+        let mut width_problem = false;
         for it in items {
             match it {
                 ShownItem::Kern(k) => {
-                    if font.vertical {
-                        let d = k / 1000.0 * size;
-                        f.text.ay = [f.text.ay[0] - d, f.text.ay[1] - d];
-                    } else {
-                        let d = k / 1000.0 * size * h;
-                        f.text.ax = [f.text.ax[0] - d, f.text.ax[1] - d];
-                    }
+                    let d = k / 1000.0 * size * h;
+                    f.text.ax = [f.text.ax[0] - d, f.text.ax[1] - d];
                 }
                 ShownItem::Str(bytes) => {
                     for (code, whole) in font.codes(bytes) {
                         if !self.tick(1) {
                             return;
                         }
-                        let w = font.width(code, whole);
+                        let w = match font.width(code, whole) {
+                            Ok(w) => w,
+                            Err(why) => {
+                                if !width_problem {
+                                    width_problem = true;
+                                    self.problem(format!("text in {}: {why}", self.place()));
+                                }
+                                None
+                            }
+                        };
                         let space = if code == 32 && !whole {
                             gs.word_space
                         } else {
                             0.0
                         };
-                        // Where the glyph is, in the text space of the line.
-                        let (ax, ay) = (f.text.ax, f.text.ay);
-                        let (x, y);
-                        let known = matches!(w, Some(v) if v > 0.0 || floor_x);
-                        if font.vertical {
-                            x = [ax[0] - size.abs() * h, ax[1] + size.abs() * h];
-                            y = [
-                                ay[0] - 1.5 * size.abs() + gs.rise,
-                                ay[1] + size.abs() + gs.rise,
-                            ];
-                        } else {
-                            let xs = match w {
-                                Some(w) if known => {
-                                    let across = if floor_x { w.max(1.0) } else { w };
-                                    [ax[0], ax[1] + across * size * h]
-                                }
-                                _ => [ax[0] + cell_x0 * size * h, ax[1] + cell_x1 * size * h],
-                            };
-                            x = [xs[0].min(xs[1]), xs[0].max(xs[1])];
-                            let ys = [gs.rise + cell_y0 * size, gs.rise + cell_y1 * size];
-                            y = [ys[0].min(ys[1]), ys[0].max(ys[1])];
-                        }
+                        // Where the glyph is, in the text space of the line: the pen is an
+                        // interval, and the glyph is as wide as its width, or as the widest glyph
+                        // when the width is not known.
+                        let ax = f.text.ax;
+                        let top = w.unwrap_or(ADVANCE_RANGE[1]);
+                        let xs = [ax[0], ax[1] + top * size * h];
+                        let x = [xs[0].min(xs[1]), xs[0].max(xs[1])];
+                        let ys = [gs.rise + cell_y0 * size, gs.rise + cell_y1 * size];
+                        let y = [ys[0].min(ys[1]), ys[0].max(ys[1])];
                         let m = mul(&f.text.tm, &gs.ctm);
                         let pts = [
                             apply(&m, x[0], y[0]),
@@ -1425,31 +1520,30 @@ impl<'a, 'd> Walker<'a, 'd> {
                             apply(&m, x[0], y[1]),
                             apply(&m, x[1], y[1]),
                         ];
-                        // The space of a font that is not in the file is drawn as nothing.
-                        let blank = font.kind == FontKind::Simple && !font.embedded && code == 32;
-                        // The place is known when the width is and the interval of the pen is
-                        // narrow.
+                        // The place is known when the interval of the pen is narrow.
                         let pen_known = (ax[1] - ax[0]).abs() <= 0.25 * (size * h).abs();
-                        let certain = known && !font.vertical && pen_known;
-                        if !blank {
-                            self.emit(Event {
-                                class: Class::Glyph,
-                                bbox: bounds(&pts),
-                                shape: Shape::Other,
-                                kind: "glyph of text",
-                                fill: gs.fill,
-                                stroke: gs.stroke,
-                                width: 0.0,
-                                clip: (gs.clip_box, gs.clip_exact),
-                                smask: gs.smask,
-                                dashed: gs.dashed,
-                                translucent: gs.translucent,
-                                centre: certain,
-                            });
-                        }
+                        self.emit(Event {
+                            class: Class::Glyph,
+                            bbox: bounds(&pts),
+                            shape: Shape::Other,
+                            kind: "glyph of text",
+                            fill: gs.fill,
+                            stroke: gs.stroke,
+                            width: 0.0,
+                            clip: (gs.clip_box, gs.clip_exact),
+                            smask: gs.smask,
+                            dashed: gs.dashed,
+                            translucent: gs.translucent,
+                            unsupported: None,
+                        });
                         // The glyph procedure of a Type 3 font is walked, to place what it paints.
-                        if font.kind == FontKind::Type3 && font.procs.contains_key(&code) {
-                            if pen_known {
+                        if font.kind == FontKind::Type3 {
+                            if !font.procs.contains_key(&code) {
+                                self.problem(format!(
+                                    "the code {code} of a Type 3 font shown in {} is not named by /Differences, and a viewer names it through the base encoding, so what it paints is not known",
+                                    self.place()
+                                ));
+                            } else if pen_known {
                                 let origin = [size * h, 0.0, 0.0, size, ax[0], gs.rise];
                                 let glyph_to_page = mul(&font.t3_matrix, &mul(&origin, &m));
                                 self.type3_glyph(&font, code, &gs, glyph_to_page, f.res, f.depth);
@@ -1462,24 +1556,17 @@ impl<'a, 'd> Walker<'a, 'd> {
                         }
                         // The advance.
                         let adv = |wv: f64| (wv * size + gs.char_space + space) * h;
-                        let slack = font.slack();
                         let (lo, hi) = match w {
                             Some(w) => {
-                                let (a, b) = (adv(w * (1.0 - slack)), adv(w * (1.0 + slack)));
-                                (a.min(b), a.max(b))
+                                let a = adv(w);
+                                (a, a)
                             }
                             None => {
-                                let top = font.max_w.max(ADVANCE_RANGE[1]);
-                                let (a, b) = (adv(ADVANCE_RANGE[0]), adv(top));
+                                let (a, b) = (adv(ADVANCE_RANGE[0]), adv(ADVANCE_RANGE[1]));
                                 (a.min(b), a.max(b))
                             }
                         };
-                        if font.vertical {
-                            let d = size.abs() * 1.5;
-                            f.text.ay = [f.text.ay[0] - d, f.text.ay[1]];
-                        } else {
-                            f.text.ax = [f.text.ax[0] + lo, f.text.ax[1] + hi];
-                        }
+                        f.text.ax = [f.text.ax[0] + lo, f.text.ax[1] + hi];
                     }
                 }
             }
@@ -1554,8 +1641,8 @@ impl<'a, 'd> Walker<'a, 'd> {
             return;
         };
         let n = *n;
-        let draws = match self.patterns.get(&n) {
-            Some(d) => *d,
+        let (draws, refused) = match self.patterns.get(&n) {
+            Some(d) => d.clone(),
             None => {
                 let Some(e) = self.doc.latest(n) else {
                     self.problem(format!(
@@ -1567,15 +1654,21 @@ impl<'a, 'd> Walker<'a, 'd> {
                 let mut work = Work {
                     used: 0,
                     limit: self.budget.steps_left,
+                    refused: None,
                 };
                 let d = e.stream.is_some() && draws_image(self.doc, e, res, 0, &mut work);
                 if !self.tick(work.used.max(1)) {
                     return;
                 }
-                self.patterns.insert(n, d);
-                d
+                self.patterns.insert(n, (d, work.refused.clone()));
+                (d, work.refused)
             }
         };
+        if let Some(why) = refused {
+            self.problem(format!(
+                "the content of the tiling pattern /{name} is outside the strict profile ({why}), so what it paints is not known"
+            ));
+        }
         if draws {
             let msg = format!(
                 "an image is drawn through the tiling pattern /{name}: where the pattern is painted is not followed, so the pixels of that image were checked only in the render"
@@ -1617,157 +1710,322 @@ impl<'a, 'd> Walker<'a, 'd> {
         font
     }
 
-    /// The bounding box of a descriptor, in em, if it is plausible: four numbers that make a box
-    /// no bigger than a few em.
-    fn descriptor_box(&self, font: &Obj) -> (Option<[f64; 4]>, Option<f64>) {
-        let d = self.doc.dget(font, "FontDescriptor");
-        let b = numbers(d.get("FontBBox").unwrap_or(&Obj::Null), self.doc);
-        let bbox =
-            (b.len() == 4).then(|| [b[0] / 1000.0, b[1] / 1000.0, b[2] / 1000.0, b[3] / 1000.0]);
-        let bbox = bbox.and_then(plausible);
-        let missing = self.doc.dget(d, "MissingWidth").num().map(|w| w / 1000.0);
-        (bbox, missing)
+    /// The embedded program of a font descriptor: `key` is the entry that names it (`FontFile`,
+    /// `FontFile2` or `FontFile3`), and the program must be of the kind that the entry says. It is
+    /// read once, and what it takes to read is counted against the budget.
+    fn program(&mut self, fd: &Obj, key: &str) -> Result<Rc<Program>, String> {
+        use crate::fontprog::Format;
+        let Some(Obj::Ref(n)) = fd.get(key) else {
+            return Err(format!("its /{key} is not a stream"));
+        };
+        let n = *n;
+        if let Some(c) = self.programs.get(&n) {
+            return c.clone();
+        }
+        let doc = self.doc;
+        let read = doc.latest(n).and_then(|e| doc.stream_data(e));
+        let result = match read {
+            Some(d) if d.problem.is_none() && d.stopped_at.is_none() => {
+                if self.tick(1 + d.data.len() as u64 / 4096) {
+                    crate::fontprog::parse(&d.data).and_then(|p| {
+                        let ok = match key {
+                            "FontFile" => p.format == Format::Type1,
+                            "FontFile2" => p.format == Format::TrueType,
+                            _ => matches!(p.format, Format::Cff | Format::OpenTypeCff),
+                        };
+                        if ok {
+                            Ok(Rc::new(p))
+                        } else {
+                            Err(format!("it is not the kind of program that /{key} holds"))
+                        }
+                    })
+                } else {
+                    Err("the walk used up its budget".to_owned())
+                }
+            }
+            _ => Err(format!("its /{key} cannot be read")),
+        };
+        self.programs.insert(n, result.clone());
+        result
     }
 
-    /// Whether the font program is in the file.
-    fn has_font_file(&self, font: &Obj) -> bool {
-        let d = self.doc.dget(font, "FontDescriptor");
-        ["FontFile", "FontFile2", "FontFile3"]
+    /// The glyph cell of an embedded font: the ascent and descent of the descriptor within the
+    /// box of the program, and the checks of the profile that the box of the program lies near it.
+    fn program_cell(&self, fd: &Obj, program: &Program, max_w: f64) -> Result<[f64; 2], String> {
+        let [x0, y0, x1, y1] = program.bbox;
+        let em = |key: &str| {
+            self.doc
+                .dget(fd, key)
+                .num()
+                .map(|v| v / 1000.0)
+                .filter(|v| v.is_finite())
+        };
+        let asc = em("Ascent").filter(|v| (0.2..=2.0).contains(v));
+        let dsc = em("Descent")
+            .map(|v| -v.abs())
+            .filter(|v| (-1.5..=0.0).contains(v));
+        let lo = dsc.map_or(y0, |d| d.max(y0));
+        let hi = asc.map_or(y1, |a| a.min(y1));
+        if lo >= hi {
+            return Err("its ascent and descent leave no cell for a glyph".to_owned());
+        }
+        if y1 - hi > profile::PROGRAM_SLACK_Y || lo - y0 > profile::PROGRAM_SLACK_Y || y1 - y0 > 3.0
+        {
+            return Err(format!(
+                "the box of its program reaches from {y0:.2} em to {y1:.2} em, more than {} em beyond the cell of a glyph ({lo:.2} to {hi:.2} em), so its ink may be far from the cell",
+                profile::PROGRAM_SLACK_Y
+            ));
+        }
+        if x0 < -profile::PROGRAM_SLACK_X || x1 > max_w.max(1.0) + profile::PROGRAM_SLACK_X {
+            return Err(format!(
+                "the box of its program reaches from {x0:.2} em to {x1:.2} em across, so its ink may be far from the advance of a glyph"
+            ));
+        }
+        Ok([lo, hi])
+    }
+
+    /// `/FirstChar`, `/LastChar` and `/Widths` of a simple or Type 3 font: `/Widths` is exactly
+    /// `/LastChar - /FirstChar + 1` numbers. `None` when the font has no `/Widths`.
+    fn simple_widths(&self, font: &Obj) -> Result<Option<(i64, i64, Vec<f64>)>, String> {
+        let doc = self.doc;
+        let Some(w) = font.get("Widths") else {
+            return Ok(None);
+        };
+        let Some(arr) = doc.resolve(w).array() else {
+            return Err("its /Widths is not an array".to_owned());
+        };
+        let int = |k: &str| match doc.dget(font, k) {
+            Obj::Int(v) if (0..=255).contains(v) => Some(*v),
+            _ => None,
+        };
+        let (Some(first), Some(last)) = (int("FirstChar"), int("LastChar")) else {
+            return Err(
+                "its /FirstChar and /LastChar are not whole numbers from 0 to 255".to_owned(),
+            );
+        };
+        if usize::try_from(last - first + 1).ok() != Some(arr.len()) {
+            return Err(format!(
+                "its /Widths has {} entries, and /FirstChar {first} to /LastChar {last} need {}",
+                arr.len(),
+                last - first + 1
+            ));
+        }
+        let widths: Option<Vec<f64>> = arr
             .iter()
-            .any(|k| d.get(k).is_some())
+            .map(|x| doc.resolve(x).num().filter(|v| v.is_finite()))
+            .collect();
+        match widths {
+            Some(v) => Ok(Some((first, last, v.iter().map(|w| w / 1000.0).collect()))),
+            None => Err("an entry of its /Widths is not a number".to_owned()),
+        }
     }
 
     fn load_font(&mut self, font: &Obj, label: &str, res: &Obj) -> Font {
-        let doc = self.doc;
-        let subtype = doc.dget(font, "Subtype").name().unwrap_or("");
-        match subtype {
+        let subtype = self.doc.dget(font, "Subtype").name().unwrap_or("");
+        let loaded = match subtype {
             "Type3" => self.load_type3(font, label, res),
-            "Type0" => {
-                let enc = doc.dget(font, "Encoding");
-                let enc_name = enc.name().unwrap_or("");
-                let two_byte = matches!(enc_name, "Identity-H" | "Identity-V")
-                    || (enc_name.starts_with("Uni")
-                        && (enc_name.contains("UCS2") || enc_name.contains("UTF16")));
-                // Vertical writing: a name that ends in -V, or an embedded character map that
-                // says /WMode 1.
-                let vertical =
-                    enc_name.ends_with("-V") || doc.dget(enc, "WMode").int().unwrap_or(0) == 1;
-                let desc = doc
-                    .dget(font, "DescendantFonts")
-                    .array()
-                    .and_then(|a| a.first())
-                    .map(|d| doc.resolve(d))
-                    .unwrap_or(&Obj::Null);
-                let (bbox, _) = self.descriptor_box(desc);
-                let embedded = self.has_font_file(desc);
-                let dw = doc.dget(desc, "DW").num().unwrap_or(1000.0) / 1000.0;
-                let mut w_map: HashMap<u32, f64> = HashMap::new();
-                let mut max_w = dw;
-                if let Some(w) = doc.dget(desc, "W").array() {
-                    // Reading the widths is work.
-                    self.tick(w.len() as u64 / 16 + 1);
-                    let mut i = 0;
-                    while i < w.len() && w_map.len() < 200_000 {
-                        let Some(c) = doc.resolve(&w[i]).int() else {
-                            i += 1;
-                            continue;
-                        };
-                        match w.get(i + 1).map(|x| doc.resolve(x)) {
-                            Some(Obj::Array(list)) => {
-                                for (k, v) in list.iter().enumerate() {
-                                    if let Some(v) = doc.resolve(v).num() {
-                                        w_map.insert((c + k as i64) as u32, v / 1000.0);
-                                        max_w = max_w.max(v / 1000.0);
-                                    }
-                                }
-                                i += 2;
-                            }
-                            Some(_) => {
-                                let c2 = w.get(i + 1).and_then(|x| doc.resolve(x).int());
-                                let v = w.get(i + 2).and_then(|x| doc.resolve(x).num());
-                                if let (Some(c2), Some(v)) = (c2, v) {
-                                    let span = (c2 - c).clamp(0, 70_000);
-                                    self.tick(span as u64 / 64 + 1);
-                                    for k in 0..=span {
-                                        w_map.insert((c + k) as u32, v / 1000.0);
-                                    }
-                                    max_w = max_w.max(v / 1000.0);
-                                }
-                                i += 3;
-                            }
-                            None => break,
-                        }
-                    }
-                }
-                Font {
-                    kind: FontKind::Cid,
-                    bbox,
-                    dw,
-                    w_map,
-                    max_w,
-                    two_byte,
-                    vertical,
-                    embedded,
-                    ..Font::plain()
-                }
+            "Type0" => self.load_type0(font),
+            "Type1" | "MMType1" | "TrueType" => self.load_simple(font),
+            other => Err(format!(
+                "a font of the type {other:?} is not in the profile"
+            )),
+        };
+        loaded.unwrap_or_else(|why| Font::refused(format!("the font {label} is outside the strict profile: {why}, so where its glyphs are drawn is not known")))
+    }
+
+    /// The key (`FontFile`, `FontFile2`, `FontFile3`) of the program that a descriptor holds.
+    fn font_file_key(&self, fd: &Obj) -> Option<&'static str> {
+        ["FontFile", "FontFile2", "FontFile3"]
+            .into_iter()
+            .find(|k| fd.get(k).is_some())
+    }
+
+    /// A simple font: a standard font that is not embedded, or a font whose program is in the file.
+    fn load_simple(&mut self, font: &Obj) -> Result<Font, String> {
+        let doc = self.doc;
+        let fd = doc.dget(font, "FontDescriptor");
+        let base = doc.dget(font, "BaseFont").name().unwrap_or("");
+        let widths = self.simple_widths(font)?;
+        let (first, last, list) = widths.clone().unwrap_or((0, -1, Vec::new()));
+        let mut f = Font {
+            first,
+            last,
+            have_widths: widths.is_some(),
+            widths: list,
+            ..Font::plain()
+        };
+        if let Some(key) = self.font_file_key(fd) {
+            if widths.is_none() {
+                return Err("its program is in the file and it has no /Widths".to_owned());
             }
+            let program = self.program(fd, key)?;
+            let max_w = f.widths.iter().copied().fold(0.0, f64::max);
+            f.cell_y = self.program_cell(fd, &program, max_w)?;
+            f.program = Some(program);
+            return Ok(f);
+        }
+        // Not embedded: a standard font that the tool has the metrics of.
+        let std = crate::stdfonts::for_name(base)
+            .ok_or_else(|| format!("{base:?} is not embedded and not one of the standard fonts"))?;
+        let enc = doc.dget(font, "Encoding");
+        f.std_standard = match enc {
+            Obj::Null => true,
+            Obj::Name(n) if n == "WinAnsiEncoding" || n == "MacRomanEncoding" => false,
             _ => {
-                let (bbox, missing) = self.descriptor_box(font);
-                let widths = numbers(font.get("Widths").unwrap_or(&Obj::Null), doc);
-                Font {
-                    kind: FontKind::Simple,
-                    bbox,
-                    first: doc.dget(font, "FirstChar").int().unwrap_or(0),
-                    have_widths: !widths.is_empty(),
-                    max_w: widths
-                        .iter()
-                        .map(|w| w / 1000.0)
-                        .fold(ADVANCE_RANGE[1], f64::max),
-                    widths: widths.iter().map(|w| w / 1000.0).collect(),
-                    missing,
-                    std: if widths.is_empty() {
-                        crate::stdfonts::for_name(doc.dget(font, "BaseFont").name().unwrap_or(""))
-                    } else {
-                        None
-                    },
-                    embedded: self.has_font_file(font),
-                    ..Font::plain()
+                return Err(
+                    "the encoding of a standard font is not absent, WinAnsiEncoding or MacRomanEncoding (a /Differences, a base encoding, another name)".to_owned(),
+                )
+            }
+        };
+        if f.have_widths {
+            for code in 32..=126u32 {
+                if let Some(w) = f.declared(code) {
+                    let t = std.width(code, f.std_standard).unwrap_or(0.0);
+                    if (w - t).abs() > (profile::STD_TOLERANCE * t).max(0.0005) {
+                        return Err(format!(
+                            "the width {:.0} of the code {code} is not within {} of the standard width {:.0}",
+                            w * 1000.0,
+                            profile::STD_TOLERANCE,
+                            t * 1000.0
+                        ));
+                    }
                 }
             }
         }
+        f.std = Some(std);
+        Ok(f)
+    }
+
+    /// A composite font: `Identity-H` with a descendant whose program is in the file.
+    fn load_type0(&mut self, font: &Obj) -> Result<Font, String> {
+        let doc = self.doc;
+        let enc = doc.dget(font, "Encoding");
+        if enc.name() != Some("Identity-H") {
+            return Err("its character map is not the name Identity-H (a stream, a vertical map and every other map are not read)".to_owned());
+        }
+        if doc.dget(font, "WMode").int().unwrap_or(0) == 1 {
+            return Err("its writing mode is vertical".to_owned());
+        }
+        let desc = doc
+            .dget(font, "DescendantFonts")
+            .array()
+            .and_then(|a| (a.len() == 1).then(|| doc.resolve(&a[0])))
+            .ok_or("it has not exactly one descendant font")?;
+        let key = match doc.dget(desc, "Subtype").name() {
+            Some("CIDFontType2") => "FontFile2",
+            Some("CIDFontType0") => "FontFile3",
+            _ => return Err("its descendant is not a CIDFontType2 or CIDFontType0".to_owned()),
+        };
+        let fd = doc.dget(desc, "FontDescriptor");
+        if fd.get(key).is_none() {
+            return Err("its program is not in the file".to_owned());
+        }
+        let program = self.program(fd, key)?;
+        let dw = doc.dget(desc, "DW").num().unwrap_or(1000.0) / 1000.0;
+        let mut w_map: HashMap<u32, f64> = HashMap::new();
+        let mut max_w = dw;
+        if let Some(w) = doc.dget(desc, "W").array() {
+            // Reading the widths is work.
+            self.tick(w.len() as u64 / 16 + 1);
+            let mut i = 0;
+            while i < w.len() && w_map.len() < 200_000 {
+                let Some(c) = doc.resolve(&w[i]).int() else {
+                    i += 1;
+                    continue;
+                };
+                match w.get(i + 1).map(|x| doc.resolve(x)) {
+                    Some(Obj::Array(list)) => {
+                        for (k, v) in list.iter().enumerate() {
+                            if let Some(v) = doc.resolve(v).num() {
+                                w_map.insert((c + k as i64) as u32, v / 1000.0);
+                                max_w = max_w.max(v / 1000.0);
+                            }
+                        }
+                        i += 2;
+                    }
+                    Some(_) => {
+                        let c2 = w.get(i + 1).and_then(|x| doc.resolve(x).int());
+                        let v = w.get(i + 2).and_then(|x| doc.resolve(x).num());
+                        if let (Some(c2), Some(v)) = (c2, v) {
+                            let span = (c2 - c).clamp(0, 70_000);
+                            self.tick(span as u64 / 64 + 1);
+                            for k in 0..=span {
+                                w_map.insert((c + k) as u32, v / 1000.0);
+                            }
+                            max_w = max_w.max(v / 1000.0);
+                        }
+                        i += 3;
+                    }
+                    None => break,
+                }
+            }
+        }
+        let cid_to_gid = match doc.dget(desc, "CIDToGIDMap") {
+            Obj::Null => CidToGid::Identity,
+            Obj::Name(n) if n == "Identity" => CidToGid::Identity,
+            _ => match desc.get("CIDToGIDMap") {
+                Some(Obj::Ref(n)) if key == "FontFile2" => {
+                    let data = doc
+                        .latest(*n)
+                        .and_then(|e| doc.stream_data(e))
+                        .filter(|d| d.problem.is_none() && d.stopped_at.is_none())
+                        .ok_or("its /CIDToGIDMap cannot be read")?;
+                    self.tick(1 + data.data.len() as u64 / 4096);
+                    CidToGid::Map(
+                        data.data
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|c| u16::from_be_bytes(*c))
+                            .collect(),
+                    )
+                }
+                _ => return Err("its /CIDToGIDMap is not Identity or a stream".to_owned()),
+            },
+        };
+        Ok(Font {
+            kind: FontKind::Cid,
+            cell_y: self.program_cell(fd, &program, max_w)?,
+            dw,
+            w_map,
+            two_byte: true,
+            program: Some(program),
+            cid_to_gid,
+            ..Font::plain()
+        })
     }
 
     /// A Type 3 font: the numbers that place its glyphs, and the glyph procedure of each code
     /// (through the names of `/Encoding /Differences` and `/CharProcs`), which is walked where the
-    /// glyph is shown. A font with no widths or no glyph names cannot be placed.
-    fn load_type3(&mut self, font: &Obj, label: &str, _res: &Obj) -> Font {
+    /// glyph is shown. Every shown code must be named by `/Differences` (a viewer would name the
+    /// others through the base encoding).
+    fn load_type3(&mut self, font: &Obj, label: &str, _res: &Obj) -> Result<Font, String> {
         let doc = self.doc;
-        let matrix = {
-            let m = numbers(font.get("FontMatrix").unwrap_or(&Obj::Null), doc);
-            if m.len() == 6 {
-                [m[0], m[1], m[2], m[3], m[4], m[5]]
-            } else {
-                [0.001, 0.0, 0.0, 0.001, 0.0, 0.0]
+        let m = match font.get("FontMatrix") {
+            Some(m) => exact_numbers(m, doc, 6),
+            None => Some(vec![0.001, 0.0, 0.0, 0.001, 0.0, 0.0]),
+        }
+        .ok_or("its /FontMatrix is not six numbers")?;
+        if m[1] != 0.0 || m[2] != 0.0 || m[0] == 0.0 || m[3] == 0.0 {
+            return Err("its /FontMatrix turns, skews or collapses the glyphs".to_owned());
+        }
+        let matrix = [m[0], m[1], m[2], m[3], m[4], m[5]];
+        // The cell of a Type 3 glyph is its advance box, and as tall as the font box says (what the
+        // glyph paints is walked, and placed by its own coordinates).
+        let cell_y = match font
+            .get("FontBBox")
+            .and_then(|b| exact_numbers(b, doc, 4))
+            .filter(|b| b[3] != b[1])
+        {
+            Some(b) => {
+                let (a, c) = (apply(&matrix, 0.0, b[1]).1, apply(&matrix, 0.0, b[3]).1);
+                [a.min(c), a.max(c)]
             }
+            None => [-0.2, 1.0],
         };
-        let to_em = |b: [f64; 4]| {
-            let pts = [
-                apply(&matrix, b[0], b[1]),
-                apply(&matrix, b[2], b[1]),
-                apply(&matrix, b[0], b[3]),
-                apply(&matrix, b[2], b[3]),
-            ];
-            bounds(&pts)
-        };
-        let bbox = {
-            let b = numbers(font.get("FontBBox").unwrap_or(&Obj::Null), doc);
-            (b.len() == 4 && (b[2] - b[0]).abs() > 0.0 && (b[3] - b[1]).abs() > 0.0)
-                .then(|| to_em([b[0], b[1], b[2], b[3]]))
-        };
-        let widths = numbers(font.get("Widths").unwrap_or(&Obj::Null), doc);
+        let widths = self.simple_widths(font)?;
         let charprocs = doc.dget(font, "CharProcs");
         let mut procs: HashMap<u32, u32> = HashMap::new();
-        let mut problem = None;
         let diffs = doc.dget(doc.dget(font, "Encoding"), "Differences").array();
         match diffs {
             Some(a) => {
@@ -1791,29 +2049,31 @@ impl<'a, 'd> Walker<'a, 'd> {
                 }
             }
             None if !charprocs.entries().is_empty() => {
-                problem = Some(format!(
+                return Err(format!(
                     "the Type 3 font {label} has no /Encoding with /Differences, so the glyph that a code shows is not known"
                 ));
             }
             None => {}
         }
-        if widths.is_empty() && !procs.is_empty() {
-            problem = Some(format!(
+        if widths.is_none() && !procs.is_empty() {
+            return Err(format!(
                 "the Type 3 font {label} has no /Widths, so where its glyphs are shown is not known"
             ));
         }
-        Font {
+        let (first, last, list) = widths.clone().unwrap_or((0, -1, Vec::new()));
+        Ok(Font {
             kind: FontKind::Type3,
-            bbox: bbox.filter(|b| b.iter().all(|v| v.is_finite())),
-            first: doc.dget(font, "FirstChar").int().unwrap_or(0),
-            have_widths: !widths.is_empty(),
-            widths: widths.iter().map(|w| w * matrix[0]).collect(),
+            cell_y,
+            first,
+            last,
+            have_widths: widths.is_some(),
+            // The widths of a Type 3 font are in the glyph space.
+            widths: list.iter().map(|w| w * 1000.0 * matrix[0]).collect(),
             procs,
             t3_matrix: matrix,
             t3_res: font.get("Resources").map(|r| doc.resolve(r).clone()),
-            problem,
             ..Font::plain()
-        }
+        })
     }
 
     fn xobject(&mut self, n: u32, res: &Obj, gs: &Gs, depth: usize) {
@@ -1849,10 +2109,30 @@ impl<'a, 'd> Walker<'a, 'd> {
                         "form object {n} has the filter {stop}, which is not decoded, so its content was not walked"
                     ));
                 }
-                let m = e
+                let m = match e.value.get("Matrix") {
+                    None => IDENTITY,
+                    Some(m) => {
+                        let Some(m) = matrix_of(m, self.doc) else {
+                            self.problem(format!(
+                                "the form object {n} drawn in {} has a /Matrix that is not six numbers, and readers read such a matrix differently, so where it paints is not known",
+                                self.place()
+                            ));
+                            return;
+                        };
+                        m
+                    }
+                };
+                let Some(b) = e
                     .value
-                    .get("Matrix")
-                    .map_or(IDENTITY, |m| matrix_of(m, self.doc));
+                    .get("BBox")
+                    .and_then(|b| exact_numbers(b, self.doc, 4))
+                else {
+                    self.problem(format!(
+                        "the form object {n} drawn in {} has no /BBox of four numbers, so where it paints is not known",
+                        self.place()
+                    ));
+                    return;
+                };
                 let own = e
                     .value
                     .get("Resources")
@@ -1863,12 +2143,7 @@ impl<'a, 'd> Walker<'a, 'd> {
                 let saved = self.container;
                 let mut inner = gs.clone();
                 inner.ctm = full;
-                let b = e
-                    .value
-                    .get("BBox")
-                    .map(|b| numbers(b, self.doc))
-                    .unwrap_or_default();
-                if b.len() == 4 {
+                {
                     let pts = [
                         apply(&full, b[0], b[1]),
                         apply(&full, b[2], b[1]),
@@ -1932,23 +2207,6 @@ fn unit_bounds(ctm: &M) -> [f64; 4] {
     ])
 }
 
-/// A bounding box in em that a viewer could plausibly use: finite, with an area, and no more than
-/// a few em across.
-fn plausible(b: [f64; 4]) -> Option<[f64; 4]> {
-    let b = [
-        b[0].min(b[2]),
-        b[1].min(b[3]),
-        b[0].max(b[2]),
-        b[1].max(b[3]),
-    ];
-    let ok = b.iter().all(|v| v.is_finite() && v.abs() <= 4.0)
-        && b[2] - b[0] > 0.01
-        && b[3] - b[1] > 0.01
-        && b[2] - b[0] <= 5.0
-        && b[3] - b[1] <= 5.0;
-    ok.then_some(b)
-}
-
 /// A horizontal or vertical rectangle at most [`THIN`] thick that crosses the region from one side
 /// to the other: `Some(true)` when it runs along x.
 fn crosses_thin_rect(r: &[f64; 4], t: &[f64; 4]) -> Option<bool> {
@@ -1993,6 +2251,8 @@ fn rule_is_plain(e: &Event, t: &[f64; 4], along_x: bool) -> bool {
 pub struct Work {
     pub used: u64,
     pub limit: u64,
+    /// Why the content scanned is outside the strict profile (see [`crate::profile`]).
+    pub refused: Option<String>,
 }
 
 /// Whether the content of a form or pattern draws an image (also through a form it draws). It uses
@@ -2011,12 +2271,27 @@ pub fn draws_image(doc: &Doc, e: &Entry, fallback: &Obj, depth: usize, work: &mu
         .get("Resources")
         .map_or_else(|| fallback.clone(), |r| doc.resolve(r).clone());
     let mut found = false;
+    let mut compat = 0usize;
     for_each_op_while(&d.data, &mut |op: &Op| {
         work.used += 1;
         if work.used > work.limit {
             return false;
         }
+        if profile::is_known(op.name) {
+            if let Some(why) = profile::operand_problem(op) {
+                work.refused.get_or_insert(why);
+            }
+        } else if compat == 0 {
+            work.refused.get_or_insert_with(|| {
+                format!(
+                    "the operator {} is not one of the specification",
+                    String::from_utf8_lossy(op.name)
+                )
+            });
+        }
         match op.name {
+            b"BX" => compat += 1,
+            b"EX" => compat = compat.saturating_sub(1),
             b"BI" => found = true,
             b"Do" => {
                 if let Some(name) = op.name_arg() {
@@ -2063,36 +2338,44 @@ mod tests {
     }
 
     #[test]
-    fn a_box_that_is_not_plausible_is_the_em_box() {
-        assert_eq!(
-            plausible([-0.2, -0.3, 1.3, 1.1]),
-            Some([-0.2, -0.3, 1.3, 1.1])
-        );
-        assert_eq!(plausible([0.0, 0.0, 0.0, 0.0]), None);
-        assert_eq!(plausible([0.0, 0.0, 400.0, 400.0]), None);
-        assert_eq!(plausible([f64::NAN, 0.0, 1.0, 1.0]), None);
-    }
-
-    #[test]
     fn widths_come_from_the_font_and_codes_from_its_encoding() {
+        // An embedded simple font: widths from /FirstChar to /LastChar, a code outside is refused.
         let mut f = Font::plain();
         f.have_widths = true;
         f.first = 65;
+        f.last = 66;
         f.widths = vec![0.5, 0.6];
-        f.missing = Some(0.25);
-        assert_eq!(f.width(65, false), Some(0.5));
-        assert_eq!(f.width(66, false), Some(0.6));
-        assert_eq!(f.width(70, false), Some(0.25));
-        assert_eq!(Font::plain().width(65, false), None);
+        assert_eq!(f.width(65, false), Ok(Some(0.5)));
+        assert_eq!(f.width(66, false), Ok(Some(0.6)));
+        assert!(f.width(70, false).is_err());
+        assert!(f.width(64, false).is_err());
+        // A standard font with no widths: the tables, and an interval for a code outside them.
+        let mut s = Font::plain();
+        s.std = crate::stdfonts::for_name("Helvetica");
+        assert_eq!(s.width(65, false), Ok(Some(0.667)));
+        assert_eq!(s.width(200, false), Ok(None));
+        s.std_standard = true;
+        assert_eq!(s.width(39, false), Ok(Some(0.222)));
+        // A composite font: two-byte codes, the width from /W or /DW.
         let mut c = Font::plain();
         c.kind = FontKind::Cid;
         c.two_byte = true;
         c.dw = 0.6;
         c.w_map.insert(3, 0.2);
         assert_eq!(c.codes(&[0, 3, 0, 4]), [(3, true), (4, true)]);
-        assert_eq!(c.width(3, true), Some(0.2));
-        assert_eq!(c.width(4, true), Some(0.6));
-        c.two_byte = false;
-        assert_eq!(c.width(3, false), None);
+        assert_eq!(c.width(3, true), Ok(Some(0.2)));
+        assert_eq!(c.width(4, true), Ok(Some(0.6)));
+        assert!(c.width(3, false).is_err());
+    }
+
+    #[test]
+    fn the_cell_of_a_glyph_overlaps_a_region_with_positive_area() {
+        let region = [100.0, 100.0, 150.0, 130.0];
+        assert!(cell_overlaps(&[140.0, 110.0, 160.0, 120.0], &region));
+        // Touching, or ending where the region starts to within rounding.
+        assert!(!cell_overlaps(&[90.0, 110.0, 100.0, 120.0], &region));
+        assert!(!cell_overlaps(&[90.0, 110.0, 100.004, 120.0], &region));
+        assert!(!cell_overlaps(&[110.0, 130.0, 120.0, 140.0], &region));
+        assert!(cell_overlaps(&[90.0, 110.0, 101.0, 120.0], &region));
     }
 }

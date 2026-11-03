@@ -255,10 +255,13 @@ pub fn has_unsure_inline_image(buf: &[u8]) -> bool {
 }
 
 /// Whether some operand of the content is a token that a strict reader refuses (see
-/// [`Operand::Bad`]).
+/// [`Operand::Bad`]), or an operator of the specification has operands other than the ones that the
+/// specification gives it (see [`crate::profile`]): readers differ on those.
 pub fn has_bad_operand(buf: &[u8]) -> bool {
     let mut bad = false;
-    for_each_op(buf, &mut |op| bad |= op.bad);
+    for_each_op(buf, &mut |op| {
+        bad |= op.bad || crate::profile::operand_problem(op).is_some();
+    });
     bad
 }
 
@@ -586,14 +589,16 @@ pub enum ShownItem {
     Kern(f64),
 }
 
-/// The strings and kerning offsets that one showing operator shows.
+/// The strings and kerning offsets that one showing operator shows. An operator with more
+/// operands than it takes shows what its last operand says, as Poppler reads it (and the walk
+/// refuses such an operator: see [`crate::profile`]).
 pub fn shown(op: &Op) -> Option<Vec<ShownItem>> {
     match op.name {
         b"Tj" | b"'" | b"\"" => op.args.iter().rev().find_map(|a| match a {
             Operand::Str(s) => Some(vec![ShownItem::Str(s.clone())]),
             _ => None,
         }),
-        b"TJ" => op.args.iter().find_map(|a| match a {
+        b"TJ" => op.args.iter().rev().find_map(|a| match a {
             Operand::Array(items) => Some(
                 items
                     .iter()

@@ -187,3 +187,97 @@ pub fn cid_font(base: u32, name: &str, table: &[(u16, char)]) -> Vec<(u32, Bytes
         (base + 3, packed("", &cmap(&bfchar(table)))),
     ]
 }
+
+/// A TrueType program with no outlines (units per em 1000): the box of all glyphs, and one advance
+/// for each glyph. It has the tables that a reader needs to place glyphs (`head`, `hhea`, `maxp`,
+/// `hmtx`, `loca`, `glyf`), and Poppler loads it.
+pub fn tiny_truetype(bbox: [i16; 4], advances: &[u16]) -> Bytes {
+    let ng = advances.len() as u16;
+    let mut head = vec![0u8; 54];
+    head[18..20].copy_from_slice(&1000u16.to_be_bytes());
+    for (i, v) in bbox.iter().enumerate() {
+        head[36 + 2 * i..38 + 2 * i].copy_from_slice(&v.to_be_bytes());
+    }
+    head[0..4].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+    head[12..16].copy_from_slice(&0x5F0F_3CF5u32.to_be_bytes());
+    head[50..52].copy_from_slice(&0u16.to_be_bytes());
+    let mut hhea = vec![0u8; 36];
+    hhea[0..4].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+    hhea[34..36].copy_from_slice(&ng.to_be_bytes());
+    let mut maxp = vec![0u8; 32];
+    maxp[0..4].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+    maxp[4..6].copy_from_slice(&ng.to_be_bytes());
+    let hmtx: Bytes = advances
+        .iter()
+        .flat_map(|a| [a.to_be_bytes(), [0, 0]].concat())
+        .collect();
+    let loca = vec![0u8; 2 * (usize::from(ng) + 1)];
+    let tables: [(&[u8; 4], &Bytes); 6] = [
+        (b"glyf", &Vec::new()),
+        (b"head", &head),
+        (b"hhea", &hhea),
+        (b"hmtx", &hmtx),
+        (b"loca", &loca),
+        (b"maxp", &maxp),
+    ];
+    let mut out = vec![0, 1, 0, 0];
+    out.extend((tables.len() as u16).to_be_bytes());
+    out.extend([0u8; 6]);
+    let mut off = 12 + 16 * tables.len();
+    for (tag, t) in &tables {
+        out.extend(tag.iter());
+        out.extend(0u32.to_be_bytes());
+        out.extend((off as u32).to_be_bytes());
+        out.extend((t.len() as u32).to_be_bytes());
+        off += t.len().div_ceil(4) * 4;
+    }
+    for (_, t) in &tables {
+        out.extend(t.iter());
+        out.extend(std::iter::repeat_n(0u8, t.len().div_ceil(4) * 4 - t.len()));
+    }
+    out
+}
+
+/// The program of the composite font of `Fx` (see `Fx::program`): 400 glyphs, each 600 wide.
+pub fn cid_program() -> Bytes {
+    tiny_truetype([0, -200, 1000, 900], &[600; 400])
+}
+
+/// The objects of a simple TrueType font whose program is in the file: the font at `base`, its
+/// descriptor at `base + 1` and its program at `base + 2`. `widths` are for the codes from
+/// `first`; the descriptor says what is given for the ascent and descent, and the program has the
+/// box `bbox` and the glyph advances `advances`.
+pub fn embedded_simple(
+    base: u32,
+    first: u8,
+    widths: &[u16],
+    ascent_descent: (i32, i32),
+    bbox: [i16; 4],
+    advances: &[u16],
+) -> Vec<(u32, Bytes)> {
+    let list: String = widths.iter().map(|w| format!("{w} ")).collect();
+    let program = tiny_truetype(bbox, advances);
+    vec![
+        (
+            base,
+            format!(
+                "<< /Type /Font /Subtype /TrueType /BaseFont /ABCDEF+Tiny /Encoding /WinAnsiEncoding                  /FirstChar {first} /LastChar {} /Widths [{list}] /FontDescriptor {} 0 R >>",
+                usize::from(first) + widths.len() - 1,
+                base + 1
+            )
+            .into_bytes(),
+        ),
+        (
+            base + 1,
+            format!(
+                "<< /Type /FontDescriptor /FontName /ABCDEF+Tiny /Flags 32 /FontBBox [{} {} {} {}]                  /ItalicAngle 0 /Ascent {} /Descent {} /CapHeight 700 /StemV 80 /FontFile2 {} 0 R >>",
+                bbox[0], bbox[1], bbox[2], bbox[3], ascent_descent.0, ascent_descent.1, base + 2
+            )
+            .into_bytes(),
+        ),
+        (
+            base + 2,
+            super::hard_cases::stream_obj(&format!("/Length1 {}", program.len()), &program, true),
+        ),
+    ]
+}
