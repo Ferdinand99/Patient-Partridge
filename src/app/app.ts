@@ -582,10 +582,24 @@ export class App {
   private async settleBeforePages(doc: number): Promise<boolean> {
     const tab = this.tabs.find((t) => t.doc === doc);
     if (!tab) return true;
+    // The file that was just signed is not changed: a page tool would break the signature.
+    if (tab.signedHere) {
+      await this.tellSigned("page changes");
+      return false;
+    }
     await tab.view.flushForms().catch(() => undefined);
     await tab.annotator?.flush();
     if (!this.tabs.includes(tab)) return false;
     return this.keepRefusedText(doc);
+  }
+
+  /** Says that what the person asked for is off in a file that was signed here. */
+  private async tellSigned(what: string): Promise<void> {
+    await showNotice(this.noticeLayer, {
+      title: CERT_WORDS.signedTitle,
+      detail: CERT_WORDS.signedOff(what),
+      buttons: [{ id: "ok", label: "OK", primary: true }],
+    });
   }
 
   /**
@@ -1637,6 +1651,10 @@ export class App {
   private async setDesigning(open: boolean): Promise<void> {
     const designer = this.designer;
     if (!designer) return;
+    if (open && this.active?.signedHere) {
+      await this.tellSigned("the form tools");
+      return;
+    }
     if (open) {
       if (this.annotOpen) this.setAnnotating(false);
       await designer.openMode();
@@ -1850,6 +1868,13 @@ export class App {
     }
     tab.history.markSaved(began);
     if (saved.path !== tab.path || saved.name !== tab.name) {
+      // The tab follows the copy, which is not the signed file: it can be changed again.
+      if (tab.signedHere && saved.path !== tab.path) {
+        tab.signedHere = false;
+        tab.view.holdEdits(false);
+        tab.annotator?.setHeld(false);
+        if (this.active === tab) this.syncAnnotBar();
+      }
       tab.path = saved.path;
       tab.name = saved.name;
       this.syncChrome();
@@ -1939,6 +1964,18 @@ export class App {
   }
 
   private async askSigned(tab: Tab, copy = false): Promise<"copy" | "anyway" | "cancel"> {
+    // The file that was signed here is never saved over: only a copy is offered.
+    if (tab.signedHere && !copy) {
+      const only = await showNotice(this.noticeLayer, {
+        title: CERT_WORDS.signedTitle,
+        detail: CERT_WORDS.signedSaveOnlyCopy(tab.name),
+        buttons: [
+          { id: "cancel", label: "Cancel", safe: true },
+          { id: "copy", label: "Save a copy…", primary: true },
+        ],
+      });
+      return only.button === "copy" ? "copy" : "cancel";
+    }
     const answer = await showNotice(this.noticeLayer, {
       title: "This document is signed",
       detail: copy

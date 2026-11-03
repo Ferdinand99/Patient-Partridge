@@ -102,6 +102,9 @@ describe("the answers to what can go wrong", () => {
     "sign_no_file",
     "signer_not_loaded",
     "signer_stopped",
+    "signer_protection_unsupported",
+    "signer_chain_too_long",
+    "signer_password_too_long",
     "signer_sandbox_unavailable",
     "sign_unsaved",
     "sign_same_file",
@@ -115,6 +118,16 @@ describe("the answers to what can go wrong", () => {
     "save_too_large",
     "anything_else",
   ];
+
+  it("says why a key is refused, in the words of the signer, as text", () => {
+    const told = describeSignError({
+      code: "signer_key_unsupported",
+      message: "this kind of key is not supported (RSA keys shorter than 2048 bits are not supported)",
+    });
+    expect(told.detail).toContain("This file: RSA keys shorter than 2048 bits are not supported.");
+    // Nothing is added when the signer gave no reason.
+    expect(describeSignError({ code: "signer_key_unsupported", message: "" }).detail).not.toContain("This file");
+  });
 
   it("has a title and a detail for every code", () => {
     for (const code of codes) {

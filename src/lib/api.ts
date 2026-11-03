@@ -323,9 +323,20 @@ export const api = {
     return invoke<string | null>("sign_pick_certificate");
   },
 
-  /** Opens the chosen certificate file with its password. The password is not kept. */
-  signLoadCertificate(password: string): Promise<CertificateInfo> {
-    return invoke<CertificateInfo>("sign_load_certificate", { password });
+  /**
+   * Opens the chosen certificate file with its password, for signing the document `doc` (a key
+   * opened for one document signs no other). The password is not kept.
+   */
+  signLoadCertificate(doc: number, password: string): Promise<CertificateInfo> {
+    return invoke<CertificateInfo>("sign_load_certificate", { doc, password });
+  },
+
+  /**
+   * Whether a certificate file is still open for `doc`: the signer ends after the one signature it
+   * makes, and lets the key go when it has been open for some minutes.
+   */
+  signCertificateOpen(doc: number): Promise<boolean> {
+    return invoke<boolean>("sign_certificate_open", { doc });
   },
 
   /** Lets the key go and forgets the file that was chosen. */
@@ -503,7 +514,8 @@ export const api = {
 /** What signing with a certificate needs from the app process. Without all of it the tool is off. */
 export interface CertSignApi {
   signPickCertificate(): Promise<string | null>;
-  signLoadCertificate(password: string): Promise<CertificateInfo>;
+  signLoadCertificate(doc: number, password: string): Promise<CertificateInfo>;
+  signCertificateOpen(doc: number): Promise<boolean>;
   signForgetCertificate(): Promise<void>;
   signSetImageMark(width: number, height: number, rgba: Uint8ClampedArray): Promise<void>;
   signListFields(doc: number): Promise<SignField[]>;

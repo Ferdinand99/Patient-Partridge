@@ -48,7 +48,6 @@ export type SignMark =
 
 export interface SignRequestArgs {
   place: SignPlace;
-  name: string;
   reason: string;
   location: string;
   mark: SignMark;
@@ -105,7 +104,8 @@ export const CERT_WORDS = {
   placeFieldHint: "Choose a field.",
   pageLabel: "Page",
   textsTitle: "What the signature says",
-  signerName: "Name to show",
+  signerName: "The signature carries the name in the certificate.",
+  keyLetGo: "The key was let go after one signature. Type the password again to try once more.",
   reason: "Reason (optional)",
   location: "Place (optional)",
   pictureTitle: "Picture of your signature (optional)",
@@ -124,7 +124,12 @@ export const CERT_WORDS = {
   working: "Signing…",
   openWorking: "Opening the certificate file…",
   readOnly:
-    "This file is signed. Changing it breaks the signature, so editing is off here. To change it, save a new copy.",
+    "This file is signed. Changing it would break the signature, so annotations, form fields and page changes are off here, and it cannot be saved over. To change it, save a copy.",
+  signedTitle: "This file is signed",
+  signedOff: (what: string) =>
+    `This file is signed, so ${what} are off here: changing it would break the signature. To change it, save a copy.`,
+  signedSaveOnlyCopy: (name: string) =>
+    `"${name}" is the signed file. Saving over it would break the signature, so it is not done. A copy leaves the signed file as it is.`,
   unsavedTitle: "Save the document first",
   unsavedDetail: (name: string) =>
     `"${name}" has changes that are not saved. Patient Partridge signs a file you have saved. Save it, then sign.`,
@@ -230,11 +235,26 @@ export function describeSignError(error: AppErrorLike, fileName = "this file"): 
         title: "No key in this file",
         detail: "The file holds no private key with a certificate. Choose a file that has both.",
       };
-    case "signer_key_unsupported":
+    case "signer_key_unsupported": {
+      // The signer says why in the last pair of brackets of its message (the kind of key).
+      const why = /\(([^()]{1,120})\)\s*$/.exec(error.message)?.[1];
       return {
         title: "This kind of key is not supported",
-        detail: "Patient Partridge signs with RSA keys of 2048 to 4096 bits and with ECDSA keys on the curves P-256 and P-384.",
+        detail: `Patient Partridge signs with RSA keys of 2048 to 4096 bits and with ECDSA keys on the curves P-256 and P-384.${why ? ` This file: ${cleanText(why)}.` : ""}`,
       };
+    }
+    case "signer_protection_unsupported":
+      return {
+        title: "This certificate file cannot be opened here",
+        detail: "The file is protected in a way that Patient Partridge does not open (a method it does not know, or more than a million rounds of work). Export the certificate again with the usual protection.",
+      };
+    case "signer_chain_too_long":
+      return {
+        title: "The chain of certificates is too long",
+        detail: "The file leads through more than 12 certificates, which is more than a signature carries here. Export the certificate with a shorter chain.",
+      };
+    case "signer_password_too_long":
+      return { title: "The password is too long", detail: "A password of more than 1,024 bytes is not taken. Check the password." };
     case "signer_key_mismatch":
       return {
         title: "The key and the certificate do not belong together",

@@ -196,7 +196,7 @@ export function askCertificateSignature(request: CertDialogRequest): Promise<Sig
       textSection.append(wrap);
       return input;
     };
-    const nameInput = textField(CERT_WORDS.signerName);
+    textSection.append(el("p", "muted certsign-hint", CERT_WORDS.signerName));
     const reasonInput = textField(CERT_WORDS.reason);
     const placeInput = textField(CERT_WORDS.location);
     const pictureRow = el("div", "certsign-row");
@@ -275,7 +275,7 @@ export function askCertificateSignature(request: CertDialogRequest): Promise<Sig
       }
       pictureButton.textContent = picture ? CERT_WORDS.pictureChange : CERT_WORDS.pictureAdd;
       pictureRemove.hidden = picture === null;
-      const ready = loaded && !busy && cleanText(nameInput.value) !== "" && place() !== null;
+      const ready = loaded && !busy && place() !== null;
       sign.disabled = !ready;
       choose.disabled = busy;
       open.disabled = busy || password.disabled;
@@ -420,12 +420,11 @@ export function askCertificateSignature(request: CertDialogRequest): Promise<Sig
       sync();
       const typed = password.value;
       void api
-        .signLoadCertificate(typed)
+        .signLoadCertificate(request.doc, typed)
         .then(async (c) => {
           certificate = c;
           password.value = "";
           password.disabled = true;
-          nameInput.value = cleanText(c.name);
           showCertificate(c);
           say("");
           try {
@@ -460,7 +459,6 @@ export function askCertificateSignature(request: CertDialogRequest): Promise<Sig
       fieldName = fieldSelect.value;
       sync();
     });
-    nameInput.addEventListener("input", () => sync());
 
     // ---- the picture -------------------------------------------------------------------------
     pictureButton.addEventListener("click", () => {
@@ -500,7 +498,6 @@ export function askCertificateSignature(request: CertDialogRequest): Promise<Sig
         }
         return api.signDocument(request.doc, {
           place: chosenPlace,
-          name: cleanText(nameInput.value),
           reason: cleanText(reasonInput.value),
           location: cleanText(placeInput.value),
           mark: markOf(picture),
@@ -517,10 +514,21 @@ export function askCertificateSignature(request: CertDialogRequest): Promise<Sig
           }
           finish(result);
         })
-        .catch((e: unknown) => {
+        .catch(async (e: unknown) => {
           const error = toAppError(e);
           const told = error.code.startsWith("sign") ? describeSignError(error, `"${request.fileName}"`) : describeError(error, request.fileName);
           say(`${told.title}. ${told.detail}`);
+          // The signer ends after the one signature it makes, and lets the key go after some
+          // minutes: when it is gone, the password is asked for again.
+          const open = await api.signCertificateOpen(request.doc).catch(() => false);
+          if (!open && !closed) {
+            certificate = null;
+            summary.hidden = true;
+            warnings.hidden = true;
+            password.disabled = false;
+            password.value = "";
+            say(`${status.textContent ?? ""} ${CERT_WORDS.keyLetGo}`.trim());
+          }
         })
         .finally(() => {
           busy = false;

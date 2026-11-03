@@ -38,10 +38,11 @@ function fake(over: Partial<CertDialogApi> = {}) {
       calls.push("pick");
       return Promise.resolve("anna.p12");
     }),
-    signLoadCertificate: vi.fn((password: string) => {
+    signLoadCertificate: vi.fn((_doc: number, password: string) => {
       calls.push(`load ${password}`);
       return Promise.resolve(certificate);
     }),
+    signCertificateOpen: vi.fn(() => Promise.resolve(true)),
     signForgetCertificate: vi.fn(() => {
       calls.push("forget");
       return Promise.resolve();
@@ -49,7 +50,7 @@ function fake(over: Partial<CertDialogApi> = {}) {
     signSetImageMark: vi.fn(() => Promise.resolve()),
     signListFields: vi.fn((): Promise<SignField[]> => Promise.resolve([])),
     signDocument: vi.fn((_doc, args) => {
-      calls.push(`sign ${JSON.stringify(args.place)} ${args.name}|${args.reason}|${args.location}`);
+      calls.push(`sign ${JSON.stringify(args.place)} ${args.reason}|${args.location}`);
       return Promise.resolve(signed);
     }),
     render: vi.fn(() => Promise.resolve(new ArrayBuffer(0))),
@@ -123,8 +124,10 @@ describe("the box for signing with a certificate", () => {
     // Self-made and expired: one line each.
     const lines = [...form.querySelectorAll(".certsign-warnings li")].map((li) => li.textContent);
     expect(lines).toEqual([CERT_WORDS.selfMade, CERT_WORDS.expired]);
-    // What the signature says is filled in from the certificate; the clock and the rule are said.
-    expect((form.querySelectorAll('input[type="text"]')[0] as HTMLInputElement).value).toBe("Anna Alvorlig");
+    // The name in the signature is the certificate's own, and there is no field to type another;
+    // the clock and the rule are said.
+    expect(form.textContent).toContain(CERT_WORDS.signerName);
+    expect(form.querySelectorAll('input[type="text"]')).toHaveLength(2);
     expect(form.textContent).toContain(CERT_WORDS.clock);
     expect(form.textContent).toContain(CERT_WORDS.afterSigning);
     expect(form.textContent).toContain(CERT_WORDS.fileBeing("a.pdf", 2));
@@ -162,6 +165,50 @@ describe("the box for signing with a certificate", () => {
     expect((form.querySelector(".certsign-summary") as HTMLElement).hidden).toBe(false);
   });
 
+  it("asks for the password again when the signer has let the key go after a failure", async () => {
+    let failed = false;
+    const { api } = fake({
+      signDocument: vi.fn(() => {
+        failed = true;
+        return Promise.reject({ code: "save_verify_failed", message: "the check failed" });
+      }),
+      signCertificateOpen: vi.fn(() => Promise.resolve(!failed ? true : false)),
+    });
+    const { answer, form } = open(api);
+    await openCertificate(form);
+    const none = form.querySelector('input[type="radio"][value="none"]') as HTMLInputElement;
+    none.checked = true;
+    none.dispatchEvent(new Event("change"));
+    form.dispatchEvent(new Event("submit", { cancelable: true }));
+    await flush();
+    // The box is still there, says what happened and that the key was let go, and asks for the password.
+    expect(layer.querySelector("form")).not.toBeNull();
+    const status = (form.querySelector(".certsign-status") as HTMLElement).textContent ?? "";
+    expect(status).toContain(CERT_WORDS.keyLetGo);
+    const password = form.querySelector('input[type="password"]') as HTMLInputElement;
+    expect(password.disabled).toBe(false);
+    expect((form.querySelector(".certsign-place") as HTMLElement).hidden).toBe(true);
+    expect((button(form, CERT_WORDS.sign) as HTMLButtonElement).disabled).toBe(true);
+    button(form, CERT_WORDS.cancel).click();
+    expect(await answer).toBeNull();
+  });
+
+  it("keeps the certificate open for another try when the signer still has the key", async () => {
+    const { api } = fake({
+      signDocument: vi.fn(() => Promise.reject({ code: "sign_already_signed", message: "" })),
+    });
+    const { form } = open(api);
+    await openCertificate(form);
+    const none = form.querySelector('input[type="radio"][value="none"]') as HTMLInputElement;
+    none.checked = true;
+    none.dispatchEvent(new Event("change"));
+    form.dispatchEvent(new Event("submit", { cancelable: true }));
+    await flush();
+    expect((form.querySelector(".certsign-status") as HTMLElement).textContent).not.toContain(CERT_WORDS.keyLetGo);
+    expect((form.querySelector('input[type="password"]') as HTMLInputElement).disabled).toBe(true);
+    expect((button(form, CERT_WORDS.sign) as HTMLButtonElement).disabled).toBe(false);
+  });
+
   it("explains a key that is not supported and does not offer the next step", async () => {
     const { api } = fake({ signLoadCertificate: vi.fn(() => Promise.reject({ code: "signer_key_unsupported", message: "Ed25519" })) });
     const { form } = open(api);
@@ -178,15 +225,15 @@ describe("the box for signing with a certificate", () => {
     const none = form.querySelector('input[type="radio"][value="none"]') as HTMLInputElement;
     none.checked = true;
     none.dispatchEvent(new Event("change"));
-    const [name, reason, place] = [...form.querySelectorAll('input[type="text"]')] as HTMLInputElement[];
+    const [reason, place] = [...form.querySelectorAll('input[type="text"]')] as HTMLInputElement[];
     reason.value = "I have read this";
     place.value = "Oslo";
-    name.dispatchEvent(new Event("input"));
+    reason.dispatchEvent(new Event("input"));
     expect((button(form, CERT_WORDS.sign) as HTMLButtonElement).disabled).toBe(false);
     form.dispatchEvent(new Event("submit", { cancelable: true }));
     await flush();
     expect(await answer).toEqual(signed);
-    expect(calls.at(-1)).toBe('sign {"kind":"invisible"} Anna Alvorlig|I have read this|Oslo');
+    expect(calls.at(-1)).toBe('sign {"kind":"invisible"} I have read this|Oslo');
     expect(layer.querySelector("form")).toBeNull();
     // The certificate is not let go by the window: the app process did that when it signed.
     expect(calls).not.toContain("forget");

@@ -9,6 +9,7 @@ import { expect, test, type Page } from "@playwright/test";
 type Call = { cmd: string; args: Record<string, unknown> };
 type Stand = {
   calls: Call[];
+  pages: { calls: Call[] };
   dialog: string[];
   violations: string[];
   cert: {
@@ -34,6 +35,7 @@ test.beforeEach(async ({ page }) => {
     throw new Error(`the page opened a dialog: ${dialog.message()}`);
   });
   await page.addInitScript({ path: "e2e/fake-tauri.js" });
+  await page.addInitScript({ path: "e2e/fake-pages.js" });
   await page.goto("/");
 });
 
@@ -154,7 +156,6 @@ test("a box is dragged on the page, the signature is made, and the signed copy o
   await expect.poll(async () => (await stand(page)).cert.signed.length).toBe(1);
   const made = (await stand(page)).cert.signed[0].args as {
     place: { kind: string; page: number; rect: number[] };
-    name: string;
     reason: string;
     location: string;
     mark: { kind: string };
@@ -165,18 +166,46 @@ test("a box is dragged on the page, the signature is made, and the signed copy o
   expect(r - l).toBeGreaterThan(24);
   expect(b - t).toBeGreaterThan(24);
   expect(l).toBeGreaterThan(100);
-  expect(made).toMatchObject({ name: "Anna Alvorlig", reason: "I have read this", location: "Oslo", mark: { kind: "none" } });
+  expect(made).toMatchObject({ reason: "I have read this", location: "Oslo", mark: { kind: "none" } });
+  // The name in the signature is the certificate's: the window sends none of its own.
+  expect(made).not.toHaveProperty("name");
 
   // The signed copy is opened in a tab of its own and the person is told, in the words of the panel.
   await expect(page.locator('.tab-title[aria-selected="true"]')).toHaveText("book (signed).pdf");
   const told = page.locator(".notice").last();
   await expect(told).toContainText('Signed copy saved as "book (signed).pdf". Signature intact; signer not verified.');
   await expect(told).toContainText("Patient Partridge does not check certificates against a list of trusted issuers.");
-  await expect(told).toContainText("editing is off here");
+  await expect(told).toContainText("page changes are off here");
   await told.getByRole("button", { name: "OK" }).click();
   // The certificate was let go by the app process (the stand-in counts the forget only on a cancel).
   expect(await calls(page, "sign_forget_certificate")).toHaveLength(0);
   await expect(page.locator("#signature-badge")).toBeVisible();
+});
+
+test("in the signed copy the page tools are off and say why, and a save offers only a copy", async ({ page }) => {
+  await openBook(page);
+  await openDialog(page);
+  await openCertificate(page);
+  await sheet(page).locator('input[type="radio"][value="none"]').check();
+  await sheet(page).getByRole("button", { name: "Sign and save a copy…" }).click();
+  await expect(page.locator('.tab-title[aria-selected="true"]')).toHaveText("book (signed).pdf");
+  await page.locator(".notice").last().getByRole("button", { name: "OK" }).click();
+
+  // A page tool in the side panel: picking a page and turning it.
+  if (await page.locator("#sidebar").isHidden()) await page.locator("#sidebar-toggle").click();
+  const thumb = page.locator('#thumbs .thumb[data-page="0"]');
+  await expect(thumb).toBeAttached();
+  await thumb.click();
+  await page.keyboard.press("r");
+  const told = page.locator(".notice").last();
+  await expect(told).toContainText("This file is signed");
+  await expect(told).toContainText("page changes are off here");
+  await told.getByRole("button", { name: "OK" }).click();
+  const turned = (await stand(page)).pages.calls.filter((c) => c.cmd === "pages_rotate");
+  expect(turned).toHaveLength(0);
+  // Nothing was written to the signed file: no save was asked of the app process.
+  expect((await stand(page)).calls.filter((c) => c.cmd === "save")).toHaveLength(0);
+  await expect(page.locator("#save-button")).toBeDisabled();
 });
 
 test("a signature field of the file can be chosen, and none is offered when the file has none", async ({ page }) => {
