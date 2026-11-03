@@ -1263,8 +1263,14 @@ unsafe fn blank(bindings: &dyn PdfiumLibraryBindings, annotation: FPDF_ANNOTATIO
 /// An annotation that a page which stays also reaches is left alone, whether the two pages share
 /// the dictionary, share the `/Annots` array, or are the same page listed twice: its words belong
 /// to a page that remains. `total` is the number of pages the document has now; `deleted` holds
-/// the indices that go. Returns how many annotations were overwritten.
-pub fn scrub_pages(document: &PdfDocument<'_>, deleted: &[u32], total: u32) -> usize {
+/// the indices that go. `tick` is called after every page that is looked at, so that a long
+/// document does not go quiet. Returns how many annotations were overwritten.
+pub fn scrub_pages(
+    document: &PdfDocument<'_>,
+    deleted: &[u32],
+    total: u32,
+    tick: &mut dyn FnMut(),
+) -> usize {
     let Some(handle) = raw_document(document) else {
         return 0;
     };
@@ -1274,7 +1280,8 @@ pub fn scrub_pages(document: &PdfDocument<'_>, deleted: &[u32], total: u32) -> u
     // closed before the function returns (an annotation before the page it came from), and PDFium
     // only gets handles it gave out.
     unsafe {
-        // The annotations of the deleted pages, with the page each one was read from.
+        // The pages with annotations to overwrite are kept open a few at a time: a page that has
+        // none is closed at once (a page with a lot on it takes memory while it is open).
         let mut pages: Vec<FPDF_PAGE> = Vec::new();
         let mut found: Vec<(FPDF_ANNOTATION, bool)> = Vec::new();
         for &index in deleted {
@@ -1282,7 +1289,7 @@ pub fn scrub_pages(document: &PdfDocument<'_>, deleted: &[u32], total: u32) -> u
             if page.is_null() {
                 continue;
             }
-            pages.push(page);
+            let before = found.len();
             let count = bindings.FPDFPage_GetAnnotCount(page).max(0);
             for position in 0..count {
                 let annotation = bindings.FPDFPage_GetAnnot(page, position);
@@ -1296,40 +1303,77 @@ pub fn scrub_pages(document: &PdfDocument<'_>, deleted: &[u32], total: u32) -> u
                     found.push((annotation, false));
                 }
             }
-        }
-        // A page that stays and lists the same dictionary keeps it.
-        if !found.is_empty() {
-            for index in 0..total {
-                if deleted.contains(&index) {
-                    continue;
-                }
-                let page = bindings.FPDF_LoadPage(handle, index as c_int);
-                if page.is_null() {
-                    // A page that cannot be read cannot be shown to leave an annotation alone.
-                    for entry in found.iter_mut() {
-                        entry.1 = true;
-                    }
-                    break;
-                }
-                for entry in found.iter_mut().filter(|entry| !entry.1) {
-                    entry.1 = bindings.FPDFPage_GetAnnotIndex(page, entry.0) >= 0;
-                }
+            if found.len() > before {
+                pages.push(page);
+            } else {
                 bindings.FPDF_ClosePage(page);
-                if found.iter().all(|entry| entry.1) {
-                    break;
+            }
+            tick();
+            if pages.len() >= SCRUB_GROUP {
+                done += scrub_group(
+                    bindings,
+                    handle,
+                    (deleted, total),
+                    (std::mem::take(&mut pages), std::mem::take(&mut found)),
+                    tick,
+                );
+            }
+        }
+        done += scrub_group(bindings, handle, (deleted, total), (pages, found), tick);
+    }
+    done
+}
+
+/// How many pages with annotations of the pages that go are open at once in [`scrub_pages`].
+const SCRUB_GROUP: usize = 16;
+
+/// Overwrites the annotations of some open pages that go, except those that a page which stays
+/// lists too, and closes the annotations and the pages.
+///
+/// # Safety
+/// `handle` must be the live document of `bindings`, `pages` open pages of it and `found` open
+/// annotations that belong to those pages.
+unsafe fn scrub_group(
+    bindings: &dyn PdfiumLibraryBindings,
+    handle: FPDF_DOCUMENT,
+    (deleted, total): (&[u32], u32),
+    (pages, mut found): (Vec<FPDF_PAGE>, Vec<(FPDF_ANNOTATION, bool)>),
+    tick: &mut dyn FnMut(),
+) -> usize {
+    let mut done = 0;
+    // A page that stays and lists the same dictionary keeps it.
+    if !found.is_empty() {
+        for index in 0..total {
+            if deleted.contains(&index) {
+                continue;
+            }
+            let page = bindings.FPDF_LoadPage(handle, index as c_int);
+            if page.is_null() {
+                // A page that cannot be read cannot be shown to leave an annotation alone.
+                for entry in found.iter_mut() {
+                    entry.1 = true;
                 }
+                break;
             }
-        }
-        for (annotation, shared) in found {
-            if !shared {
-                blank(bindings, annotation);
-                done += 1;
+            for entry in found.iter_mut().filter(|entry| !entry.1) {
+                entry.1 = bindings.FPDFPage_GetAnnotIndex(page, entry.0) >= 0;
             }
-            bindings.FPDFPage_CloseAnnot(annotation);
-        }
-        for page in pages {
             bindings.FPDF_ClosePage(page);
+            tick();
+            if found.iter().all(|entry| entry.1) {
+                break;
+            }
         }
+    }
+    for (annotation, shared) in found {
+        if !shared {
+            blank(bindings, annotation);
+            done += 1;
+        }
+        bindings.FPDFPage_CloseAnnot(annotation);
+    }
+    for page in pages {
+        bindings.FPDF_ClosePage(page);
     }
     done
 }

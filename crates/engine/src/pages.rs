@@ -708,6 +708,14 @@ impl Pace {
         }
     }
 
+    /// Work goes on inside a step: the app hears of it, and the count stays.
+    fn tick(&mut self, progress: &mut dyn FnMut(u32)) {
+        if self.last.elapsed() >= PACE {
+            self.last = Instant::now();
+            progress(self.done);
+        }
+    }
+
     /// One more step is done.
     fn step(&mut self, progress: &mut dyn FnMut(u32)) {
         self.done = self.done.saturating_add(1);
@@ -1162,7 +1170,7 @@ fn delete(
         let mut pace = Pace::new();
         // The words of the notes and other annotations of the pages go as well, except those of an
         // annotation that a page which stays also shows.
-        crate::annots::scrub_pages(document, &sorted, count as u32);
+        crate::annots::scrub_pages(document, &sorted, count as u32, &mut || pace.tick(progress));
         for &index in &sorted {
             form_fields += clear_form_fields(document, index);
             pace.step(progress);
