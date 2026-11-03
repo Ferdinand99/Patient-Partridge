@@ -888,7 +888,7 @@ export class Annotator implements AnnotLayerEvents {
     if (!a.can.restore) {
       const answer = await this.host.ask({
         title: "Delete this annotation?",
-        detail: deleteWarning(a.kind),
+        detail: deleteWarning(),
         buttons: [
           { id: "cancel", label: "Cancel", safe: true },
           { id: "delete", label: "Delete", primary: true },
@@ -990,15 +990,15 @@ export class Annotator implements AnnotLayerEvents {
 /**
  * What is said before an annotation that came with the file is deleted. Saving writes a new file in
  * which the comment, the author, the rich text and the subject are not kept; it is not redaction,
- * and copies and backups made before the save keep everything. A free text box may keep its words.
+ * and copies and backups made before the save keep everything.
  */
-function deleteWarning(kind: Annotation["kind"]): string {
-  const base =
+function deleteWarning(): string {
+  return (
     "This annotation came with the file, and Undo cannot bring it back. Deleting it also clears Redo. " +
     "Taking back a delete, a move or added pages that you made before it loads the document as it was then, with the annotation in it; taking back a turn or a crop never does. " +
     "If you delete it and save, the new file does not hold its comment or author. " +
-    "This is not redaction: copies and backups made before the save still hold the text.";
-  return kind === "other" ? `${base} The words of a text box can stay in the saved file.` : base;
+    "This is not redaction: copies and backups made before the save still hold the text."
+  );
 }
 
 function pagesText(pages: number[]): string {

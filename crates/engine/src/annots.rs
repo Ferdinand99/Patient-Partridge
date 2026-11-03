@@ -50,6 +50,17 @@ pub const SIGNATURE_TEXT: &str = "Signature picture";
 /// document. A bigger sum is refused when a picture is added.
 const MAX_MARK_BYTES: usize = 32 * 1024 * 1024;
 
+/// Most bytes of pictures of signatures that may be made in PDFium over the life of one open
+/// document, counting every time one is put on a page or put back after an undo. PDFium keeps what
+/// it made for a picture until the document is closed, even after the picture is taken off, so
+/// this is the bound on that memory (the bound above is on what is remembered). Past it the
+/// document has to be saved and opened again.
+const MAX_MARK_MADE_BYTES: usize = 256 * 1024 * 1024;
+
+/// What making a picture is counted at, at least: a drawn or a typed one takes more of PDFium
+/// than the bytes of its recipe.
+const MARK_MADE_MIN: usize = 32 * 1024;
+
 /// The flags of an annotation (`/F`) that lock it: read-only and locked. A third keeps its text.
 const FLAG_READ_ONLY: i32 = 1 << 6;
 const FLAG_LOCKED: i32 = 1 << 7;
@@ -145,6 +156,9 @@ pub struct DocAnnots {
     reach: HashMap<u32, [f32; 4]>,
     /// Annotations that were removed, oldest first: `(page, id, what it was)`.
     removed: VecDeque<(u32, u32, Snapshot)>,
+    /// Bytes of pictures of signatures made in PDFium since the document was opened (see
+    /// [`MAX_MARK_MADE_BYTES`]).
+    made_bytes: usize,
 }
 
 fn refused(_: PdfiumError) -> Failure {
@@ -844,6 +858,19 @@ impl DocAnnots {
         remember: bool,
     ) -> Result<AnnotInfo, Failure> {
         let before = page.annotations().len();
+        if let Recipe::Signature { mark, .. } = &snapshot.recipe {
+            // Each picture that is made stays in PDFium's memory until the document is closed, also
+            // when it is taken off again, so a document that is put through undo and redo of a big
+            // picture many times is stopped before the engine runs out of memory.
+            let cost = mark.weight().max(MARK_MADE_MIN);
+            if self.made_bytes.saturating_add(cost) > MAX_MARK_MADE_BYTES {
+                return fail(
+                    ErrorCode::AnnotationRefused,
+                    "pictures of signatures were put on and taken off too often in this document; save it and open it again to go on",
+                );
+            }
+            self.made_bytes += cost;
+        }
         // Brings the list of ids in step before something is added to it.
         self.ids(page_index, before);
         let new_id = match id {
@@ -1115,6 +1142,7 @@ impl DocAnnots {
         self.settled.clear();
         self.originals.clear();
         self.reach.clear();
+        self.made_bytes = 0;
     }
 }
 
@@ -1541,8 +1569,10 @@ unsafe fn scrub_group(
 /// Takes the annotation at `position` off the page, with the popup it owns, after overwriting
 /// what the person wrote and detaching the appearance. Returns the places that were taken off,
 /// lowest first. A save writes the dictionaries of annotations made in the session (and any
-/// appearance stream PDFium made, which no call can overwrite) as objects that nothing refers
-/// to; those of a loaded file are left out.
+/// appearance stream PDFium made, which no call can overwrite, and the pictures of a signature)
+/// as objects that nothing refers to; those of a loaded file are left out. The save therefore
+/// writes the document twice (see `save::serialise_clean`), and the text is overwritten here as
+/// well, so that it is not left behind even where a document is written only once.
 fn remove_raw(
     document: &PdfDocument<'static>,
     page_index: u32,

@@ -122,6 +122,40 @@ pub fn serialise_up_to(
     Ok(out.bytes)
 }
 
+/// Writes the document for a save, without anything that nothing refers to.
+///
+/// PDFium writes every object that was made in this session, whether or not anything still refers
+/// to it: the picture of a signature that Undo took off, the drawing that was deleted, the
+/// appearance of a note that is gone. Those would stay in the saved file, whole, with the pixels or
+/// the lines in them. The objects of a file that was loaded are written only when something refers
+/// to them. So the bytes are written once, read in again as a document of their own, and written a
+/// second time; the second writing is the file. The cost is one more load and one more write of the
+/// same bytes, and the memory for a second copy of them.
+pub fn serialise_clean(
+    pdfium: &Pdfium,
+    document: &PdfDocument<'_>,
+    password: Option<&str>,
+    progress: &mut dyn FnMut(u32),
+) -> Result<Vec<u8>, Failure> {
+    let first = serialise_up_to(document, MAX_SAVE_BYTES, progress)?;
+    let pages = document.pages().len();
+    let reread = pdfium
+        .load_pdf_from_byte_vec(first, password)
+        .map_err(|_| {
+            (
+                ErrorCode::SaveFailed,
+                "the written document could not be read again".to_string(),
+            )
+        })?;
+    if reread.pages().len() != pages {
+        return Err((
+            ErrorCode::SaveFailed,
+            "the written document has another number of pages when it is read again".to_string(),
+        ));
+    }
+    serialise_up_to(&reread, MAX_SAVE_BYTES, progress)
+}
+
 /// The failure to give when the file the document is read from is not to be trusted.
 pub fn source_failure(problem: Problem) -> Failure {
     match problem {

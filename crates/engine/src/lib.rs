@@ -456,8 +456,9 @@ impl Engine {
                 // The file must be what it was when the parts that are in memory were read: the
                 // parts that are not are read now, and a mix of two versions is not a document.
                 self.check_source(progress)?;
-                let bytes =
-                    save::serialise_up_to(document, partridge_protocol::MAX_SAVE_BYTES, progress)?;
+                // Written twice, so that what nothing refers to is not in the file (see there).
+                let password = self.passwords.get(&doc).map(|s| s.0.as_str());
+                let bytes = save::serialise_clean(pdfium, document, password, progress)?;
                 self.check_source(progress)?;
                 let size = bytes.len() as u32;
                 self.saves.insert(doc, bytes);
