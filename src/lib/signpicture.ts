@@ -31,6 +31,18 @@ export const MAX_IMAGE_PIXELS = 1_024 * 512;
 /** Largest file the window reads as an image to import, in bytes. */
 export const MAX_IMAGE_FILE_BYTES = 12 * 1024 * 1024;
 
+/**
+ * Largest side and most pixels an image file may declare in its header and still be decoded. A
+ * file of a few kilobytes can declare a picture of many gigabytes, and the decoder makes all of
+ * it before the window can scale it down. The signature picture is scaled to a much smaller size
+ * afterwards, so these only guard the decoder.
+ */
+export const MAX_DECODE_SIDE = 8_192;
+export const MAX_DECODE_PIXELS = 40_000_000;
+
+/** How much of the start of an image file is read to find its size in the header. */
+export const HEADER_BYTES = 2 * 1024 * 1024;
+
 /** Most signatures kept for later, the longest name of one, and the most bytes of a kept image (PNG). */
 export const MAX_SAVED = 20;
 export const MAX_NAME_CHARS = 60;
@@ -136,7 +148,7 @@ export const PICTURE_WORDS = {
   full: "That is as much as a signature picture holds. Undo the last line or clear it to draw more.",
   tooLong: "A signature picture holds at most 40 characters.",
   missingLetter: "This font has no letter for one of the characters. Take it out or pick another font.",
-  imageFailed: "That file could not be read as a picture. Choose a PNG, JPEG or WebP file.",
+  imageFailed: "That file could not be read as a picture. Choose a PNG, JPEG, WebP, GIF or BMP file.",
   imageTooBig: "That file is too big to read. Choose a smaller picture.",
   storeFull: "As many signatures are saved as can be. Delete one first.",
   placed: "Signature picture placed.",
@@ -311,6 +323,130 @@ export function fitImageSize(width: number, height: number): { width: number; he
     h = Math.max(1, Math.floor((height * w) / width));
   }
   return { width: w, height: h };
+}
+
+/** The size an image file declares, in pixels. */
+export interface ImageSize {
+  width: number;
+  height: number;
+}
+
+/**
+ * The width and the height an image file declares in its header: PNG, JPEG, WebP, GIF and BMP.
+ * `null` for a file that is none of these or whose header is cut short or does not hold a size.
+ * Nothing is decoded.
+ */
+export function imageSizeOf(bytes: Uint8Array): ImageSize | null {
+  const u8 = (at: number) => (at >= 0 && at < bytes.length ? bytes[at] : -1);
+  const be16 = (at: number) => (at + 1 < bytes.length ? (bytes[at] << 8) | bytes[at + 1] : -1);
+  const le16 = (at: number) => (at + 1 < bytes.length ? bytes[at] | (bytes[at + 1] << 8) : -1);
+  const be32 = (at: number) => (at + 3 < bytes.length ? bytes[at] * 0x1000000 + ((bytes[at + 1] << 16) | (bytes[at + 2] << 8) | bytes[at + 3]) : -1);
+  const le32 = (at: number) => (at + 3 < bytes.length ? bytes[at] + (bytes[at + 1] << 8) + (bytes[at + 2] << 16) + bytes[at + 3] * 0x1000000 : -1);
+  const le24 = (at: number) => (at + 2 < bytes.length ? bytes[at] | (bytes[at + 1] << 8) | (bytes[at + 2] << 16) : -1);
+  const text = (at: number, length: number) => {
+    if (at + length > bytes.length) return "";
+    let out = "";
+    for (let i = 0; i < length; i++) out += String.fromCharCode(bytes[at + i]);
+    return out;
+  };
+  const size = (width: number, height: number): ImageSize | null =>
+    width > 0 && height > 0 && Number.isFinite(width) && Number.isFinite(height) ? { width, height } : null;
+
+  // PNG: the signature, then the header chunk (IHDR) with the width and the height.
+  if (u8(0) === 0x89 && text(1, 3) === "PNG" && be32(4) === 0x0d0a1a0a) {
+    if (text(12, 4) !== "IHDR") return null;
+    return size(be32(16), be32(20));
+  }
+  // GIF: the size of the screen, two numbers of two bytes.
+  if (text(0, 6) === "GIF87a" || text(0, 6) === "GIF89a") return size(le16(6), le16(8));
+  // BMP: a file header, then a header whose first number is its own length.
+  if (text(0, 2) === "BM") {
+    const header = le32(14);
+    if (header === 12) return size(le16(18), le16(20));
+    if (header >= 40) {
+      const width = le32(18);
+      const rows = le32(22);
+      // A height above 2^31 is a negative number: rows stored from the top.
+      return size(width > 0x7fffffff ? -1 : width, rows > 0x7fffffff ? 0x100000000 - rows : rows);
+    }
+    return null;
+  }
+  // WebP: a RIFF file whose first chunk says how the picture is coded.
+  if (text(0, 4) === "RIFF" && text(8, 4) === "WEBP") {
+    const kind = text(12, 4);
+    if (kind === "VP8 ") {
+      if (bytes.length < 30 || u8(23) !== 0x9d || u8(24) !== 0x01 || u8(25) !== 0x2a) return null;
+      return size(le16(26) & 0x3fff, le16(28) & 0x3fff);
+    }
+    if (kind === "VP8L") {
+      if (bytes.length < 25 || u8(20) !== 0x2f) return null;
+      const bits = le32(21);
+      return size((bits & 0x3fff) + 1, ((bits >>> 14) & 0x3fff) + 1);
+    }
+    if (kind === "VP8X") return size(le24(24) + 1, le24(27) + 1);
+    return null;
+  }
+  // JPEG: segments that each start with 0xFF and a marker; a "start of frame" holds the size.
+  if (u8(0) === 0xff && u8(1) === 0xd8) {
+    let at = 2;
+    while (at + 3 < bytes.length) {
+      if (bytes[at] !== 0xff) return null;
+      let marker = bytes[at + 1];
+      // Any number of 0xFF may fill before a marker.
+      while (marker === 0xff && at + 2 < bytes.length) {
+        at += 1;
+        marker = bytes[at + 1];
+      }
+      at += 2;
+      // Markers that stand alone: no length follows.
+      if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd8)) continue;
+      // The end of the picture or the start of the data, and no size before it.
+      if (marker === 0xd9 || marker === 0xda) return null;
+      const length = be16(at);
+      if (length < 2) return null;
+      const frame = marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc;
+      if (frame) return length >= 7 ? size(be16(at + 5), be16(at + 3)) : null;
+      at += length;
+    }
+    return null;
+  }
+  return null;
+}
+
+/** What the header of an image file says about it. */
+export type ImageHeader = "ok" | "too-big" | "unreadable";
+
+/** Judges a size from a header: inside the side and the pixel limits of the decoder or not. */
+export function judgeImageSize(size: ImageSize | null): ImageHeader {
+  if (!size) return "unreadable";
+  if (size.width > MAX_DECODE_SIDE || size.height > MAX_DECODE_SIDE || size.width * size.height > MAX_DECODE_PIXELS) {
+    return "too-big";
+  }
+  return "ok";
+}
+
+/** The first bytes of a file, whichever way this environment can read a Blob. */
+async function headOf(blob: Blob): Promise<Uint8Array> {
+  const part = blob.slice(0, HEADER_BYTES);
+  if (typeof part.arrayBuffer === "function") return new Uint8Array(await part.arrayBuffer());
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(new Uint8Array(reader.result as ArrayBuffer));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsArrayBuffer(part);
+  });
+}
+
+/**
+ * Reads the header of an image file and judges its size, before anything decodes the picture.
+ * A file whose header cannot be read is not decoded.
+ */
+export async function checkImageHeader(blob: Blob): Promise<ImageHeader> {
+  try {
+    return judgeImageSize(imageSizeOf(await headOf(blob)));
+  } catch {
+    return "unreadable";
+  }
 }
 
 /** Makes the near-white pixels see-through. `threshold` is the lowest level (0 to 255) of the darkest channel that counts as white. */

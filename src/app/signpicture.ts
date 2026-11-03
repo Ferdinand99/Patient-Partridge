@@ -20,6 +20,7 @@ import {
   base64Bytes,
   bodyOf,
   canBeginStroke,
+  checkImageHeader,
   cleanName,
   cleanTypedText,
   drawnPicture,
@@ -376,18 +377,27 @@ export function askSignaturePicture(request: PictureRequest): Promise<PictureAns
         imageStatus.textContent = PICTURE_WORDS.imageFailed;
         return;
       }
-      void tools
-        .decode(file)
-        .then((decoded) => {
-          if (closed) return;
-          const size = fitImageSize(decoded.width, decoded.height);
-          if (!size || decoded.rgba.length !== decoded.width * decoded.height * 4) {
-            imageStatus.textContent = PICTURE_WORDS.imageFailed;
-            return;
+      const shown = (decoded: DecodedImage) => {
+        if (closed) return;
+        const size = fitImageSize(decoded.width, decoded.height);
+        if (!size || decoded.rgba.length !== decoded.width * decoded.height * 4) {
+          imageStatus.textContent = PICTURE_WORDS.imageFailed;
+          return;
+        }
+        image = decoded;
+        imageStatus.textContent = `${decoded.width} by ${decoded.height} pixels.`;
+        sync();
+      };
+      // The header of the file says how big the picture is. A file of a few kilobytes can declare a
+      // picture that takes gigabytes to decode, so the decoder only sees files that declare less.
+      void checkImageHeader(file)
+        .then((header) => {
+          if (closed) return undefined;
+          if (header !== "ok") {
+            imageStatus.textContent = header === "too-big" ? PICTURE_WORDS.imageTooBig : PICTURE_WORDS.imageFailed;
+            return undefined;
           }
-          image = decoded;
-          imageStatus.textContent = `${decoded.width} by ${decoded.height} pixels.`;
-          sync();
+          return tools.decode(file).then(shown);
         })
         .catch(() => {
           if (!closed) imageStatus.textContent = PICTURE_WORDS.imageFailed;
@@ -806,6 +816,8 @@ export async function scaleImage(image: DecodedImage, width: number, height: num
 
 /** Reads an image file into pixels with the window's own image decoder, no bigger than the limits. */
 export async function decodeImage(blob: Blob): Promise<DecodedImage> {
+  // Before the decoder makes the picture: its header says how big it is (see `checkImageHeader`).
+  if ((await checkImageHeader(blob)) !== "ok") throw new Error("not a picture of a size that is read");
   const bitmap = await createImageBitmap(blob);
   try {
     const size = fitImageSize(bitmap.width, bitmap.height);

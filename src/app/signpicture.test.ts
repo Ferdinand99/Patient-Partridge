@@ -103,7 +103,21 @@ function draw(canvas: HTMLCanvasElement, points: [number, number][]) {
 const button = (root: ParentNode, label: string) =>
   [...root.querySelectorAll("button")].find((b) => b.textContent === label || b.getAttribute("aria-label") === label) as HTMLButtonElement;
 
-const flush = () => new Promise((r) => setTimeout(r, 0));
+const flush = () => new Promise((r) => setTimeout(r, 10));
+
+/** The first bytes of a PNG file: the signature and the header chunk, with the size it declares. */
+function pngHead(width: number, height: number): Uint8Array {
+  const out = new Uint8Array(33);
+  out.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52]);
+  const view = new DataView(out.buffer);
+  view.setUint32(16, width);
+  view.setUint32(20, height);
+  return out;
+}
+
+function pngFile(name = "sig.png", width = 4, height = 2): File {
+  return new File([pngHead(width, height) as BlobPart], name, { type: "image/png" });
+}
 
 describe("the box says what a picture of a signature is", () => {
   it("states that it is a picture, not a digital signature, and does not show who placed it", () => {
@@ -276,7 +290,7 @@ describe("importing an image", () => {
     button(form, "Image").click();
     const go = button(form, "Use on the page");
     expect(go.disabled).toBe(true);
-    pick(form, new File([new Uint8Array(10)], "sig.png", { type: "image/png" }));
+    pick(form, pngFile("sig.png"));
     await flush();
     expect(t.decode).toHaveBeenCalledTimes(1);
     expect(go.disabled).toBe(false);
@@ -293,7 +307,7 @@ describe("importing an image", () => {
     const t = tools({ decode: vi.fn(() => Promise.resolve(pixels(3, 3, [255, 255, 255, 255]))) });
     const { answer, form } = open(t);
     button(form, "Image").click();
-    pick(form, new File([new Uint8Array(10)], "white.png", { type: "image/png" }));
+    pick(form, pngFile("white.png"));
     await flush();
     const go = button(form, "Use on the page");
     expect(go.disabled).toBe(false);
@@ -313,7 +327,7 @@ describe("importing an image", () => {
     const mixed: DecodedImage = { width: 2, height: 1, rgba: new Uint8ClampedArray([255, 255, 255, 255, 10, 10, 10, 255]) };
     const { answer, form } = open(tools({ decode: vi.fn(() => Promise.resolve(mixed)) }));
     button(form, "Image").click();
-    pick(form, new File([new Uint8Array(10)], "pen.png", { type: "image/png" }));
+    pick(form, pngFile("pen.png"));
     await flush();
     const box = form.querySelector<HTMLInputElement>('.sigpic-check input[type="checkbox"]')!;
     box.checked = true;
@@ -345,9 +359,40 @@ describe("importing an image", () => {
     const t = tools({ decode: vi.fn(() => Promise.resolve({ width: 4, height: 4, rgba: new Uint8ClampedArray(7) })) });
     const { form } = open(t);
     button(form, "Image").click();
-    pick(form, new File([new Uint8Array(10)], "x.png", { type: "image/png" }));
+    pick(form, pngFile("x.png", 4, 4));
     await flush();
     expect(button(form, "Use on the page").disabled).toBe(true);
+  });
+
+  it("reads the size in the header first and decodes nothing that declares a picture too big to decode", async () => {
+    const t = tools();
+    const { form, q } = open(t);
+    button(form, "Image").click();
+    const status = () => q<HTMLElement>("#" + form.querySelector("[role=tabpanel]:not([hidden])")!.id + " .sigpic-status").textContent;
+    // A file of 33 bytes that says it is a picture of 30000 by 30000 pixels.
+    const bomb = pngFile("bomb.png", 30_000, 30_000);
+    expect(bomb.size).toBe(33);
+    pick(form, bomb);
+    await flush();
+    expect(status()).toBe(PICTURE_WORDS.imageTooBig);
+    expect(t.decode).not.toHaveBeenCalled();
+    // One side too long, or too many pixels in all.
+    pick(form, pngFile("wide.png", 8_193, 1));
+    await flush();
+    expect(status()).toBe(PICTURE_WORDS.imageTooBig);
+    pick(form, pngFile("square.png", 7_000, 7_000));
+    await flush();
+    expect(status()).toBe(PICTURE_WORDS.imageTooBig);
+    expect(t.decode).not.toHaveBeenCalled();
+    // A header that holds no size is refused as not being a picture.
+    pick(form, new File([new Uint8Array(40)], "zeros.png", { type: "image/png" }));
+    await flush();
+    expect(status()).toBe(PICTURE_WORDS.imageFailed);
+    expect(t.decode).not.toHaveBeenCalled();
+    // At the limit it is read.
+    pick(form, pngFile("limit.png", 6_000, 6_000));
+    await flush();
+    expect(t.decode).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -484,7 +529,7 @@ describe("keeping a signature for later", () => {
     const { answer, form } = open(t);
     button(form, "Image").click();
     const input = form.querySelector<HTMLInputElement>("input.sigpic-file")!;
-    Object.defineProperty(input, "files", { value: [new File([new Uint8Array(10)], "s.png", { type: "image/png" })], configurable: true });
+    Object.defineProperty(input, "files", { value: [pngFile("s.png")], configurable: true });
     input.dispatchEvent(new Event("change", { bubbles: true }));
     await flush();
     const keep = form.querySelector<HTMLInputElement>('.sigpic-keep input[type="checkbox"]')!;

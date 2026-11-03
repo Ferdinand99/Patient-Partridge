@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_WIDTH,
+  MAX_DECODE_SIDE,
   MAX_IMAGE_PIXELS,
   MAX_IMAGE_SIDE,
   MAX_NAME_CHARS,
@@ -15,6 +16,7 @@ import {
   base64Bytes,
   bodyOf,
   canBeginStroke,
+  checkImageHeader,
   chaikin,
   cleanName,
   cleanTypedText,
@@ -22,6 +24,8 @@ import {
   fitImageSize,
   fromBase64,
   hasInk,
+  imageSizeOf,
+  judgeImageSize,
   pictureOfSaved,
   pictureWords,
   sameRect,
@@ -302,5 +306,92 @@ describe("what the window says", () => {
       // Strings and comments alike: the words that must not be said are not said anywhere.
       expect(source, file).not.toMatch(new RegExp("\\b(legal|legally|court|guarantee|guaranteed|eidas|compliant|certified|" + "ad" + "obe|acro" + "bat)\\b", "i"));
     }
+  });
+});
+
+describe("the size an image file declares", () => {
+  const ascii = (text: string) => Array.from(text, (c) => c.charCodeAt(0));
+  const be32 = (n: number) => [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255];
+  const le16 = (n: number) => [n & 255, (n >> 8) & 255];
+  const le32 = (n: number) => [n & 255, (n >>> 8) & 255, (n >>> 16) & 255, (n >>> 24) & 255];
+  const le24 = (n: number) => [n & 255, (n >> 8) & 255, (n >> 16) & 255];
+
+  const png = (w: number, h: number) =>
+    new Uint8Array([0x89, ...ascii("PNG"), 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, ...ascii("IHDR"), ...be32(w), ...be32(h), 8, 6, 0, 0, 0]);
+  const gif = (w: number, h: number) => new Uint8Array([...ascii("GIF89a"), ...le16(w), ...le16(h), 0, 0, 0]);
+  const bmp = (w: number, h: number) => new Uint8Array([...ascii("BM"), ...new Array(12).fill(0), ...le32(40), ...le32(w), ...le32(h >>> 0), 1, 0, 24, 0]);
+  const bmpCore = (w: number, h: number) => new Uint8Array([...ascii("BM"), ...new Array(12).fill(0), ...le32(12), ...le16(w), ...le16(h), 1, 0, 24, 0]);
+  const webpLossy = (w: number, h: number) =>
+    new Uint8Array([...ascii("RIFF"), 0, 0, 0, 0, ...ascii("WEBPVP8 "), 0, 0, 0, 0, 0, 0, 0, 0x9d, 0x01, 0x2a, ...le16(w), ...le16(h)]);
+  const webpLossless = (w: number, h: number) => {
+    const bits = (w - 1) | ((h - 1) << 14);
+    return new Uint8Array([...ascii("RIFF"), 0, 0, 0, 0, ...ascii("WEBPVP8L"), 0, 0, 0, 0, 0x2f, ...le32(bits >>> 0)]);
+  };
+  const webpExtended = (w: number, h: number) =>
+    new Uint8Array([...ascii("RIFF"), 0, 0, 0, 0, ...ascii("WEBPVP8X"), 10, 0, 0, 0, 0, 0, 0, 0, ...le24(w - 1), ...le24(h - 1)]);
+  const jpeg = (w: number, h: number, marker = 0xc0) =>
+    new Uint8Array([
+      0xff, 0xd8,
+      // A segment with some other data first (an EXIF block would be one), then fill bytes, then the frame.
+      0xff, 0xe1, 0, 6, 1, 2, 3, 4,
+      0xff, 0xff,
+      0xff, marker, 0, 17, 8, (h >> 8) & 255, h & 255, (w >> 8) & 255, w & 255, 3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1,
+    ]);
+
+  it("is read from the header of a PNG, a GIF, a BMP, a WebP and a JPEG without decoding anything", () => {
+    expect(imageSizeOf(png(640, 480))).toEqual({ width: 640, height: 480 });
+    expect(imageSizeOf(png(30_000, 20_000))).toEqual({ width: 30_000, height: 20_000 });
+    expect(imageSizeOf(gif(320, 200))).toEqual({ width: 320, height: 200 });
+    expect(imageSizeOf(bmp(300, 100))).toEqual({ width: 300, height: 100 });
+    // Rows stored from the top say so with a negative height.
+    expect(imageSizeOf(bmp(300, -100))).toEqual({ width: 300, height: 100 });
+    expect(imageSizeOf(bmpCore(64, 32))).toEqual({ width: 64, height: 32 });
+    expect(imageSizeOf(webpLossy(800, 600))).toEqual({ width: 800, height: 600 });
+    expect(imageSizeOf(webpLossless(1234, 567))).toEqual({ width: 1234, height: 567 });
+    expect(imageSizeOf(webpExtended(4000, 3000))).toEqual({ width: 4000, height: 3000 });
+    expect(imageSizeOf(jpeg(1920, 1080))).toEqual({ width: 1920, height: 1080 });
+    // A progressive frame is a frame too; the tables (0xC4) are not.
+    expect(imageSizeOf(jpeg(50, 60, 0xc2))).toEqual({ width: 50, height: 60 });
+    expect(imageSizeOf(jpeg(50, 60, 0xc4))).toBeNull();
+  });
+
+  it("is nothing for a header that is cut short, wrong or from another kind of file", () => {
+    for (const bytes of [
+      new Uint8Array(0),
+      new Uint8Array(40),
+      png(10, 10).subarray(0, 20),
+      gif(10, 10).subarray(0, 8),
+      bmp(10, 10).subarray(0, 20),
+      webpLossy(10, 10).subarray(0, 28),
+      jpeg(10, 10).subarray(0, 14),
+      new Uint8Array(ascii("<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10'/>")),
+      png(0, 10),
+      gif(10, 0),
+    ]) {
+      expect(imageSizeOf(bytes)).toBeNull();
+    }
+    // A PNG whose first chunk is not the header chunk.
+    const odd = png(10, 10);
+    odd.set(ascii("IDAT"), 12);
+    expect(imageSizeOf(odd)).toBeNull();
+    // A JPEG that reaches the data before any frame.
+    expect(imageSizeOf(new Uint8Array([0xff, 0xd8, 0xff, 0xda, 0, 2, 0, 0]))).toBeNull();
+  });
+
+  it("is judged against the side and the pixel limit of the decoder", () => {
+    expect(judgeImageSize({ width: 1, height: 1 })).toBe("ok");
+    expect(judgeImageSize({ width: MAX_DECODE_SIDE, height: 4_000 })).toBe("ok");
+    expect(judgeImageSize({ width: MAX_DECODE_SIDE + 1, height: 1 })).toBe("too-big");
+    expect(judgeImageSize({ width: 1, height: MAX_DECODE_SIDE + 1 })).toBe("too-big");
+    expect(judgeImageSize({ width: 7_000, height: 7_000 })).toBe("too-big");
+    expect(judgeImageSize({ width: 30_000, height: 30_000 })).toBe("too-big");
+    expect(judgeImageSize(null)).toBe("unreadable");
+  });
+
+  it("is checked on a file before the decoder is asked, and the words name the formats the box takes", async () => {
+    expect(await checkImageHeader(new Blob([png(100, 50)]))).toBe("ok");
+    expect(await checkImageHeader(new Blob([png(100_000, 100_000)]))).toBe("too-big");
+    expect(await checkImageHeader(new Blob(["not a picture"]))).toBe("unreadable");
+    for (const format of ["PNG", "JPEG", "WebP", "GIF", "BMP"]) expect(PICTURE_WORDS.imageFailed).toContain(format);
   });
 });
