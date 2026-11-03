@@ -90,7 +90,7 @@ const STATE_ACTIONS: [&[u8]; 2] = [b"ResetForm", b"Hide"];
 const FIELD_EVENTS: [&[u8]; 4] = [b"K", b"V", b"F", b"C"];
 
 /// What a search found out about a document.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Scan {
     /// No widget of the form is filled in.
     pub whole_form: bool,
@@ -99,7 +99,7 @@ pub struct Scan {
 }
 
 /// The dictionaries with an `/A` or an `/AA`, by which of the two they have and their box.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Records {
     /// For each pair of keys and box (in steps of [`CELL`]): whether one of them reaches a reset or
     /// a hide.

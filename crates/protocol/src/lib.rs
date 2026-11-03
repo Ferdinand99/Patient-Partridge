@@ -18,6 +18,8 @@ use std::io::{self, Read, Write};
 
 mod annots;
 pub use annots::*;
+mod author;
+pub use author::*;
 #[cfg(test)]
 mod annots_tests;
 mod forms;
@@ -30,7 +32,7 @@ pub use signatures::*;
 mod signatures_tests;
 
 /// Version of this protocol. Both sides check it in the `Hello` exchange.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// Largest frame (payload) either side accepts: 128 MiB, enough for the biggest allowed bitmap.
 pub const MAX_FRAME_LEN: usize = 128 * 1024 * 1024;
@@ -241,6 +243,13 @@ pub enum ErrorCode {
     /// The file to insert pages from could not be used: its engine stopped, took too long or could not
     /// start, or the file does not allow its pages to be copied. The document itself is not affected.
     InsertSourceFailed = 55,
+    /// The form designer cannot make the change (a name that is taken or not allowed, a box
+    /// outside the page, a value the font cannot draw, a field it did not make). The message says
+    /// why in words for the reader.
+    AuthorRefused = 70,
+    /// The form designer cannot work on this document at all: it is encrypted, it has an XFA form,
+    /// or its structure is not one the designer can write into.
+    AuthorUnsupported = 71,
     /// The permissions of the document do not allow the change (inserting, deleting, moving or
     /// turning pages, changing a page's boxes, or copying pages out).
     PagesNotAllowed = 56,
@@ -285,6 +294,8 @@ impl ErrorCode {
             54 => ErrorCode::Busy,
             55 => ErrorCode::InsertSourceFailed,
             56 => ErrorCode::PagesNotAllowed,
+            70 => ErrorCode::AuthorRefused,
+            71 => ErrorCode::AuthorUnsupported,
             24 => ErrorCode::FormUnsupported,
             25 => ErrorCode::FormFieldRefused,
             18 => ErrorCode::NoSuchAnnotation,
@@ -321,6 +332,8 @@ impl ErrorCode {
             ErrorCode::Busy => "busy",
             ErrorCode::InsertSourceFailed => "insert_source_failed",
             ErrorCode::PagesNotAllowed => "pages_not_allowed",
+            ErrorCode::AuthorRefused => "author_refused",
+            ErrorCode::AuthorUnsupported => "author_unsupported",
             ErrorCode::FormUnsupported => "form_unsupported",
             ErrorCode::FormFieldRefused => "form_field_refused",
             ErrorCode::NoSuchAnnotation => "no_such_annotation",
@@ -403,6 +416,8 @@ pub enum RequestBody {
     FontReport,
     /// A page tool: delete, reorder, rotate, crop, insert, extract (see the `pages` module).
     Pages(PagesRequest),
+    /// The form designer: make, change and take away form fields (see the `author` module).
+    Author(AuthorRequest),
     /// The annotations of one page that the reader can show and change: markup (highlight,
     /// underline, strike-out), notes, drawings and stamps, and a few kinds that can only be removed.
     /// Links and form fields are not in the list.
@@ -601,6 +616,7 @@ pub enum ResponseBody {
     },
     /// The answer to a page tool.
     Pages(PagesResponse),
+    Author(AuthorResponse),
     /// Answer to `ListAnnots`, at most [`MAX_ANNOTS_PER_PAGE`] entries.
     Annots {
         items: Vec<AnnotInfo>,
@@ -793,6 +809,7 @@ impl Request {
                 put_u32(&mut out, self.id);
             }
             RequestBody::Pages(request) => request.encode(self.id, &mut out),
+            RequestBody::Author(request) => request.encode(self.id, &mut out),
             RequestBody::ListAnnots { doc, page } => {
                 out.push(TAG_REQ_LIST_ANNOTS);
                 put_u32(&mut out, self.id);
@@ -952,6 +969,9 @@ impl Request {
             }
             t if (pages::FIRST_REQUEST_TAG..=pages::LAST_REQUEST_TAG).contains(&t) => {
                 RequestBody::Pages(PagesRequest::decode(t, &mut r)?)
+            }
+            t if (author::FIRST_REQUEST_TAG..=author::LAST_REQUEST_TAG).contains(&t) => {
+                RequestBody::Author(AuthorRequest::decode(t, &mut r)?)
             }
             TAG_REQ_FORM_INFO => RequestBody::FormInfo { doc: r.u32()? },
             TAG_REQ_LIST_FORM_FIELDS => RequestBody::ListFormFields {
@@ -1236,6 +1256,7 @@ impl Response {
                 }
             }
             ResponseBody::Pages(response) => response.encode(self.id, &mut out),
+            ResponseBody::Author(response) => response.encode(self.id, &mut out),
             ResponseBody::Annots { items } => {
                 out.push(TAG_RES_ANNOTS);
                 put_u32(&mut out, self.id);
@@ -1501,6 +1522,9 @@ impl Response {
             }
             t if (pages::FIRST_RESPONSE_TAG..=pages::LAST_RESPONSE_TAG).contains(&t) => {
                 ResponseBody::Pages(PagesResponse::decode(t, &mut r)?)
+            }
+            t if (author::FIRST_RESPONSE_TAG..=author::LAST_RESPONSE_TAG).contains(&t) => {
+                ResponseBody::Author(AuthorResponse::decode(t, &mut r)?)
             }
             TAG_RES_ANNOTS => {
                 let count = r.u32()? as usize;
@@ -3061,6 +3085,10 @@ mod tags {
                 !(pages::FIRST_REQUEST_TAG..=pages::LAST_REQUEST_TAG).contains(tag),
                 "request tag {tag} is in the range of the page tools"
             );
+            assert!(
+                !(author::FIRST_REQUEST_TAG..=author::LAST_REQUEST_TAG).contains(tag),
+                "request tag {tag} is in the range of the form designer"
+            );
         }
         let mut seen = std::collections::HashSet::new();
         for tag in &responses {
@@ -3068,6 +3096,10 @@ mod tags {
             assert!(
                 !(pages::FIRST_RESPONSE_TAG..=pages::LAST_RESPONSE_TAG).contains(tag),
                 "answer tag {tag} is in the range of the page tools"
+            );
+            assert!(
+                !(author::FIRST_RESPONSE_TAG..=author::LAST_RESPONSE_TAG).contains(tag),
+                "answer tag {tag} is in the range of the form designer"
             );
         }
         // Every error code reads back as itself and has a name of its own.
@@ -3083,12 +3115,12 @@ mod tags {
             }
         }
         // The codes of the annotations and forms, and those of the page tools, are all there.
-        for raw in [18u8, 19, 20, 24, 25, 50, 51, 52, 53, 54, 55, 56] {
+        for raw in [18u8, 19, 20, 24, 25, 50, 51, 52, 53, 54, 55, 56, 70, 71] {
             assert!(
                 ErrorCode::from_u8(raw).is_some(),
                 "error code {raw} is missing"
             );
         }
-        assert_eq!(PROTOCOL_VERSION, 9);
+        assert_eq!(PROTOCOL_VERSION, 10);
     }
 }

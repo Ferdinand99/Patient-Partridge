@@ -132,6 +132,17 @@ const MAX_READ_BYTES: usize = 1024 * 1024;
 /// asks for a bitmap that is this many times larger than the page and divides the answer.
 const PRECISION: f32 = 16.0;
 
+/// Test builds only: how many times an environment searched the written-out document for actions.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub static ENV_SCANS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// What kind of form the document has, or `None` when its handle cannot be found.
+pub(crate) fn kind_of(pdfium: &'static Pdfium, document: &PdfDocument<'_>) -> Option<FormKind> {
+    let handle = raw_document(document)?;
+    Some(form_kind(pdfium.bindings(), handle))
+}
+
 /// The form environment of one document.
 pub struct FormEnv {
     bindings: &'static dyn PdfiumLibraryBindings,
@@ -257,6 +268,42 @@ impl FormEnv {
             }
             _ => Scan::everything(),
         };
+        #[cfg(debug_assertions)]
+        ENV_SCANS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self::open_with(bindings, handle, scan)
+    }
+
+    /// Makes the environment for a document with a search that was made before, for a document
+    /// that was changed since in ways that add no action (the form designer reloads the document
+    /// with new fields, which carry none). The document is not written out again.
+    pub fn create_with_scan(
+        pdfium: &'static Pdfium,
+        document: &PdfDocument<'_>,
+        scan: Scan,
+    ) -> Result<FormEnv, Failure> {
+        let bindings = pdfium.bindings();
+        let Some(handle) = raw_document(document) else {
+            return Err(unsupported("the form of this document cannot be reached"));
+        };
+        match form_kind(bindings, handle) {
+            FormKind::Acro => Self::open_with(bindings, handle, scan),
+            FormKind::Xfa => Err(unsupported(
+                "this form is an XFA form, which the reader does not support",
+            )),
+            FormKind::None => Err(unsupported("this document has no form")),
+        }
+    }
+
+    /// What the search of the document found, to carry to the environment of its next version.
+    pub fn scan_to_keep(&self) -> Scan {
+        self.scan.clone()
+    }
+
+    fn open_with(
+        bindings: &'static dyn PdfiumLibraryBindings,
+        handle: FPDF_DOCUMENT,
+        scan: Scan,
+    ) -> Result<FormEnv, Failure> {
         // SAFETY: a read of the permissions.
         let may_fill = unsafe { bindings.FPDF_GetDocPermissions(handle) } as u32 & PERMIT_FILL != 0;
         // SAFETY: every field of the structure is a number, a pointer or an optional function, and
