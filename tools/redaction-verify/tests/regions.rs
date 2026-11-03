@@ -1606,11 +1606,10 @@ fn a_standard_font_without_widths_is_placed_by_the_widths_of_the_standard_font()
         fx.build()
     };
     let leak = || Leak(&[PAINTED_MESSAGE, GLYPH_MESSAGE], &[]);
-    check(
+    no_geometry(
         "four glyphs: the fourth only reaches over the edge",
         &page("BT /F1 20 Tf 20 420 Td (AAAA) Tj ET\n", "Helvetica"),
         &white_region(),
-        Clean,
     );
     check(
         "the fifth has its centre in the region",
@@ -1619,11 +1618,10 @@ fn a_standard_font_without_widths_is_placed_by_the_widths_of_the_standard_font()
         leak(),
     );
     // Times A is 722 wide, Courier is 600: the same text ends elsewhere.
-    check(
+    no_geometry(
         "Courier: four glyphs, the cell of the fourth ends at 68",
         &page("BT /F1 20 Tf 20 420 Td (AAAA) Tj ET\n", "Courier"),
         &white_region(),
-        Clean,
     );
     check(
         "Courier: the fifth has its centre in the region",
@@ -1641,11 +1639,10 @@ fn a_standard_font_without_widths_is_placed_by_the_widths_of_the_standard_font()
     );
     // The space of a font that is not in the file draws nothing: here it lies over the region
     // and the letter before it does not.
-    check(
+    no_geometry(
         "a space over the region",
         &page("BT /F1 12 Tf 66 420 Td (x ) Tj ET\n", "Helvetica"),
         &white_region(),
-        Clean,
     );
 }
 
@@ -2892,4 +2889,13 @@ fn work_that_is_done_before_the_walk_is_counted_against_its_budget() {
         r.out
     );
     assert!(started.elapsed() < std::time::Duration::from_secs(20));
+}
+
+/// The report has no hit of the geometry (the render may still see the ink of a glyph that
+/// straddles the edge, with the font that the machine draws it in).
+#[track_caller]
+fn no_geometry(name: &str, bytes: &[u8], spec: &str) {
+    let r = cli(bytes, Some(spec), &[], &[]);
+    assert!(!r.out.contains(PAINTED_MESSAGE), "{name}\n{}", r.out);
+    assert!(r.code == 0 || r.code == 1, "{name}\n{}", r.out);
 }
