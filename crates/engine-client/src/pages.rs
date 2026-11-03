@@ -55,6 +55,31 @@ fn refuse(message: &str) -> ClientError {
     }
 }
 
+/// An answer that must be `Changed`, with page sizes the window can lay out. A document of no
+/// pages is never a result: the engine refuses to delete the last page, and a document that reads
+/// back with none is not the one that was open.
+pub(crate) fn accept_changed(body: ResponseBody) -> Result<PagesChanged, ResponseBody> {
+    match body {
+        ResponseBody::Pages(PagesResponse::Changed {
+            pages,
+            snapshot,
+            count,
+            form_fields,
+        }) if !pages.is_empty()
+            && usable_sizes(&pages)
+            && count as usize <= partridge_protocol::MAX_PAGES =>
+        {
+            Ok(PagesChanged {
+                pages,
+                snapshot,
+                count,
+                form_fields,
+            })
+        }
+        other => Err(other),
+    }
+}
+
 fn usable_sizes(pages: &[PageSize]) -> bool {
     pages
         .iter()
@@ -90,28 +115,7 @@ impl EngineClient {
             doc,
             what,
             |doc| RequestBody::Pages(op(doc)),
-            |body| match body {
-                ResponseBody::Pages(PagesResponse::Changed {
-                    pages,
-                    snapshot,
-                    count,
-                    form_fields,
-                    // A document of no pages is never a result: the engine refuses to delete the
-                    // last page, and a document that reads back with none is not the one that was
-                    // open.
-                }) if !pages.is_empty()
-                    && usable_sizes(&pages)
-                    && count as usize <= partridge_protocol::MAX_PAGES =>
-                {
-                    Ok(PagesChanged {
-                        pages,
-                        snapshot,
-                        count,
-                        form_fields,
-                    })
-                }
-                other => Err(other),
-            },
+            accept_changed,
         )
     }
 
