@@ -52,6 +52,9 @@ pub struct Op<'a> {
     pub offset: usize,
     /// For `BI`: the dictionary text and the data of the inline image.
     pub inline: Option<(&'a [u8], &'a [u8])>,
+    /// For `BI`: where the data of the image ends is in doubt (no length that fits, and no `EI`
+    /// that the content after it confirms), so what follows may have been read wrongly.
+    pub inline_unsure: bool,
 }
 
 impl Op<'_> {
@@ -182,6 +185,25 @@ fn parse_array(buf: &[u8], mut i: usize, depth: usize) -> (Vec<Operand>, usize) 
 
 /// Calls `f` for each operator of the content stream `buf`.
 pub fn for_each_op<'a>(buf: &'a [u8], f: &mut dyn FnMut(&Op<'a>)) {
+    for_each_op_while(buf, &mut |op| {
+        f(op);
+        true
+    });
+}
+
+/// Whether some inline image of the content has an end that is in doubt (see
+/// [`Op::inline_unsure`]).
+pub fn has_unsure_inline_image(buf: &[u8]) -> bool {
+    if !buf.windows(2).any(|w| w == b"BI") {
+        return false;
+    }
+    let mut unsure = false;
+    for_each_op(buf, &mut |op| unsure |= op.inline_unsure);
+    unsure
+}
+
+/// Calls `f` for each operator of the content stream `buf` until it returns `false`.
+pub fn for_each_op_while<'a>(buf: &'a [u8], f: &mut dyn FnMut(&Op<'a>) -> bool) {
     let n = buf.len();
     let mut args: Vec<Operand> = Vec::new();
     let mut first: Option<usize> = None;
@@ -248,22 +270,27 @@ pub fn for_each_op<'a>(buf: &'a [u8], f: &mut dyn FnMut(&Op<'a>)) {
                     continue;
                 }
                 let offset = first.unwrap_or(start);
-                if tok == b"BI" {
-                    let (dict, data, after) = inline_image(buf, i);
+                let go = if tok == b"BI" {
+                    let img = inline_image(buf, i);
+                    i = img.after;
                     f(&Op {
                         name: tok,
                         args: Vec::new(),
                         offset,
-                        inline: Some((dict, data)),
-                    });
-                    i = after;
+                        inline: Some((img.dict, img.data)),
+                        inline_unsure: img.unsure,
+                    })
                 } else {
                     f(&Op {
                         name: tok,
                         args: std::mem::take(&mut args),
                         offset,
                         inline: None,
-                    });
+                        inline_unsure: false,
+                    })
+                };
+                if !go {
+                    return;
                 }
                 args.clear();
                 first = None;
@@ -272,9 +299,136 @@ pub fn for_each_op<'a>(buf: &'a [u8], f: &mut dyn FnMut(&Op<'a>)) {
     }
 }
 
+/// An inline image as the tokenizer found it.
+struct InlineImage<'a> {
+    dict: &'a [u8],
+    data: &'a [u8],
+    /// The offset after `EI`.
+    after: usize,
+    unsure: bool,
+}
+
+/// The integer after `/L` or `/Length` in the dictionary text of an inline image.
+fn declared_length(dict: &[u8]) -> Option<usize> {
+    let mut toks = dict.split(|b| is_space(*b)).filter(|t| !t.is_empty());
+    while let Some(t) = toks.next() {
+        if t == b"/L" || t == b"/Length" {
+            return std::str::from_utf8(toks.next()?).ok()?.parse().ok();
+        }
+    }
+    None
+}
+
+/// The number of bytes of the data of an unfiltered inline image, from its dictionary.
+fn computed_length(dict: &[u8]) -> Option<usize> {
+    use crate::pdfobj::{parse, Obj};
+    let text = [b"<< ".as_slice(), dict, b" >>"].concat();
+    let (d, _) = parse(&text, 0)?;
+    let get = |a: &str, b: &str| d.get(a).or_else(|| d.get(b));
+    if get("F", "Filter").is_some() {
+        return None;
+    }
+    let num = |o: Option<&Obj>| {
+        o.and_then(Obj::int)
+            .filter(|v| *v > 0 && *v < 1_000_000_000)
+    };
+    let w = usize::try_from(num(get("W", "Width"))?).ok()?;
+    let h = usize::try_from(num(get("H", "Height"))?).ok()?;
+    let mask = matches!(get("IM", "ImageMask"), Some(Obj::Bool(true)));
+    let (ncomp, bits) = if mask {
+        (1, 1)
+    } else {
+        let ncomp = match get("CS", "ColorSpace")? {
+            Obj::Name(n) => match n.as_str() {
+                "G" | "DeviceGray" | "CalGray" => 1,
+                "RGB" | "DeviceRGB" | "CalRGB" => 3,
+                "CMYK" | "DeviceCMYK" => 4,
+                _ => return None,
+            },
+            Obj::Array(a) => match a.first()?.name()? {
+                "I" | "Indexed" => 1,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let bits = usize::try_from(num(get("BPC", "BitsPerComponent"))?).ok()?;
+        (ncomp, bits)
+    };
+    let row = w.checked_mul(ncomp)?.checked_mul(bits)?.div_ceil(8);
+    row.checked_mul(h)
+}
+
+/// Whether the bytes after an `EI` read as content: operands and then a known operator, and no
+/// binary bytes.
+fn reads_as_content(buf: &[u8], mut i: usize) -> bool {
+    let n = buf.len();
+    for _ in 0..8 {
+        while i < n && is_space(buf[i]) {
+            i += 1;
+        }
+        if i >= n {
+            return true;
+        }
+        let c = buf[i];
+        match c {
+            b'%' => {
+                while i < n && buf[i] != b'\n' && buf[i] != b'\r' {
+                    i += 1;
+                }
+            }
+            b'(' => match parse_literal(buf, i) {
+                Some((_, e, _)) => i = e,
+                None => return false,
+            },
+            b'<' if buf.get(i + 1) == Some(&b'<') => i = skip_dict(buf, i),
+            b'<' => match parse_hex(buf, i) {
+                Some((_, e)) => i = e,
+                None => return false,
+            },
+            b'[' => i = parse_array(buf, i + 1, 0).1,
+            b'/' => i = token_end(buf, i + 1).max(i + 1),
+            _ if is_delim(c) => return false,
+            _ => {
+                let e = token_end(buf, i);
+                let tok = &buf[i..e];
+                if tok.iter().any(|b| !(0x21..0x7F).contains(b)) {
+                    return false;
+                }
+                if matches!(tok[0], b'0'..=b'9' | b'+' | b'-' | b'.') {
+                    if std::str::from_utf8(tok)
+                        .ok()
+                        .and_then(|t| t.parse::<f64>().ok())
+                        .is_none()
+                    {
+                        return false;
+                    }
+                } else {
+                    // The first operator decides.
+                    return crate::roles::is_operator(tok) && tok != b"EI";
+                }
+                i = e.max(i + 1);
+            }
+        }
+    }
+    true
+}
+
+/// Whether an `EI` that ends the data is at `p`: white space (or the start of the data) before it,
+/// and white space or the end after it.
+fn ei_at(buf: &[u8], p: usize, data_start: usize) -> bool {
+    buf.get(p) == Some(&b'E')
+        && buf.get(p + 1) == Some(&b'I')
+        && (p <= data_start || is_space(buf[p - 1]))
+        && buf.get(p + 2).is_none_or(|c| is_space(*c))
+}
+
 /// The dictionary text, the data and the offset after `EI` of an inline image; `i` is just after
-/// `BI`.
-fn inline_image(buf: &[u8], i: usize) -> (&[u8], &[u8], usize) {
+/// `BI`. The end of the data is taken from `/L` or `/Length` when the dictionary has one, from the
+/// size of the samples when the image has no filter, and otherwise it is the first `EI` that is
+/// followed by white space and content that reads as operators, as Poppler finds it. When none of
+/// these gives an end the image is `unsure`: the rest is read from the first `EI` between white
+/// space, or to the end.
+fn inline_image(buf: &[u8], i: usize) -> InlineImage<'_> {
     let n = buf.len();
     let mut j = i;
     let mut dict_end = n;
@@ -293,22 +447,66 @@ fn inline_image(buf: &[u8], i: usize) -> (&[u8], &[u8], usize) {
         j += 1;
     }
     if dict_end == n {
-        return (&buf[i..n], &[], n);
+        return InlineImage {
+            dict: &buf[i..n],
+            data: &[],
+            after: n,
+            unsure: true,
+        };
     }
-    let data_start = j;
-    while j + 1 < n {
-        if buf[j] == b'E'
-            && buf[j + 1] == b'I'
-            && j > 0
-            && is_space(buf[j - 1])
-            && (j + 2 >= n || is_space(buf[j + 2]))
-        {
-            let data_end = j.saturating_sub(1).max(data_start);
-            return (&buf[i..dict_end], &buf[data_start..data_end], j + 2);
+    let dict = &buf[i..dict_end];
+    // The data starts after one white-space byte; a carriage return and a line feed may be two.
+    let starts = if buf[j - 1] == b'\r' && buf.get(j) == Some(&b'\n') {
+        [j, j + 1]
+    } else {
+        [j, j]
+    };
+    let declared = declared_length(dict).or_else(|| computed_length(dict));
+    if let Some(len) = declared {
+        for start in starts {
+            let end = start.saturating_add(len);
+            // A little white space between the data and EI is allowed.
+            if let Some(q) = (end..=end.saturating_add(2)).find(|q| ei_at(buf, *q, end)) {
+                return InlineImage {
+                    dict,
+                    data: &buf[start..end],
+                    after: q + 2,
+                    unsure: false,
+                };
+            }
         }
-        j += 1;
     }
-    (&buf[i..dict_end], &buf[data_start..], n)
+    let data_start = starts[1];
+    let mut first_plain: Option<usize> = None;
+    for p in data_start..n.saturating_sub(1) {
+        if ei_at(buf, p, data_start) {
+            first_plain.get_or_insert(p);
+            if reads_as_content(buf, p + 2) {
+                let end = if p > data_start { p - 1 } else { p };
+                return InlineImage {
+                    dict,
+                    data: &buf[data_start..end],
+                    after: p + 2,
+                    // A length was declared or computed, and the data does not end there.
+                    unsure: declared.is_some(),
+                };
+            }
+        }
+    }
+    match first_plain {
+        Some(p) => InlineImage {
+            dict,
+            data: &buf[data_start..if p > data_start { p - 1 } else { p }],
+            after: p + 2,
+            unsure: true,
+        },
+        None => InlineImage {
+            dict,
+            data: &buf[data_start..],
+            after: n,
+            unsure: true,
+        },
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -478,5 +676,63 @@ mod tests {
                 ("Q".to_owned(), 0),
             ]
         );
+    }
+
+    fn inline_of(buf: &[u8]) -> Vec<(Vec<u8>, bool, Vec<u8>)> {
+        let mut out = Vec::new();
+        for_each_op(buf, &mut |op| {
+            if let Some((_, data)) = op.inline {
+                out.push((data.to_vec(), op.inline_unsure, op.name.to_vec()));
+            } else {
+                out.push((Vec::new(), false, op.name.to_vec()));
+            }
+        });
+        out
+    }
+
+    #[test]
+    fn the_data_of_an_inline_image_ends_where_its_size_says() {
+        // 64 bytes of samples that hold ` EI (`.
+        let mut data = b"\x80 EI (".to_vec();
+        data.extend(std::iter::repeat_n(0x80u8, 58));
+        let buf = [
+            b"BI /W 64 /H 1 /BPC 8 /CS /G ID ".as_slice(),
+            &data,
+            b"\nEI Q 0 g",
+        ]
+        .concat();
+        let ops = inline_of(&buf);
+        assert_eq!(ops[0].0, data);
+        assert!(!ops[0].1);
+        let names: Vec<_> = ops.iter().map(|o| o.2.clone()).collect();
+        assert_eq!(names, [b"BI".to_vec(), b"Q".to_vec(), b"g".to_vec()]);
+    }
+
+    #[test]
+    fn a_declared_length_is_used_and_checked() {
+        let buf = b"BI /W 1 /H 1 /F /AHx /L 8 ID 00 EI 0> EI Q";
+        let ops = inline_of(buf);
+        assert_eq!(ops[0].0, b"00 EI 0>");
+        assert!(!ops[0].1);
+        // A length that does not fit: the first EI that content follows is taken, and the image
+        // is in doubt.
+        let buf = b"BI /W 1 /H 1 /F /AHx /L 40 ID 00> EI Q";
+        let ops = inline_of(buf);
+        assert!(ops[0].1);
+        assert_eq!(ops[1].2, b"Q");
+    }
+
+    #[test]
+    fn without_a_length_the_ei_must_be_followed_by_content() {
+        // The first EI is data (a binary byte follows); the second is followed by an operator.
+        let buf = b"BI /W 1 /H 1 /F /Fl ID ab EI \x01\x02 cd EI Q 0 g";
+        let ops = inline_of(buf);
+        assert_eq!(ops[0].0, b"ab EI \x01\x02 cd");
+        assert!(!ops[0].1);
+        // No EI that is confirmed, none at all: the end is in doubt.
+        let ops = inline_of(b"BI /W 1 /H 1 /F /Fl ID abcdef");
+        assert!(ops[0].1);
+        assert!(has_unsure_inline_image(b"BI /W 1 /H 1 /F /Fl ID abcdef"));
+        assert!(!has_unsure_inline_image(b"BI /W 1 /H 1 /F /Fl ID abc EI Q"));
     }
 }

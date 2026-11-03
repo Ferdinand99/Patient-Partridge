@@ -447,7 +447,7 @@ fn vector_shapes_are_seen_by_the_render() {
         "the box alone, black, red named",
         &boxed,
         &red,
-        Leak(&[RENDER_MESSAGE, PAINTED_MESSAGE], &[]),
+        Leak(&[RENDER_MESSAGE], &[PAINTED_MESSAGE]),
     );
     // Text turned into outlines is a shape like any other.
     check(
@@ -758,19 +758,27 @@ fn a_signature_under_the_box_is_a_leak() {
         &black_region(),
         Clean,
     );
-    // A box that is not the region is geometry like any other: here it is the page.
+    // One colour over the whole region carries nothing: a box that is the page is no leak.
     check(
         "a box that is the page",
         &plain_page(b"0 g 0 0 612 792 re f\n", &[]),
         &black_region(),
+        Clean,
+    );
+    // A box that does not cover the whole region is geometry like any other.
+    check(
+        "a box that covers half the region",
+        &plain_page(b"0 g 72 400 25 50 re f\n", &[]),
+        &black_region(),
         Leak(&[PAINTED_MESSAGE], &[]),
     );
-    // A box in the wrong colour is not the box that the region names.
+    // A box in the wrong colour paints nothing that tells; the render sees that it is not the
+    // colour that the region names.
     check(
         "a white box, black named",
         &plain_page(b"1 g 72 400 50 50 re f\n", &[]),
         &black_region(),
-        Leak(&[PAINTED_MESSAGE, RENDER_MESSAGE], &[]),
+        Leak(&[RENDER_MESSAGE], &[PAINTED_MESSAGE]),
     );
     // A stroke round the region is painted there too.
     check(
@@ -1289,7 +1297,13 @@ fn the_tolerance_of_a_jpeg_is_for_its_own_pixels_only() {
         );
         fx.build()
     };
-    let spec = region([72.0, 400.0, 172.0, 500.0], Some("[255,255,255]"));
+    // The spec has a text to look for, so a glyph under the region is the business of the text
+    // layers and only the render sees how it looks.
+    let spec = region([72.0, 400.0, 172.0, 500.0], Some("[255,255,255]")).replacen(
+        '{',
+        r#"{"text":["Zyxwv"],"#,
+        1,
+    );
     check("the white picture alone", &page(b""), &spec, Clean);
     check(
         "light gray text beside it",
@@ -1329,5 +1343,786 @@ fn an_annotation_that_a_viewer_draws_from_its_own_entries_is_could_not_check() {
         &page("300 300 350 350"),
         &white_region(),
         Clean,
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// One interpreter: the glyphs of every font, the clip, the text state, the box and the geometry
+// that carries nothing.
+
+/// The same region with a text to look for that is not in the file: the text layers cover the
+/// glyphs then, and the region check does not read them as leaks.
+fn with_text_needle(spec: &str) -> String {
+    spec.replacen('{', r#"{"text":["Zyxwv"],"#, 1)
+}
+
+const TXT_IN: &[u8] = b"BT /F1 12 Tf 80 420 Td (Ola Nordmann) Tj ET\n";
+
+/// A Helvetica whose widths are known: A and B are 1000 wide, everything else 500.
+fn wide_font() -> Bytes {
+    let widths: String = (32..=66)
+        .map(|c| if c >= 65 { "1000 " } else { "500 " })
+        .collect();
+    format!(
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding \
+         /FirstChar 32 /LastChar 66 /Widths [{widths}] >>"
+    )
+    .into_bytes()
+}
+
+fn with_wide_font(content: &str) -> Bytes {
+    let mut fx = Fx::new(&[BENIGN, content.as_bytes()].concat());
+    fx.extra.insert(5, wide_font());
+    fx.build()
+}
+
+const GLYPH_MESSAGE: &str = "glyph of text";
+
+#[test]
+fn text_under_a_region_is_a_leak_in_every_font() {
+    let cid = Fx::new(b"").show("Ola Nordmann");
+    let cid_text = format!("BT /F2 12 Tf 80 420 Td {cid} Tj ET\n").into_bytes();
+    for (font, text) in [("Helvetica", TXT_IN.to_vec()), ("CID", cid_text)] {
+        // Under the box that redacts it: the text is still there.
+        check(
+            &format!("{font} text under the box"),
+            &drawn(&[text.as_slice(), BOX].concat(), ""),
+            &black_region(),
+            Leak(&[PAINTED_MESSAGE, GLYPH_MESSAGE], &[]),
+        );
+        // Not painted over at all.
+        check(
+            &format!("{font} text, no box"),
+            &drawn(&text, ""),
+            &black_region(),
+            Leak(&[PAINTED_MESSAGE, GLYPH_MESSAGE], &[]),
+        );
+        // A text to look for that is not there: the glyphs are the business of the text layers.
+        // (The test font of the composite case is not embedded, and the renderer says so.)
+        if font == "Helvetica" {
+            check(
+                &format!("{font} text under the box, a text needle in the spec"),
+                &drawn(&[text.as_slice(), BOX].concat(), ""),
+                &with_text_needle(&black_region()),
+                Clean,
+            );
+        }
+    }
+    // Nothing shows it: no render mode that draws, hidden optional content.
+    let invisible = String::from_utf8_lossy(TXT_IN).replace("BT ", "BT 3 Tr ");
+    check(
+        "render mode 3",
+        &drawn(invisible.as_bytes(), ""),
+        &white_region(),
+        Leak(&[PAINTED_MESSAGE, GLYPH_MESSAGE], &[RENDER_MESSAGE]),
+    );
+    check(
+        "hidden optional content",
+        &Fx::new(BENIGN).hidden(TXT_IN).build(),
+        &white_region(),
+        Leak(&[PAINTED_MESSAGE, GLYPH_MESSAGE], &[RENDER_MESSAGE]),
+    );
+    check(
+        "white text",
+        &drawn(b"1 g BT /F1 12 Tf 80 420 Td (Ola Nordmann) Tj ET\n", ""),
+        &white_region(),
+        Leak(&[PAINTED_MESSAGE, GLYPH_MESSAGE], &[RENDER_MESSAGE]),
+    );
+    check(
+        "text in a clip that cuts it away",
+        &drawn(
+            b"q 300 300 10 10 re W n BT /F1 12 Tf 80 420 Td (Ola Nordmann) Tj ET Q\n",
+            "",
+        ),
+        &white_region(),
+        Leak(&[PAINTED_MESSAGE, GLYPH_MESSAGE], &[RENDER_MESSAGE]),
+    );
+    // Text that is somewhere else, and a region with no text.
+    check(
+        "text elsewhere",
+        &drawn(b"BT /F1 12 Tf 300 300 Td (Ola Nordmann) Tj ET\n", ""),
+        &white_region(),
+        Clean,
+    );
+    check("no text", &drawn(b"", ""), &white_region(), Clean);
+    // A glyph of a text clip is geometry like any other.
+    check(
+        "text added to the clip, then the box",
+        &drawn(
+            b"q BT /F1 40 Tf 7 Tr 80 410 Td (Ola) Tj ET 0 g 72 400 50 50 re f Q\n",
+            "",
+        ),
+        &black_region(),
+        Leak(&[PAINTED_MESSAGE, GLYPH_MESSAGE], &[]),
+    );
+}
+
+#[test]
+fn the_glyphs_of_a_text_are_placed_one_by_one() {
+    // (name, content, whether a glyph meets the region 72 400 122 450). The font is 10 points,
+    // and A is as wide as the font size.
+    let cases: &[(&str, &str, bool)] = &[
+        ("inside", "BT /F1 10 Tf 100 420 Td (A) Tj ET", true),
+        (
+            "left of the region",
+            "BT /F1 10 Tf 20 420 Td (AAA) Tj ET",
+            false,
+        ),
+        (
+            "character spacing moves the third glyph in",
+            "BT /F1 10 Tf 40 Tc 20 420 Td (AAA) Tj ET",
+            true,
+        ),
+        (
+            "word spacing moves the glyph after a space in",
+            "BT /F1 10 Tf 40 Tw 20 420 Td (A A) Tj ET",
+            true,
+        ),
+        (
+            "without word spacing it does not get there",
+            "BT /F1 10 Tf 20 420 Td (A A) Tj ET",
+            false,
+        ),
+        (
+            "the horizontal scale widens the advance",
+            "BT /F1 10 Tf 200 Tz 20 420 Td (AAA) Tj ET",
+            true,
+        ),
+        (
+            "kerning to the right",
+            "BT /F1 10 Tf 20 420 Td [(A) -5000 (A)] TJ ET",
+            true,
+        ),
+        (
+            "kerning back, over the region",
+            "BT /F1 10 Tf 150 420 Td [(A) 5000 (A)] TJ ET",
+            true,
+        ),
+        (
+            "text rise lifts the glyph in",
+            "BT /F1 10 Tf 80 300 Td 100 Ts (A) Tj ET",
+            true,
+        ),
+        (
+            "without the rise it stays below",
+            "BT /F1 10 Tf 80 300 Td (A) Tj ET",
+            false,
+        ),
+        (
+            "the next line with T*",
+            "BT /F1 10 Tf 80 500 Td 60 TL T* (A) Tj ET",
+            true,
+        ),
+        (
+            "the line above is not the region",
+            "BT /F1 10 Tf 80 500 Td 60 TL (A) Tj ET",
+            false,
+        ),
+        (
+            "the next line with the quote operator",
+            "BT /F1 10 Tf 80 500 Td 60 TL (A) ' ET",
+            true,
+        ),
+        (
+            "the next line with the double quote operator",
+            "BT /F1 10 Tf 80 500 Td 60 TL 0 0 (A) \" ET",
+            true,
+        ),
+        (
+            "TD sets the leading and moves",
+            "BT /F1 10 Tf 80 500 Td 0 -60 TD (A) Tj ET",
+            true,
+        ),
+        (
+            "turned text",
+            "BT /F1 10 Tf 0 1 -1 0 100 380 Tm (AAA) Tj ET",
+            true,
+        ),
+        (
+            "q and Q give the text state back",
+            "/F1 10 Tf q /F1 50 Tf 40 Tc 200 Tz 100 Ts Q BT 20 420 Td (AAA) Tj ET",
+            false,
+        ),
+    ];
+    for (name, content, leak) in cases {
+        let page = with_wide_font(&format!("{content}\n"));
+        if *leak {
+            check(
+                name,
+                &page,
+                &white_region(),
+                Leak(&[PAINTED_MESSAGE, GLYPH_MESSAGE], &[]),
+            );
+        } else {
+            check(name, &page, &white_region(), Clean);
+        }
+    }
+}
+
+#[test]
+fn the_glyphs_of_a_type3_font_are_placed_like_all_others() {
+    let names = vec!["a".to_owned()];
+    let page = |text: &str| {
+        let mut fx = Fx::new(&[BENIGN, text.as_bytes(), b"\n", BOX].concat());
+        fx.extra.insert(6, fonts::type3_font(65, &names, 20, None));
+        fx.extra
+            .insert(20, stream_obj("", b"500 0 d0 0 0 400 400 re f", false));
+        fx.build()
+    };
+    let type3 = || Leak(&[PAINTED_MESSAGE, "glyphs of a Type 3 font"], &[]);
+    check(
+        "a glyph under the box",
+        &page("BT /F2 12 Tf 80 420 Td (A) Tj ET"),
+        &black_region(),
+        type3(),
+    );
+    // Shown at 300 and kerned back by 228 points: the second glyph is at 78.
+    check(
+        "kerned back into the region",
+        &page("BT /F2 12 Tf 300 420 Td [(A) 19000 (A) -19000] TJ ET"),
+        &black_region(),
+        type3(),
+    );
+    check(
+        "raised into the region",
+        &page("BT /F2 12 Tf 80 300 Td 110 Ts (A) Tj ET"),
+        &black_region(),
+        type3(),
+    );
+    // The font is set outside the text object, changed inside a q .. Q, and the glyph is shown
+    // after the Q: it is the Type 3 font again.
+    check(
+        "the font that Q gives back",
+        &page("/F2 12 Tf q BT /F1 12 Tf 300 300 Td (x) Tj ET Q BT 80 420 Td (A) Tj ET"),
+        &black_region(),
+        type3(),
+    );
+    check(
+        "the same glyph far from the region",
+        &page("BT /F2 12 Tf 300 420 Td (A) Tj ET"),
+        &black_region(),
+        Clean,
+    );
+    // A glyph that paints is geometry that no text layer reads, with a text to look for too.
+    check(
+        "a painting glyph, with a text needle",
+        &page("BT /F2 12 Tf 80 420 Td (A) Tj ET"),
+        &with_text_needle(&black_region()),
+        type3(),
+    );
+    // A glyph that paints nothing is text, and the text layers read it.
+    let silent = {
+        let mut fx = Fx::new(
+            &[
+                BENIGN,
+                b"BT /F2 12 Tf 80 420 Td (A) Tj ET\n".as_slice(),
+                BOX,
+            ]
+            .concat(),
+        );
+        fx.extra.insert(6, fonts::type3_font(65, &names, 20, None));
+        fx.extra.insert(20, stream_obj("", b"500 0 d0", false));
+        fx.build()
+    };
+    check(
+        "a glyph that paints nothing",
+        &silent,
+        &black_region(),
+        Leak(&[PAINTED_MESSAGE, GLYPH_MESSAGE], &[]),
+    );
+    check(
+        "a glyph that paints nothing, with a text needle",
+        &silent,
+        &with_text_needle(&black_region()),
+        Clean,
+    );
+}
+
+#[test]
+fn text_that_a_viewer_draws_from_an_annotation_is_a_leak() {
+    let page = |annot: &str| {
+        let mut fx = Fx::new(BENIGN);
+        fx.page_extra.push_str(" /Annots [30 0 R]");
+        fx.extra.insert(30, annot.as_bytes().to_vec());
+        fx.build()
+    };
+    let freetext = |contents: &str, rect: &str| {
+        page(&format!(
+            "<< /Type /Annot /Subtype /FreeText /F 2 /Rect [{rect}] /P 3 0 R /Contents ({contents}) \
+             /DA (/Helv 9 Tf 0 g) >>"
+        ))
+    };
+    // Hidden, with no appearance: a viewer draws the text from /Contents.
+    check(
+        "a free text annotation with text",
+        &freetext("Ola Nordmann", "72 400 122 450"),
+        &white_region(),
+        Leak(&[PAINTED_MESSAGE, "text of a FreeText annotation"], &[]),
+    );
+    // Also when the spec has a text to look for: the entry is not a glyph.
+    check(
+        "the same, with a text needle",
+        &freetext("Ola Nordmann", "72 400 122 450"),
+        &with_text_needle(&white_region()),
+        Leak(&[PAINTED_MESSAGE, "text of a FreeText annotation"], &[]),
+    );
+    check(
+        "a free text annotation elsewhere",
+        &freetext("Ola Nordmann", "300 300 350 350"),
+        &white_region(),
+        Clean,
+    );
+    // No text: the viewer still draws something, and where is not known.
+    let r = cli(
+        &freetext("", "72 400 122 450"),
+        Some(&white_region()),
+        &[],
+        &[],
+    );
+    assert_eq!(r.code, 2, "{}", r.out);
+    assert!(
+        r.problems()
+            .iter()
+            .any(|p| p.contains("FreeText annotation with no appearance stream")),
+        "{}",
+        r.out
+    );
+    check(
+        "a widget with a value",
+        &page(
+            "<< /Type /Annot /Subtype /Widget /FT /Tx /T (f1) /Rect [72 400 122 450] /P 3 0 R \
+             /V (Ola Nordmann) /DA (/Helv 9 Tf 0 g) >>",
+        ),
+        &white_region(),
+        Leak(&[PAINTED_MESSAGE, "text of a Widget annotation"], &[]),
+    );
+    check(
+        "a note with text",
+        &page(
+            "<< /Type /Annot /Subtype /Text /Rect [72 400 122 450] /P 3 0 R /Contents (secret) >>",
+        ),
+        &white_region(),
+        Leak(&[PAINTED_MESSAGE, "text of a Text annotation"], &[]),
+    );
+    // A pop-up shows the text of the annotation that it belongs to.
+    let popup = {
+        let mut fx = Fx::new(BENIGN);
+        fx.page_extra.push_str(" /Annots [30 0 R 31 0 R]");
+        fx.extra.insert(
+            30,
+            b"<< /Type /Annot /Subtype /Text /Rect [300 300 320 320] /P 3 0 R /Contents (secret) \
+              /Popup 31 0 R >>"
+                .to_vec(),
+        );
+        fx.extra.insert(
+            31,
+            b"<< /Type /Annot /Subtype /Popup /Rect [72 400 122 450] /Parent 30 0 R /Open true >>"
+                .to_vec(),
+        );
+        fx.build()
+    };
+    check(
+        "a pop-up over the region",
+        &popup,
+        &white_region(),
+        Leak(&[PAINTED_MESSAGE, "text of a Popup annotation"], &[]),
+    );
+}
+
+#[test]
+fn a_clip_path_is_geometry() {
+    let sigpath = b"75 405 m 90 440 l 100 410 l 115 445 l 118 405 l";
+    let boxed = |inner: &[u8]| plain_page(&[inner, BOX].concat(), &[]);
+    // The signature is the clip, and the box fills the region through it: with a second box on
+    // top, the render is black, and the file still paints the signature.
+    let shaped = [b"q ".as_slice(), sigpath, b" W n 0 g 72 400 50 50 re f Q\n"].concat();
+    check(
+        "a signature as a clip, filled by the box, then the box",
+        &boxed(&shaped),
+        &black_region(),
+        Leak(&[PAINTED_MESSAGE, "clip path"], &[]),
+    );
+    check(
+        "the same without a box on top",
+        &plain_page(&shaped, &[]),
+        &black_region(),
+        Leak(&[PAINTED_MESSAGE], &[]),
+    );
+    // The box and a hairline that stops inside the region, and the box and a small rectangle in
+    // the same path.
+    check(
+        "the box and a hairline that does not cross",
+        &plain_page(&[BOX, b"0 w 0 g 80 430 m 110 430 l S\n"].concat(), &[]),
+        &black_region(),
+        Leak(&[PAINTED_MESSAGE, "stroke of a path"], &[]),
+    );
+    check(
+        "the box and a small rectangle in one path",
+        &plain_page(b"0 g 72 400 50 50 re 80 410 5 5 re f\n", &[]),
+        &black_region(),
+        Leak(&[PAINTED_MESSAGE], &[]),
+    );
+    // A clip that is one rectangle that holds the region cuts nothing.
+    check(
+        "a clip that is the page",
+        &boxed(b"q 0 0 612 792 re W n 0 g 72 400 50 50 re f Q\n"),
+        &black_region(),
+        Clean,
+    );
+    check(
+        "a clip round the region",
+        &boxed(b"q 60 390 80 70 re W* n 0 g 72 400 50 50 re f Q\n"),
+        &black_region(),
+        Clean,
+    );
+    // A clip that is a rectangle inside the region cuts into it.
+    check(
+        "a clip inside the region",
+        &boxed(b"q 80 410 20 20 re W n 0 g 72 400 50 50 re f Q\n"),
+        &black_region(),
+        Leak(&[PAINTED_MESSAGE, "clip path"], &[]),
+    );
+    // A clip of two rectangles is not one rectangle.
+    check(
+        "a clip of two rectangles",
+        &boxed(b"q 0 0 612 792 re 100 100 5 5 re W n 0 g 72 400 50 50 re f Q\n"),
+        &black_region(),
+        Leak(&[PAINTED_MESSAGE], &[]),
+    );
+    // The clip ends with Q: a box after it is clipped by nothing, and the clip was geometry.
+    check(
+        "a box after the clip ended",
+        &boxed(b"q 80 410 20 20 re W n Q 0 g 72 400 50 50 re f\n"),
+        &black_region(),
+        Leak(&[PAINTED_MESSAGE, "clip path"], &[]),
+    );
+    // A soft mask shapes what the box paints.
+    let mask = stream_obj(
+        "/Type /XObject /Subtype /Form /BBox [0 0 612 792] \
+         /Group << /S /Transparency /CS /DeviceGray >>",
+        b"1 g 0 0 612 792 re f",
+        false,
+    );
+    let masked = {
+        let mut fx = Fx::new(&[BENIGN, b"/GS0 gs 0 g 72 400 50 50 re f\n".as_slice()].concat());
+        fx.resources_extra.push_str(
+            " /ExtGState << /GS0 << /SMask << /Type /Mask /S /Luminosity /G 10 0 R >> >> >>",
+        );
+        fx.extra.insert(10, mask);
+        fx.build()
+    };
+    check(
+        "a box under a soft mask",
+        &masked,
+        &black_region(),
+        Leak(&[PAINTED_MESSAGE], &[]),
+    );
+}
+
+/// The line `Contact: Ola Nordmann, Storgata 1` with `Nordmann,` taken out and the rest kept where
+/// it was, and the box on the word.
+const KEPT: &[u8] = b"BT /F1 12 Tf 72 420 Td (Contact: Ola ) Tj ET\n\
+                      BT /F1 12 Tf 190 420 Td (Storgata 1) Tj ET\n";
+const CR_BOX: &[u8] = b"0 g 138 416 50 16 re f\n";
+
+fn word_spec() -> String {
+    r##"{"text":["Nordmann"],"regions":[{"page":1,"rect":[138,416,188,432],"fill":"#000000"}]}"##
+        .to_owned()
+}
+
+#[test]
+fn geometry_that_carries_nothing_about_the_region_is_not_a_leak() {
+    let page = |before: &[u8], after: &[u8]| {
+        plain_page(&[before, BENIGN, KEPT, after, CR_BOX].concat(), &[])
+    };
+    let spec = word_spec();
+    check("the plain page", &page(b"", b""), &spec, Clean);
+    // A page that is painted white first, a table cell shaded, a table rule through the row.
+    check(
+        "a white page background",
+        &page(b"1 g 0 0 612 792 re f 0 g\n", b""),
+        &spec,
+        Clean,
+    );
+    check(
+        "a cell shading that holds the region",
+        &page(b"0.9 g 60 410 440 28 re f 0 g\n", b""),
+        &spec,
+        Clean,
+    );
+    check(
+        "a table rule through the row",
+        &page(b"", b"0.5 w 0 G 60 424 m 500 424 l S\n"),
+        &spec,
+        Clean,
+    );
+    check(
+        "a vertical table rule",
+        &page(b"", b"0.5 w 0 G 160 300 m 160 500 l S\n"),
+        &spec,
+        Clean,
+    );
+    check(
+        "a thin rectangle across the row",
+        &page(b"", b"0 g 60 423 440 1.5 re f\n"),
+        &spec,
+        Clean,
+    );
+    check(
+        "rules above and below the row",
+        &page(
+            b"",
+            b"0.5 w 0 G 60 414 m 500 414 l S 60 434 m 500 434 l S\n",
+        ),
+        &spec,
+        Clean,
+    );
+    // Whatever is not one of these is a leak.
+    check(
+        "a shading that only reaches into the region",
+        &page(b"0.9 g 100 410 40 28 re f 0 g\n", b""),
+        &spec,
+        Leak(&[PAINTED_MESSAGE], &[]),
+    );
+    check(
+        "a rule that ends in the region",
+        &page(b"", b"0.5 w 0 G 60 424 m 150 424 l S\n"),
+        &spec,
+        Leak(&[PAINTED_MESSAGE, "stroke of a path"], &[]),
+    );
+    check(
+        "a rule thicker than two points",
+        &page(b"", b"3 w 0 G 60 424 m 500 424 l S\n"),
+        &spec,
+        Leak(&[PAINTED_MESSAGE, "stroke of a path"], &[]),
+    );
+    check(
+        "a rule that is slanted",
+        &page(b"", b"0.5 w 0 G 60 410 m 500 438 l S\n"),
+        &spec,
+        Leak(&[PAINTED_MESSAGE, "stroke of a path"], &[]),
+    );
+    check(
+        "a rule with a bend",
+        &page(b"", b"0.5 w 0 G 60 424 m 150 424 l 500 424 l S\n"),
+        &spec,
+        Leak(&[PAINTED_MESSAGE, "stroke of a path"], &[]),
+    );
+    check(
+        "a thick rectangle across the row",
+        &page(b"", b"0 g 60 420 440 6 re f\n"),
+        &spec,
+        Leak(&[PAINTED_MESSAGE, "fill of a path"], &[]),
+    );
+    check(
+        "a background that a shape clips",
+        &page(
+            b"q 140 410 m 160 430 l 180 410 l 185 435 l W n 1 g 0 0 612 792 re f Q 0 g\n",
+            b"",
+        ),
+        &spec,
+        Leak(&[PAINTED_MESSAGE], &[]),
+    );
+    check(
+        "a rule that a clip cuts",
+        &page(
+            b"",
+            b"q 150 420 20 8 re W n 0.5 w 0 G 60 424 m 500 424 l S Q\n",
+        ),
+        &spec,
+        Leak(&[PAINTED_MESSAGE], &[]),
+    );
+    check(
+        "a background and a stroke round it",
+        &page(b"0.9 g 0 G 60 410 440 28 re B 0 g\n", b""),
+        &spec,
+        Leak(&[PAINTED_MESSAGE, "fill and stroke of a path"], &[]),
+    );
+    let pattern = stream_obj(
+        "/PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 4 4] /XStep 4 /YStep 4 \
+         /Resources << >>",
+        b"0 0 2 2 re f",
+        false,
+    );
+    check(
+        "a background in a pattern colour",
+        &plain_page(
+            &[
+                b"/Pattern cs /P1 scn 60 410 440 28 re f 0 g\n".as_slice(),
+                CR_BOX,
+            ]
+            .concat(),
+            &[(19, pattern)],
+        ),
+        &spec,
+        Leak(&[PAINTED_MESSAGE], &[]),
+    );
+}
+
+#[test]
+fn a_page_with_a_great_deal_of_content_loses_no_geometry() {
+    // 100 000 small fills, and then a signature under the box.
+    let line = b"0 g 500 700 1 1 re f\n";
+    let page = |n: usize| {
+        let fills = line.repeat(n);
+        plain_page(&[fills.as_slice(), SIG, BOX].concat(), &[])
+    };
+    check(
+        "99 000 fills and a signature",
+        &page(99_000),
+        &black_region(),
+        Leak(&[PAINTED_MESSAGE, "fill of a path"], &[]),
+    );
+    check(
+        "100 000 fills and a signature",
+        &page(100_000),
+        &black_region(),
+        Leak(&[PAINTED_MESSAGE, "fill of a path"], &[]),
+    );
+    // The same page, with a budget that is too small: not a pass, but "could not check".
+    let bytes = page(100_000);
+    let r = cli(
+        &bytes,
+        Some(&black_region()),
+        &["--walk-steps", "50000"],
+        &[],
+    );
+    assert_eq!(r.code, 2, "{}", r.out);
+    assert!(
+        r.problems()
+            .iter()
+            .any(|p| p.contains("budget of 50000 steps")),
+        "{}",
+        r.out
+    );
+    let r = cli(
+        &bytes,
+        Some(&black_region()),
+        &["--walk-budget", "0.001"],
+        &[],
+    );
+    assert_eq!(r.code, 2, "{}", r.out);
+    assert!(
+        r.problems().iter().any(|p| p.contains("0.001 s")),
+        "{}",
+        r.out
+    );
+    assert!(!r.out.contains("clean"), "{}", r.out);
+    let r = cli(&bytes, Some(&black_region()), &["--walk-steps", "0"], &[]);
+    assert_eq!(r.code, 2, "{}", r.out);
+    assert!(r.out.contains("--walk-steps wants"), "{}", r.out);
+}
+
+#[test]
+fn forms_that_draw_forms_are_held_to_the_budget() {
+    // Each level draws the next one ten times: 1000 leaf forms with four levels.
+    let mut extra: Vec<(u32, Bytes)> = Vec::new();
+    for lvl in 0..4u32 {
+        let (body, res) = if lvl < 3 {
+            (
+                "/N Do\n".repeat(10),
+                format!(" /Resources << /XObject << /N {} 0 R >> >>", 41 + lvl),
+            )
+        } else {
+            ("0 g 500 700 1 1 re f\n".to_owned(), String::new())
+        };
+        extra.push((
+            40 + lvl,
+            stream_obj(
+                &format!("/Type /XObject /Subtype /Form /BBox [0 0 612 792]{res}"),
+                body.as_bytes(),
+                false,
+            ),
+        ));
+    }
+    let mut fx = Fx::new(&[BENIGN, b"/N Do\n".as_slice(), BOX].concat());
+    fx.resources_extra.push_str(" /XObject << /N 40 0 R >>");
+    for (n, b) in extra {
+        fx.extra.insert(n, b);
+    }
+    let bytes = fx.build();
+    check("forms that draw forms", &bytes, &black_region(), Clean);
+    let r = cli(&bytes, Some(&black_region()), &["--walk-steps", "300"], &[]);
+    assert_eq!(r.code, 2, "{}", r.out);
+    assert!(
+        r.problems()
+            .iter()
+            .any(|p| p.contains("budget of 300 steps")),
+        "{}",
+        r.out
+    );
+}
+
+/// 64 bytes of image data that hold ` EI (`.
+fn tricky_image_data() -> Vec<u8> {
+    let mut data = b"\x80 EI (".to_vec();
+    data.extend(std::iter::repeat_n(0x80u8, 58));
+    assert_eq!(data.len(), 64);
+    data
+}
+
+fn inline_image(data: &[u8]) -> Vec<u8> {
+    [
+        b"q 50 0 0 1 300 300 cm BI /W 64 /H 1 /BPC 8 /CS /G ID ".as_slice(),
+        data,
+        b"\nEI Q\n",
+    ]
+    .concat()
+}
+
+#[test]
+fn inline_image_data_with_an_ei_in_it_does_not_hide_what_follows() {
+    // The data has ` EI (` in it; the size of the image says how long it is.
+    let after = [SIG, b"% )\n".as_slice(), BOX].concat();
+    check(
+        "a signature after an inline image, under the box",
+        &plain_page(&[inline_image(&tricky_image_data()), after].concat(), &[]),
+        &black_region(),
+        Leak(&[PAINTED_MESSAGE, "fill of a path"], &[]),
+    );
+    // Hidden text after such an image is read by the decode layer, as after any other.
+    let cid = Fx::new(b"").show("Ola Nordmann");
+    let ops = format!("BT /F2 12 Tf 72 600 Td {cid} Tj ET\n% )\n");
+    for (name, data) in [
+        ("with the bytes", tricky_image_data()),
+        ("plain", vec![0x80u8; 64]),
+    ] {
+        let fx = Fx::new(&[BENIGN, &inline_image(&data)].concat()).hidden(ops.as_bytes());
+        let r = cli(&fx.build(), Some(r#"{"text":["Ola Nordmann"]}"#), &[], &[]);
+        assert_eq!(r.code, 1, "{name}\n{}", r.out);
+        assert!(r.layers().contains("decode"), "{name}\n{}", r.out);
+    }
+}
+
+#[test]
+fn an_inline_image_whose_end_is_in_doubt_is_could_not_check() {
+    // Filtered, no length, and no EI at all: where the image ends is not known.
+    let content =
+        b"q 50 0 0 50 300 300 cm BI /W 4 /H 4 /BPC 8 /CS /G /F /AHx ID 0000000000000000>\n";
+    let r = cli(&plain_page(content, &[]), Some(REGION), &[], &[]);
+    assert_eq!(r.code, 2, "{}", r.out);
+    assert!(
+        r.problems()
+            .iter()
+            .any(|p| p.contains("inline image") && p.contains("not certain")),
+        "{}",
+        r.out
+    );
+    // The decode layer says it too.
+    let r = cli(
+        &plain_page(content, &[]),
+        Some(r#"{"text":["Ola Nordmann"]}"#),
+        &["--only", "decode"],
+        &[],
+    );
+    assert_eq!(r.code, 2, "{}", r.out);
+    // With the end where it should be, nothing is in doubt.
+    let ok =
+        b"q 50 0 0 50 300 300 cm BI /W 4 /H 4 /BPC 8 /CS /G /F /AHx ID 0000000000000000> EI Q\n";
+    let r = cli(&plain_page(ok, &[]), Some(REGION), &[], &[]);
+    assert!(
+        !r.problems().iter().any(|p| p.contains("inline image")),
+        "{}",
+        r.out
     );
 }

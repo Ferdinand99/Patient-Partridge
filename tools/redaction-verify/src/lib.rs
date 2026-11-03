@@ -36,14 +36,19 @@
 //!    rest of it is left out of the render check too, because the codec changed those pixels. A
 //!    JPEG with no such block under the region, or with quantisation tables so coarse that a flat
 //!    block may be off by more than 16 levels of 255, is "could not check".
-//! 3. The geometry. Every path that is filled or stroked, every shading and every glyph of a Type 3
-//!    font that is shown, in the page, the forms it draws, the appearances of its annotations (all
-//!    states, and the icons of a widget) and the glyph procedures, is placed on the page. One that
-//!    meets the region is a leak, whatever its colour, clip, transparency, blend mode or optional
-//!    content: it is in the file, and shows when the box over it goes or the layer is turned on.
-//!    The only geometry allowed is the box that redacts: a fill of one rectangle that is the
-//!    region, in the fill colour that the region names. Where the bounds of something cannot be
-//!    computed, that is "could not check".
+//! 3. The geometry. One interpreter walks the content of the page with a complete graphics state
+//!    (the stack of `q` and `Q`, the matrix, the clip, the colours, the text state, the text and
+//!    line matrices), through forms, soft mask groups, every state of every annotation appearance
+//!    and the icons of a widget. Every painting event is placed on the page: a glyph of any font, a
+//!    path that is filled or stroked, a clip path, a shading. One that meets the region is a leak,
+//!    whatever its colour, clip, transparency, blend mode, render mode or optional content: it is in
+//!    the file, and shows when the box over it goes or the layer is turned on. The glyphs of
+//!    ordinary fonts count when the spec has no text to look for. Geometry that carries nothing
+//!    about what was under the region is allowed: the box that redacts, a fill of one rectangle in
+//!    one device colour that holds the whole region, a rule at most 2 points thick that crosses it,
+//!    and a clip that is one rectangle that holds it (see `walk`). Where the bounds of something
+//!    cannot be computed, or the walk needs more than its budget of steps or time, that is "could
+//!    not check".
 //!
 //! Content streams are found from the structure of the file: the contents of a page, forms,
 //! appearances, patterns, Type 3 glyph procedures. A stream with such a role is always decoded as
@@ -74,9 +79,12 @@
 //! - Geometry in objects that no page draws (an orphan form, a pattern that is not used) is not
 //!   placed, because nothing says where it would be. The text of those objects is read.
 //! - Geometry is placed by its bounds, and bounds err on the side of a leak: a curve is bounded by
-//!   its control points, a stroke by the widest line a viewer draws. A line a few points from a
-//!   region can be a leak. A page background that is painted as a rectangle under a region is a
-//!   leak too, unless it is the box.
+//!   its control points, a stroke by the widest line a viewer draws, a glyph by the bounding box of
+//!   its font (the full em where the font has none), so text that ends at the edge of a region can
+//!   meet it. A line a few points from a region can be a leak. A font with no widths gives
+//!   intervals for the places of its glyphs, and wider boxes.
+//! - A tool that leaves its process group by itself is out of reach of the time limit: only the
+//!   tool and the processes in its group (its tree on Windows) are stopped.
 //! - Images drawn through a tiling pattern or by Type 3 glyphs are seen by the render only, and
 //!   the check says so.
 //!
@@ -100,6 +108,7 @@ pub mod strings;
 mod structure;
 pub mod textdec;
 pub mod tools;
+mod walk;
 
 pub use search::{Encoding, Features, Form, Via};
 
@@ -232,6 +241,12 @@ pub struct Spec {
     /// Rectangles that were redacted: the images under them must be blank.
     pub regions: Vec<Region>,
 }
+
+/// The most steps that the walk over the content of the pages of the regions takes by default.
+pub const DEFAULT_WALK_STEPS: u64 = 100_000_000;
+
+/// The most time that this walk takes by default.
+pub const DEFAULT_WALK_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// The resolution of the render that checks a region.
 pub const RENDER_DPI: u32 = 144;
@@ -438,6 +453,12 @@ pub struct Options {
     /// How long all the calls for the file may take together. The default is the variable
     /// `VERIFIER_FILE_BUDGET` (seconds), or 900 s.
     pub file_budget: std::time::Duration,
+    /// The most steps (operators and glyphs) that the walk over the content of the pages of the
+    /// regions may take before the check ends with "could not check". The default is
+    /// [`DEFAULT_WALK_STEPS`].
+    pub walk_steps: u64,
+    /// The most time that this walk may take for the file. The default is [`DEFAULT_WALK_BUDGET`].
+    pub walk_budget: std::time::Duration,
 }
 
 impl Default for Options {
@@ -449,6 +470,8 @@ impl Default for Options {
             password: None,
             tool_timeout: tools::tool_timeout_from_env(),
             file_budget: tools::file_budget_from_env(),
+            walk_steps: DEFAULT_WALK_STEPS,
+            walk_budget: DEFAULT_WALK_BUDGET,
         }
     }
 }
@@ -648,6 +671,7 @@ pub fn verify(pdf: &Path, spec: &Spec, opts: &Options) -> Result<Report> {
         set: &set,
         password,
         qdf: std::cell::OnceCell::new(),
+        plain: std::cell::OnceCell::new(),
         revisions: std::cell::OnceCell::new(),
     };
     tools::begin(opts.tool_timeout, opts.file_budget);

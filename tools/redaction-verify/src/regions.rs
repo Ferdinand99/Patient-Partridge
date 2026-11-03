@@ -12,14 +12,18 @@
 //!    the region must all be one value (within a tolerance for a lossy codec). This does not
 //!    depend on the codec: a sample is what the decoder gives, however the engine stored the
 //!    image again.
-//! 3. The geometry. Paths, shadings and the glyphs of Type 3 fonts that are painted are placed on
-//!    the page by the matrices of the content that paints them, and any that meets the region is a
-//!    leak whatever its colour, clip, transparency, blend mode or optional content, except the
-//!    box that redacts (see [`check_paints`]). What a viewer cannot show now can be shown later.
+//! 3. The geometry. One interpreter ([`crate::walk`]) walks the content of the page, with a
+//!    complete graphics state, and every painting event (a glyph of any font, a path that is
+//!    filled or stroked, a clip path, a shading) is placed on the page. Any that meets the region
+//!    is a leak whatever its colour, clip, transparency, blend mode, render mode or optional
+//!    content, except geometry that carries nothing about what was under the region (the box that
+//!    redacts, a fill of one colour that contains the region, a rule that crosses it). What a
+//!    viewer cannot show now can be shown later. The glyphs of ordinary fonts are leaks when the
+//!    spec has no text to look for: the text layers cover them otherwise.
 //!
 //! Where the check cannot be done (a codec that is not decoded, a mask that cannot be read, a
 //! region too small to leave a pixel after the margin, a render that fails, content whose bounds
-//! are not known) it is a problem.
+//! are not known, a walk that needs more steps or time than its budget) it is a problem.
 //!
 //! A JPEG changes the pixels near the edge of what was blanked. A block of samples that the edge of
 //! the region cuts (8 x 8 samples, 16 x 16 with subsampled colour) has the ringing of the codec all
@@ -30,18 +34,19 @@
 //! image use (see [`JPEG_TOLERANCE_CAP`]). The blocks are in the grid of the image, so a turned
 //! image is looked at the same way as one that is not.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
-use std::rc::Rc;
 
 use crate::carve;
-use crate::content::{apply, for_each_op, mul, Matrix, Op, IDENTITY};
+use crate::content::apply;
 use crate::layers::Ctx;
 use crate::pdfobj::{Doc, Entry, Obj};
 use crate::tools;
-use crate::{Hit, Layer, Region, Report, Result, Subject, RENDER_DPI, RENDER_MARGIN};
+use crate::walk::{
+    bounds, matrix_of, numbers, overlaps, Budget, Found, Placement, Source, Target, Walker, M,
+};
+use crate::{Hit, Layer, NeedleKind, Region, Report, Result, Subject, RENDER_DPI, RENDER_MARGIN};
 
-type M = Matrix;
 /// The most device pixels one render may have.
 const MAX_RENDER_PIXELS: usize = 80_000_000;
 /// The most samples of one image that the check keeps track of.
@@ -54,800 +59,6 @@ fn invert(m: &M) -> Option<M> {
     }
     let (a, b, c, d) = (m[3] / det, -m[1] / det, -m[2] / det, m[0] / det);
     Some([a, b, c, d, -(m[4] * a + m[5] * c), -(m[4] * b + m[5] * d)])
-}
-
-fn matrix_of(o: &Obj, doc: &Doc) -> M {
-    match doc.resolve(o) {
-        Obj::Array(a) if a.len() == 6 => {
-            let mut m = IDENTITY;
-            for (i, x) in a.iter().enumerate() {
-                m[i] = doc.resolve(x).num().unwrap_or(m[i]);
-            }
-            m
-        }
-        _ => IDENTITY,
-    }
-}
-
-fn numbers(o: &Obj, doc: &Doc) -> Vec<f64> {
-    doc.resolve(o)
-        .array()
-        .map(|a| a.iter().filter_map(|x| doc.resolve(x).num()).collect())
-        .unwrap_or_default()
-}
-
-/// An image that is drawn, with the matrix that maps its unit square to the page.
-struct Placement {
-    ctm: M,
-    /// The image object, or the dictionary text and data of an inline image.
-    image: Source,
-}
-
-enum Source {
-    Object(u32),
-    Inline(Vec<u8>, Vec<u8>),
-}
-
-/// A colour that was set, as far as the check needs to know it: a device colour, or something
-/// else (a pattern, another colour space).
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Colour {
-    Rgb([u8; 3]),
-    Other,
-}
-
-fn to_byte(v: f64) -> u8 {
-    (v.clamp(0.0, 1.0) * 255.0).round() as u8
-}
-
-/// The colour that these operands of `sc`, `scn`, `g`, `rg` or `k` give in a device colour space.
-fn colour_of(n: &[f64]) -> Colour {
-    match n.len() {
-        1 => {
-            let g = to_byte(n[0]);
-            Colour::Rgb([g, g, g])
-        }
-        3 => Colour::Rgb([to_byte(n[0]), to_byte(n[1]), to_byte(n[2])]),
-        4 => {
-            let k = 1.0 - n[3].clamp(0.0, 1.0);
-            Colour::Rgb([
-                to_byte((1.0 - n[0].clamp(0.0, 1.0)) * k),
-                to_byte((1.0 - n[1].clamp(0.0, 1.0)) * k),
-                to_byte((1.0 - n[2].clamp(0.0, 1.0)) * k),
-            ])
-        }
-        _ => Colour::Other,
-    }
-}
-
-/// How far a painted rectangle may be from the region and still be the box that redacted it: the
-/// edge that the render check leaves out, in points.
-const BOX_TOLERANCE: f64 = RENDER_MARGIN as f64 * 72.0 / RENDER_DPI as f64;
-
-/// A path, a shading or the glyphs of a Type 3 font that are painted on the page: where they are,
-/// whatever their colour, clip, transparency or visibility.
-struct Painted {
-    /// The bounds on the page, in points: of the points of the path (and of its control points),
-    /// widened by the line when it is stroked.
-    bbox: [f64; 4],
-    kind: &'static str,
-    /// For the fill of a path that is one rectangle: the rectangle.
-    rect: Option<[f64; 4]>,
-    colour: Colour,
-    place: String,
-}
-
-/// The graphics state that the geometry depends on.
-#[derive(Clone)]
-struct Gs {
-    ctm: M,
-    line_width: f64,
-    miter: f64,
-    fill: Colour,
-    stroke: Colour,
-}
-
-/// The path that is being built.
-#[derive(Default)]
-struct PathState {
-    pts: Vec<(f64, f64)>,
-    rects: usize,
-    other: usize,
-}
-
-/// A Type 3 font, as far as the position of its glyphs needs.
-struct Type3 {
-    /// Some glyph procedure paints a path or a shading.
-    paints: bool,
-    matrix: M,
-    bbox: Option<[f64; 4]>,
-    first: i64,
-    widths: Vec<f64>,
-}
-
-/// Where the text is, for the shown glyphs of a Type 3 font.
-struct TextState {
-    tm: M,
-    tlm: M,
-    size: f64,
-    leading: f64,
-    char_space: f64,
-    word_space: f64,
-    scale: f64,
-    font: Option<Rc<Type3>>,
-    /// How far the text position may be off, in text space units, because the width of the glyphs
-    /// of other fonts is estimated.
-    uncertain: f64,
-}
-
-impl TextState {
-    fn new() -> TextState {
-        TextState {
-            tm: IDENTITY,
-            tlm: IDENTITY,
-            size: 0.0,
-            leading: 0.0,
-            char_space: 0.0,
-            word_space: 0.0,
-            scale: 100.0,
-            font: None,
-            uncertain: 0.0,
-        }
-    }
-
-    fn move_to(&mut self, tx: f64, ty: f64) {
-        self.tlm = mul(&[1.0, 0.0, 0.0, 1.0, tx, ty], &self.tlm);
-        self.tm = self.tlm;
-        self.uncertain = 0.0;
-    }
-}
-
-struct Walker<'a, 'd> {
-    doc: &'a Doc<'d>,
-    out: Vec<Placement>,
-    paints: Vec<Painted>,
-    problems: Vec<String>,
-    /// The bounds of the page, form, pattern or glyph that is being walked, in points: nothing
-    /// that it paints is outside.
-    container: [f64; 4],
-    /// Where in the file the walk is, for the places in messages.
-    trail: Vec<String>,
-    fonts: HashMap<u32, Option<Rc<Type3>>>,
-    /// Annotations that a viewer draws from their own entries (an ink path, a line) because they
-    /// have no appearance stream: their rectangle and subtype.
-    bare: Vec<([f64; 4], String)>,
-}
-
-impl<'a, 'd> Walker<'a, 'd> {
-    fn new(doc: &'a Doc<'d>, container: [f64; 4]) -> Self {
-        Walker {
-            doc,
-            out: Vec::new(),
-            paints: Vec::new(),
-            problems: Vec::new(),
-            container,
-            trail: Vec::new(),
-            fonts: HashMap::new(),
-            bare: Vec::new(),
-        }
-    }
-
-    fn problem(&mut self, msg: String) {
-        if !self.problems.contains(&msg) {
-            self.problems.push(msg);
-        }
-    }
-
-    fn place(&self) -> String {
-        if self.trail.is_empty() {
-            "the page content".to_owned()
-        } else {
-            self.trail.join(", in ")
-        }
-    }
-
-    fn record(&mut self, p: Painted) {
-        if self.paints.len() < 100_000 {
-            self.paints.push(p);
-        }
-    }
-
-    /// A path that is painted. The bounds are those of the points (a curve stays inside the hull
-    /// of its control points), and of the line when it is stroked.
-    fn paint_path(&mut self, path: &PathState, gs: &Gs, fill: bool, stroke: bool) {
-        if path.pts.is_empty() {
-            return;
-        }
-        if path
-            .pts
-            .iter()
-            .any(|(x, y)| !x.is_finite() || !y.is_finite())
-        {
-            self.problem(format!(
-                "a path in {} has coordinates that cannot be read, so where it paints is not known",
-                self.place()
-            ));
-            return;
-        }
-        let mut bbox = bounds(&path.pts);
-        if stroke {
-            // The widest line a viewer draws: a hairline is one device pixel, a join may reach
-            // the miter limit (at most 10 times the half width).
-            let scale = (gs.ctm[0].hypot(gs.ctm[1])).max(gs.ctm[2].hypot(gs.ctm[3]));
-            let half = (gs.line_width.abs() * scale).max(0.5) / 2.0;
-            let joins = path.pts.len() > 2;
-            let reach = half
-                * if joins {
-                    gs.miter.clamp(1.5, 10.0)
-                } else {
-                    1.5
-                };
-            bbox = [
-                bbox[0] - reach,
-                bbox[1] - reach,
-                bbox[2] + reach,
-                bbox[3] + reach,
-            ];
-        }
-        let kind = match (fill, stroke) {
-            (true, true) => "fill and stroke of a path",
-            (true, false) => "fill of a path",
-            _ => "stroke of a path",
-        };
-        let rect = (fill && !stroke && path.rects == 1 && path.other == 0).then_some(bbox);
-        let place = self.place();
-        self.record(Painted {
-            bbox,
-            kind,
-            rect,
-            colour: gs.fill,
-            place,
-        });
-    }
-
-    /// `sh`: a shading paints the whole clip, which this check does not follow, so the bounds are
-    /// those of the shading (`/BBox`) or else of the page, form, pattern or glyph.
-    fn shading(&mut self, name: &[u8], res: &Obj, gs: &Gs) {
-        let name: String = name.iter().map(|b| char::from(*b)).collect();
-        let sh = self.doc.dget(self.doc.dget(res, "Shading"), &name);
-        let mut bbox = self.container;
-        if sh.is_dict() {
-            let b = sh
-                .get("BBox")
-                .map(|b| numbers(b, self.doc))
-                .unwrap_or_default();
-            if b.len() == 4 {
-                let pts = [
-                    apply(&gs.ctm, b[0], b[1]),
-                    apply(&gs.ctm, b[2], b[1]),
-                    apply(&gs.ctm, b[0], b[3]),
-                    apply(&gs.ctm, b[2], b[3]),
-                ];
-                bbox = bounds(&pts);
-            }
-        } else {
-            self.problem(format!(
-                "the shading /{name} in {} cannot be found, so where it paints is not known",
-                self.place()
-            ));
-            return;
-        }
-        let place = self.place();
-        self.record(Painted {
-            bbox,
-            kind: "shading",
-            rect: None,
-            colour: Colour::Other,
-            place,
-        });
-    }
-
-    fn content(&mut self, data: &[u8], res: &Obj, ctm: M, depth: usize) {
-        if depth > 8 {
-            self.problem("forms are nested more than 8 deep".to_owned());
-            return;
-        }
-        let mut gs = Gs {
-            ctm,
-            line_width: 1.0,
-            miter: 10.0,
-            fill: Colour::Rgb([0, 0, 0]),
-            stroke: Colour::Rgb([0, 0, 0]),
-        };
-        let mut stack: Vec<Gs> = Vec::new();
-        let mut path = PathState::default();
-        let mut ts = TextState::new();
-        for_each_op(data, &mut |op: &Op| {
-            let n = op.nums();
-            let point = |gs: &Gs, x: f64, y: f64| apply(&gs.ctm, x, y);
-            let malformed = |w: &mut Self, what: &str| {
-                w.problem(format!(
-                    "{what} in {} has the wrong operands, so where it paints is not known",
-                    w.place()
-                ));
-            };
-            match op.name {
-                b"q" => stack.push(gs.clone()),
-                b"Q" => {
-                    if let Some(g) = stack.pop() {
-                        gs = g;
-                    }
-                }
-                b"cm" => {
-                    if n.len() == 6 {
-                        gs.ctm = mul(&[n[0], n[1], n[2], n[3], n[4], n[5]], &gs.ctm);
-                    } else {
-                        malformed(self, "a cm operator");
-                    }
-                }
-                b"w" => {
-                    if let Some(v) = n.first() {
-                        gs.line_width = *v;
-                    }
-                }
-                b"M" => {
-                    if let Some(v) = n.first() {
-                        gs.miter = *v;
-                    }
-                }
-                b"g" | b"rg" | b"k" => gs.fill = colour_of(&n),
-                b"G" | b"RG" | b"K" => gs.stroke = colour_of(&n),
-                b"cs" | b"CS" => {
-                    let c = match op.name_arg() {
-                        Some(b"DeviceGray" | b"DeviceRGB" | b"DeviceCMYK") => {
-                            Colour::Rgb([0, 0, 0])
-                        }
-                        _ => Colour::Other,
-                    };
-                    if op.name == b"cs" {
-                        gs.fill = c;
-                    } else {
-                        gs.stroke = c;
-                    }
-                }
-                // A pattern colour: its images are drawn wherever the pattern is painted.
-                b"scn" | b"SCN" | b"sc" | b"SC" => {
-                    let fill = matches!(op.name, b"scn" | b"sc");
-                    let c = if let Some(name) = op.name_arg() {
-                        self.pattern(name, res);
-                        Colour::Other
-                    } else {
-                        colour_of(&n)
-                    };
-                    if fill {
-                        gs.fill = c;
-                    } else {
-                        gs.stroke = c;
-                    }
-                }
-                b"m" | b"l" => {
-                    if n.len() == 2 {
-                        path.pts.push(point(&gs, n[0], n[1]));
-                        path.other += 1;
-                    } else {
-                        malformed(self, "a path operator");
-                    }
-                }
-                b"c" => {
-                    if n.len() == 6 {
-                        for i in 0..3 {
-                            path.pts.push(point(&gs, n[2 * i], n[2 * i + 1]));
-                        }
-                        path.other += 1;
-                    } else {
-                        malformed(self, "a path operator");
-                    }
-                }
-                b"v" | b"y" => {
-                    if n.len() == 4 {
-                        for i in 0..2 {
-                            path.pts.push(point(&gs, n[2 * i], n[2 * i + 1]));
-                        }
-                        path.other += 1;
-                    } else {
-                        malformed(self, "a path operator");
-                    }
-                }
-                b"re" => {
-                    if n.len() == 4 {
-                        let (x, y, w, h) = (n[0], n[1], n[2], n[3]);
-                        for (px, py) in [(x, y), (x + w, y), (x, y + h), (x + w, y + h)] {
-                            path.pts.push(point(&gs, px, py));
-                        }
-                        path.rects += 1;
-                    } else {
-                        malformed(self, "a path operator");
-                    }
-                }
-                b"f" | b"F" | b"f*" => {
-                    self.paint_path(&path, &gs, true, false);
-                    path = PathState::default();
-                }
-                b"S" | b"s" => {
-                    self.paint_path(&path, &gs, false, true);
-                    path = PathState::default();
-                }
-                b"B" | b"B*" | b"b" | b"b*" => {
-                    self.paint_path(&path, &gs, true, true);
-                    path = PathState::default();
-                }
-                b"n" => path = PathState::default(),
-                b"sh" => match op.name_arg() {
-                    Some(name) => self.shading(name, res, &gs),
-                    None => malformed(self, "an sh operator"),
-                },
-                b"BI" => {
-                    if let Some((d, data)) = op.inline {
-                        self.out.push(Placement {
-                            ctm: gs.ctm,
-                            image: Source::Inline(d.to_vec(), data.to_vec()),
-                        });
-                    }
-                }
-                b"Do" => {
-                    let Some(name) = op.name_arg() else { return };
-                    let name: String = name.iter().map(|b| char::from(*b)).collect();
-                    let xo = self.doc.dget(res, "XObject");
-                    let Some(Obj::Ref(n)) = self.doc.resolve(xo).get(&name) else {
-                        return;
-                    };
-                    self.xobject(*n, res, gs.ctm, depth);
-                }
-                // A soft mask is a form that is drawn in the space of the moment it is set.
-                b"gs" => {
-                    if let Some(name) = op.name_arg() {
-                        let name: String = name.iter().map(|b| char::from(*b)).collect();
-                        let state = self.doc.dget(self.doc.dget(res, "ExtGState"), &name);
-                        if let Some(w) = self.doc.dget(state, "LW").num() {
-                            gs.line_width = w;
-                        }
-                        if let Some(m) = self.doc.dget(state, "ML").num() {
-                            gs.miter = m;
-                        }
-                        let mask = self.doc.dget(state, "SMask");
-                        if let Some(Obj::Ref(n)) = mask.get("G") {
-                            self.xobject(*n, res, gs.ctm, depth);
-                        }
-                    }
-                }
-                // Text: only the glyphs of a Type 3 font paint geometry; the letters of the other
-                // fonts are the business of the text layers.
-                b"BT" => {
-                    ts.tm = IDENTITY;
-                    ts.tlm = IDENTITY;
-                    ts.uncertain = 0.0;
-                }
-                b"Tf" => {
-                    if let Some(name) = op.name_arg() {
-                        ts.font = self.type3(name, res);
-                    }
-                    if let Some(s) = n.last() {
-                        ts.size = *s;
-                    }
-                }
-                b"TL" => {
-                    if let Some(v) = n.last() {
-                        ts.leading = *v;
-                    }
-                }
-                b"Tc" => ts.char_space = n.last().copied().unwrap_or(0.0),
-                b"Tw" => ts.word_space = n.last().copied().unwrap_or(0.0),
-                b"Tz" => ts.scale = n.last().copied().unwrap_or(100.0),
-                b"Tm" => {
-                    if n.len() == 6 {
-                        ts.tlm = [n[0], n[1], n[2], n[3], n[4], n[5]];
-                        ts.tm = ts.tlm;
-                        ts.uncertain = 0.0;
-                    }
-                }
-                b"Td" | b"TD" => {
-                    if n.len() == 2 {
-                        if op.name == b"TD" {
-                            ts.leading = -n[1];
-                        }
-                        ts.move_to(n[0], n[1]);
-                    }
-                }
-                b"T*" => ts.move_to(0.0, -ts.leading),
-                b"Tj" | b"TJ" | b"'" | b"\"" => {
-                    if matches!(op.name, b"'" | b"\"") {
-                        if op.name == b"\"" && n.len() >= 2 {
-                            ts.word_space = n[0];
-                            ts.char_space = n[1];
-                        }
-                        ts.move_to(0.0, -ts.leading);
-                    }
-                    if let Some(items) = crate::content::shown(op) {
-                        self.show(&items, &mut ts, &gs);
-                    }
-                }
-                _ => {}
-            }
-        });
-    }
-
-    /// Shown text: the glyphs of a Type 3 font that paints are geometry at the text position. The
-    /// width of the glyphs of other fonts is estimated, and the estimate widens the bounds.
-    fn show(&mut self, items: &[crate::content::ShownItem], ts: &mut TextState, gs: &Gs) {
-        use crate::content::ShownItem;
-        let size = ts.size;
-        let scale = ts.scale / 100.0;
-        let t3 = ts.font.clone();
-        let mut advance = 0.0;
-        for it in items {
-            match it {
-                ShownItem::Str(bytes) => match &t3 {
-                    Some(f) => {
-                        for b in bytes {
-                            let w = usize::try_from(i64::from(*b) - f.first)
-                                .ok()
-                                .and_then(|i| f.widths.get(i))
-                                .copied()
-                                .unwrap_or(0.0);
-                            let space = if *b == 32 { ts.word_space } else { 0.0 };
-                            advance += (w * f.matrix[0] * size + ts.char_space + space) * scale;
-                        }
-                    }
-                    None => {
-                        let est = bytes.len() as f64 * size.abs();
-                        ts.uncertain += est * scale;
-                        advance += est * 0.5 * scale;
-                    }
-                },
-                ShownItem::Kern(k) => advance -= k / 1000.0 * size * scale,
-            }
-        }
-        if let Some(f) = t3.filter(|f| f.paints) {
-            match f.bbox {
-                Some(b) => {
-                    let corners = [(b[0], b[1]), (b[2], b[1]), (b[0], b[3]), (b[2], b[3])]
-                        .map(|(x, y)| apply(&f.matrix, x, y));
-                    let (gx0, gx1) = corners
-                        .iter()
-                        .fold((f64::MAX, f64::MIN), |(l, h), p| (l.min(p.0), h.max(p.0)));
-                    let (gy0, gy1) = corners
-                        .iter()
-                        .fold((f64::MAX, f64::MIN), |(l, h), p| (l.min(p.1), h.max(p.1)));
-                    let (x0, x1) = (
-                        gx0.min(gx1) * size * scale + advance.min(0.0) - ts.uncertain,
-                        gx0.max(gx1) * size * scale + advance.max(0.0) + ts.uncertain,
-                    );
-                    let (y0, y1) = (gy0.min(gy1) * size, gy0.max(gy1) * size);
-                    let m = mul(&ts.tm, &gs.ctm);
-                    let pts = [
-                        apply(&m, x0.min(x1), y0.min(y1)),
-                        apply(&m, x0.max(x1), y0.min(y1)),
-                        apply(&m, x0.min(x1), y0.max(y1)),
-                        apply(&m, x0.max(x1), y0.max(y1)),
-                    ];
-                    let bbox = bounds(&pts);
-                    if bbox.iter().all(|v| v.is_finite()) {
-                        let place = self.place();
-                        self.record(Painted {
-                            bbox,
-                            kind: "glyphs of a Type 3 font",
-                            rect: None,
-                            colour: Colour::Other,
-                            place,
-                        });
-                    } else {
-                        self.problem(format!(
-                            "Type 3 text in {} has a position that cannot be read, so where it paints is not known",
-                            self.place()
-                        ));
-                    }
-                }
-                None => self.problem(format!(
-                    "a Type 3 font in {} that paints has no usable /FontBBox, so where its glyphs paint is not known",
-                    self.place()
-                )),
-            }
-        }
-        ts.tm = mul(&[1.0, 0.0, 0.0, 1.0, advance, 0.0], &ts.tm);
-    }
-
-    /// A tiling pattern that draws an image: where it is painted is not followed (that needs the
-    /// path), so the image is not placed. The render check sees the pixels; the object-level check
-    /// cannot, and says so.
-    fn pattern(&mut self, name: &[u8], res: &Obj) {
-        let name: String = name.iter().map(|b| char::from(*b)).collect();
-        let pats = self.doc.dget(res, "Pattern");
-        let Some(Obj::Ref(n)) = self.doc.resolve(pats).get(&name) else {
-            return;
-        };
-        let Some(e) = self.doc.latest(*n) else { return };
-        if e.stream.is_some() && draws_image(self.doc, e, res, 0) {
-            let msg = format!(
-                "an image is drawn through the tiling pattern /{name}: where the pattern is painted is not followed, so the pixels of that image were checked only in the render"
-            );
-            self.problem(msg);
-        }
-    }
-
-    /// A Type 3 font: whether its glyph procedures paint geometry, and the numbers that place its
-    /// glyphs. A font whose glyphs draw an image is said, like a pattern, because where the glyphs
-    /// are shown is not followed for images.
-    fn type3(&mut self, name: &[u8], res: &Obj) -> Option<Rc<Type3>> {
-        let name: String = name.iter().map(|b| char::from(*b)).collect();
-        let fonts = self.doc.dget(res, "Font");
-        let font = self.doc.dget(fonts, &name);
-        if self.doc.dget(font, "Subtype").name() != Some("Type3") {
-            return None;
-        }
-        let key = match fonts.get(&name) {
-            Some(Obj::Ref(n)) => Some(*n),
-            _ => None,
-        };
-        if let Some(k) = key {
-            if let Some(c) = self.fonts.get(&k) {
-                return c.clone();
-            }
-        }
-        let own = font.get("Resources").map(|r| self.doc.resolve(r).clone());
-        let font_res = own.unwrap_or_else(|| res.clone());
-        let procs: Vec<&Entry> = self
-            .doc
-            .dget(font, "CharProcs")
-            .entries()
-            .iter()
-            .filter_map(|(_, v)| match v {
-                Obj::Ref(n) => self.doc.latest(*n),
-                _ => None,
-            })
-            .filter(|e| e.stream.is_some())
-            .collect();
-        let draws = procs.iter().any(|e| draws_image(self.doc, e, &font_res, 0));
-        let paints = procs
-            .iter()
-            .any(|e| paints_geometry(self.doc, e, &font_res, 0));
-        if draws {
-            let msg = format!(
-                "an image is drawn by the glyphs of the Type 3 font /{name}: where the glyphs are shown is not followed, so the pixels of that image were checked only in the render"
-            );
-            self.problem(msg);
-        }
-        let matrix = {
-            let m = numbers(font.get("FontMatrix").unwrap_or(&Obj::Null), self.doc);
-            if m.len() == 6 {
-                [m[0], m[1], m[2], m[3], m[4], m[5]]
-            } else {
-                [0.001, 0.0, 0.0, 0.001, 0.0, 0.0]
-            }
-        };
-        let bbox = {
-            let b = numbers(font.get("FontBBox").unwrap_or(&Obj::Null), self.doc);
-            (b.len() == 4 && (b[2] - b[0]).abs() > 0.0 && (b[3] - b[1]).abs() > 0.0)
-                .then(|| [b[0], b[1], b[2], b[3]])
-        };
-        let info = Some(Rc::new(Type3 {
-            paints,
-            matrix,
-            bbox,
-            first: self.doc.dget(font, "FirstChar").int().unwrap_or(0),
-            widths: numbers(font.get("Widths").unwrap_or(&Obj::Null), self.doc),
-        }));
-        if let Some(k) = key {
-            self.fonts.insert(k, info.clone());
-        }
-        info
-    }
-
-    fn xobject(&mut self, n: u32, res: &Obj, ctm: M, depth: usize) {
-        let Some(e) = self.doc.latest(n) else { return };
-        match self.doc.dget(&e.value, "Subtype").name() {
-            Some("Image") => self.out.push(Placement {
-                ctm,
-                image: Source::Object(n),
-            }),
-            Some("Form") => {
-                let Some(d) = self.doc.stream_data(e) else {
-                    return;
-                };
-                if let Some(p) = &d.problem {
-                    self.problem(format!("form object {n}: {p}"));
-                }
-                if let Some(stop) = &d.stopped_at {
-                    self.problem(format!(
-                        "form object {n} has the filter {stop}, which is not decoded, so its content was not walked"
-                    ));
-                }
-                let m = e
-                    .value
-                    .get("Matrix")
-                    .map_or(IDENTITY, |m| matrix_of(m, self.doc));
-                let own = e
-                    .value
-                    .get("Resources")
-                    .map(|r| self.doc.resolve(r).clone());
-                let res2 = own.unwrap_or_else(|| res.clone());
-                let full = mul(&m, &ctm);
-                // Nothing that the form paints is outside its box.
-                let saved = self.container;
-                let b = e
-                    .value
-                    .get("BBox")
-                    .map(|b| numbers(b, self.doc))
-                    .unwrap_or_default();
-                if b.len() == 4 {
-                    let pts = [
-                        apply(&full, b[0], b[1]),
-                        apply(&full, b[2], b[1]),
-                        apply(&full, b[0], b[3]),
-                        apply(&full, b[2], b[3]),
-                    ];
-                    self.container = bounds(&pts);
-                }
-                self.trail.push(format!("form object {n}"));
-                self.content(&d.data, &res2, full, depth + 1);
-                self.trail.pop();
-                self.container = saved;
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Whether the content of a form, pattern or glyph procedure draws an image (also through a form
-/// it draws). It uses its own resources, or `fallback` where it has none.
-fn draws_image(doc: &Doc, e: &Entry, fallback: &Obj, depth: usize) -> bool {
-    let Some(d) = doc.stream_data(e) else {
-        return false;
-    };
-    let res = e
-        .value
-        .get("Resources")
-        .map_or_else(|| fallback.clone(), |r| doc.resolve(r).clone());
-    let mut found = false;
-    for_each_op(&d.data, &mut |op: &Op| match op.name {
-        b"BI" => found = true,
-        b"Do" => {
-            let Some(name) = op.name_arg() else { return };
-            let name: String = name.iter().map(|b| char::from(*b)).collect();
-            let xo = doc.dget(&res, "XObject");
-            let Some(Obj::Ref(n)) = doc.resolve(xo).get(&name) else {
-                return;
-            };
-            let Some(x) = doc.latest(*n) else { return };
-            match doc.dget(&x.value, "Subtype").name() {
-                Some("Image") => found = true,
-                Some("Form") if depth < 4 => found |= draws_image(doc, x, &res, depth + 1),
-                _ => {}
-            }
-        }
-        _ => {}
-    });
-    found
-}
-
-/// Whether the content of a glyph procedure paints a path or a shading (also through a form it
-/// draws).
-fn paints_geometry(doc: &Doc, e: &Entry, fallback: &Obj, depth: usize) -> bool {
-    let Some(d) = doc.stream_data(e) else {
-        // Content that cannot be read may paint anything.
-        return true;
-    };
-    let res = e
-        .value
-        .get("Resources")
-        .map_or_else(|| fallback.clone(), |r| doc.resolve(r).clone());
-    let mut found = false;
-    for_each_op(&d.data, &mut |op: &Op| match op.name {
-        b"f" | b"F" | b"f*" | b"S" | b"s" | b"B" | b"B*" | b"b" | b"b*" | b"sh" => found = true,
-        b"Do" => {
-            let Some(name) = op.name_arg() else { return };
-            let name: String = name.iter().map(|b| char::from(*b)).collect();
-            let xo = doc.dget(&res, "XObject");
-            let Some(Obj::Ref(n)) = doc.resolve(xo).get(&name) else {
-                return;
-            };
-            let Some(x) = doc.latest(*n) else { return };
-            if doc.dget(&x.value, "Subtype").name() == Some("Form") {
-                found |= depth >= 4 || paints_geometry(doc, x, &res, depth + 1);
-            }
-        }
-        _ => {}
-    });
-    found
 }
 
 /// The decoded content of a page (its streams, one after the other), or why it cannot be read.
@@ -1243,16 +454,6 @@ struct Zone {
     h: usize,
     checked: Checked,
     tolerance: u8,
-}
-
-fn bounds(points: &[(f64, f64)]) -> [f64; 4] {
-    let (x0, x1) = points
-        .iter()
-        .fold((f64::MAX, f64::MIN), |(l, h), p| (l.min(p.0), h.max(p.0)));
-    let (y0, y1) = points
-        .iter()
-        .fold((f64::MAX, f64::MIN), |(l, h), p| (l.min(p.1), h.max(p.1)));
-    [x0, y0, x1, y1]
 }
 
 /// The result of looking at one set of samples under a region.
@@ -1960,51 +1161,26 @@ fn check_render(
     }
 }
 
-/// Whether two rectangles overlap (they do not when they only touch).
-fn overlaps(a: &[f64; 4], b: &[f64; 4]) -> bool {
-    a[2] > b[0] && a[0] < b[2] && a[3] > b[1] && a[1] < b[3]
-}
-
-/// Geometry that is painted inside a redaction region is in the file whatever its colour, clip,
-/// transparency, blend mode or visibility: a reader that shows it later (a layer turned on, the
-/// fill taken away) shows what was to be redacted. The only geometry allowed there is the box that
-/// redacts: the fill of one rectangle that is the region, within [`BOX_TOLERANCE`], in the fill
-/// colour of the region (or, when the region names none, in any one device colour).
-fn check_paints(paints: &[Painted], region: &Region, ri: usize, rep: &mut Report) {
-    let [rx0, ry0, rx1, ry1] = region.rect;
-    let rect = [rx0.min(rx1), ry0.min(ry1), rx0.max(rx1), ry0.max(ry1)];
-    let is_the_box = |p: &Painted| -> bool {
-        let Some(r) = p.rect else { return false };
-        let same_place = r
-            .iter()
-            .zip(&rect)
-            .all(|(a, b)| (a - b).abs() <= BOX_TOLERANCE);
-        let colour = match (p.colour, region.fill) {
-            (Colour::Rgb(c), Some(f)) => c.iter().zip(&f).all(|(a, b)| a.abs_diff(*b) <= 2),
-            (Colour::Rgb(_), None) => true,
-            (Colour::Other, _) => false,
-        };
-        same_place && colour
+/// Geometry that meets a redaction region is in the file whatever its colour, clip, transparency,
+/// blend mode or visibility: a reader that shows it later (a layer turned on, the fill taken away)
+/// shows what was to be redacted. The walk has already left out the geometry that carries nothing
+/// (see [`crate::walk`]); what is left is reported here.
+fn report_found(found: &Found, region: &Region, ri: usize, rep: &mut Report) {
+    let Some((place, bbox)) = &found.first else {
+        return;
     };
-    let found: Vec<&Painted> = paints
-        .iter()
-        .filter(|p| overlaps(&p.bbox, &rect) && !is_the_box(p))
-        .collect();
-    let Some(first) = found.first() else { return };
-    let mut kinds: Vec<&str> = found.iter().map(|p| p.kind).collect();
-    kinds.sort_unstable();
-    kinds.dedup();
+    let kinds: Vec<&str> = found.kinds.iter().copied().collect();
     rep.hits.push(Hit {
         layer: Layer::Images,
         subject: Subject::Rule(format!(
             "painted geometry inside a redaction region: {} object(s) ({}) are painted there, and stay in the file whatever their colour, clip, transparency or visibility; the first is in {} and reaches from ({:.1}, {:.1}) to ({:.1}, {:.1}) points",
-            found.len(),
+            found.count,
             kinds.join(", "),
-            first.place,
-            first.bbox[0],
-            first.bbox[1],
-            first.bbox[2],
-            first.bbox[3]
+            place,
+            bbox[0],
+            bbox[1],
+            bbox[2],
+            bbox[3]
         )),
         offset: None,
         location: format!("page {}, region {}", region.page, ri + 1),
@@ -2022,8 +1198,16 @@ pub fn check(ctx: &Ctx, bytes: &[u8], rep: &mut Report) -> Result<()> {
         return Ok(());
     }
     let mut cache: Cache = HashMap::new();
+    let mut budget = Budget::new(ctx.opts.walk_steps, ctx.opts.walk_budget);
+    // The regions of each page, in the order of the spec: a page is walked once.
+    let mut by_page: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for (ri, region) in ctx.spec.regions.iter().enumerate() {
-        let Some((page, res)) = region.page.checked_sub(1).and_then(|i| pages.get(i)) else {
+        if region
+            .page
+            .checked_sub(1)
+            .and_then(|i| pages.get(i))
+            .is_none()
+        {
             rep.problems.push(format!(
                 "images: region {} names page {}, the file has {} pages",
                 ri + 1,
@@ -2031,7 +1215,14 @@ pub fn check(ctx: &Ctx, bytes: &[u8], rep: &mut Report) -> Result<()> {
                 pages.len()
             ));
             continue;
-        };
+        }
+        by_page.entry(region.page).or_default().push(ri);
+    }
+    // The glyphs of ordinary fonts are the business of the text layers when the spec has a text to
+    // look for; when it has none, a glyph under a region is a leak.
+    let glyphs_leak = !ctx.spec.needles.iter().any(|n| n.kind == NeedleKind::Text);
+    for (page_no, ris) in by_page {
+        let (page, res) = &pages[page_no - 1];
         // Nothing is painted outside the media box.
         let media = numbers(inherited(&doc, page, "MediaBox"), &doc);
         let container = if media.len() == 4 {
@@ -2044,46 +1235,80 @@ pub fn check(ctx: &Ctx, bytes: &[u8], rep: &mut Report) -> Result<()> {
         } else {
             [f64::MIN, f64::MIN, f64::MAX, f64::MAX]
         };
-        let mut w = Walker::new(&doc, container);
+        let targets: Vec<Target> = ris
+            .iter()
+            .map(|ri| {
+                let r = &ctx.spec.regions[*ri];
+                Target {
+                    rect: normalised(r.rect),
+                    fill: r.fill,
+                }
+            })
+            .collect();
+        let mut w = Walker::new(&doc, container, targets, glyphs_leak, budget);
         match contents(&doc, page) {
-            Ok(data) => w.content(&data, &doc.resolve(res).clone(), IDENTITY, 0),
+            Ok(data) => w.page(&data, &doc.resolve(res).clone()),
             Err(why) => w.problem(why),
         }
         annotations(&mut w, page, container);
+        budget = w.budget;
         for p in w.problems.drain(..) {
-            rep.problems
-                .push(format!("images: page {}: {p}", region.page));
+            rep.problems.push(format!("images: page {page_no}: {p}"));
         }
-        let zones: Vec<Zone> = w
-            .out
-            .iter()
-            .flat_map(|pl| check_placement(&doc, region, ri, pl, rep))
-            .collect();
-        check_paints(&w.paints, region, ri, rep);
-        for (rect, sub) in &w.bare {
-            let [rx0, ry0, rx1, ry1] = region.rect;
-            let region_rect = [rx0.min(rx1), ry0.min(ry1), rx0.max(rx1), ry0.max(ry1)];
-            if overlaps(rect, &region_rect) {
-                rep.problem(format!(
-                    "images: page {}, region {}: a {sub} annotation with no appearance stream lies over the region; a viewer draws it from its own entries, which this check does not place, so what it draws was not checked",
-                    region.page,
-                    ri + 1
-                ));
+        for (k, ri) in ris.iter().enumerate() {
+            let region = &ctx.spec.regions[*ri];
+            let rect = normalised(region.rect);
+            let zones: Vec<Zone> = w
+                .out
+                .iter()
+                .flat_map(|pl| check_placement(&doc, region, *ri, pl, rep))
+                .collect();
+            report_found(&w.found[k], region, *ri, rep);
+            for (r, sub) in &w.bare_text {
+                if overlaps(r, &rect) {
+                    rep.hits.push(Hit {
+                        layer: Layer::Images,
+                        subject: Subject::Rule(format!(
+                            "painted geometry inside a redaction region: the text of a {sub} annotation with no appearance stream lies over the region; a viewer draws that text from the entries of the annotation (/Contents, /RC, /V)"
+                        )),
+                        offset: None,
+                        location: format!("page {}, region {}", region.page, ri + 1),
+                        form: None,
+                    });
+                }
             }
+            for (r, sub) in &w.bare {
+                if overlaps(r, &rect) {
+                    rep.problem(format!(
+                        "images: page {}, region {}: a {sub} annotation with no appearance stream lies over the region; a viewer draws it from its own entries, which this check does not place, so what it draws was not checked",
+                        region.page,
+                        ri + 1
+                    ));
+                }
+            }
+            check_render(
+                ctx,
+                &doc,
+                region.page,
+                page,
+                region,
+                *ri,
+                &zones,
+                &mut cache,
+                rep,
+            );
         }
-        check_render(
-            ctx,
-            &doc,
-            region.page,
-            page,
-            region,
-            ri,
-            &zones,
-            &mut cache,
-            rep,
-        );
     }
     Ok(())
+}
+
+fn normalised(r: [f64; 4]) -> [f64; 4] {
+    [
+        r[0].min(r[2]),
+        r[1].min(r[3]),
+        r[0].max(r[2]),
+        r[1].max(r[3]),
+    ]
 }
 
 /// The streams of an appearance, in every state: `/N`, `/R` and `/D` hold a stream or a dictionary
@@ -2113,8 +1338,9 @@ fn appearance_streams(doc: &Doc, v: &Obj, out: &mut Vec<u32>, depth: usize) {
 }
 
 /// The annotations that draw something of their own, and that a viewer draws from their entries
-/// (`/InkList`, `/L`, `/Vertices`, `/QuadPoints`) when they have no appearance stream.
-const DRAWN_BY_VIEWER: [&str; 12] = [
+/// (`/InkList`, `/L`, `/Vertices`, `/QuadPoints`, `/Contents`, the value of a field) when they
+/// have no appearance stream.
+const DRAWN_BY_VIEWER: [&str; 17] = [
     "Ink",
     "Line",
     "Square",
@@ -2127,13 +1353,40 @@ const DRAWN_BY_VIEWER: [&str; 12] = [
     "Squiggly",
     "StrikeOut",
     "Caret",
+    "FreeText",
+    "Widget",
+    "Text",
+    "FileAttachment",
+    "Popup",
 ];
+
+/// The entries that a viewer draws text from.
+const TEXT_KEYS: [&str; 3] = ["Contents", "RC", "V"];
+
+/// Whether an annotation has text in the entries that a viewer draws it from. A pop-up shows the
+/// text of the annotation that it belongs to.
+fn has_entry_text(doc: &Doc, ad: &Obj, depth: usize) -> bool {
+    let text = |o: &Obj| match doc.resolve(o) {
+        Obj::Str(s) => s.iter().any(|b| !crate::strings::is_space(*b)),
+        // A stream (rich text) or anything else that is not empty.
+        Obj::Null | Obj::Name(_) | Obj::Bool(_) | Obj::Int(_) | Obj::Real(_) => false,
+        Obj::Array(a) => !a.is_empty(),
+        Obj::Dict(_) | Obj::Ref(_) => true,
+    };
+    if TEXT_KEYS.iter().any(|k| ad.get(k).is_some_and(text)) {
+        return true;
+    }
+    depth < 2
+        && ad
+            .get("Parent")
+            .is_some_and(|p| has_entry_text(doc, doc.resolve(p), depth + 1))
+}
 
 /// Walks every form that a viewer can draw for an annotation: all states of the normal, rollover
 /// and down appearances, and the icons of a widget (`/MK /I`, `/RI`, `/IX`), each fitted to the
 /// rectangle of the annotation as a viewer does.
 fn annotations(w: &mut Walker, page: &Entry, container: [f64; 4]) {
-    let doc = w.doc;
+    let doc = w.doc();
     let Obj::Array(annots) = doc.dget(&page.value, "Annots") else {
         return;
     };
@@ -2158,13 +1411,19 @@ fn annotations(w: &mut Walker, page: &Entry, container: [f64; 4]) {
         if forms.is_empty() {
             // No appearance stream: a viewer draws these from their own entries.
             let sub = doc.dget(ad, "Subtype").name().unwrap_or("");
-            if DRAWN_BY_VIEWER.contains(&sub) && rect.len() == 4 {
-                let r = [
-                    rect[0].min(rect[2]),
-                    rect[1].min(rect[3]),
-                    rect[0].max(rect[2]),
-                    rect[1].max(rect[3]),
-                ];
+            if !DRAWN_BY_VIEWER.contains(&sub) {
+                continue;
+            }
+            if rect.len() != 4 {
+                w.problem(format!(
+                    "a {sub} annotation with no appearance stream has no /Rect, so where a viewer draws it is not known"
+                ));
+                continue;
+            }
+            let r = normalised([rect[0], rect[1], rect[2], rect[3]]);
+            if has_entry_text(doc, ad, 0) {
+                w.bare_text.push((r, sub.to_owned()));
+            } else {
                 w.bare.push((r, sub.to_owned()));
             }
             continue;
@@ -2189,7 +1448,7 @@ fn annotations(w: &mut Walker, page: &Entry, container: [f64; 4]) {
             let m = e
                 .value
                 .get("Matrix")
-                .map_or(IDENTITY, |m| matrix_of(m, doc));
+                .map_or(crate::content::IDENTITY, |m| matrix_of(m, doc));
             let pts = [
                 apply(&m, bbox[0], bbox[1]),
                 apply(&m, bbox[2], bbox[1]),
@@ -2215,18 +1474,8 @@ fn annotations(w: &mut Walker, page: &Entry, container: [f64; 4]) {
                 .get("Resources")
                 .map(|r| doc.resolve(r).clone())
                 .unwrap_or(Obj::Null);
-            w.container = container;
-            w.trail.push("an annotation appearance".to_owned());
-            w.xobject_form(n, &res, a_m);
-            w.trail.pop();
+            w.appearance(n, &res, a_m, container);
         }
-    }
-}
-
-impl Walker<'_, '_> {
-    /// A form that is drawn with the matrix `ctm` (an appearance stream).
-    fn xobject_form(&mut self, n: u32, res: &Obj, ctm: M) {
-        self.xobject(n, res, ctm, 0);
     }
 }
 
@@ -2273,6 +1522,7 @@ fn expand_inline(d: &Obj) -> Obj {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::content::{mul, IDENTITY};
 
     #[test]
     fn a_matrix_and_its_inverse_cancel() {

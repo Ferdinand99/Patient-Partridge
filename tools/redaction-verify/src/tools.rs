@@ -2,8 +2,9 @@
 //! uses a PDF library of the app, so a bug in the code under test cannot hide in the check.
 //!
 //! Every call has a time limit, and all the calls for one file share a budget. A tool that runs
-//! over is killed with everything it started, and the check ends with an error (exit status 2): a
-//! file that was not fully checked is never reported clean.
+//! over is killed with everything it started (its process group on Unix, its process tree on
+//! Windows; a process that leaves the group on its own is out of reach), and the check ends with an
+//! error (exit status 2): a file that was not fully checked is never reported clean.
 
 use std::cell::RefCell;
 use std::ffi::OsStr;
@@ -97,16 +98,32 @@ fn program(var: &str, name: &str) -> String {
     std::env::var(var).unwrap_or_else(|_| name.to_owned())
 }
 
-/// Stops the child and everything it started (the child leads a process group of its own).
-fn kill(child: &mut std::process::Child) {
+/// Stops everything that a tool started: the processes of its group on Unix (the tool leads a
+/// group of its own), its tree on Windows.
+fn kill_tree(pid: u32) {
     #[cfg(unix)]
     {
         let _ = Command::new("kill")
-            .args(["-KILL", "--", &format!("-{}", child.id())])
+            .args(["-KILL", "--", &format!("-{pid}")])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
     }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = pid;
+}
+
+/// Stops the child and everything it started.
+fn kill(child: &mut std::process::Child) {
+    kill_tree(child.id());
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -229,6 +246,9 @@ fn run(var: &str, name: &str, args: &[&OsStr]) -> Result<Output, Error> {
             Err(_) => return Err(timed_out(&mut child)),
         }
     }
+    // Whatever the tool left running in its group (a child that holds no pipe) is stopped too.
+    #[cfg(unix)]
+    kill_tree(child.id());
     Ok(Output {
         status: status.code().unwrap_or(-1),
         stdout,

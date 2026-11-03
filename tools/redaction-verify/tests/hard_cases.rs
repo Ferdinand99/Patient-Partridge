@@ -305,6 +305,36 @@ BT /F2 12 Tf 72 600 Td {} Tj ET
         spec.clone(),
         Leak(&["decode"]),
     ));
+    // The surname is shown first and a TJ offset takes the text position back over it, so that the
+    // first name is drawn before it on the page; and the same words in text that is turned.
+    let kerned_back = b"BT /F1 12 Tf 110 600 Td [(Nordmann) 7834 (Ola)] TJ ET
+";
+    v.push(case(
+        "a run that kerns back over the word before it, hidden",
+        Fx::new(BENIGN).hidden(kerned_back).build(),
+        spec.clone(),
+        Leak(&["decode"]),
+    ));
+    v.push(case(
+        "a run that kerns back over the word before it, drawn",
+        Fx::new(&benign_plus(kerned_back)).build(),
+        spec.clone(),
+        Leak(&["decode", "text"]),
+    ));
+    let turned = b"BT /F1 12 Tf 0 1 -1 0 300 422 Tm (Nordmann) Tj 0 1 -1 0 300 400 Tm (Ola) Tj ET
+";
+    v.push(case(
+        "words turned 90 degrees, drawn out of reading order, hidden",
+        Fx::new(BENIGN).hidden(turned).build(),
+        spec.clone(),
+        Leak(&["decode"]),
+    ));
+    v.push(case(
+        "words turned 90 degrees, drawn out of reading order, drawn",
+        Fx::new(&benign_plus(turned)).build(),
+        spec.clone(),
+        Leak(&["decode", "text"]),
+    ));
     // Another first name (made of letters of the font): not the phrase in either order.
     v.push(case(
         "words that are not the phrase in either order",

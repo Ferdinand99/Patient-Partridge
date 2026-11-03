@@ -26,13 +26,17 @@ pub enum Piece {
     },
     /// A word space, a new line or the end of a text object.
     Sep,
-    /// The text position moved (a new text object, `Td`, `TD`, `T*`, `Tm`, `'`, `"`): where the
-    /// next string starts on the page, after the matrix of the page, and the size of the text.
-    /// Hundredths of a point.
+    /// The text position moved (a new text object, `Td`, `TD`, `T*`, `Tm`, `'`, `"`, or a `TJ`
+    /// offset that kerns back by more than the run before it is wide): where the next string
+    /// starts on the page, after the matrix of the page, and the size of the text. Hundredths of a
+    /// point. `dx` and `dy` are the direction in which the text runs on the page (a unit vector, in
+    /// thousandths): `(1000, 0)` for text that is not turned.
     Pos {
         x: i64,
         y: i64,
         size: i64,
+        dx: i64,
+        dy: i64,
     },
 }
 
@@ -43,11 +47,26 @@ struct TextState {
     font: String,
     size: f64,
     leading: f64,
+    /// The horizontal scale (`Tz`), as a factor.
+    scale: f64,
 }
+
+/// What a glyph is at least wide, and what it is on average, in em: the fonts are not known where
+/// the text is cut into pieces, so where a run ends is an estimate.
+const GLYPH_MIN: f64 = 0.25;
+const GLYPH_MEAN: f64 = 0.5;
 
 fn hundredths(v: f64) -> i64 {
     if v.is_finite() {
         (v * 100.0).round().clamp(-1e15, 1e15) as i64
+    } else {
+        0
+    }
+}
+
+fn thousandths(v: f64) -> i64 {
+    if v.is_finite() {
+        (v * 1000.0).round().clamp(-1e6, 1e6) as i64
     } else {
         0
     }
@@ -62,16 +81,28 @@ pub fn pieces(data: &[u8]) -> Vec<Piece> {
         font: String::new(),
         size: 0.0,
         leading: 0.0,
+        scale: 1.0,
     };
     let mut stack: Vec<TextState> = Vec::new();
     let (mut tm, mut tlm) = (IDENTITY, IDENTITY);
-    let at = |tm: &Matrix, gs: &TextState| -> Piece {
-        let m = mul(tm, &gs.ctm);
+    // How far the position has moved along the line since the matrix was set (estimated, in text
+    // space), and how wide the run since the last position is at least.
+    let (mut adv, mut run) = (0.0f64, 0.0f64);
+    let at = |tm: &Matrix, adv: f64, gs: &TextState| -> Piece {
+        let m = mul(&mul(&[1.0, 0.0, 0.0, 1.0, adv, 0.0], tm), &gs.ctm);
         let scale = (m[0] * m[3] - m[1] * m[2]).abs().sqrt();
+        let len = m[0].hypot(m[1]);
+        let (dx, dy) = if len > 1e-9 {
+            (m[0] / len, m[1] / len)
+        } else {
+            (1.0, 0.0)
+        };
         Piece::Pos {
             x: hundredths(m[4]),
             y: hundredths(m[5]),
             size: hundredths(gs.size.abs() * scale),
+            dx: thousandths(dx),
+            dy: thousandths(dy),
         }
     };
     for_each_op(data, &mut |op: &Op| match op.name {
@@ -100,11 +131,17 @@ pub fn pieces(data: &[u8]) -> Vec<Piece> {
                 gs.leading = *l;
             }
         }
+        b"Tz" => {
+            if let Some(z) = op.nums().last() {
+                gs.scale = *z / 100.0;
+            }
+        }
         b"BT" => {
             tm = IDENTITY;
             tlm = IDENTITY;
+            (adv, run) = (0.0, 0.0);
             out.push(Piece::Sep);
-            out.push(at(&tm, &gs));
+            out.push(at(&tm, adv, &gs));
         }
         b"ET" => out.push(Piece::Sep),
         b"Tm" => {
@@ -113,8 +150,9 @@ pub fn pieces(data: &[u8]) -> Vec<Piece> {
                 tlm = [n[0], n[1], n[2], n[3], n[4], n[5]];
                 tm = tlm;
             }
+            (adv, run) = (0.0, 0.0);
             out.push(Piece::Sep);
-            out.push(at(&tm, &gs));
+            out.push(at(&tm, adv, &gs));
         }
         b"Td" | b"TD" | b"T*" => {
             let n = op.nums();
@@ -128,8 +166,9 @@ pub fn pieces(data: &[u8]) -> Vec<Piece> {
             }
             tlm = mul(&[1.0, 0.0, 0.0, 1.0, tx, ty], &tlm);
             tm = tlm;
+            (adv, run) = (0.0, 0.0);
             out.push(Piece::Sep);
-            out.push(at(&tm, &gs));
+            out.push(at(&tm, adv, &gs));
         }
         _ => {
             if let Some(items) = shown(op) {
@@ -137,18 +176,39 @@ pub fn pieces(data: &[u8]) -> Vec<Piece> {
                 if matches!(op.name, b"'" | b"\"") {
                     tlm = mul(&[1.0, 0.0, 0.0, 1.0, 0.0, -gs.leading], &tlm);
                     tm = tlm;
+                    (adv, run) = (0.0, 0.0);
                     out.push(Piece::Sep);
-                    out.push(at(&tm, &gs));
+                    out.push(at(&tm, adv, &gs));
                 }
                 out.push(Piece::Sep);
+                let unit = gs.size.abs() * gs.scale;
                 for it in items {
                     match it {
-                        ShownItem::Str(bytes) => out.push(Piece::Show {
-                            font: gs.font.clone(),
-                            bytes,
-                        }),
-                        ShownItem::Kern(k) if k <= WORD_SPACE => out.push(Piece::Sep),
-                        ShownItem::Kern(_) => {}
+                        ShownItem::Str(bytes) => {
+                            adv += bytes.len() as f64 * GLYPH_MEAN * gs.size * gs.scale;
+                            run += bytes.len() as f64 * GLYPH_MIN * unit;
+                            out.push(Piece::Show {
+                                font: gs.font.clone(),
+                                bytes,
+                            });
+                        }
+                        ShownItem::Kern(k) => {
+                            if k <= WORD_SPACE {
+                                out.push(Piece::Sep);
+                            }
+                            // A positive offset moves the text position back. Back by more than
+                            // the run so far is wide: what follows is drawn before it, to the
+                            // left, and is a run of its own.
+                            let back = k / 1000.0 * gs.size * gs.scale;
+                            adv -= back;
+                            if back * gs.size.signum() > run {
+                                out.push(Piece::Sep);
+                                out.push(at(&tm, adv, &gs));
+                                run = 0.0;
+                            } else {
+                                run = (run - back * gs.size.signum()).max(0.0);
+                            }
+                        }
                     }
                 }
             }
@@ -162,6 +222,8 @@ struct Group {
     x: i64,
     y: i64,
     size: i64,
+    /// The direction of the text on the page (thousandths of a unit vector).
+    dir: (i64, i64),
     text: Vec<char>,
 }
 
@@ -172,34 +234,60 @@ fn push_space(text: &mut Vec<char>) {
 }
 
 /// The order of the runs of text as a reader sees them: by line from the top (runs whose starts are
-/// less than a third of a line apart are on one line), and by position along the line.
+/// less than a third of a line apart are on one line), and by position along the line. Runs that
+/// are turned the same way have lines of their own, along their own direction, so that text that is
+/// turned is read along its own lines. The groups of one direction come in the order of the first
+/// run of each.
 fn reading_order(groups: &[Group]) -> Vec<usize> {
-    let mut idx: Vec<usize> = (0..groups.len()).collect();
-    idx.sort_by(|a, b| {
-        groups[*b]
-            .y
-            .cmp(&groups[*a].y)
-            .then(groups[*a].x.cmp(&groups[*b].x))
-    });
-    let mut lines: Vec<Vec<usize>> = Vec::new();
-    for i in idx {
-        match lines.last_mut() {
-            Some(line) => {
-                let first = &groups[line[0]];
-                let tolerance = (first.size.max(groups[i].size) / 3).max(100);
-                if (first.y - groups[i].y).abs() <= tolerance {
-                    line.push(i);
-                } else {
-                    lines.push(vec![i]);
-                }
-            }
-            None => lines.push(vec![i]),
+    let mut buckets: Vec<((i64, i64), Vec<usize>)> = Vec::new();
+    for (i, g) in groups.iter().enumerate() {
+        // Directions within a tenth of a unit are the same.
+        let key = (
+            (g.dir.0 + 50).div_euclid(100),
+            (g.dir.1 + 50).div_euclid(100),
+        );
+        match buckets.iter_mut().find(|b| b.0 == key) {
+            Some(b) => b.1.push(i),
+            None => buckets.push((key, vec![i])),
         }
     }
-    for line in &mut lines {
-        line.sort_by_key(|i| (groups[*i].x, *i));
+    let mut order = Vec::with_capacity(groups.len());
+    for (_, members) in &buckets {
+        let (dx, dy) = match groups[members[0]].dir {
+            (0, 0) => (1000, 0),
+            d => d,
+        };
+        // Along the line, and across it (from the top for text that is not turned), in the same
+        // units as the positions times a thousand.
+        let along = |g: &Group| g.x * dx + g.y * dy;
+        let across = |g: &Group| g.x * dy - g.y * dx;
+        let mut idx = members.clone();
+        idx.sort_by(|a, b| {
+            across(&groups[*a])
+                .cmp(&across(&groups[*b]))
+                .then(along(&groups[*a]).cmp(&along(&groups[*b])))
+        });
+        let mut lines: Vec<Vec<usize>> = Vec::new();
+        for i in idx {
+            match lines.last_mut() {
+                Some(line) => {
+                    let first = &groups[line[0]];
+                    let tolerance = (first.size.max(groups[i].size) / 3).max(100) * 1000;
+                    if (across(first) - across(&groups[i])).abs() <= tolerance {
+                        line.push(i);
+                    } else {
+                        lines.push(vec![i]);
+                    }
+                }
+                None => lines.push(vec![i]),
+            }
+        }
+        for line in &mut lines {
+            line.sort_by_key(|i| (along(&groups[*i]), *i));
+        }
+        order.extend(lines.concat());
     }
-    lines.concat()
+    order
 }
 
 /// The runs of text in reading order, joined with a space; `None` when that is the order of the
@@ -218,6 +306,7 @@ fn ordered_text(groups: &[Group]) -> Option<Vec<char>> {
             x: g.x,
             y: g.y,
             size: g.size,
+            dir: g.dir,
             text: Vec::new(),
         })
         .collect();
@@ -540,6 +629,7 @@ pub fn decode(doc: &Doc, res: &Resolver, entry: Option<&Entry>, pieces: &[Piece]
             x: 0,
             y: 0,
             size: 0,
+            dir: (1000, 0),
             text: Vec::new(),
         }];
         let mut gaps = 0usize;
@@ -551,10 +641,11 @@ pub fn decode(doc: &Doc, res: &Resolver, entry: Option<&Entry>, pieces: &[Piece]
                         push_space(&mut g.text);
                     }
                 }
-                Piece::Pos { x, y, size } => groups.push(Group {
+                Piece::Pos { x, y, size, dx, dy } => groups.push(Group {
                     x: *x,
                     y: *y,
                     size: *size,
+                    dir: (*dx, *dy),
                     text: Vec::new(),
                 }),
                 Piece::Show { font, bytes } => {
@@ -631,7 +722,7 @@ mod tests {
         let at: Vec<(i64, i64, i64)> = p
             .iter()
             .filter_map(|x| match x {
-                Piece::Pos { x, y, size } => Some((*x, *y, *size)),
+                Piece::Pos { x, y, size, .. } => Some((*x, *y, *size)),
                 _ => None,
             })
             .collect();
@@ -648,6 +739,7 @@ mod tests {
                     x: *x * 100,
                     y: *y * 100,
                     size: 1200,
+                    dir: (1000, 0),
                     text: t.chars().collect(),
                 })
                 .collect()
@@ -672,6 +764,79 @@ mod tests {
         assert_eq!(
             text(&groups(&[(72, 600, "Ola"), (110, 600, "Nordmann")])),
             None
+        );
+    }
+
+    fn starts(data: &[u8]) -> Vec<(i64, i64)> {
+        pieces(data)
+            .iter()
+            .filter_map(|p| match p {
+                Piece::Pos { x, y, .. } => Some((*x, *y)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_tj_offset_that_kerns_back_past_the_run_starts_a_new_one() {
+        // Nordmann is drawn at 110, and the offset takes the position back by 94 points, which is
+        // more than the run is wide: Ola starts to the left of where Nordmann starts.
+        let at = starts(b"BT /F1 12 Tf 110 600 Td [(Nordmann) 7834 (Ola)] TJ ET");
+        assert_eq!(at.len(), 3);
+        assert!(at[2].0 < at[1].0, "{at:?}");
+        // A small offset (a kern of a letter pair) starts nothing.
+        let at = starts(b"BT /F1 12 Tf 110 600 Td [(Nord) 20 (mann)] TJ ET");
+        assert_eq!(at.len(), 2);
+        // A move to the right starts nothing either.
+        let at = starts(b"BT /F1 12 Tf 110 600 Td [(Nord) -20000 (mann)] TJ ET");
+        assert_eq!(at.len(), 2);
+    }
+
+    #[test]
+    fn turned_text_is_sorted_along_its_own_lines() {
+        let turned = |x: i64, y: i64, t: &str| Group {
+            x: x * 100,
+            y: y * 100,
+            size: 1200,
+            // Text that runs up the page.
+            dir: (0, 1000),
+            text: t.chars().collect(),
+        };
+        let groups = [turned(300, 422, "Nordmann"), turned(300, 400, "Ola")];
+        assert_eq!(
+            ordered_text(&groups).map(|t| t.into_iter().collect::<String>()),
+            Some("Ola Nordmann".to_owned())
+        );
+        // The same runs as text that is not turned would be read from the top, which is the
+        // order of the stream here.
+        let flat = |x: i64, y: i64, t: &str| Group {
+            dir: (1000, 0),
+            ..turned(x, y, t)
+        };
+        assert_eq!(
+            ordered_text(&[flat(300, 422, "Nordmann"), flat(300, 400, "Ola")]),
+            None
+        );
+    }
+
+    #[test]
+    fn text_that_is_turned_is_sorted_beside_text_that_is_not() {
+        let run = |x: i64, y: i64, dir: (i64, i64), t: &str| Group {
+            x: x * 100,
+            y: y * 100,
+            size: 1200,
+            dir,
+            text: t.chars().collect(),
+        };
+        // A line of ordinary text first, then two turned runs that were drawn out of order.
+        let groups = [
+            run(72, 720, (1000, 0), "Quarterly report"),
+            run(300, 422, (0, 1000), "Nordmann"),
+            run(300, 400, (0, 1000), "Ola"),
+        ];
+        assert_eq!(
+            ordered_text(&groups).map(|t| t.into_iter().collect::<String>()),
+            Some("Quarterly report Ola Nordmann".to_owned())
         );
     }
 }

@@ -208,3 +208,25 @@ fn tools_that_finish_in_time_are_not_affected() {
     let r = cli(&clean(), Some(SPEC), &["--tool-timeout", "60"], &[]);
     assert_eq!(r.code, 0, "{}", r.out);
 }
+
+#[test]
+fn a_process_that_a_tool_leaves_behind_in_its_group_is_stopped_when_the_tool_ends() {
+    // The tool starts a child that holds no pipe and ends with status 0. Nothing waits for the
+    // child, and nothing may leave it running.
+    let dir = Dir::new();
+    let d = dir.0.path().display();
+    let script = format!(
+        "#!/bin/sh\ncase \"$1\" in\n  -v) exec pdftotext -v;;\nesac\nsleep 60 >/dev/null 2>&1 &\necho $! > {d}/stand-in.child\nexit 0\n"
+    );
+    let p = dir.0.path().join("stand-in");
+    std::fs::write(&p, script).unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let r = cli(
+        &clean(),
+        Some(SPEC),
+        &["--only", "text"],
+        &[("PDFTOTEXT", p.to_str().unwrap())],
+    );
+    assert!(r.code == 0 || r.code == 2, "{}", r.out);
+    assert_killed(&dir, "stand-in", &["child"]);
+}

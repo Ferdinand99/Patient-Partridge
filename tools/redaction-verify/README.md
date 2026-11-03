@@ -42,7 +42,7 @@ Every call of qpdf or Poppler has a time limit, and all the calls for one file s
 | all calls for the file | `VERIFIER_FILE_BUDGET` (seconds) | `--file-budget SECS` | 900 s |
 
 A flag wins over the variable. A call that runs over, or that is still running when the budget is
-used up, is killed together with everything it started (it runs in a process group of its own), and
+used up, is killed together with everything it started (on Unix it runs in a process group of its own, and the group is killed, also after a normal end; on Windows the process tree is killed with `taskkill /T`; a process that leaves the group on its own is out of reach), and
 the run ends with exit status 2 and a message that names the tool and the setting. That holds even
 when another layer has found a leak: the file was not fully checked, so no report is given. A value
 must be a number above 0 (a fraction is allowed). In the library, `Options::tool_timeout` and
@@ -58,10 +58,34 @@ A region (`{"page": 1, "rect": [x0, y0, x1, y1], "fill": "#000000"}`) must pass 
    compared only where whole blocks lie inside the region and the tolerance comes from the
    quantisation tables that its components use, capped at 16 levels. A JPEG that cannot be judged
    (no whole block under the region, or tables too coarse) is "could not check".
-3. No path, shading or Type 3 glyph is painted under the region, in the page, in forms, in every
-   state of every annotation appearance, or in glyph procedures, whatever its colour, clip,
-   transparency, blend mode or optional content. The only geometry allowed is the box that
-   redacts: the fill of one rectangle that is the region, in the fill colour that the region names.
+3. The geometry. One interpreter walks the content of the page with a complete graphics state (the
+   stack of `q` and `Q`, the matrix, the clip, the colours, the text state with spacing, scale,
+   leading, rise and font, the text and line matrices) and follows forms (with `/Matrix` and
+   `/BBox`), soft mask groups, every state of every annotation appearance and the icons of widgets.
+   Every painting event is placed on the page: a glyph of any font, the fill or stroke of a path, a
+   clip path, a shading. One that meets the region is a leak whatever its colour, clip,
+   transparency, blend mode, render mode or optional content.
+
+   - A glyph is placed from the advance of each glyph (`/Widths`, or `/W` and `/DW`) and its box
+     from the bounding box of the font (the full em where the font has none that is plausible).
+     Where a width is not known, the position of every later glyph of the string is an interval
+     and the boxes cover it.
+   - The glyphs of ordinary fonts are leaks when the spec has no text to look for. With a text in
+     the spec, the text layers read them. The glyphs of a Type 3 font that paints are geometry
+     either way.
+   - An annotation that a viewer draws from its entries (`/Contents`, `/RC`, the value of a field)
+     because it has no appearance stream is a leak when it has text and lies over the region, and
+     "could not check" when it has none.
+   - Geometry that carries nothing about what was under the region is allowed, when it is painted
+     with no clip that cuts into the region and no soft mask: the box that redacts (one rectangle
+     that is the region, in the colour that the region names); one rectangle in one device colour
+     that holds the whole region (a page background, the shading of a cell); a horizontal or
+     vertical line, or a rectangle, at most 2 points thick, that crosses the whole region from one
+     side to the other (the rules of a table); a clip path that is one rectangle that holds the
+     region. A clip that is anything else is geometry that meets the region.
+   - Nothing is dropped. Every event is tested against the regions as it happens. A page that needs
+     more than `--walk-steps` steps (operators and glyphs; default 100 000 000) or more than
+     `--walk-budget` seconds (default 120) is "could not check".
 
 Name the fill colour: without it a region over one image sample, or a box of any colour, cannot be
 told from a region that was not redacted.
@@ -77,8 +101,10 @@ told from a region that was not redacted.
   appearances, is not joined. A word that one glyph of a Type 3 font draws is a gap of at most three
   characters.
 - Geometry in objects that no page draws is not placed. Bounds err on the side of a leak: a curve is
-  bounded by its control points, a stroke by the widest line a viewer draws, and a page background
-  painted as a rectangle under a region is a leak unless it is the box.
+  bounded by its control points, a stroke by the widest line a viewer draws, and a glyph by the
+  box of its font, so text that ends at the edge of a region can meet it. A font with no widths
+  (a standard font that the file does not describe) gives intervals, wider boxes and more false
+  alarms.
 - Images drawn through a tiling pattern or by Type 3 glyphs are checked by the render only, and the
   check says so.
 - A region is compared at 144 dpi with an edge of two pixels, so a redaction whose edge is more than

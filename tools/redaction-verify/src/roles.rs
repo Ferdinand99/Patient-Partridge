@@ -178,7 +178,7 @@ pub enum Kind {
 }
 
 /// Whether a token is an operator of the content stream language.
-fn is_operator(name: &[u8]) -> bool {
+pub fn is_operator(name: &[u8]) -> bool {
     matches!(
         name,
         b"b" | b"B"

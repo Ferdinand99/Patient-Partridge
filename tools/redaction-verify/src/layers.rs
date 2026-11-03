@@ -26,6 +26,8 @@ pub struct Ctx<'a> {
     pub password: Option<NamedTempFile>,
     /// The copy of the file that qpdf normalised, or why there is none.
     pub qdf: OnceCell<std::result::Result<Vec<u8>, String>>,
+    /// The same with the content streams left as they were written.
+    pub plain: OnceCell<std::result::Result<Vec<u8>, String>>,
     /// The revisions of an encrypted file, decrypted.
     pub revisions: OnceCell<Revisions>,
 }
@@ -62,6 +64,35 @@ impl Ctx<'_> {
             Some(p) => vec![OsString::from("-upw"), OsString::from(p)],
             None => Vec::new(),
         }
+    }
+
+    /// The same copy with the content streams as the producer wrote them (`--normalize-content=n`).
+    /// qpdf reads an inline image in its own way when it normalises content, and where it thinks
+    /// the data ends can differ from where a viewer finds the end; the region check reads the
+    /// content as it was written.
+    pub fn plain_copy(&self) -> &std::result::Result<Vec<u8>, String> {
+        self.plain.get_or_init(|| {
+            let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+            let out = dir.path().join("plain.pdf");
+            let r = self
+                .qpdf(&[
+                    OsStr::new("--qdf"),
+                    OsStr::new("--normalize-content=n"),
+                    OsStr::new("--object-streams=disable"),
+                    OsStr::new("--stream-data=uncompress"),
+                    self.path.as_os_str(),
+                    out.as_os_str(),
+                ])
+                .map_err(|e| e.0)?;
+            match std::fs::read(&out) {
+                Ok(b) if r.status == 0 || r.status == 3 => Ok(b),
+                _ => Err(format!(
+                    "qpdf could not normalise the file (exit {}): {}",
+                    r.status,
+                    first_line(&r.stderr)
+                )),
+            }
+        })
     }
 
     /// `qpdf --qdf` of the file: object streams opened, streams uncompressed, encryption removed.
@@ -154,7 +185,7 @@ pub fn run(ctx: &Ctx, rep: &mut Report) -> Result<()> {
     if do_images {
         pdfimages(ctx, rep)?;
         if !ctx.spec.regions.is_empty() {
-            match ctx.qdf_copy() {
+            match ctx.plain_copy() {
                 Ok(bytes) => crate::regions::check(ctx, bytes, rep)?,
                 Err(why) => rep.problems.push(format!(
                     "images: the regions were not checked, because {why}"
@@ -471,6 +502,11 @@ impl Pass<'_, '_> {
     }
 
     fn decode_data(&mut self, doc: &Doc, entry: Option<&Entry>, data: &[u8], place: &str) {
+        if self.ctx.on(Layer::Decode) && crate::content::has_unsure_inline_image(data) {
+            self.rep.problem(format!(
+                "decode: {place} has an inline image whose end is not certain (no length that fits, and no EI that the content after it confirms), so the text after it may not have been read"
+            ));
+        }
         let pieces = textdec::pieces(data);
         if !pieces
             .iter()

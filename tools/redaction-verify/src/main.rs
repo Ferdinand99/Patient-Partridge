@@ -13,6 +13,9 @@
 //!   --show-values          print the values of hit needles (default: kind, position, digest)
 //!   --tool-timeout SECS    the longest one call of qpdf or Poppler may take (default 120, or the
 //!                          variable VERIFIER_TOOL_TIMEOUT); a call over the limit is killed, exit 2
+//!   --walk-steps N         the most steps (operators and glyphs) the walk over the content of a
+//!                          region page may take (default 100000000); over it, exit 2
+//!   --walk-budget SECS     the longest that walk may take (default 120); over it, exit 2
 //!   --file-budget SECS     the longest all calls for the file may take (default 900, or the
 //!                          variable VERIFIER_FILE_BUDGET)
 //! ```
@@ -28,7 +31,7 @@ fn usage() -> ExitCode {
     eprintln!(
         "usage: redaction-verify [--spec FILE] [--text S].. [--metadata S].. [--field S].. \
          [--bookmark S].. [--attachment S].. [--image-sha256 HEX].. [--forbid-key /K].. \
-         [--scrubbed] [--single-revision] [--only LAYERS] [--skip LAYERS] [--show-values] [--tool-timeout SECS] [--file-budget SECS] FILE.pdf"
+         [--scrubbed] [--single-revision] [--only LAYERS] [--skip LAYERS] [--show-values] [--tool-timeout SECS] [--file-budget SECS] [--walk-steps N] [--walk-budget SECS] FILE.pdf"
     );
     ExitCode::from(2)
 }
@@ -85,6 +88,8 @@ fn run() -> Result<ExitCode, String> {
     let mut password: Option<String> = None;
     let mut tool_timeout = None;
     let mut file_budget = None;
+    let mut walk_steps = None;
+    let mut walk_budget = None;
     while let Some(a) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
         match a.as_str() {
@@ -115,6 +120,20 @@ fn run() -> Result<ExitCode, String> {
             }
             "--file-budget" => {
                 file_budget = Some(seconds("--file-budget", &value("--file-budget")?)?);
+            }
+            "--walk-steps" => {
+                let v = value("--walk-steps")?;
+                walk_steps = Some(match v.parse::<u64>() {
+                    Ok(n) if n > 0 => n,
+                    _ => {
+                        return Err(format!(
+                            "--walk-steps wants a whole number above 0, not \"{v}\""
+                        ))
+                    }
+                });
+            }
+            "--walk-budget" => {
+                walk_budget = Some(seconds("--walk-budget", &value("--walk-budget")?)?);
             }
             "--region" => spec.regions.push(region(&value("--region")?)?),
             "--password-file" => {
@@ -154,6 +173,12 @@ fn run() -> Result<ExitCode, String> {
     opts.password = password;
     if let Some(t) = tool_timeout {
         opts.tool_timeout = t;
+    }
+    if let Some(n) = walk_steps {
+        opts.walk_steps = n;
+    }
+    if let Some(t) = walk_budget {
+        opts.walk_budget = t;
     }
     if let Some(b) = file_budget {
         opts.file_budget = b;
