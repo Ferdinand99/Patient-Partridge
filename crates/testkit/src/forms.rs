@@ -44,6 +44,8 @@ pub struct FormOptions {
     /// An object that no page uses and that is this many bytes long, so that the file is big and
     /// the form is small.
     pub padding: usize,
+    /// An XMP metadata stream on the catalog (`XMP_CATALOG_TITLE`), as most forms carry.
+    pub xmp: bool,
 }
 
 /// A growing list of objects. The kit's `build` puts the catalog, the page tree and the font at 1 to
@@ -352,6 +354,13 @@ pub fn forms_with(opts: &FormOptions) -> Vec<u8> {
         );
         annots.push(widget);
         field_refs.push_str(&format!(" {widget} 0 R"));
+    }
+    if opts.xmp {
+        let stream = objs.add(stream_object(
+            "/Type /Metadata /Subtype /XML",
+            &crate::xmp_packet(crate::XMP_CATALOG_TITLE),
+        ));
+        catalog.push_str(&format!(" /Metadata {stream} 0 R"));
     }
     if opts.xfa {
         let template = objs.add(stream_object(

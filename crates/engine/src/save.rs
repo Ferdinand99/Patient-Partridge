@@ -73,13 +73,36 @@ impl Write for Capped {
     }
 }
 
-/// Writes the document out as PDFium would write a copy of it, with every change made so far.
+/// Writes the document out as PDFium would write a copy of it, with every change made so far, for
+/// bytes that leave the engine (see [`serialise_checked`]).
 pub fn serialise(document: &PdfDocument<'_>) -> Result<Vec<u8>, Failure> {
-    serialise_up_to(document, MAX_SAVE_BYTES, &mut |_| {})
+    serialise_checked(document, MAX_SAVE_BYTES, &mut |_| {})
 }
 
-/// As [`serialise`], with a limit of `limit` bytes (a test makes it small), and `progress` told
-/// how many bytes are written now and then.
+/// As [`serialise_up_to`], and the bytes are looked at before they are handed over: a protected
+/// document whose file would hold an XMP metadata stream that PDFium writes without encryption is
+/// refused (see the module `metadata`). Every write whose bytes leave the engine is made with this,
+/// and nothing that stays in the engine needs to be.
+pub fn serialise_checked(
+    document: &PdfDocument<'_>,
+    limit: usize,
+    progress: &mut dyn FnMut(u32),
+) -> Result<Vec<u8>, Failure> {
+    let bytes = serialise_up_to(document, limit, progress)?;
+    if metadata::leaves_metadata_in_the_clear(&bytes, progress) {
+        return Err((
+            ErrorCode::SaveMetadataNotEncrypted,
+            "the document is protected and has XMP metadata, which would be written without encryption, so it was not written"
+                .to_string(),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Writes the document out as PDFium would write a copy of it, with a limit of `limit` bytes (a
+/// test makes it small), and `progress` told how many bytes are written now and then. The bytes
+/// are not looked at: they are for what stays in the engine (the form actions are looked for in
+/// them). A write whose bytes leave the engine is made with [`serialise_checked`].
 pub fn serialise_up_to(
     document: &PdfDocument<'_>,
     limit: usize,
@@ -120,15 +143,6 @@ pub fn serialise_up_to(
             "the document was written in a form that is not a PDF".to_string(),
         ));
     }
-    // PDFium writes the XMP metadata of a protected document without encryption (see the module
-    // `metadata`). The bytes are not handed over when they hold such a stream.
-    if security_revision(document) != 0 && metadata::leaves_metadata_in_the_clear(&out.bytes) {
-        return Err((
-            ErrorCode::SaveMetadataNotEncrypted,
-            "the document is password protected and has XMP metadata, which would be written without encryption, so it was not written"
-                .to_string(),
-        ));
-    }
     Ok(out.bytes)
 }
 
@@ -147,7 +161,9 @@ pub fn serialise_clean(
     password: Option<&str>,
     progress: &mut dyn FnMut(u32),
 ) -> Result<Vec<u8>, Failure> {
-    let first = serialise_up_to(document, MAX_SAVE_BYTES, progress)?;
+    let mut first = serialise_checked(document, MAX_SAVE_BYTES, progress)?;
+    // The buffer grew by doubling; the reload needs the room.
+    first.shrink_to_fit();
     let pages = document.pages().len();
     let reread = pdfium
         .load_pdf_from_byte_vec(first, password)
@@ -163,7 +179,7 @@ pub fn serialise_clean(
             "the written document has another number of pages when it is read again".to_string(),
         ));
     }
-    serialise_up_to(&reread, MAX_SAVE_BYTES, progress)
+    serialise_checked(&reread, MAX_SAVE_BYTES, progress)
 }
 
 /// The failure to give when the file the document is read from is not to be trusted.

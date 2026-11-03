@@ -23,11 +23,14 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use common::*;
-use partridge_protocol::{ErrorCode, RequestBody, ResponseBody};
+use partridge_protocol::{
+    field_flag, ErrorCode, FormFieldKind, FormValue, RequestBody, ResponseBody,
+};
 use partridge_testkit as kit;
 use pdfium_render::prelude::*;
 
 const PASSWORD: &str = "secret";
+const OWNER_PASSWORD: &str = "owner-secret";
 
 fn required() -> bool {
     std::env::var_os("PARTRIDGE_REQUIRE_READERS").is_some()
@@ -132,6 +135,11 @@ const CLEAR_WAYS: [Way; 3] = [
 
 /// `plain` protected by qpdf in `way`, with [`PASSWORD`] as the user password.
 fn protect(dir: &Dir, plain: &[u8], way: &Way) -> Vec<u8> {
+    protect_for(dir, plain, way, PASSWORD)
+}
+
+/// As `protect`, with another user password (the owner password is always `owner-secret`).
+fn protect_for(dir: &Dir, plain: &[u8], way: &Way, user: &str) -> Vec<u8> {
     let input = dir.write("plain.pdf", plain);
     let output = dir.0.join("protected.pdf");
     // An option for all of qpdf (the weak ciphers) comes before the encryption options.
@@ -143,7 +151,7 @@ fn protect(dir: &Dir, plain: &[u8], way: &Way) -> Vec<u8> {
     if weak {
         args.push("--allow-weak-crypto");
     }
-    args.extend(["--encrypt", PASSWORD, "owner-secret"]);
+    args.extend(["--encrypt", user, OWNER_PASSWORD]);
     args.extend_from_slice(tail);
     let input_str = input.to_str().unwrap();
     let output_str = output.to_str().unwrap();
@@ -157,10 +165,14 @@ fn protect(dir: &Dir, plain: &[u8], way: &Way) -> Vec<u8> {
 /// What qpdf reads from `file` with the password: the file without its encryption, with the
 /// streams uncompressed.
 fn read_back(dir: &Dir, file: &[u8], what: &str) -> Vec<u8> {
+    read_back_with(dir, file, what, PASSWORD)
+}
+
+fn read_back_with(dir: &Dir, file: &[u8], what: &str, password: &str) -> Vec<u8> {
     let input = dir.write("saved.pdf", file);
     let output = dir.0.join("read-back.pdf");
     let (ok, text) = qpdf(&[
-        &format!("--password={PASSWORD}"),
+        &format!("--password={password}"),
         "--decrypt",
         "--stream-data=uncompress",
         input.to_str().unwrap(),
@@ -172,9 +184,13 @@ fn read_back(dir: &Dir, file: &[u8], what: &str) -> Vec<u8> {
 
 /// qpdf checks the structure of the file and the decryption of every stream.
 fn assert_clean(dir: &Dir, file: &[u8], what: &str) {
+    assert_clean_with(dir, file, what, PASSWORD)
+}
+
+fn assert_clean_with(dir: &Dir, file: &[u8], what: &str, password: &str) {
     let input = dir.write("checked.pdf", file);
     let (ok, text) = qpdf(&[
-        &format!("--password={PASSWORD}"),
+        &format!("--password={password}"),
         "--check",
         input.to_str().unwrap(),
     ]);
@@ -477,4 +493,173 @@ fn a_protected_document_without_metadata_is_saved_as_before() {
         open(e, &saved, None).unwrap_err(),
         ErrorCode::PasswordRequired
     );
+}
+
+#[test]
+fn a_protected_form_with_xmp_is_filled_in_and_is_not_saved() {
+    if !have_qpdf() {
+        return;
+    }
+    // A form that is protected with an owner password only (the user password is empty, so it
+    // opens without one) and carries XMP metadata, as most forms do. The bytes that the form code
+    // looks at never leave the engine, so the check must not run on them: the fields stay
+    // editable. The save is what is refused.
+    let dir = Dir::new("form");
+    let way = &WAYS[3];
+    let mut baseline: Option<Vec<(String, u16)>> = None;
+    for xmp in [false, true] {
+        let plain = kit::forms_with(&kit::FormOptions {
+            xmp,
+            ..kit::FormOptions::default()
+        });
+        let bytes = protect_for(&dir, &plain, way, "");
+        let mut guard = engine();
+        let e = &mut guard.0;
+        let doc = open(e, &bytes, None).unwrap();
+        let ResponseBody::FormFields { fields } =
+            ask(e, RequestBody::ListFormFields { doc, page: 0 })
+        else {
+            panic!("no fields");
+        };
+        assert!(fields.len() > 5, "xmp {xmp}: {} fields", fields.len());
+        // No field is blocked as a whole (the form is not taken for one with actions), and the
+        // flags are the ones of the same form without the metadata (one field is read only in
+        // the form itself).
+        let blocked = field_flag::FORM_BLOCKED | field_flag::ACTION_BLOCKED;
+        let flags: Vec<(String, u16)> = fields.iter().map(|f| (f.name.clone(), f.flags)).collect();
+        for (name, flag) in &flags {
+            assert_eq!(
+                flag & blocked,
+                0,
+                "xmp {xmp}: {name} is blocked ({flag:#x})"
+            );
+        }
+        match &baseline {
+            None => baseline = Some(flags),
+            Some(before) => assert_eq!(&flags, before, "the flags changed with the metadata"),
+        }
+        let text = fields
+            .iter()
+            .find(|f| f.kind == FormFieldKind::Text)
+            .expect("a text field");
+        let answer = ask(
+            e,
+            RequestBody::SetFormField {
+                doc,
+                page: 0,
+                index: text.index,
+                name: text.name.clone(),
+                value: FormValue::Text("filled in".into()),
+            },
+        );
+        assert!(
+            matches!(answer, ResponseBody::FormFields { .. }),
+            "xmp {xmp}: {answer:?}"
+        );
+        match try_save(e, doc) {
+            Ok(saved) => {
+                assert!(!xmp, "a form with XMP was saved");
+                assert_clean_with(&dir, &saved, "form", "");
+            }
+            Err((code, _)) => {
+                assert!(xmp, "a form without XMP was refused");
+                assert_eq!(code, ErrorCode::SaveMetadataNotEncrypted);
+            }
+        }
+        ask(e, RequestBody::Close { doc });
+    }
+}
+
+#[test]
+fn a_file_protected_with_an_owner_password_only_is_refused_with_metadata_too() {
+    if !have_qpdf() {
+        return;
+    }
+    // The most common real case: no user password, so nobody types one, and XMP on the catalog.
+    let dir = Dir::new("owner-only");
+    for way in &WAYS {
+        let bytes = protect_for(&dir, &kit::xmp_pdf(true, false), way, "");
+        let mut guard = engine();
+        let e = &mut guard.0;
+        let doc = open(e, &bytes, None).unwrap();
+        let (code, _) = refused(try_save(e, doc), way.name);
+        assert_eq!(code, ErrorCode::SaveMetadataNotEncrypted, "{}", way.name);
+        ask(e, RequestBody::Close { doc });
+    }
+}
+
+#[test]
+fn a_document_opened_with_the_owner_password_is_written_again_with_that_password() {
+    if !have_qpdf() {
+        return;
+    }
+    // A save reads the written bytes in again as a second document, with the password the
+    // document was opened with: here the owner password, for a revision 3 (RC4 128) file and a
+    // revision 6 (AES 256) one.
+    let dir = Dir::new("owner-open");
+    for way in [&WAYS[1], &WAYS[3]] {
+        let bytes = protect(&dir, &kit::xmp_pdf(false, false), way);
+        let mut guard = engine();
+        let e = &mut guard.0;
+        let doc = open(e, &bytes, Some(OWNER_PASSWORD)).unwrap();
+        add_text(e, doc);
+        let saved = try_save(e, doc).unwrap_or_else(|err| panic!("{}: {err:?}", way.name));
+        assert_clean_with(&dir, &saved, way.name, OWNER_PASSWORD);
+        let back = read_back_with(&dir, &saved, way.name, OWNER_PASSWORD);
+        for phrase in kit::XMP_OTHER_PHRASES {
+            assert!(plain_in(&back, phrase), "{}: {phrase}", way.name);
+        }
+        let again = open(e, &saved, Some(OWNER_PASSWORD)).unwrap();
+        assert!(page_text(e, again, 0).0.contains("AN-EDIT"), "{}", way.name);
+        ask(e, RequestBody::Close { doc: again });
+    }
+}
+
+#[test]
+fn a_file_of_an_older_revision_that_says_it_leaves_the_metadata_clear_is_kept_so() {
+    // The generator's own protection (revision 2, RC4 40) with `/EncryptMetadata false`. The key
+    // is read by PDFium for every revision, though a reader that follows the standard to the
+    // letter reads it only for revision 4 and up; the check goes by what PDFium writes. The
+    // stream is clear and is written back as it was; without the key it is refused.
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let packet = kit::xmp_packet(kit::XMP_CATALOG_TITLE);
+    let clear = open(e, &kit::encrypted_xmp_pdf(PASSWORD, true), Some(PASSWORD)).unwrap();
+    let saved = try_save(e, clear).expect("a clear stream is kept");
+    assert!(plain_in(&saved, &packet));
+    let again = open(e, &saved, Some(PASSWORD)).unwrap();
+    assert!(try_save(e, again).is_ok());
+    let locked = open(e, &kit::encrypted_xmp_pdf(PASSWORD, false), Some(PASSWORD)).unwrap();
+    let (code, _) = refused(
+        try_save(e, locked),
+        "a stream that is meant to be encrypted",
+    );
+    assert_eq!(code, ErrorCode::SaveMetadataNotEncrypted);
+}
+
+#[test]
+fn a_stream_whose_type_is_a_reference_is_encrypted_like_any_other() {
+    if !have_qpdf() {
+        return;
+    }
+    // PDFium does not follow the reference, so the stream is not a metadata stream to it and is
+    // written encrypted; the check agrees and lets the save through. This pins the agreement: a
+    // PDFium that followed the reference would make the saved file hold the packet in the clear.
+    let dir = Dir::new("indirect");
+    let packet = kit::xmp_packet(kit::XMP_CATALOG_TITLE);
+    for way in &WAYS {
+        let bytes = protect(&dir, &kit::xmp_indirect_type_pdf(), way);
+        let mut guard = engine();
+        let e = &mut guard.0;
+        let doc = open(e, &bytes, Some(PASSWORD)).unwrap();
+        let saved = try_save(e, doc).unwrap_or_else(|err| panic!("{}: {err:?}", way.name));
+        assert!(!plain_in(&saved, &packet), "{}: in the clear", way.name);
+        let back = read_back(&dir, &saved, way.name);
+        assert!(
+            plain_in(&back, &packet),
+            "{}: qpdf does not read it",
+            way.name
+        );
+        ask(e, RequestBody::Close { doc });
+    }
 }
