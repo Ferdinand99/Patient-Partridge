@@ -36,6 +36,9 @@ pub struct FormOptions {
     pub xfa_full: bool,
     /// A signature field holding a signature dictionary, as `signed_pdf` has.
     pub signed: bool,
+    /// A signature field that holds nothing, as a form has before anybody signs it. With
+    /// `signed` the form has both.
+    pub empty_signature: bool,
     /// Fields that sit under a parent field: `person.first` and `person.last`.
     pub nested: bool,
     /// An object that no page uses and that is this many bytes long, so that the file is big and
@@ -342,6 +345,14 @@ pub fn forms_with(opts: &FormOptions) -> Vec<u8> {
         field_refs.push_str(&format!(" {widget} 0 R"));
         acro_extra.push_str(" /SigFlags 3");
     }
+    if opts.empty_signature {
+        let widget = objs.add(
+            "<< /Type /Annot /Subtype /Widget /FT /Sig /T (empty_signature) \
+             /Rect [72 100 250 140] /F 132 /P 4 0 R >>",
+        );
+        annots.push(widget);
+        field_refs.push_str(&format!(" {widget} 0 R"));
+    }
     if opts.xfa {
         let template = objs.add(stream_object(
             "",
@@ -425,6 +436,23 @@ pub fn xfa_full_pdf() -> Vec<u8> {
 pub fn forms_signed_pdf() -> Vec<u8> {
     forms_with(&FormOptions {
         signed: true,
+        ..FormOptions::default()
+    })
+}
+
+/// A form with a signature field that nobody has signed: no signature dictionary, no byte range.
+pub fn forms_empty_signature_pdf() -> Vec<u8> {
+    forms_with(&FormOptions {
+        empty_signature: true,
+        ..FormOptions::default()
+    })
+}
+
+/// A form with one signature field that holds a signature and one that holds nothing.
+pub fn forms_signed_and_empty_signature_pdf() -> Vec<u8> {
+    forms_with(&FormOptions {
+        signed: true,
+        empty_signature: true,
         ..FormOptions::default()
     })
 }
