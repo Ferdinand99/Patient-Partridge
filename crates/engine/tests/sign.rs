@@ -385,15 +385,16 @@ fn what_cannot_be_signed_is_refused_with_its_own_code() {
 fn a_protected_document_that_the_save_refuses_is_not_signed_either() {
     let mut shared = engine();
     let e = &mut shared.0;
-    // The signing starts with the checked save: a protected document with XMP metadata that would
-    // be written without encryption is refused for that, before anything else is looked at.
+    // A protected document is refused before anything is written, so the file that holds metadata
+    // PDFium would write without encryption is never put out for a signature, with the metadata in
+    // the clear or in any other form. (The write that follows is the checked save, so a way round
+    // the first refusal would meet the second.)
     let doc = open(e, &kit::encrypted_xmp_pdf("secret", false), Some("secret")).unwrap();
     assert_eq!(
         begin(e, spec(doc, rect_place(0))).err(),
-        Some(ErrorCode::SaveMetadataNotEncrypted)
+        Some(ErrorCode::SignEncrypted)
     );
     ask(e, RequestBody::Close { doc });
-    // One that keeps its metadata in the clear is written, and then refused as encrypted.
     let doc = open(e, &kit::encrypted_xmp_pdf("secret", true), Some("secret")).unwrap();
     assert_eq!(
         begin(e, spec(doc, rect_place(0))).err(),

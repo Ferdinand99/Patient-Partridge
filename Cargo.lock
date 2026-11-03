@@ -3066,7 +3066,7 @@ version = "0.2.2"
 
 [[package]]
 name = "partridge-sandbox"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
@@ -3074,7 +3074,7 @@ dependencies = [
 
 [[package]]
 name = "partridge-signer"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "libc",
  "p12-keystore",
@@ -3088,7 +3088,7 @@ dependencies = [
 
 [[package]]
 name = "partridge-signer-protocol"
-version = "0.2.0"
+version = "0.2.2"
 
 [[package]]
 name = "partridge-testkit"
