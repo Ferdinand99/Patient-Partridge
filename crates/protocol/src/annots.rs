@@ -53,6 +53,9 @@ pub enum AnnotKind {
     /// Something else the reader shows and can only remove: a squiggly underline, a text box, a
     /// square or a circle.
     Other = 7,
+    /// A picture of a signature that this reader placed in the session: a stamp that can be
+    /// moved and resized. Once the file is saved and opened again it is an ordinary stamp.
+    Signature = 8,
 }
 
 impl AnnotKind {
@@ -65,6 +68,7 @@ impl AnnotKind {
             5 => AnnotKind::Ink,
             6 => AnnotKind::Stamp,
             7 => AnnotKind::Other,
+            8 => AnnotKind::Signature,
             other => return Err(ProtocolError::UnknownValue(other)),
         })
     }
@@ -87,6 +91,7 @@ impl AnnotKind {
             AnnotKind::Ink => "ink",
             AnnotKind::Stamp => "stamp",
             AnnotKind::Other => "other",
+            AnnotKind::Signature => "signature",
         }
     }
 }
@@ -160,8 +165,10 @@ pub mod ability {
     /// The file locks the annotation (its flags say read-only or locked), or the document does not
     /// allow annotations to be changed. No other bit is set then, except possibly none.
     pub const LOCKED: u8 = 32;
+    /// The annotation can be made bigger or smaller (a signature picture).
+    pub const RESIZE: u8 = 64;
     /// All the bits that mean something.
-    pub const ALL: u8 = EDIT_TEXT | RECOLOUR | MOVE | REMOVE | RESTORE | LOCKED;
+    pub const ALL: u8 = EDIT_TEXT | RECOLOUR | MOVE | REMOVE | RESTORE | LOCKED | RESIZE;
 }
 
 /// One annotation of a page.

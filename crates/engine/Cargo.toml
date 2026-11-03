@@ -30,6 +30,10 @@ const-oid = "=0.9.6"
 spki = "=0.7.3"
 ring = { version = "=0.17.14", default-features = false, features = ["alloc"] }
 
+# The outlines of the letters of a typed signature picture (see src/sigmark.rs), read from the
+# bundled fonts only. `ttf-parser` is not used: it is unmaintained (RUSTSEC-2026-0192).
+skrifa = { version = "=0.40.0", default-features = false, features = ["std"] }
+
 # System calls for the sandbox and the resource limits (pinned like everything else).
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.191"

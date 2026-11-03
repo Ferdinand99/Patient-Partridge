@@ -35,6 +35,7 @@ pub mod pagetree;
 pub mod sandbox;
 pub mod save;
 pub mod sigcheck;
+pub mod sigmark;
 pub mod signatures;
 pub mod source;
 pub mod startup;
@@ -577,6 +578,27 @@ impl Engine {
             } => {
                 let (document, state) = self.annotating(doc)?;
                 let item = state.add_stamp(document, page, x, y, stamp)?;
+                Ok(ResponseBody::Annot { item })
+            }
+            RequestBody::AddSignature {
+                doc,
+                page,
+                rect,
+                color,
+                mark,
+            } => {
+                let (document, state) = self.annotating(doc)?;
+                let item = state.add_signature(document, page, rect, color, mark)?;
+                Ok(ResponseBody::Annot { item })
+            }
+            RequestBody::PlaceSignature {
+                doc,
+                page,
+                id,
+                rect,
+            } => {
+                let (document, state) = self.annotating(doc)?;
+                let item = state.place_signature(document, page, id, rect)?;
                 Ok(ResponseBody::Annot { item })
             }
             RequestBody::UpdateAnnot {
