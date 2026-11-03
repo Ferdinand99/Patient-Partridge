@@ -554,7 +554,7 @@ impl Font {
                     );
                 }
                 let w = self.w_map.get(&code).copied().unwrap_or(self.dw);
-                if !(0.0..=profile::MAX_WIDTH).contains(&w) {
+                if !(profile::MIN_WIDTH..=profile::MAX_WIDTH).contains(&w) {
                     return Err(format!(
                         "the width {w} em of the code {code} is not a width"
                     ));
@@ -571,6 +571,16 @@ impl Font {
                         return Err(format!(
                             "the width {w} em of the code {code} is not the advance {a:.3} em of its glyph in the font program"
                         ));
+                    }
+                    // The glyph is where its advance box is: its ink does not reach far from it.
+                    let ink = gid.and_then(|g| self.program.as_ref().and_then(|p| p.ink_x(g)));
+                    if let Some([x0, x1]) = ink {
+                        if x0 < -profile::INK_SLACK || x1 > w + profile::INK_SLACK {
+                            return Err(format!(
+                                "the ink of the glyph of the code {code} reaches from {x0:.2} em to {x1:.2} em, more than {} em beyond its advance box of {w} em",
+                                profile::INK_SLACK
+                            ));
+                        }
                     }
                 }
                 Ok(Some(w))

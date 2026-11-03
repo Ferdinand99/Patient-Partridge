@@ -28,10 +28,18 @@ pub struct Program {
     pub advances: Option<Vec<f64>>,
     /// The same, sorted.
     sorted: Vec<f64>,
+    /// The ink of each glyph across, `[xmin, xmax]` from the origin in em, for a glyph that has an
+    /// outline (TrueType and OpenType programs with `loca` and `glyf`).
+    ink_x: Option<Vec<Option<[f64; 2]>>>,
 }
 
 impl Program {
-    fn new(format: Format, bbox: [f64; 4], advances: Option<Vec<f64>>) -> Result<Program, String> {
+    fn new(
+        format: Format,
+        bbox: [f64; 4],
+        advances: Option<Vec<f64>>,
+        ink_x: Option<Vec<Option<[f64; 2]>>>,
+    ) -> Result<Program, String> {
         if bbox.iter().any(|v| !v.is_finite() || v.abs() > 100.0)
             || bbox[2] <= bbox[0]
             || bbox[3] <= bbox[1]
@@ -45,12 +53,18 @@ impl Program {
             bbox,
             advances,
             sorted,
+            ink_x,
         })
     }
 
     /// The advance of a glyph, if the program has advances.
     pub fn advance(&self, gid: usize) -> Option<f64> {
         self.advances.as_ref()?.get(gid).copied()
+    }
+
+    /// The ink of a glyph across, `[xmin, xmax]` in em from its origin, if the glyph has an outline.
+    pub fn ink_x(&self, gid: usize) -> Option<[f64; 2]> {
+        self.ink_x.as_ref()?.get(gid).copied().flatten()
     }
 
     /// Whether some glyph of the program has an advance within the tolerance of `w`.
@@ -145,7 +159,40 @@ fn sfnt(data: &[u8], format: Format) -> Result<Program, String> {
         }
         _ => None,
     };
-    Program::new(format, bbox, advances)
+    let ink_x = advances
+        .as_ref()
+        .and_then(|a| glyph_ink(data, head, a.len(), upem));
+    Program::new(format, bbox, advances, ink_x)
+}
+
+/// The ink of every glyph across, from the header of its outline in `glyf` (found through `loca`).
+fn glyph_ink(data: &[u8], head: usize, glyphs: usize, upem: f64) -> Option<Vec<Option<[f64; 2]>>> {
+    let (loca, loca_len) = table(data, b"loca")?;
+    let (glyf, glyf_len) = table(data, b"glyf")?;
+    let long = i16_at(data, head + 50)? != 0;
+    let entry = if long { 4 } else { 2 };
+    if loca_len < (glyphs + 1) * entry {
+        return None;
+    }
+    let offset = |g: usize| -> Option<usize> {
+        if long {
+            usize::try_from(u32_at(data, loca + 4 * g)?).ok()
+        } else {
+            Some(usize::from(u16_at(data, loca + 2 * g)?) * 2)
+        }
+    };
+    let mut out = Vec::with_capacity(glyphs);
+    for g in 0..glyphs {
+        let (a, b) = (offset(g)?, offset(g + 1)?);
+        if b > a && b - a >= 10 && b <= glyf_len {
+            let x0 = f64::from(i16_at(data, glyf + a + 2)?) / upem;
+            let x1 = f64::from(i16_at(data, glyf + a + 6)?) / upem;
+            out.push(Some([x0.min(x1), x0.max(x1)]));
+        } else {
+            out.push(None);
+        }
+    }
+    Some(out)
 }
 
 /// An INDEX of a CFF program at `at`: the ranges of its entries and the offset after it.
@@ -274,6 +321,7 @@ fn cff(d: &[u8]) -> Result<Program, String> {
         Format::Cff,
         [b[0] / 1000.0, b[1] / 1000.0, b[2] / 1000.0, b[3] / 1000.0],
         None,
+        None,
     )
 }
 
@@ -309,6 +357,7 @@ fn type1(d: &[u8]) -> Result<Program, String> {
     Program::new(
         Format::Type1,
         [b[0] / 1000.0, b[1] / 1000.0, b[2] / 1000.0, b[3] / 1000.0],
+        None,
         None,
     )
 }

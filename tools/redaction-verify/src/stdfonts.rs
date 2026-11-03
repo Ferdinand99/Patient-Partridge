@@ -85,8 +85,66 @@ impl Std {
     }
 }
 
+/// The names (lower case, letters and digits only) of the standard fonts and the names that a
+/// viewer maps to them. A name that is not here (`Arial-Black`, `Helvetica-Narrow`, `ArialNarrow`,
+/// `HelveticaNeue`) is another font, with other widths.
+const HELVETICA_NAMES: [&str; 3] = ["helvetica", "arial", "arialmt"];
+const HELVETICA_OBLIQUE_NAMES: [&str; 4] = [
+    "helveticaoblique",
+    "arialitalic",
+    "arialitalicmt",
+    "helveticaitalic",
+];
+const HELVETICA_BOLD_NAMES: [&str; 3] = ["helveticabold", "arialbold", "arialboldmt"];
+const HELVETICA_BOLD_OBLIQUE_NAMES: [&str; 4] = [
+    "helveticaboldoblique",
+    "arialbolditalic",
+    "arialbolditalicmt",
+    "helveticabolditalic",
+];
+const TIMES_NAMES: [&str; 5] = [
+    "times",
+    "timesroman",
+    "timesnewroman",
+    "timesnewromanps",
+    "timesnewromanpsmt",
+];
+const TIMES_BOLD_NAMES: [&str; 4] = [
+    "timesbold",
+    "timesnewromanbold",
+    "timesnewromanpsbold",
+    "timesnewromanpsboldmt",
+];
+const TIMES_ITALIC_NAMES: [&str; 4] = [
+    "timesitalic",
+    "timesnewromanitalic",
+    "timesnewromanpsitalic",
+    "timesnewromanpsitalicmt",
+];
+const TIMES_BOLD_ITALIC_NAMES: [&str; 4] = [
+    "timesbolditalic",
+    "timesnewromanbolditalic",
+    "timesnewromanpsbolditalic",
+    "timesnewromanpsbolditalicmt",
+];
+const COURIER_NAMES: [&str; 12] = [
+    "courier",
+    "courierbold",
+    "courieroblique",
+    "courierboldoblique",
+    "couriernew",
+    "couriernewbold",
+    "couriernewitalic",
+    "couriernewbolditalic",
+    "couriernewpsmt",
+    "couriernewpsboldmt",
+    "couriernewpsitalicmt",
+    "couriernewpsbolditalicmt",
+];
+
 /// The standard font that a `/BaseFont` name stands for (a subset tag is ignored, and so are
-/// spaces, commas and hyphens: `Arial,Bold`, `TimesNewRomanPS-BoldItalicMT`).
+/// spaces, commas and hyphens: `Arial,Bold`, `TimesNewRomanPS-BoldItalicMT`). Only the names of
+/// the 14 standard fonts and the ones a viewer maps to them: any other name is another font.
 pub fn for_name(base_font: &str) -> Option<Std> {
     let name = match base_font.split_once('+') {
         Some((tag, rest)) if tag.len() == 6 && tag.bytes().all(|b| b.is_ascii_uppercase()) => rest,
@@ -97,26 +155,22 @@ pub fn for_name(base_font: &str) -> Option<Std> {
         .filter(|c| c.is_ascii_alphanumeric())
         .collect::<String>()
         .to_ascii_lowercase();
-    let bold = n.contains("bold") || n.contains("black") || n.contains("heavy");
-    let italic = n.contains("italic") || n.contains("oblique");
-    if n.contains("courier") {
+    let n = n.as_str();
+    let is = |names: &[&str]| names.contains(&n);
+    if is(&COURIER_NAMES) {
         Some(Std::Courier)
-    } else if n.contains("helvetica") || n.starts_with("arial") {
-        Some(if bold {
-            Std::Table(&HELVETICA_BOLD, 278)
-        } else {
-            Std::Table(&HELVETICA, 222)
-        })
-    } else if n.contains("times") {
-        Some(Std::Table(
-            match (bold, italic) {
-                (false, false) => &TIMES,
-                (true, false) => &TIMES_BOLD,
-                (false, true) => &TIMES_ITALIC,
-                (true, true) => &TIMES_BOLD_ITALIC,
-            },
-            333,
-        ))
+    } else if is(&HELVETICA_NAMES) || is(&HELVETICA_OBLIQUE_NAMES) {
+        Some(Std::Table(&HELVETICA, 222))
+    } else if is(&HELVETICA_BOLD_NAMES) || is(&HELVETICA_BOLD_OBLIQUE_NAMES) {
+        Some(Std::Table(&HELVETICA_BOLD, 278))
+    } else if is(&TIMES_NAMES) {
+        Some(Std::Table(&TIMES, 333))
+    } else if is(&TIMES_BOLD_NAMES) {
+        Some(Std::Table(&TIMES_BOLD, 333))
+    } else if is(&TIMES_ITALIC_NAMES) {
+        Some(Std::Table(&TIMES_ITALIC, 333))
+    } else if is(&TIMES_BOLD_ITALIC_NAMES) {
+        Some(Std::Table(&TIMES_BOLD_ITALIC, 333))
     } else {
         None
     }
@@ -149,6 +203,21 @@ mod tests {
         );
         assert_eq!(for_name("Symbol"), None);
         assert_eq!(for_name("ZapfDingbats"), None);
+        // Other fonts that look like a standard font have other widths.
+        for other in [
+            "Arial-Black",
+            "ArialNarrow",
+            "Helvetica-Narrow",
+            "HelveticaNeue",
+            "Arial-BoldItalicMTX",
+            "TimesTen-Roman",
+            "CourierStd",
+            "NotHelvetica",
+        ] {
+            assert_eq!(for_name(other), None, "{other}");
+        }
+        assert!(for_name("Arial,BoldItalic").is_some());
+        assert!(for_name("TimesNewRoman,Bold").is_some());
         // Outside the table.
         assert_eq!(for_name("Helvetica").unwrap().width(200, false), None);
         // The quote codes follow the encoding.

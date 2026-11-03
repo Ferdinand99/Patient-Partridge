@@ -585,6 +585,33 @@ fn the_widths_of_a_composite_font_are_the_advances_of_its_program() {
         SPEC,
         "has no glyph in the font program",
     );
+    // The ink of the glyph of the first code (glyph 257) is 0.9 to 1.5 em from its origin, and its
+    // advance box is 0.6 em wide: the ink is not where the cell is.
+    let advances = [600u16; 400];
+    let shifted = fonts::tiny_truetype_ink([0, -200, 2000, 900], &advances, &[(257, 900, 1500)]);
+    never_clean(
+        "a glyph whose ink is outside its advance box",
+        &cid_page(text.as_bytes(), shifted, 600),
+        SPEC,
+        "the ink of the glyph",
+    );
+    let near = fonts::tiny_truetype_ink([0, -200, 1000, 900], &advances, &[(257, 20, 580)]);
+    leak(
+        "a glyph whose ink is inside its advance box",
+        &cid_page(text.as_bytes(), near, 600),
+        SPEC,
+    );
+    // A width of zero, which the program has too, hides nothing: it is refused.
+    never_clean(
+        "a glyph of no width",
+        &cid_page(
+            text.as_bytes(),
+            fonts::tiny_truetype([0, -200, 1000, 900], &[0; 400]),
+            0,
+        ),
+        SPEC,
+        "is not a width",
+    );
     never_clean(
         "a program whose box reaches 3 em up",
         &cid_page(

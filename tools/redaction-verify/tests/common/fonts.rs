@@ -192,7 +192,24 @@ pub fn cid_font(base: u32, name: &str, table: &[(u16, char)]) -> Vec<(u32, Bytes
 /// for each glyph. It has the tables that a reader needs to place glyphs (`head`, `hhea`, `maxp`,
 /// `hmtx`, `loca`, `glyf`), and Poppler loads it.
 pub fn tiny_truetype(bbox: [i16; 4], advances: &[u16]) -> Bytes {
+    tiny_truetype_ink(bbox, advances, &[])
+}
+
+/// The same, with an outline header for these glyphs: the glyph number, and the `xMin` and `xMax`
+/// of its ink, in thousandths of an em. The glyph has no contours, so nothing is drawn.
+pub fn tiny_truetype_ink(bbox: [i16; 4], advances: &[u16], ink: &[(usize, i16, i16)]) -> Bytes {
     let ng = advances.len() as u16;
+    let mut glyf: Bytes = Vec::new();
+    let mut loca: Bytes = Vec::new();
+    for g in 0..=advances.len() {
+        loca.extend(((glyf.len() / 2) as u16).to_be_bytes());
+        if let Some((_, x0, x1)) = ink.iter().find(|(i, ..)| *i == g) {
+            let mut h = vec![0u8; 12];
+            h[2..4].copy_from_slice(&x0.to_be_bytes());
+            h[6..8].copy_from_slice(&x1.to_be_bytes());
+            glyf.extend(h);
+        }
+    }
     let mut head = vec![0u8; 54];
     head[18..20].copy_from_slice(&1000u16.to_be_bytes());
     for (i, v) in bbox.iter().enumerate() {
@@ -211,9 +228,8 @@ pub fn tiny_truetype(bbox: [i16; 4], advances: &[u16]) -> Bytes {
         .iter()
         .flat_map(|a| [a.to_be_bytes(), [0, 0]].concat())
         .collect();
-    let loca = vec![0u8; 2 * (usize::from(ng) + 1)];
     let tables: [(&[u8; 4], &Bytes); 6] = [
-        (b"glyf", &Vec::new()),
+        (b"glyf", &glyf),
         (b"head", &head),
         (b"hhea", &hhea),
         (b"hmtx", &hmtx),

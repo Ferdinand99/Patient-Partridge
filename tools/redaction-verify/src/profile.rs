@@ -28,7 +28,8 @@
 //!      and, for a TrueType program, widths that are advances of the program;
 //!    - a composite font (Type 0) with the encoding `Identity-H` (a name, not a stream), a
 //!      descendant font whose program is in the file, and, for a TrueType descendant, widths that
-//!      are the advances of the program for the glyph of the code;
+//!      are the advances of the program for the glyph of the code, with the ink of that glyph
+//!      within [`INK_SLACK`] em of its advance box;
 //!    - a Type 3 font whose `/FontMatrix` has no rotation or skew, whose `/Widths` fit
 //!      `/FirstChar`..`/LastChar`, and in which every shown code is named by `/Differences`, has a
 //!      procedure in `/CharProcs` that can be read and is walked.
@@ -72,8 +73,12 @@ pub const PROGRAM_SLACK_X: f64 = 1.2;
 pub const ADVANCE_TOLERANCE: f64 = 0.02;
 pub const ADVANCE_ABS: f64 = 0.005;
 
-/// The least width of a shown glyph of a simple font, in em, other than a space.
+/// The least width of a shown glyph, in em (a simple font may show a space of no width).
 pub const MIN_WIDTH: f64 = 0.01;
+
+/// How far the ink of a glyph of a composite font with a TrueType program may reach left of its
+/// origin and right of its advance, in em.
+pub const INK_SLACK: f64 = 0.3;
 
 /// The most that the width of a glyph may be, in em.
 pub const MAX_WIDTH: f64 = 3.0;
