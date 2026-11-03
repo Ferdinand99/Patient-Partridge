@@ -294,7 +294,7 @@ describe("signatureFontsSection", () => {
     const text = read("THIRD-PARTY-NOTICES");
     expect(text).toContain("Signature fonts (3 fonts)");
     for (const name of ["Great Vibes (GreatVibes-Regular.ttf)", "Allura (Allura-Regular.ttf)", "Kristi (Kristi-Regular.ttf)"]) expect(text).toContain(name);
-    expect(text).toContain("Copyright 2015 The Great Vibes Pro Project Authors");
+    expect(text).toContain("Copyright 2010 The Great Vibes Pro Project Authors");
   });
 });
 
