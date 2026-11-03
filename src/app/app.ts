@@ -1048,6 +1048,7 @@ export class App {
           onPlace: (page, x, y, client) => tab.annotator?.onPlace(page, x, y, client),
           onStroke: (page, points) => tab.annotator?.onStroke(page, points),
           onMove: (page, id, dx, dy) => tab.annotator?.onMove(page, id, dx, dy),
+          onResize: (page, id, rect) => tab.annotator?.onResize(page, id, rect),
           onEdit: (page, id) => tab.annotator?.onEdit(page, id),
           onLoadFailed: (page, error) => tab.annotator?.onLoadFailed(page, error),
         },

@@ -529,9 +529,13 @@ export function askSignaturePicture(request: PictureRequest): Promise<PictureAns
           savedStatus.textContent = "The name could not be saved.";
         }
         renderSaved();
+        keepFocus();
       };
       ok.addEventListener("click", () => void commit());
-      cancel.addEventListener("click", () => renderSaved());
+      cancel.addEventListener("click", () => {
+        renderSaved();
+        keepFocus();
+      });
       input.addEventListener("keydown", (e) => {
         if (e.key === "Enter") {
           e.preventDefault();
@@ -541,6 +545,7 @@ export function askSignaturePicture(request: PictureRequest): Promise<PictureAns
           e.preventDefault();
           e.stopPropagation();
           renderSaved();
+          keepFocus();
         }
       });
       row.replaceChildren(input, ok, cancel);
@@ -557,6 +562,12 @@ export function askSignaturePicture(request: PictureRequest): Promise<PictureAns
         savedStatus.textContent = "The signature could not be deleted.";
       }
       renderSaved();
+      keepFocus();
+    };
+
+    /** The focus was on a button the list took away: it goes to the tab, so that the keys still work in the box. */
+    const keepFocus = () => {
+      if (!closed && !form.contains(document.activeElement)) tabButtons.get(tab)?.focus();
     };
 
     // ---- ink colour, saving, and the buttons -----------------------------------------------
@@ -684,7 +695,7 @@ export function askSignaturePicture(request: PictureRequest): Promise<PictureAns
       closed = true;
       form.remove();
       request.layer.hidden = request.layer.childElementCount === 0;
-      request.layer.removeEventListener("keydown", onKey);
+      document.removeEventListener("keydown", onKey);
       for (const url of urls) URL.revokeObjectURL(url);
       previousFocus?.focus?.();
       resolve(answer);
@@ -696,7 +707,9 @@ export function askSignaturePicture(request: PictureRequest): Promise<PictureAns
         finish(null);
       }
     };
-    request.layer.addEventListener("keydown", onKey);
+    // On the document, not on the layer: after a delete in the list the focus is on nothing, and
+    // Escape must still close the box.
+    document.addEventListener("keydown", onKey);
     cancel.addEventListener("click", () => finish(null));
 
     const keep = async (picture: Chosen): Promise<boolean> => {
