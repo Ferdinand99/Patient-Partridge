@@ -138,19 +138,27 @@ fn fail<T>(code: ErrorCode, message: impl Into<String>) -> Result<T, Failure> {
     Err((code, message.into()))
 }
 
+/// Overwrites a string with zeros, so that what it held does not stay in memory.
+fn wipe(text: &mut str) {
+    // SAFETY: the bytes are overwritten in place with zeros, which are valid text, and the writes
+    // are volatile so that they are not removed.
+    unsafe {
+        for byte in text.as_bytes_mut() {
+            std::ptr::write_volatile(byte, 0);
+        }
+    }
+}
+
 /// A password kept in memory while its document is open (the engine has to load a copy of the
-/// document with it). It is overwritten with zeros when it is let go of.
+/// document with it). It is overwritten with zeros when it is let go of, and so is the copy in the
+/// request once the document is open. This is best effort: the buffer the frame was read into, the
+/// C string that `pdfium-render` makes for each load and the copy in PDFium's parser are not in
+/// the engine's hands.
 struct Secret(String);
 
 impl Drop for Secret {
     fn drop(&mut self) {
-        // SAFETY: the bytes are overwritten in place and the string is dropped right after, so no
-        // one reads it as text again. The writes are volatile so that they are not removed.
-        unsafe {
-            for byte in self.0.as_bytes_mut() {
-                std::ptr::write_volatile(byte, 0);
-            }
-        }
+        wipe(&mut self.0);
     }
 }
 
@@ -319,7 +327,13 @@ impl Engine {
                     sandbox: self.sandbox.clone(),
                 })
             }
-            RequestBody::Open { password } => self.open(pdfium, password.as_deref()),
+            RequestBody::Open { mut password } => {
+                let opened = self.open(pdfium, password.as_deref());
+                if let Some(password) = password.as_mut() {
+                    wipe(password);
+                }
+                opened
+            }
             RequestBody::Render {
                 doc,
                 page,

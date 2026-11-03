@@ -61,6 +61,9 @@ describe("describeError: saving", () => {
       expect(describeError({ code, message: "" }, "tax.pdf").detail, code).toContain('"tax.pdf"');
     }
     expect(describeError({ code: "save_write_failed", message: "no luck" }, "tax.pdf").detail).toContain("no luck");
+    const protectedFile = describeError({ code: "save_metadata_not_encrypted", message: "" }, "tax.pdf");
+    expect(protectedFile.detail).toContain("saving a copy does not help");
+    expect(protectedFile.detail).toContain("Nothing was saved");
   });
 });
 

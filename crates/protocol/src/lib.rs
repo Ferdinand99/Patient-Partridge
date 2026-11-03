@@ -224,9 +224,6 @@ pub enum ErrorCode {
     /// The field is not there any more, is not the one named, is read only, or cannot be set to
     /// what was asked.
     FormFieldRefused = 25,
-    /// The document is password protected and has an XMP metadata stream, which PDFium cannot write
-    /// encrypted and which must not be written in the clear. Nothing is serialised.
-    SaveMetadataNotEncrypted = 21,
     /// The annotation does not exist (any more), or the page changed under the window.
     NoSuchAnnotation = 18,
     /// The annotation exists but does not allow this change (for example, a drawing has no colour
@@ -234,6 +231,9 @@ pub enum ErrorCode {
     AnnotationRefused = 19,
     /// The document's own permissions do not allow annotations to be added or changed.
     AnnotationsNotAllowed = 20,
+    /// The document is protected and has an XMP metadata stream, which PDFium cannot write encrypted
+    /// and which must not be written in the clear. Nothing is serialised.
+    SaveMetadataNotEncrypted = 21,
 }
 
 impl ErrorCode {
@@ -2581,6 +2581,7 @@ mod tests {
         }
         assert!(ErrorCode::from_u8(0).is_none());
         assert!(ErrorCode::from_u8(22).is_none());
+        assert!(ErrorCode::from_u8(23).is_none());
         assert_eq!(ErrorCode::from_u8(16).unwrap().name(), "source_changed");
         assert_eq!(ErrorCode::from_u8(17).unwrap().name(), "source_unreadable");
         assert_eq!(ErrorCode::from_u8(14).unwrap().name(), "save_failed");
