@@ -24,7 +24,7 @@ app_team="$(team_of "$app")"
 echo
 echo "== Every program inside =="
 printf '%-48s %-14s %-12s %s\n' file architectures runtime timestamp
-required=("Contents/MacOS/partridge-engine" "Contents/Resources/libpdfium.dylib")
+required=("Contents/MacOS/partridge-engine" "Contents/MacOS/partridge-signer" "Contents/Resources/libpdfium.dylib")
 seen=()
 while IFS= read -r f; do
   kind="$(file -b "$f")"

@@ -34,6 +34,8 @@ function run(command, args) {
 }
 
 const exe = process.platform === "win32" ? ".exe" : "";
+// The programs that go next to the app: the PDF engine, and the signer that holds a certificate key.
+const PROGRAMS = ["partridge-engine", "partridge-signer"];
 const binaries = join(root, "src-tauri", "binaries");
 mkdirSync(binaries, { recursive: true });
 
@@ -59,32 +61,32 @@ if (universal) {
   // which a plain "install these targets" step of a workflow does not touch.
   run("rustup", ["target", "add", ...MAC_TRIPLES]);
   for (const triple of MAC_TRIPLES) {
-    run("cargo", ["build", "--release", "-p", "partridge-engine", "--locked", "--target", triple]);
-    copyFileSync(
-      join(targetDir, triple, "release", "partridge-engine"),
-      join(binaries, `partridge-engine-${triple}`),
-    );
+    run("cargo", ["build", "--release", "-p", "partridge-engine", "-p", "partridge-signer", "--locked", "--target", triple]);
+    for (const program of PROGRAMS) {
+      copyFileSync(join(targetDir, triple, "release", program), join(binaries, `${program}-${triple}`));
+    }
   }
-  run("lipo", [
-    "-create",
-    "-output",
-    join(binaries, `partridge-engine-${UNIVERSAL_TRIPLE}`),
-    ...MAC_TRIPLES.map((t) => join(binaries, `partridge-engine-${t}`)),
-  ]);
+  for (const program of PROGRAMS) {
+    run("lipo", [
+      "-create",
+      "-output",
+      join(binaries, `${program}-${UNIVERSAL_TRIPLE}`),
+      ...MAC_TRIPLES.map((t) => join(binaries, `${program}-${t}`)),
+    ]);
+  }
   description = `universal macOS (${MAC_TRIPLES.join(" + ")})`;
 } else {
   const id = platformId();
   const libraryDir = await fetchPdfium(id);
   folder = id;
   file = libraryFor(id).file;
-  run("cargo", ["build", "--release", "-p", "partridge-engine", "--locked"]);
+  run("cargo", ["build", "--release", "-p", "partridge-engine", "-p", "partridge-signer", "--locked"]);
   const host = spawnSync("rustc", ["-vV"], { encoding: "utf8", shell }).stdout;
   const triple = /^host: (.+)$/m.exec(host)?.[1]?.trim();
   if (!triple) throw new Error("Could not read the Rust host triple from `rustc -vV`.");
-  copyFileSync(
-    join(targetDir, "release", `partridge-engine${exe}`),
-    join(binaries, `partridge-engine-${triple}${exe}`),
-  );
+  for (const program of PROGRAMS) {
+    copyFileSync(join(targetDir, "release", `${program}${exe}`), join(binaries, `${program}-${triple}${exe}`));
+  }
   description = `${id} (${triple}); library from ${libraryDir}`;
 }
 

@@ -65,6 +65,16 @@ jobs:
         run: |
           sudo apt-get install -y qpdf poppler-utils
           echo "PARTRIDGE_REQUIRE_READERS=1" >> "$GITHUB_ENV"
+      # A third reader for the files that signing with a certificate makes: pyHanko, a validator of
+      # signed PDFs written by someone else, pinned like everything else
+      # (crates/engine/tests/sign_readers.rs).
+      - name: Install the validator of signatures (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/pyhanko"
+          "$RUNNER_TEMP/pyhanko/bin/pip" install --no-cache-dir pyhanko==0.38.0 pyhanko-certvalidator==0.33.0
+          echo "PARTRIDGE_PYHANKO_PYTHON=$RUNNER_TEMP/pyhanko/bin/python" >> "$GITHUB_ENV"
+          echo "PARTRIDGE_REQUIRE_PYHANKO=1" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
@@ -160,6 +170,15 @@ jobs:
           fi
           ls target/release/examples 2>/dev/null | grep -q selftest && { echo "The self-test program was built in release." >&2; exit 1; }
           echo "ok: no test switches in the release engine"
+      - name: The release signer has no test code
+        if: matrix.lint
+        run: |
+          cargo build --release --locked -p partridge-signer
+          if grep -aq 'PARTRIDGE_TEST_' target/release/partridge-signer; then
+            echo "The release signer contains test switches." >&2
+            exit 1
+          fi
+          echo "ok: no test switches in the release signer"
       - name: The engine has no network code, the app does not link PDFium
         if: matrix.lint
         run: scripts/check-engine-deps.sh
@@ -394,6 +413,13 @@ jobs:
           [ "$RUNNER_OS" = "Windows" ] && bin=target/release/partridge-engine.exe
           if grep -aq 'PARTRIDGE_TEST_' "$bin"; then
             echo "The release engine contains test switches." >&2
+            exit 1
+          fi
+          echo "ok: no test switches in $bin"
+          bin=target/release/partridge-signer
+          [ "$RUNNER_OS" = "Windows" ] && bin=target/release/partridge-signer.exe
+          if grep -aq 'PARTRIDGE_TEST_' "$bin"; then
+            echo "The release signer contains test switches." >&2
             exit 1
           fi
           echo "ok: no test switches in $bin"

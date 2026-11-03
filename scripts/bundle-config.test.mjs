@@ -13,7 +13,7 @@ describe("update files", () => {
 describe("bundleConfig", () => {
   it("ships the engine as a sidecar and the library with its licences from the right folder", () => {
     const c = bundleConfig({ folder: "mac-universal", file: "libpdfium.dylib", env: {} });
-    expect(c.bundle.externalBin).toEqual(["binaries/partridge-engine"]);
+    expect(c.bundle.externalBin).toEqual(["binaries/partridge-engine", "binaries/partridge-signer"]);
     expect(c.bundle.resources).toEqual({
       "../vendor/pdfium/mac-universal/libpdfium.dylib": "libpdfium.dylib",
       "../vendor/pdfium/mac-universal/LICENSE": "pdfium-LICENSE",

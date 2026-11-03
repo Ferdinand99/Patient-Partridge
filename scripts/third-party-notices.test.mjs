@@ -389,7 +389,7 @@ describe("notices.sh", () => {
   it("runs cargo-about with --fail, so a crate without a readable licence stops the build", () => {
     const script = read("scripts/notices.sh");
     const commands = script.split("cargo about generate").slice(1);
-    expect(commands).toHaveLength(2);
+    expect(commands).toHaveLength(3);
     for (const c of commands) expect(c.split("\n")[0] + c.split("\n")[1]).toContain("--fail");
   });
 });
