@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_WIDTH,
+  HEADER_BYTES,
   MAX_DECODE_SIDE,
   MAX_IMAGE_PIXELS,
   MAX_IMAGE_SIDE,
@@ -318,7 +319,18 @@ describe("the size an image file declares", () => {
 
   const png = (w: number, h: number) =>
     new Uint8Array([0x89, ...ascii("PNG"), 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, ...ascii("IHDR"), ...be32(w), ...be32(h), 8, 6, 0, 0, 0]);
-  const gif = (w: number, h: number) => new Uint8Array([...ascii("GIF89a"), ...le16(w), ...le16(h), 0, 0, 0]);
+  // A GIF with a screen, a global colour table of two colours, and frames (each given by its size
+  // and, if it has them, its place). Each frame has an extension before it, a colour table of its
+  // own when asked, and its data in two sub-blocks.
+  const gifFrame = (w: number, h: number, left = 0, top = 0, ownColours = false) => [
+    0x21, 0xf9, 4, 0, 0, 0, 0, 0,
+    0x2c, ...le16(left), ...le16(top), ...le16(w), ...le16(h), ownColours ? 0x80 : 0,
+    ...(ownColours ? [0, 0, 0, 255, 255, 255] : []),
+    2, 3, 1, 2, 3, 2, 4, 5, 0,
+  ];
+  const gifBytes = (sw: number, sh: number, frames: number[][], trailer = true) =>
+    new Uint8Array([...ascii("GIF89a"), ...le16(sw), ...le16(sh), 0x80, 0, 0, 0, 0, 0, 255, 255, 255, ...frames.flat(), ...(trailer ? [0x3b] : [])]);
+  const gif = (w: number, h: number) => gifBytes(w, h, [gifFrame(w, h)]);
   const bmp = (w: number, h: number) => new Uint8Array([...ascii("BM"), ...new Array(12).fill(0), ...le32(40), ...le32(w), ...le32(h >>> 0), 1, 0, 24, 0]);
   const bmpCore = (w: number, h: number) => new Uint8Array([...ascii("BM"), ...new Array(12).fill(0), ...le32(12), ...le16(w), ...le16(h), 1, 0, 24, 0]);
   const webpLossy = (w: number, h: number) =>
@@ -362,6 +374,19 @@ describe("the size an image file declares", () => {
       png(10, 10).subarray(0, 20),
       gif(10, 10).subarray(0, 8),
       bmp(10, 10).subarray(0, 20),
+      // A GIF cut short: in the screen, in the colour table, in a frame, in its data, or before the trailer.
+      gif(10, 10).subarray(0, 14),
+      gif(10, 10).subarray(0, 25),
+      gif(10, 10).subarray(0, 36),
+      gif(10, 10).subarray(0, gif(10, 10).length - 3),
+      gif(10, 10).subarray(0, gif(10, 10).length - 1),
+      // A GIF with no frame, or with a block that is none.
+      gifBytes(10, 10, []),
+      gifBytes(10, 10, [[0x55, 0, 0]]),
+      // A screen of nothing and no frame that has a size.
+      gifBytes(0, 0, [gifFrame(0, 0)]),
+      // A second frame that is cut short is not passed over for the first.
+      gifBytes(10, 10, [gifFrame(10, 10), gifFrame(10, 10).slice(0, 12)], false),
       webpLossy(10, 10).subarray(0, 28),
       jpeg(10, 10).subarray(0, 14),
       new Uint8Array(ascii("<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10'/>")),
@@ -378,6 +403,24 @@ describe("the size an image file declares", () => {
     expect(imageSizeOf(new Uint8Array([0xff, 0xd8, 0xff, 0xda, 0, 2, 0, 0]))).toBeNull();
   });
 
+  it("is the largest of the screen and every frame of a GIF", () => {
+    // A screen of 1 by 1 and a frame of 16000 by 16000: what a decoder makes is the frame.
+    const bomb = gifBytes(1, 1, [gifFrame(16_000, 16_000)]);
+    expect(imageSizeOf(bomb)).toEqual({ width: 16_000, height: 16_000 });
+    expect(judgeImageSize(imageSizeOf(bomb))).toBe("too-big");
+    // A later frame counts as much as the first, and a frame is counted with its place.
+    expect(imageSizeOf(gifBytes(10, 10, [gifFrame(10, 10), gifFrame(9_000, 5, 0, 0, true)]))).toEqual({ width: 9_000, height: 10 });
+    expect(imageSizeOf(gifBytes(10, 10, [gifFrame(10, 10, 8_000, 8_000)]))).toEqual({ width: 8_010, height: 8_010 });
+    expect(judgeImageSize(imageSizeOf(gifBytes(10, 10, [gifFrame(10, 10), gifFrame(10, 10), gifFrame(8_193, 1)])))).toBe("too-big");
+    // A frame that is too big is not hidden behind frames that are small: many of them, and extensions.
+    const many = Array.from({ length: 200 }, () => gifFrame(20, 20, 0, 0, true));
+    expect(imageSizeOf(gifBytes(20, 20, many))).toEqual({ width: 20, height: 20 });
+    expect(judgeImageSize(imageSizeOf(gifBytes(20, 20, [...many, gifFrame(1, 20_000)])))).toBe("too-big");
+    // A normal GIF is read.
+    expect(judgeImageSize(imageSizeOf(gif(640, 480)))).toBe("ok");
+    expect(imageSizeOf(gifBytes(300, 200, [gifFrame(300, 200), gifFrame(100, 100, 10, 10)]))).toEqual({ width: 300, height: 200 });
+  });
+
   it("is judged against the side and the pixel limit of the decoder", () => {
     expect(judgeImageSize({ width: 1, height: 1 })).toBe("ok");
     expect(judgeImageSize({ width: MAX_DECODE_SIDE, height: 4_000 })).toBe("ok");
@@ -392,6 +435,16 @@ describe("the size an image file declares", () => {
     expect(await checkImageHeader(new Blob([png(100, 50)]))).toBe("ok");
     expect(await checkImageHeader(new Blob([png(100_000, 100_000)]))).toBe("too-big");
     expect(await checkImageHeader(new Blob(["not a picture"]))).toBe("unreadable");
+    // A GIF is judged by every frame, also past the first bytes of the file.
+    expect(await checkImageHeader(new Blob([gif(100, 50)]))).toBe("ok");
+    expect(await checkImageHeader(new Blob([gifBytes(1, 1, [gifFrame(16_000, 16_000)])]))).toBe("too-big");
+    expect(await checkImageHeader(new Blob([gif(100, 50).subarray(0, 30)]))).toBe("unreadable");
+    // The frame that is too big comes after more than the first bytes that are read for a header.
+    const filler = [0x2c, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, ...Array.from({ length: 9_000 }, () => [255, ...new Array(255).fill(0)]).flat(), 0];
+    const late = gifBytes(1, 1, [filler, gifFrame(16_000, 16_000)]);
+    expect(late.length).toBeGreaterThan(HEADER_BYTES);
+    expect(await checkImageHeader(new Blob([late]))).toBe("too-big");
+    expect(await checkImageHeader(new Blob([gifBytes(1, 1, [filler, gifFrame(1, 1)])]))).toBe("ok");
     for (const format of ["PNG", "JPEG", "WebP", "GIF", "BMP"]) expect(PICTURE_WORDS.imageFailed).toContain(format);
   });
 });

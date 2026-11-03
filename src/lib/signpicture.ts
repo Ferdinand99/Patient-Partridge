@@ -331,6 +331,62 @@ export interface ImageSize {
   height: number;
 }
 
+/** Most blocks of a GIF that are walked before the file is given up on (a block is at least a byte). */
+const MAX_GIF_BLOCKS = 2_000_000;
+
+/**
+ * The size of a GIF as a decoder will make it: the largest of the screen and of every frame (its
+ * place plus its size). The walk goes from block to block, over the colour tables, the extensions
+ * and the sub-blocks of data, to the trailer. A file that is cut short, has a block that is not
+ * one, or has no frame at all gives `null`: it is not decoded.
+ */
+function gifSize(bytes: Uint8Array): ImageSize | null {
+  const n = bytes.length;
+  if (n < 13) return null;
+  const le16 = (at: number) => bytes[at] | (bytes[at + 1] << 8);
+  // The index after a run of sub-blocks (a length, then that many bytes, ending with a length of
+  // 0), or -1 when the file ends first. Each step moves on by at least a byte.
+  const skipSubBlocks = (from: number): number => {
+    let at = from;
+    while (at < n) {
+      const length = bytes[at];
+      at += 1 + length;
+      if (length === 0) return at;
+    }
+    return -1;
+  };
+  let width = le16(6);
+  let height = le16(8);
+  let at = 13 + (bytes[10] & 0x80 ? 3 * (1 << ((bytes[10] & 7) + 1)) : 0);
+  let frames = 0;
+  for (let blocks = 0; blocks < MAX_GIF_BLOCKS; blocks++) {
+    if (at >= n) return null;
+    const block = bytes[at];
+    if (block === 0x3b) {
+      return frames > 0 && width > 0 && height > 0 ? { width, height } : null;
+    }
+    if (block === 0x21) {
+      // An extension: its label, then sub-blocks.
+      at = skipSubBlocks(at + 2);
+      if (at < 0) return null;
+    } else if (block === 0x2c) {
+      // A frame: left, top, width, height, a byte of flags, perhaps a colour table, the size of
+      // the code, and the data in sub-blocks.
+      if (at + 10 > n) return null;
+      width = Math.max(width, le16(at + 1) + le16(at + 5));
+      height = Math.max(height, le16(at + 3) + le16(at + 7));
+      frames += 1;
+      const flags = bytes[at + 9];
+      at += 10 + (flags & 0x80 ? 3 * (1 << ((flags & 7) + 1)) : 0) + 1;
+      at = skipSubBlocks(at);
+      if (at < 0) return null;
+    } else {
+      return null;
+    }
+  }
+  return null;
+}
+
 /**
  * The width and the height an image file declares in its header: PNG, JPEG, WebP, GIF and BMP.
  * `null` for a file that is none of these or whose header is cut short or does not hold a size.
@@ -357,8 +413,9 @@ export function imageSizeOf(bytes: Uint8Array): ImageSize | null {
     if (text(12, 4) !== "IHDR") return null;
     return size(be32(16), be32(20));
   }
-  // GIF: the size of the screen, two numbers of two bytes.
-  if (text(0, 6) === "GIF87a" || text(0, 6) === "GIF89a") return size(le16(6), le16(8));
+  // GIF: the screen, and every frame in the file (a decoder makes the picture as big as the
+  // largest of them, whatever the screen says).
+  if (text(0, 6) === "GIF87a" || text(0, 6) === "GIF89a") return gifSize(bytes);
   // BMP: a file header, then a header whose first number is its own length.
   if (text(0, 2) === "BM") {
     const header = le32(14);
@@ -426,8 +483,8 @@ export function judgeImageSize(size: ImageSize | null): ImageHeader {
 }
 
 /** The first bytes of a file, whichever way this environment can read a Blob. */
-async function headOf(blob: Blob): Promise<Uint8Array> {
-  const part = blob.slice(0, HEADER_BYTES);
+async function headOf(blob: Blob, length: number = HEADER_BYTES): Promise<Uint8Array> {
+  const part = blob.slice(0, length);
   if (typeof part.arrayBuffer === "function") return new Uint8Array(await part.arrayBuffer());
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -443,7 +500,13 @@ async function headOf(blob: Blob): Promise<Uint8Array> {
  */
 export async function checkImageHeader(blob: Blob): Promise<ImageHeader> {
   try {
-    return judgeImageSize(imageSizeOf(await headOf(blob)));
+    let head = await headOf(blob);
+    // The frames of a GIF follow one another through the whole file, and each is judged, so the
+    // whole file (which is held to its own size limit) is read.
+    if (head.length >= 4 && head[0] === 0x47 && head[1] === 0x49 && head[2] === 0x46 && head[3] === 0x38) {
+      head = await headOf(blob, MAX_IMAGE_FILE_BYTES);
+    }
+    return judgeImageSize(imageSizeOf(head));
   } catch {
     return "unreadable";
   }

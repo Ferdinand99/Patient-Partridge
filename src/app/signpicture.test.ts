@@ -389,6 +389,18 @@ describe("importing an image", () => {
     await flush();
     expect(status()).toBe(PICTURE_WORDS.imageFailed);
     expect(t.decode).not.toHaveBeenCalled();
+    // A GIF whose screen is 1 by 1 and whose frame is 16000 by 16000 (a few hundred bytes).
+    const frame = (w: number, h: number) => [0x2c, 0, 0, 0, 0, w & 255, w >> 8, h & 255, h >> 8, 0, 2, 2, 0x44, 0x01, 0];
+    const gif = (...frames: number[][]) =>
+      new Uint8Array([0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 1, 0, 1, 0, 0x80, 0, 0, 0, 0, 0, 255, 255, 255, ...frames.flat(), 0x3b]);
+    pick(form, new File([gif(frame(16_000, 16_000)) as BlobPart], "bomb.gif", { type: "image/gif" }));
+    await flush();
+    expect(status()).toBe(PICTURE_WORDS.imageTooBig);
+    // A GIF that is cut short is refused as not being read.
+    pick(form, new File([gif(frame(10, 10)).subarray(0, 28) as BlobPart], "cut.gif", { type: "image/gif" }));
+    await flush();
+    expect(status()).toBe(PICTURE_WORDS.imageFailed);
+    expect(t.decode).not.toHaveBeenCalled();
     // At the limit it is read.
     pick(form, pngFile("limit.png", 6_000, 6_000));
     await flush();
