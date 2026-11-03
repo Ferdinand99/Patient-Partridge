@@ -36,7 +36,6 @@ use crate::{ClientError, EngineClient, EngineConfig, SaveStreamError};
 #[derive(Debug, Clone)]
 pub struct SignOptions {
     pub place: SignPlace,
-    pub name: String,
     pub reason: String,
     pub location: String,
     /// A picture to show in the box. It proves nothing.
@@ -60,7 +59,25 @@ pub struct SignOutcome {
 }
 
 /// Room left over in the signature after the longest one the signer says it makes.
-const RESERVE_MARGIN: u32 = 64;
+pub(crate) const RESERVE_MARGIN: u32 = 64;
+
+/// The name the signature carries: the name in the certificate that signs, so that what a page
+/// shows and what a program reads from the signature are the same person. Cut to what the engine
+/// takes.
+fn signer_name(certificate: &Certificate) -> String {
+    let mut name = String::new();
+    for c in certificate.name.chars() {
+        if name.len() + c.len_utf8() > 200 {
+            break;
+        }
+        name.push(c);
+    }
+    if name.trim().is_empty() {
+        "Signer".to_string()
+    } else {
+        name
+    }
+}
 
 fn refused(code: ErrorCode, message: &str) -> ClientError {
     ClientError::Engine {
@@ -124,13 +141,23 @@ pub fn verify_signed(
         let report = client
             .signatures(opened.doc, now())
             .map_err(|e| verify(format!("its signature could not be checked ({e})")))?;
-        if report.total != 1 || report.unlisted != 0 || report.items.len() != 1 {
+        // Signature fields that nobody has signed (the document may have had some) have no byte
+        // range and stay as they were; what must be there is one signature with a value, and
+        // nothing that looks like another.
+        let signed: Vec<_> = report
+            .items
+            .iter()
+            .filter(|item| !item.byte_range.is_empty())
+            .collect();
+        if signed.len() != 1 || report.unlisted != 0 || report.total as usize != report.items.len()
+        {
             return Err(verify(format!(
-                "it holds {} signatures and {} marks of others, not one signature",
-                report.total, report.unlisted
+                "it holds {} signatures with a value and {} marks of others, not one signature",
+                signed.len(),
+                report.unlisted
             )));
         }
-        let item = &report.items[0];
+        let item = signed[0];
         if !matches!(
             item.state,
             SignatureState::UnknownSigner | SignatureState::Trusted
@@ -210,6 +237,14 @@ pub(crate) fn sign_document(
             "the document is encrypted, so it cannot be signed",
         ));
     }
+    // The engine looks for the marks of a signature in the bytes it writes; PDFium's own count of
+    // the signatures that hold something is a second way of seeing the same, and either is enough.
+    if info.signatures > 0 {
+        return Err(refused(
+            ErrorCode::SignAlreadySigned,
+            "the document holds signatures already",
+        ));
+    }
     // What the pages are like now, as the engine that holds the document sees them. The file that
     // is written must give the same, apart from the new signature field.
     let print = client.sign_fingerprint(doc)?;
@@ -240,7 +275,7 @@ pub(crate) fn sign_document(
                 let spec = SignSpec {
                     doc: 0,
                     place: options.place.clone(),
-                    name: options.name.clone(),
+                    name: signer_name(&certificate),
                     reason: options.reason.clone(),
                     location: options.location.clone(),
                     signed_at: options.signed_at,

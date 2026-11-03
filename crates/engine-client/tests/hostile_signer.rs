@@ -158,7 +158,7 @@ fn a_file_or_a_password_over_the_cap_is_refused_before_the_signer_is_asked() {
         other => panic!("{other:?}"),
     }
     match signer.load(b"x", &"p".repeat(5_000)) {
-        Err(ClientError::Signer { code, .. }) => assert_eq!(code, "signer_wrong_password"),
+        Err(ClientError::Signer { code, .. }) => assert_eq!(code, "signer_password_too_long"),
         other => panic!("{other:?}"),
     }
     // Both were refused without a word to the signer, which is still there.

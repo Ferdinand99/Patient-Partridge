@@ -199,3 +199,114 @@ pub fn resaved(engine: &mut Engine, bytes: &[u8]) -> Vec<u8> {
     ask(engine, RequestBody::Close { doc });
     out
 }
+
+// ---- documents written by hand, with bytes that are not text ----------------------------------
+
+/// A one-page document from raw objects (`objects[i]` is object `i + 1`, and the first is the
+/// catalog), with a plain table. The bytes of the objects are written as they are.
+pub fn raw_pdf(objects: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+    let mut at = Vec::new();
+    for (i, body) in objects.iter().enumerate() {
+        at.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let table = out.len();
+    out.extend_from_slice(
+        format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+    );
+    for offset in at {
+        out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{table}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+/// The strings of `latin1_form_pdf`, as bytes: Latin-1 and UTF-16 with a byte order mark.
+pub const LATIN1_FIELD: &[u8] = b"(Underskrift s\xf8ker)";
+pub const LATIN1_TIP: &[u8] = b"(Signer h\xe9r)";
+pub const UTF16_FIELD: &[u8] = b"(\xfe\xff\x00U\x00n\x00d\x00e\x00r\x00\xc5)";
+pub const LABEL: &[u8] = b"(Side \xc5-)";
+pub const LANGUAGE: &[u8] = b"(nb-\xf8)";
+pub const FORM_DEFAULT: &[u8] = b"(/Helv 0 Tf 0 g \xe5)";
+pub const PAGE_NOTE: &[u8] = b"(\xe5\xf8 \xfe\xff)";
+
+/// The names of the two signature fields of `latin1_form_pdf` as the engine reads them.
+pub const LATIN1_NAME: &str = "Underskrift s\u{f8}ker";
+pub const UTF16_NAME: &str = "Under\u{c5}";
+
+/// A form with two empty signature fields whose names (Latin-1 and UTF-16BE), a page label, a
+/// language, the default appearance of the form and a note on the page are all bytes that are not
+/// valid UTF-8.
+pub fn latin1_form_pdf() -> Vec<u8> {
+    let join = |parts: &[&[u8]]| parts.concat();
+    raw_pdf(&[
+        join(&[
+            b"<< /Type /Catalog /Pages 2 0 R /Lang ",
+            LANGUAGE,
+            b" /PageLabels << /Nums [0 << /P ",
+            LABEL,
+            b" >>] >> /AcroForm << /Fields [5 0 R 6 0 R] /DA ",
+            FORM_DEFAULT,
+            b" /DR << /Font << /Helv 4 0 R >> >> >> >>",
+        ]),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        join(&[
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /Helv 4 0 R >> >> /Annots [5 0 R 6 0 R] /Note ",
+            PAGE_NOTE,
+            b" >>",
+        ]),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        join(&[
+            b"<< /Type /Annot /Subtype /Widget /FT /Sig /T ",
+            LATIN1_FIELD,
+            b" /TU ",
+            LATIN1_TIP,
+            b" /Rect [72 100 250 140] /F 132 /P 3 0 R >>",
+        ]),
+        join(&[
+            b"<< /Type /Annot /Subtype /Widget /FT /Sig /T ",
+            UTF16_FIELD,
+            b" /Rect [72 160 250 200] /F 132 /P 3 0 R >>",
+        ]),
+    ])
+}
+
+/// A form whose one empty signature field is described by `extra` (a seed value, a lock, an old
+/// look), on a page whose annotation list may be an object of its own.
+pub fn one_field_pdf(field_extra: &[u8], shared_annots: bool) -> Vec<u8> {
+    let join = |parts: &[&[u8]]| parts.concat();
+    let page_annots: &[u8] = if shared_annots { b"7 0 R" } else { b"[5 0 R]" };
+    let mut objects = vec![
+        b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [5 0 R] >> >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>".to_vec(),
+        join(&[
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots ",
+            page_annots,
+            b" >>",
+        ]),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        join(&[
+            b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (box) /Rect [72 100 250 140] /F 132 /P 3 0 R ",
+            field_extra,
+            b" >>",
+        ]),
+        join(&[
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots ",
+            if shared_annots { b"7 0 R" } else { b"[]" },
+            b" >>",
+        ]),
+    ];
+    if shared_annots {
+        objects.push(b"[5 0 R]".to_vec());
+    }
+    raw_pdf(&objects)
+}

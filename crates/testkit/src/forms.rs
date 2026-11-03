@@ -39,6 +39,8 @@ pub struct FormOptions {
     /// A signature field that holds nothing, as a form has before anybody signs it. With
     /// `signed` the form has both.
     pub empty_signature: bool,
+    /// A second signature field that holds nothing, below the first.
+    pub second_empty_signature: bool,
     /// Fields that sit under a parent field: `person.first` and `person.last`.
     pub nested: bool,
     /// An object that no page uses and that is this many bytes long, so that the file is big and
@@ -355,6 +357,14 @@ pub fn forms_with(opts: &FormOptions) -> Vec<u8> {
         annots.push(widget);
         field_refs.push_str(&format!(" {widget} 0 R"));
     }
+    if opts.second_empty_signature {
+        let widget = objs.add(
+            "<< /Type /Annot /Subtype /Widget /FT /Sig /T (second_signature) \
+             /Rect [72 160 250 200] /F 132 /P 4 0 R >>",
+        );
+        annots.push(widget);
+        field_refs.push_str(&format!(" {widget} 0 R"));
+    }
     if opts.xmp {
         let stream = objs.add(stream_object(
             "/Type /Metadata /Subtype /XML",
@@ -453,6 +463,15 @@ pub fn forms_signed_pdf() -> Vec<u8> {
 pub fn forms_empty_signature_pdf() -> Vec<u8> {
     forms_with(&FormOptions {
         empty_signature: true,
+        ..FormOptions::default()
+    })
+}
+
+/// A form with two signature fields that hold nothing.
+pub fn forms_two_empty_signatures_pdf() -> Vec<u8> {
+    forms_with(&FormOptions {
+        empty_signature: true,
+        second_empty_signature: true,
         ..FormOptions::default()
     })
 }

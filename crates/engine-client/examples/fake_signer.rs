@@ -117,18 +117,25 @@ fn main() {
             },
             Request::Sign { .. } => match mode.as_str() {
                 "wrong-answer" => send(&mut output, Response::Loaded(certificate())),
-                "long-signature" => send(
-                    &mut output,
-                    Response::Signed {
-                        cms: vec![0x30; 2_000],
-                    },
-                ),
-                _ => send(
-                    &mut output,
-                    Response::Signed {
-                        cms: vec![0x30; 100],
-                    },
-                ),
+                // Like the real signer, the stand-in ends after the one signature it makes.
+                "long-signature" => {
+                    send(
+                        &mut output,
+                        Response::Signed {
+                            cms: vec![0x30; 2_000],
+                        },
+                    );
+                    return;
+                }
+                _ => {
+                    send(
+                        &mut output,
+                        Response::Signed {
+                            cms: vec![0x30; 100],
+                        },
+                    );
+                    return;
+                }
             },
             Request::Close => {
                 send(&mut output, Response::Closed);

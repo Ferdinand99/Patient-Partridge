@@ -102,7 +102,6 @@ fn options() -> SignOptions {
             page: 0,
             rect: [72.0, 600.0, 272.0, 660.0],
         },
-        name: "Test Signer RSA 2048".into(),
         reason: "I have read this".into(),
         location: "Oslo".into(),
         mark: None,
@@ -477,6 +476,7 @@ fn the_check_of_the_new_file_refuses_a_file_that_is_not_the_one_that_was_made() 
     let pool = EnginePool::new(config(), 4);
     let (handle, _) = pool.open(&text(&source), None).unwrap();
     let mut signer = loaded_signer("rsa2048.p12");
+    let certificate = signer.certificate().unwrap().clone();
     pool.sign_as(
         handle,
         &target,
@@ -485,7 +485,6 @@ fn the_check_of_the_new_file_refuses_a_file_that_is_not_the_one_that_was_made() 
         SaveOptions::default(),
     )
     .unwrap();
-    let certificate = signer.certificate().unwrap().clone();
     signer.close();
 
     // What the document looked like, for the check: its fingerprint without signature fields.
@@ -544,4 +543,149 @@ fn the_check_of_the_new_file_refuses_a_file_that_is_not_the_one_that_was_made() 
         ok(&unsigned, &certificate, &print, 2),
         Err(SaveError::Verify(_))
     ));
+}
+
+fn has(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+#[test]
+fn the_signer_has_let_the_key_go_after_the_one_signature_and_the_name_is_the_certificates() {
+    let dir = Dir::new("once");
+    let source = dir.write("a.pdf", &kit::simple_pdf(1));
+    let target = dir.0.join("a (signed).pdf");
+    let pool = EnginePool::new(config(), 4);
+    let (handle, _) = pool.open(&text(&source), None).unwrap();
+    let mut signer = loaded_signer("rsa2048.p12");
+    pool.sign_as(
+        handle,
+        &target,
+        &mut signer,
+        &options(),
+        SaveOptions::default(),
+    )
+    .unwrap();
+    // The signer ended after the signature: no certificate is open in it any more.
+    assert!(signer.certificate().is_none());
+    let error = signer.load(&fixture("rsa2048.p12"), "test").unwrap_err();
+    assert_eq!(code_of(&error), "signer_stopped");
+    // The signature names the holder of the certificate, whatever else the person might have typed.
+    let signed = fs::read(&target).unwrap();
+    assert!(has(&signed, b"/Name (Test Signer RSA 2048)"));
+}
+
+#[test]
+fn a_document_with_signature_fields_that_nobody_signed_is_signed_the_whole_way() {
+    let dir = Dir::new("empty-fields");
+    let pool = EnginePool::new(config(), 4);
+    for (pdf, fields) in [
+        (kit::forms_empty_signature_pdf(), vec!["empty_signature"]),
+        (
+            kit::forms_two_empty_signatures_pdf(),
+            vec!["empty_signature", "second_signature"],
+        ),
+    ] {
+        let source = dir.write("form.pdf", &pdf);
+        let (handle, _) = pool.open(&text(&source), None).unwrap();
+        let mut places = vec![
+            SignPlace::Rect {
+                page: 0,
+                rect: [72.0, 600.0, 272.0, 660.0],
+            },
+            SignPlace::Invisible,
+        ];
+        places.extend(fields.iter().map(|name| SignPlace::Field {
+            page: 0,
+            name: (*name).to_string(),
+        }));
+        for (n, place) in places.into_iter().enumerate() {
+            let target = dir.0.join(format!("form-signed-{}-{n}.pdf", fields.len()));
+            let mut signer = loaded_signer("rsa2048.p12");
+            let mut chosen = options();
+            chosen.place = place.clone();
+            let outcome = pool
+                .sign_as(
+                    handle,
+                    &target,
+                    &mut signer,
+                    &chosen,
+                    SaveOptions::default(),
+                )
+                .unwrap_or_else(|e| panic!("{place:?}: {e:?}"));
+            // One signature holds; the fields that nobody signed are still there, still empty.
+            let client = EngineClient::new(config());
+            let opened = client.open(&text(&target), None).unwrap();
+            let report = client.signatures(opened.doc, 1_781_524_800).unwrap();
+            let held = report
+                .items
+                .iter()
+                .filter(|i| !i.byte_range.is_empty())
+                .count();
+            assert_eq!(held, 1, "{place:?}: {:?}", report.items);
+            let empty = report.items.len() - held;
+            let used = usize::from(matches!(place, SignPlace::Field { .. }));
+            // A new box adds a field of its own; a field that is used leaves one less.
+            let expected = if used == 1 {
+                fields.len() - 1
+            } else {
+                fields.len()
+            };
+            assert_eq!(empty, expected, "{place:?}: {:?}", report.items);
+            client.kill();
+            assert!(!outcome.field.is_empty());
+        }
+    }
+}
+
+#[test]
+fn strings_that_are_not_text_reach_the_signed_file_as_they_were() {
+    let dir = Dir::new("latin1");
+    let source = dir.write("form.pdf", &sign_support::latin1_form_pdf());
+    let pool = EnginePool::new(config(), 4);
+    let (handle, _) = pool.open(&text(&source), None).unwrap();
+    let target = dir.0.join("form (signed).pdf");
+    let mut signer = loaded_signer("rsa2048.p12");
+    let mut chosen = options();
+    chosen.place = SignPlace::Field {
+        page: 0,
+        name: sign_support::LATIN1_NAME.to_string(),
+    };
+    pool.sign_as(
+        handle,
+        &target,
+        &mut signer,
+        &chosen,
+        SaveOptions::default(),
+    )
+    .unwrap();
+    let signed = fs::read(&target).unwrap();
+    assert!(!has(&signed, &[0xef, 0xbf, 0xbd]));
+    for bytes in [
+        sign_support::LATIN1_FIELD,
+        sign_support::LATIN1_TIP,
+        sign_support::UTF16_FIELD,
+        sign_support::LABEL,
+        sign_support::LANGUAGE,
+        sign_support::FORM_DEFAULT,
+    ] {
+        assert!(
+            has(&signed, bytes),
+            "{} is not in the signed file",
+            String::from_utf8_lossy(bytes)
+        );
+    }
+    // The other field is listed under the name it had.
+    let client = EngineClient::new(config());
+    let opened = client.open(&text(&target), None).unwrap();
+    let names: Vec<String> = client
+        .sign_fields(opened.doc)
+        .unwrap()
+        .into_iter()
+        .map(|f| f.name)
+        .collect();
+    assert!(
+        names.contains(&sign_support::UTF16_NAME.to_string()),
+        "{names:?}"
+    );
+    client.kill();
 }

@@ -101,7 +101,7 @@ fn the_signer_program_greets_loads_signs_and_ends() {
         panic!("not signed");
     };
     assert!(cms.len() <= info.signature_bytes as usize);
-    assert_eq!(signer.ask(Request::Close), Response::Closed);
+    // The signer ends by itself after the one signature it made: the key is not kept.
     let status = signer.child.wait().unwrap();
     assert!(status.success(), "{status}");
 }
@@ -132,7 +132,6 @@ fn the_signer_makes_every_kind_of_signature_after_it_is_locked_in() {
             panic!("{file} was not signed");
         };
         assert!(cms.len() <= info.signature_bytes as usize);
-        signer.ask(Request::Close);
         assert!(signer.child.wait().unwrap().success());
     }
 }

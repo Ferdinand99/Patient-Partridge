@@ -89,6 +89,8 @@ fn code_of(code: ErrorCode) -> &'static str {
         ErrorCode::SandboxUnavailable => "signer_sandbox_unavailable",
         ErrorCode::Internal => "signer_internal",
         ErrorCode::ProtocolMismatch => "signer_protocol_mismatch",
+        ErrorCode::ProtectionUnsupported => "signer_protection_unsupported",
+        ErrorCode::ChainTooLong => "signer_chain_too_long",
     }
 }
 
@@ -269,7 +271,7 @@ impl SignerSession {
         }
         if password.len() > MAX_PASSWORD_BYTES {
             return Err(signer_error(
-                "signer_wrong_password",
+                "signer_password_too_long",
                 "the password is too long",
             ));
         }
@@ -290,6 +292,19 @@ impl SignerSession {
         message.zeroize();
         match outcome? {
             Response::Loaded(certificate) => {
+                // A signature that would not fit the room the engine may keep for it is told
+                // now, not after the placement and the file dialog.
+                if certificate
+                    .signature_bytes
+                    .saturating_add(crate::sign::RESERVE_MARGIN)
+                    > partridge_protocol::MAX_SIGN_RESERVE
+                {
+                    self.kill();
+                    return Err(signer_error(
+                        "signer_too_large",
+                        "the certificates in the file make a signature that is too big",
+                    ));
+                }
                 self.certificate = Some(certificate.clone());
                 Ok(certificate)
             }
@@ -320,7 +335,14 @@ impl SignerSession {
             .encode(),
             timeout,
         )? {
-            Response::Signed { cms } => Ok(cms),
+            Response::Signed { cms } => {
+                // The signer lets the key go and ends after the one signature it makes: it is
+                // waited for, and this session has no certificate any more.
+                self.certificate = None;
+                self.ended = true;
+                let _ = self.process.wait();
+                Ok(cms)
+            }
             Response::Error { code, message } => Err(signer_error(code_of(code), message)),
             _ => {
                 self.kill();

@@ -189,6 +189,44 @@ def main(out):
         file.unlink()
     work.rmdir()
 
+def extra(out):
+    """Files added later for tests of what is refused. They have a certificate authority of their
+    own, so making them does not touch the files above: run this with `--extra` on its own."""
+    out = Path(out)
+    long_ago, far_off = when(2020), when(2120)
+    # A chain of fourteen certificates: the holder's and thirteen authorities above it.
+    authorities = []
+    previous_key, previous_name = None, None
+    for level in range(13):
+        key = rsa.generate_private_key(65537, 2048)
+        subject = name(f"Partridge Test Deep Authority {level}")
+        if previous_key is None:
+            cert = certificate(subject, key, subject, key, 1000 + level, long_ago, far_off, ca=True)
+        else:
+            cert = certificate(subject, key, previous_name, previous_key, 1000 + level, long_ago, far_off, ca=True)
+        authorities.append((key, subject, cert))
+        previous_key, previous_name = key, subject
+    holder = rsa.generate_private_key(65537, 2048)
+    holder_cert = certificate(name("Test Signer Deep Chain"), holder, previous_name, previous_key, 2000,
+                              long_ago, far_off)
+    chain = [cert for (_, _, cert) in reversed(authorities)]
+    write(out, "rsa2048-chain14.p12", holder, holder_cert, chain)
+
+    # The holder with the eleven nearest authorities is a chain of twelve, the most that is carried.
+    write(out, "rsa2048-chain12.p12", holder, holder_cert, chain[:11])
+    # An RSA key with the public exponent 3, which other programs do not accept.
+    root_key = rsa.generate_private_key(65537, 2048)
+    root_name = name("Partridge Test Small Exponent Root")
+    root = certificate(root_name, root_key, root_name, root_key, 3000, long_ago, far_off, ca=True)
+    key3 = rsa.generate_private_key(3, 2048)
+    write(out, "rsa2048-exponent3.p12", key3,
+          certificate(name("Test Signer Exponent 3"), key3, root_name, root_key, 3001, long_ago, far_off), [root])
+
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "crates/signer/tests/fixtures")
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    folder = args[0] if args else "crates/signer/tests/fixtures"
+    if "--extra" in sys.argv:
+        extra(folder)
+    else:
+        main(folder)

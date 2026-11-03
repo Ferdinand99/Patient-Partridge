@@ -35,6 +35,8 @@ pub struct Signer {
     sandbox: String,
     identity: Option<Identity>,
     greeted: bool,
+    /// A signature was made.
+    signed: bool,
     /// When set, the signer answers the greeting with this and does nothing else.
     refusal: Option<String>,
 }
@@ -46,6 +48,7 @@ impl Signer {
             sandbox: sandbox.to_string(),
             identity: None,
             greeted: false,
+            signed: false,
             refusal: None,
         }
     }
@@ -54,6 +57,11 @@ impl Signer {
     pub fn refuse(&mut self, why: &str) {
         self.identity = None;
         self.refusal = Some(why.to_string());
+    }
+
+    /// True once a signature was made: the signer answers nothing more and ends.
+    pub fn is_finished(&self) -> bool {
+        self.signed
     }
 
     /// True once [`Signer::refuse`] was called: the signer answers the next request and stops.
@@ -94,7 +102,13 @@ impl Signer {
             Request::Sign { digest } => match &self.identity {
                 None => error(ErrorCode::NotLoaded, "no certificate file is loaded"),
                 Some(identity) => match sign(identity, &digest) {
-                    Ok(cms) => Response::Signed { cms },
+                    Ok(cms) => {
+                        // One signature, and then the key is let go and the signer ends: a key
+                        // that is not needed any more is not kept.
+                        self.identity = None;
+                        self.signed = true;
+                        Response::Signed { cms }
+                    }
                     Err(e) => error(e.code, &e.message),
                 },
             },
@@ -155,7 +169,7 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write, signer: &mut Signer
         if signer.is_refusing() {
             return 5;
         }
-        if closing {
+        if closing || signer.is_finished() {
             return 0;
         }
     }

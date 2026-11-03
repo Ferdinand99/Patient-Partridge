@@ -180,6 +180,27 @@ fn keys_that_readers_cannot_check_are_refused_by_name() {
 }
 
 #[test]
+fn each_key_that_is_refused_says_why() {
+    let e = load(&fixture("rsa1024.p12"), "test").err().unwrap();
+    assert!(e.message.contains("shorter than 2048"), "{}", e.message);
+    let e = load(&fixture("rsa2048-exponent3.p12"), "test")
+        .err()
+        .unwrap();
+    assert_eq!(e.code, ErrorCode::KeyUnsupported);
+    assert!(e.message.contains("65537"), "{}", e.message);
+}
+
+#[test]
+fn a_chain_is_carried_whole_or_the_file_is_refused() {
+    // Twelve certificates are the most a signature carries.
+    let identity = load(&fixture("rsa2048-chain12.p12"), "test").unwrap();
+    assert_eq!(identity.certificate().chain, 12);
+    // One more is not cut off: the file is refused, so that the chain is never left short of its root.
+    let e = load(&fixture("rsa2048-chain14.p12"), "test").err().unwrap();
+    assert_eq!(e.code, ErrorCode::ChainTooLong);
+}
+
+#[test]
 fn a_file_without_a_private_key_is_refused() {
     assert_eq!(refused("no-key.p12", "test"), ErrorCode::NoKey);
 }
@@ -409,14 +430,15 @@ fn a_signature_needs_a_certificate_and_one_certificate_is_held_at_a_time() {
         panic!("not signed");
     };
     assert!(cms.len() <= info.signature_bytes as usize);
-    // After Close the key is gone.
-    assert_eq!(signer.handle(Request::Close), Response::Closed);
+    // After the one signature the key is gone, and the signer is finished.
+    assert!(signer.is_finished());
     assert_eq!(
         code(signer.handle(Request::Sign {
             digest: vec![5; 32]
         })),
         ErrorCode::NotLoaded
     );
+    assert_eq!(signer.handle(Request::Close), Response::Closed);
 }
 
 #[test]

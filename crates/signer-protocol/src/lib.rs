@@ -106,6 +106,12 @@ pub enum ErrorCode {
     Internal = 10,
     /// The two sides do not speak the same version.
     ProtocolMismatch = 11,
+    /// The file is protected in a way the signer does not open (a method it does not know, or a
+    /// request for more rounds of work than it allows).
+    ProtectionUnsupported = 12,
+    /// The certificates of the file lead through more than [`MAX_CHAIN`] others, so the chain would
+    /// be cut short.
+    ChainTooLong = 13,
 }
 
 impl ErrorCode {
@@ -122,6 +128,8 @@ impl ErrorCode {
             9 => ErrorCode::SandboxUnavailable,
             10 => ErrorCode::Internal,
             11 => ErrorCode::ProtocolMismatch,
+            12 => ErrorCode::ProtectionUnsupported,
+            13 => ErrorCode::ChainTooLong,
             other => return Err(ProtocolError::UnknownValue(other)),
         })
     }
@@ -140,6 +148,8 @@ impl ErrorCode {
             ErrorCode::SandboxUnavailable => "sandbox_unavailable",
             ErrorCode::Internal => "internal",
             ErrorCode::ProtocolMismatch => "protocol_mismatch",
+            ErrorCode::ProtectionUnsupported => "protection_unsupported",
+            ErrorCode::ChainTooLong => "chain_too_long",
         }
     }
 }

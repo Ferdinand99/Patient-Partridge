@@ -983,6 +983,7 @@ pub fn run() {
             certsign::sign_pick_certificate,
             certsign::sign_load_certificate,
             certsign::sign_forget_certificate,
+            certsign::sign_certificate_open,
             certsign::sign_set_image_mark,
             certsign::sign_list_fields,
             certsign::sign_document,

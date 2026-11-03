@@ -84,6 +84,14 @@ fuzz_target!(|data: &[u8]| {
     );
     let at = text_after(out, b"/ByteRange ").expect("a byte range");
     assert_eq!(&out[at..at + range.len()], range.as_bytes());
+    // Nothing the file held was turned into the replacement character on the way (which is what
+    // happens to a string that is not text when it is copied through text): a file that has none
+    // gets none in the part that was added.
+    let replacement = [0xef_u8, 0xbf, 0xbd];
+    let has_replacement = |bytes: &[u8]| bytes.windows(3).any(|w| w == replacement);
+    if !has_replacement(file) {
+        assert!(!has_replacement(&out[file.len()..]), "a string was turned into text");
+    }
     // The last table is where the last `startxref` says, and what it lists is where it says.
     let start = text_after(out, b"startxref\n").expect("startxref");
     let end = out[start..].iter().position(|b| *b == b'\n').unwrap();
@@ -92,6 +100,28 @@ fuzz_target!(|data: &[u8]| {
         .parse()
         .unwrap();
     assert!(out[table..].starts_with(b"xref\n"));
+    // The trailer names the catalog, the new size, and the table before (inside the old file).
+    let trailer = &out[table..];
+    let trailer_at = trailer
+        .windows(7)
+        .position(|w| w == b"trailer")
+        .expect("a trailer");
+    let trailer = &trailer[trailer_at..];
+    for key in [&b" /Root "[..], b" /Size ", b" /Prev "] {
+        assert!(
+            trailer.windows(key.len()).any(|w| w == key),
+            "the trailer has no {}",
+            String::from_utf8_lossy(key)
+        );
+    }
+    // The last one is ours: the values copied from the file before it may hold the same words.
+    let prev_at = trailer.windows(7).rposition(|w| w == b" /Prev ").unwrap() + 7;
+    let prev: usize = String::from_utf8_lossy(&trailer[prev_at..])
+        .split_whitespace()
+        .next()
+        .and_then(|n| n.parse().ok())
+        .expect("a number after /Prev");
+    assert!(prev < file.len(), "/Prev points past the file it was given");
     let text = String::from_utf8_lossy(&out[table + 5..]);
     let mut lines = text.lines();
     while let Some(head) = lines.next() {

@@ -198,7 +198,9 @@ pub fn arb_signer_response(u: &mut Unstructured) -> Result<SignerResponse> {
                 SignerError::SandboxUnavailable,
                 SignerError::Internal,
                 SignerError::ProtocolMismatch,
-            ][u.int_in_range(0..=10usize)?],
+                SignerError::ProtectionUnsupported,
+                SignerError::ChainTooLong,
+            ][u.int_in_range(0..=12usize)?],
             message: plain_up_to(u, MAX_TEXT_BYTES)?,
         },
     })

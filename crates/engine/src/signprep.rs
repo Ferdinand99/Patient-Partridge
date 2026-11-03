@@ -253,38 +253,43 @@ fn pdf_date(unix: i64) -> String {
 // ---- reading and changing dictionaries -----------------------------------------------------------------
 
 /// `<<...>>` for the entries of a dictionary, with the keys of `changes` (each with its new value as
-/// text) replaced or added. Keys that stand twice and are changed leave only the new one.
-fn changed_dictionary(b: &[u8], entries: &[Entry], changes: &[(&str, String)]) -> String {
-    let mut out = String::from("<<");
+/// bytes) replaced or added. Keys that stand twice and are changed leave only the new one. Every
+/// entry that is not changed is copied byte for byte: a PDF string holds any bytes (Latin-1, UTF-16),
+/// so nothing here ever goes through text.
+fn changed_dictionary(b: &[u8], entries: &[Entry], changes: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    let mut out = b"<<".to_vec();
     for e in entries {
         if changes.iter().any(|(k, _)| e.key == k.as_bytes()) {
             continue;
         }
-        let raw = &b[e.at..e.value.start];
-        let raw = String::from_utf8_lossy(raw);
-        out.push_str(raw.trim_end());
-        out.push(' ');
-        out.push_str(&String::from_utf8_lossy(&b[e.value.clone()]));
-        out.push('\n');
+        out.extend_from_slice(b[e.at..e.value.start].trim_ascii_end());
+        out.push(b' ');
+        out.extend_from_slice(&b[e.value.clone()]);
+        out.push(b'\n');
     }
     for (key, value) in changes {
-        out.push('/');
-        out.push_str(key);
-        out.push(' ');
-        out.push_str(value);
-        out.push('\n');
+        out.push(b'/');
+        out.extend_from_slice(key.as_bytes());
+        out.push(b' ');
+        out.extend_from_slice(value);
+        out.push(b'\n');
     }
-    out.push_str(">>");
+    out.extend_from_slice(b">>");
     out
 }
 
-/// A list with `reference` added at its end. `value` is the list as written, `[...]`.
-fn list_with(b: &[u8], value: &Range<usize>, reference: &str) -> Option<String> {
-    let text = std::str::from_utf8(b.get(value.clone())?).ok()?;
-    let text = text.trim_end();
-    let inner = text.strip_suffix(']')?.trim_end();
-    text.starts_with('[')
-        .then(|| format!("{inner} {reference}]"))
+/// A list with `reference` added at its end. `value` is the list as written, `[...]`; the items are
+/// copied byte for byte.
+fn list_with(b: &[u8], value: &Range<usize>, reference: &str) -> Option<Vec<u8>> {
+    let text = b.get(value.clone())?.trim_ascii_end();
+    let inner = text.strip_suffix(b"]")?.trim_ascii_end();
+    text.starts_with(b"[").then(|| {
+        let mut out = inner.to_vec();
+        out.push(b' ');
+        out.extend_from_slice(reference.as_bytes());
+        out.push(b']');
+        out
+    })
 }
 
 /// What a walk of the form found about one field.
@@ -494,7 +499,7 @@ fn rewrite_list(
     }
     let body = list_with(b, &object.value, reference)
         .ok_or_else(|| structure(&format!("the {what} is not a list")))?;
-    update.rewrite(n, object.generation, body.into_bytes());
+    update.rewrite(n, object.generation, body);
     Ok(())
 }
 
@@ -507,7 +512,7 @@ fn add_to_list(
     value: &Range<usize>,
     reference: &str,
     what: &str,
-) -> Result<Option<String>, Refusal> {
+) -> Result<Option<Vec<u8>>, Refusal> {
     let b = table.bytes;
     match reference_number(b, value) {
         Some(n) => {
@@ -558,7 +563,7 @@ pub fn prepare(base: Vec<u8>, pages: usize, spec: &Spec<'_>) -> Result<Prepared,
         objects: BTreeMap::new(),
         next: old_size,
     };
-    let mut catalog_changes: Vec<(&str, String)> = Vec::new();
+    let mut catalog_changes: Vec<(&str, Vec<u8>)> = Vec::new();
 
     // The version: a signature of this kind is a feature of version 1.7.
     let version = match entry(&catalog, b"Version") {
@@ -566,7 +571,7 @@ pub fn prepare(base: Vec<u8>, pages: usize, spec: &Spec<'_>) -> Result<Prepared,
         None => None,
     };
     if version.as_deref().is_none_or(|v| v < b"1.7".as_slice()) {
-        catalog_changes.push(("Version", "/1.7".to_string()));
+        catalog_changes.push(("Version", b"/1.7".to_vec()));
     }
 
     // The form: where it is, whether it is one that can take a signature, and its fields.
@@ -624,6 +629,14 @@ pub fn prepare(base: Vec<u8>, pages: usize, spec: &Spec<'_>) -> Result<Prepared,
                 ));
             }
             let (object, entries) = plain_dictionary(&table, node.number, "field")?;
+            // A seed value (what the field asks of the signature) and a lock (the fields to lock
+            // after signing) are not applied by this program, so a field that has one is not
+            // signed: signing it would not do what the field says.
+            if entry(&entries, b"SV").is_some() || entry(&entries, b"Lock").is_some() {
+                return Err(Refusal::Refused(
+                    "that field asks for settings that Patient Partridge does not apply (a seed value or a lock), so it does not sign it".to_string(),
+                ));
+            }
             existing = Some((node.number, object, entries));
             (*name).to_string()
         }
@@ -660,6 +673,19 @@ pub fn prepare(base: Vec<u8>, pages: usize, spec: &Spec<'_>) -> Result<Prepared,
         None
     };
     let widget_ref = new_widget.map(|n| format!("{n} 0 R"));
+    // A field of the document that gets no look is given an empty one.
+    let empty_look = if existing.is_some() && look_numbers.is_none() {
+        Some(update.number()?)
+    } else {
+        None
+    };
+    if let Some(n) = empty_look {
+        update.rewrite(
+            n,
+            0,
+            stream_object("\n/Type /XObject /Subtype /Form /BBox [0 0 1 1]", b""),
+        );
+    }
 
     // The form gets the flag that says the document is signed (and, for a new field, the field in
     // its list). It is written in the catalog or, when the catalog names it, in its own object.
@@ -673,10 +699,10 @@ pub fn prepare(base: Vec<u8>, pages: usize, spec: &Spec<'_>) -> Result<Prepared,
     let sig_flags = (sig_flags_old | 3).to_string();
     match &acro_entries {
         Some(entries) => {
-            let mut changes: Vec<(&str, String)> = vec![("SigFlags", sig_flags)];
+            let mut changes: Vec<(&str, Vec<u8>)> = vec![("SigFlags", sig_flags.into_bytes())];
             if let Some(reference) = &widget_ref {
                 match entry(entries, b"Fields") {
-                    None => changes.push(("Fields", format!("[{reference}]"))),
+                    None => changes.push(("Fields", format!("[{reference}]").into_bytes())),
                     Some(f) => {
                         if let Some(text) =
                             add_to_list(&mut update, &table, f, reference, "list of fields")?
@@ -690,7 +716,7 @@ pub fn prepare(base: Vec<u8>, pages: usize, spec: &Spec<'_>) -> Result<Prepared,
             match acro_object {
                 Some(n) => {
                     let generation = table.object(n)?.map_or(0, |o| o.generation);
-                    update.rewrite(n, generation, text.into_bytes());
+                    update.rewrite(n, generation, text);
                 }
                 None => catalog_changes.push(("AcroForm", text)),
             }
@@ -701,27 +727,44 @@ pub fn prepare(base: Vec<u8>, pages: usize, spec: &Spec<'_>) -> Result<Prepared,
                 .ok_or_else(|| structure("the form is not there"))?;
             catalog_changes.push((
                 "AcroForm",
-                format!("<</Fields [{reference}]\n/SigFlags {sig_flags}>>"),
+                format!("<</Fields [{reference}]\n/SigFlags {sig_flags}>>").into_bytes(),
             ));
         }
     }
     update.rewrite(
         root_number,
         root.generation,
-        changed_dictionary(b, &catalog, &catalog_changes).into_bytes(),
+        changed_dictionary(b, &catalog, &catalog_changes),
     );
 
     // The page shows a new field.
     if let Some(reference) = &widget_ref {
         let (page_object, page_entries) = plain_dictionary(&table, page_number, "page")?;
-        let change = match entry(&page_entries, b"Annots") {
-            None => Some(format!("[{reference}]")),
-            Some(a) => add_to_list(&mut update, &table, a, reference, "list of annotations")?,
+        // A list of annotations that stands as an object of its own may be the list of other pages
+        // too, so it is left as it is, and this page gets a list of its own with the same entries.
+        let list = match entry(&page_entries, b"Annots") {
+            None => format!("[{reference}]").into_bytes(),
+            Some(a) => {
+                let value = match reference_number(b, a) {
+                    Some(n) => {
+                        let object = table
+                            .object(n)?
+                            .ok_or_else(|| structure("the list of annotations is not there"))?;
+                        if !plain_object(b, &object.value) {
+                            return Err(structure(
+                                "the list of annotations is followed by more than a list",
+                            ));
+                        }
+                        object.value
+                    }
+                    None => a.clone(),
+                };
+                list_with(b, &value, reference)
+                    .ok_or_else(|| structure("the list of annotations is not a list"))?
+            }
         };
-        if let Some(text) = change {
-            let text = changed_dictionary(b, &page_entries, &[("Annots", text)]);
-            update.rewrite(page_number, page_object.generation, text.into_bytes());
-        }
+        let text = changed_dictionary(b, &page_entries, &[("Annots", list)]);
+        update.rewrite(page_number, page_object.generation, text);
     }
 
     // The signature dictionary. The byte range and the hole are written as placeholders of their
@@ -784,15 +827,20 @@ pub fn prepare(base: Vec<u8>, pages: usize, spec: &Spec<'_>) -> Result<Prepared,
     // The field.
     match existing {
         Some((n, object, entries)) => {
-            let mut changes: Vec<(&str, String)> =
-                vec![("V", format!("{sig_number} 0 R")), ("F", "132".to_string())];
-            if let Some(form) = appearance {
-                changes.push(("AP", format!("<</N {form} 0 R>>")));
+            let mut changes: Vec<(&str, Vec<u8>)> = vec![
+                ("V", format!("{sig_number} 0 R").into_bytes()),
+                ("F", b"132".to_vec()),
+            ];
+            // A field with no look gets an empty one, so that what the file had in it before (a
+            // "sign here" mark) is not left showing on a field that is signed.
+            let form = appearance.or(empty_look);
+            if let Some(form) = form {
+                changes.push(("AP", format!("<</N {form} 0 R>>").into_bytes()));
             }
             update.rewrite(
                 n,
                 object.generation,
-                changed_dictionary(b, &entries, &changes).into_bytes(),
+                changed_dictionary(b, &entries, &changes),
             );
         }
         None => {
@@ -953,11 +1001,15 @@ mod tests {
     fn a_dictionary_is_written_again_with_its_changes() {
         let text = b"<< /A 1 /B (two) /A 3 /C [1 2] >>";
         let entries = dictionary(text, &(0..text.len())).unwrap();
-        let out = changed_dictionary(text, &entries, &[("A", "9".into()), ("D", "/x".into())]);
-        let again = dictionary(out.as_bytes(), &(0..out.len())).unwrap();
+        let out = changed_dictionary(
+            text,
+            &entries,
+            &[("A", b"9".to_vec()), ("D", b"/x".to_vec())],
+        );
+        let again = dictionary(&out, &(0..out.len())).unwrap();
         let get = |k: &str| {
             let v = entry(&again, k.as_bytes()).unwrap();
-            out[v.clone()].to_string()
+            String::from_utf8(out[v.clone()].to_vec()).unwrap()
         };
         assert_eq!(get("A"), "9");
         assert_eq!(get("B"), "(two)");
@@ -971,11 +1023,30 @@ mod tests {
         let text = b"[1 0 R 2 0 R ]";
         assert_eq!(
             list_with(text, &(0..text.len()), "7 0 R").unwrap(),
-            "[1 0 R 2 0 R 7 0 R]"
+            b"[1 0 R 2 0 R 7 0 R]"
         );
         let text = b"[]";
-        assert_eq!(list_with(text, &(0..2), "7 0 R").unwrap(), "[ 7 0 R]");
+        assert_eq!(list_with(text, &(0..2), "7 0 R").unwrap(), b"[ 7 0 R]");
         let text = b"<< >>";
         assert!(list_with(text, &(0..5), "7 0 R").is_none());
+    }
+
+    #[test]
+    fn bytes_that_are_not_text_are_copied_as_they_are() {
+        // Latin-1, UTF-16 with its byte order mark, and a byte that is no text in any encoding.
+        let text: &[u8] =
+            b"<< /T (S\xf8ker) /TU (\xfe\xff\x00\xc5\x00A) /L [(\xe5) (\xff\xfe)] /K 1 >>";
+        let entries = dictionary(text, &(0..text.len())).unwrap();
+        let out = changed_dictionary(text, &entries, &[("K", b"2".to_vec())]);
+        let again = dictionary(&out, &(0..out.len())).unwrap();
+        for key in ["T", "TU", "L"] {
+            let before = entry(&entries, key.as_bytes()).unwrap();
+            let after = entry(&again, key.as_bytes()).unwrap();
+            assert_eq!(text[before.clone()], out[after.clone()], "{key}");
+        }
+        assert!(!out.windows(3).any(|w| w == [0xef, 0xbf, 0xbd]));
+        let list: &[u8] = b"[(\xe5) (\xfe\xff\x00A) ]";
+        let with = list_with(list, &(0..list.len()), "7 0 R").unwrap();
+        assert_eq!(with, b"[(\xe5) (\xfe\xff\x00A) 7 0 R]");
     }
 }

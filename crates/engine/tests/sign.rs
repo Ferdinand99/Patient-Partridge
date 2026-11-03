@@ -11,6 +11,7 @@ use common::designer::{add, apply_ok, open as open_designer, widget};
 
 use common::*;
 use partridge_engine::sigcheck::TrustList;
+use partridge_engine::Engine;
 use partridge_protocol::{
     DesignField, DesignKind, DesignProps, ErrorCode, RequestBody, ResponseBody, SignPlace,
     SignRequest, SignResponse, SignatureFont, SignatureMark, SignatureReason as R,
@@ -848,4 +849,255 @@ fn a_signature_field_made_by_the_form_designer_can_be_signed() {
     let p = begin(e, spec(doc, rect_place(0))).unwrap();
     assert_eq!(p.field, "Signature2");
     ask(e, RequestBody::Close { doc });
+}
+
+// ---- strings that are not text stay as they were ----------------------------------------------------
+
+/// The bytes after PDFium's file: what the signature added.
+fn added(signed: &[u8]) -> &[u8] {
+    let first = signed
+        .windows(5)
+        .position(|w| w == b"%%EOF")
+        .expect("the file the signature goes after ends with a mark");
+    &signed[first..]
+}
+
+fn has(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+#[test]
+fn strings_that_are_not_ascii_stay_byte_for_byte_under_the_signature() {
+    let mut shared = engine();
+    let e = &mut shared.0;
+    let pdf = latin1_form_pdf();
+    for place in [
+        rect_place(0),
+        SignPlace::Field {
+            page: 0,
+            name: LATIN1_NAME.into(),
+        },
+        SignPlace::Field {
+            page: 0,
+            name: UTF16_NAME.into(),
+        },
+        SignPlace::Invisible,
+    ] {
+        let (signed, r) = sign_with(e, &pdf, "p256.p12", place.clone());
+        // The signature holds.
+        assert!(
+            r.items.iter().any(|i| i.state == S::UnknownSigner),
+            "{place:?}: {:?}",
+            r.items
+        );
+        // Nothing was turned into the replacement character, in the file or in what was added.
+        assert!(
+            !has(&signed, &[0xef, 0xbf, 0xbd]),
+            "{place:?}: a replacement character"
+        );
+        // Every string the dictionaries that were written again carry is there as PDFium wrote it.
+        let tail = added(&signed);
+        let mut strings = vec![
+            ("the page label", LABEL),
+            ("the language", LANGUAGE),
+            ("the form's default appearance", FORM_DEFAULT),
+        ];
+        // The page is written again when it gets a new field.
+        if !matches!(place, SignPlace::Field { .. }) {
+            strings.push(("the note on the page", PAGE_NOTE));
+        }
+        for (what, bytes) in strings {
+            assert!(has(tail, bytes), "{place:?}: {what} changed");
+            assert!(
+                has(&signed[..signed.len() - tail.len()], bytes),
+                "{what} was not in the file"
+            );
+        }
+        // The other field keeps its name too (a field that is not signed is written again only when
+        // the page or the list of fields is), and the one that was signed keeps its own.
+        for (what, bytes) in [
+            ("the name of a field", UTF16_FIELD),
+            ("the name of a field", LATIN1_FIELD),
+        ] {
+            assert!(has(&signed, bytes), "{place:?}: {what} changed");
+        }
+    }
+    // The signed field is listed under the name it had.
+    let (signed, _) = sign_with(
+        e,
+        &pdf,
+        "p256.p12",
+        SignPlace::Field {
+            page: 0,
+            name: LATIN1_NAME.into(),
+        },
+    );
+    let tail = added(&signed);
+    assert!(has(tail, LATIN1_FIELD) && has(tail, LATIN1_TIP));
+}
+
+// ---- fields that were there before ----------------------------------------------------------------
+
+#[test]
+fn a_document_with_empty_signature_fields_is_signed_in_a_box_in_no_box_and_in_either_field() {
+    let mut shared = engine();
+    let e = &mut shared.0;
+    for pdf in [
+        kit::forms_empty_signature_pdf(),
+        kit::forms_two_empty_signatures_pdf(),
+    ] {
+        let fields = if has(&pdf, b"second_signature") { 2 } else { 1 };
+        let mut places = vec![
+            rect_place(0),
+            SignPlace::Invisible,
+            SignPlace::Field {
+                page: 0,
+                name: "empty_signature".into(),
+            },
+        ];
+        if fields == 2 {
+            places.push(SignPlace::Field {
+                page: 0,
+                name: "second_signature".into(),
+            });
+        }
+        for place in places {
+            let (signed, r) = sign_with(e, &pdf, "rsa2048.p12", place.clone());
+            let field = match &place {
+                SignPlace::Field { name, .. } => name.clone(),
+                _ => "Signature1".to_string(),
+            };
+            let held: Vec<_> = r
+                .items
+                .iter()
+                .filter(|i| !i.byte_range.is_empty())
+                .collect();
+            assert_eq!(held.len(), 1, "{place:?}: {:?}", r.items);
+            assert_eq!(held[0].state, S::UnknownSigner, "{place:?}");
+            // The fields that nobody signed stay empty: they are still listed as places to sign.
+            let doc = open(e, &signed, None).unwrap();
+            let ResponseBody::Sign(SignResponse::Fields { fields: left }) =
+                ask(e, RequestBody::Sign(SignRequest::Fields { doc }))
+            else {
+                panic!("no fields");
+            };
+            ask(e, RequestBody::Close { doc });
+            let used = usize::from(matches!(place, SignPlace::Field { .. }));
+            let others = left.iter().filter(|f| f.name != field).count();
+            assert_eq!(others, fields - used, "{place:?}: {left:?}");
+        }
+    }
+}
+
+#[test]
+fn a_field_that_asks_for_a_seed_value_or_a_lock_is_not_signed() {
+    let mut shared = engine();
+    let e = &mut shared.0;
+    for (extra, what) in [
+        (
+            &b"/SV << /Type /SV /Ff 2 /SubFilter [/adbe.pkcs7.detached] >>"[..],
+            "seed value",
+        ),
+        (&b"/Lock << /Type /SigFieldLock /Action /All >>"[..], "lock"),
+    ] {
+        let doc = open(e, &one_field_pdf(extra, false), None).unwrap();
+        let (code, text) = refusal_text(
+            e,
+            spec(
+                doc,
+                SignPlace::Field {
+                    page: 0,
+                    name: "box".into(),
+                },
+            ),
+        );
+        assert_eq!(code, ErrorCode::SignRefused, "{what}");
+        assert!(text.contains("seed value or a lock"), "{what}: {text}");
+        // A box on the page is signed all the same.
+        let (signed, r) = sign_with(e, &one_field_pdf(extra, false), "p256.p12", rect_place(0));
+        assert!(
+            r.items.iter().any(|i| i.state == S::UnknownSigner),
+            "{what}: {signed:?}"
+        );
+        ask(e, RequestBody::Close { doc });
+    }
+}
+
+#[test]
+fn a_field_with_no_look_loses_the_old_one() {
+    let mut shared = engine();
+    let e = &mut shared.0;
+    // A field smaller than the smallest box that holds a look, with a look of its own ("sign here").
+    let small = b"/Rect [72 100 80 108] /AP << /N 7 0 R >>";
+    let pdf = {
+        let mut objects = vec![
+            b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [5 0 R] >> >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>".to_vec(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+            [
+                &b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (box) /F 132 /P 3 0 R "[..],
+                small,
+                b" >>",
+            ]
+            .concat(),
+            b"<< /Type /Metadata >>".to_vec(),
+        ];
+        objects.push(
+            b"<< /Type /XObject /Subtype /Form /BBox [0 0 8 8] /Length 21 >>\nstream\n1 0 0 rg 0 0 8 8 re f\nendstream"
+                .to_vec(),
+        );
+        raw_pdf(&objects)
+    };
+    let (signed, r) = sign_with(
+        e,
+        &pdf,
+        "p256.p12",
+        SignPlace::Field {
+            page: 0,
+            name: "box".into(),
+        },
+    );
+    assert!(
+        r.items.iter().any(|i| i.state == S::UnknownSigner),
+        "{:?}",
+        r.items
+    );
+    // The field points at a look that draws nothing, not at the red square it had.
+    let tail = added(&signed);
+    assert!(has(tail, b"/BBox [0 0 1 1]"), "an empty look was written");
+    assert!(
+        !has(tail, b"/AP << /N 7 0 R >>"),
+        "the old look is still named"
+    );
+}
+
+#[test]
+fn a_list_of_annotations_that_pages_share_is_not_changed_for_the_other_pages() {
+    let mut shared = engine();
+    let e = &mut shared.0;
+    let pdf = one_field_pdf(b"", true);
+    let (signed, r) = sign_with(e, &pdf, "p256.p12", rect_place(0));
+    assert!(
+        r.items.iter().any(|i| i.state == S::UnknownSigner),
+        "{:?}",
+        r.items
+    );
+    // The second page has the list it had (the old field, shared) and nothing new: the new field
+    // is on page one only.
+    let on_second = |e: &mut Engine, bytes: &[u8]| {
+        let doc = open(e, bytes, None).unwrap();
+        ask(e, RequestBody::FormInfo { doc });
+        let n = match ask(e, RequestBody::ListFormFields { doc, page: 1 }) {
+            ResponseBody::FormFields { fields } => fields.len(),
+            other => panic!("{other:?}"),
+        };
+        ask(e, RequestBody::Close { doc });
+        n
+    };
+    assert_eq!(
+        on_second(e, &signed),
+        on_second(e, &pdf),
+        "the new field shows on the second page too"
+    );
 }

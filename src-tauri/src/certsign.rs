@@ -12,14 +12,14 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use partridge_engine_client::{
     Certificate, CertificateKey, ClientError, SaveOptions, SignOptions, SignPlace, SignatureFont,
     SignatureMark, SignerConfig, SignerSession,
 };
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 use zeroize::Zeroize;
 
@@ -39,9 +39,22 @@ struct Inner {
     file: Option<PathBuf>,
     /// The signer, once a certificate file was opened.
     signer: Option<SignerSession>,
+    /// The document the box was opened for. A key opened for one document signs no other.
+    doc: Option<u64>,
+    /// When the certificate file was opened; the key is let go after [`KEY_LIFETIME`].
+    opened: Option<Instant>,
+    /// Counts the openings, so that the watch of an earlier one knows it is not the last.
+    generation: u64,
     /// An imported picture for the box, as pixels (the window decoded it).
     image: Option<SignatureMark>,
 }
+
+/// How long a key stays in the signer when nothing is signed with it. The signer ends after one
+/// signature; a key that is opened and then forgotten about is let go by the app after this time.
+const KEY_LIFETIME: Duration = Duration::from_secs(5 * 60);
+
+/// How often the watch looks at the clock.
+const WATCH_EVERY: Duration = Duration::from_secs(10);
 
 fn state(s: &CertificateState) -> std::sync::MutexGuard<'_, Inner> {
     s.inner.lock().unwrap_or_else(|e| e.into_inner())
@@ -53,10 +66,40 @@ impl CertificateState {
         let mut inner = state(self);
         inner.file = None;
         inner.image = None;
+        inner.doc = None;
+        inner.opened = None;
         if let Some(signer) = inner.signer.take() {
             signer.close();
         }
     }
+
+    /// Lets the key go when it has been open longer than [`KEY_LIFETIME`]. The file that was
+    /// picked stays, so that the person can type the password again.
+    fn let_go_if_old(&self, generation: u64) -> bool {
+        let mut inner = state(self);
+        if inner.generation != generation || inner.signer.is_none() {
+            return true;
+        }
+        if inner.opened.is_some_and(|at| at.elapsed() >= KEY_LIFETIME) {
+            inner.opened = None;
+            if let Some(signer) = inner.signer.take() {
+                signer.close();
+            }
+            return true;
+        }
+        false
+    }
+}
+
+/// Watches the key of one opening and lets it go when it is old. Ends when the key is gone.
+fn watch(app: AppHandle, generation: u64) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(WATCH_EVERY);
+        let certificate = app.state::<CertificateState>();
+        if certificate.let_go_if_old(generation) {
+            return;
+        }
+    });
 }
 
 fn error(code: &str, message: &str) -> CommandError {
@@ -186,6 +229,26 @@ pub async fn sign_pick_certificate(
             "That place is not a file on this computer.",
         ));
     };
+    // A file that is not a plain file or is too big is told now, before a password is asked for.
+    std::fs::metadata(&path)
+        .map_err(|_| {
+            error(
+                "sign_file_unreadable",
+                "The certificate file could not be read.",
+            )
+        })
+        .and_then(|meta| {
+            if !meta.is_file() {
+                Err(error("sign_file_unreadable", "That is not a file."))
+            } else if meta.len() as usize > partridge_engine_client::MAX_CERTIFICATE_FILE {
+                Err(error(
+                    "signer_too_large",
+                    "The certificate file is too big.",
+                ))
+            } else {
+                Ok(())
+            }
+        })?;
     certificate.forget();
     let name = path
         .file_name()
@@ -199,7 +262,9 @@ pub async fn sign_pick_certificate(
 /// overwritten here; it is not kept. A wrong password leaves the file picked for another try.
 #[tauri::command]
 pub async fn sign_load_certificate(
+    app: AppHandle,
     certificate: State<'_, CertificateState>,
+    doc: u64,
     mut password: String,
 ) -> Result<CertificateView, CommandError> {
     let path = state(&certificate).file.clone();
@@ -248,8 +313,30 @@ pub async fn sign_load_certificate(
     .await
     .map_err(|e| error("internal", &e.to_string()))?;
     let (signer, result) = outcome;
-    state(&certificate).signer = signer;
+    let opened = result.is_ok();
+    let generation = {
+        let mut inner = state(&certificate);
+        inner.signer = signer;
+        if opened {
+            inner.doc = Some(doc);
+            inner.opened = Some(Instant::now());
+            inner.generation += 1;
+        }
+        inner.generation
+    };
+    if opened {
+        watch(app, generation);
+    }
     result.map(|c| CertificateView::of(&c, now_seconds()))
+}
+
+/// Whether a certificate file is open in the signer. The window asks after a signing that did not
+/// succeed: the signer ends after the one signature it makes (and lets the key go after a time), so
+/// the password may be needed again.
+#[tauri::command]
+pub fn sign_certificate_open(certificate: State<'_, CertificateState>, doc: u64) -> bool {
+    let inner = state(&certificate);
+    inner.signer.is_some() && inner.doc == Some(doc)
 }
 
 /// Lets the key go and forgets the file that was picked.
@@ -328,7 +415,6 @@ pub enum MarkArgs {
 #[serde(rename_all = "camelCase")]
 pub struct SignArgs {
     place: PlaceArgs,
-    name: String,
     reason: String,
     location: String,
     mark: MarkArgs,
@@ -415,7 +501,7 @@ pub async fn sign_document(
             "This document has changes that are not saved.",
         ));
     }
-    if state(&certificate).signer.is_none() {
+    if !sign_certificate_open(certificate.clone(), doc) {
         return Err(error("signer_not_loaded", "No certificate file is open."));
     }
     let pool = engine.0.clone();
@@ -442,7 +528,6 @@ pub async fn sign_document(
     };
     let options = SignOptions {
         place,
-        name: args.name,
         reason: args.reason,
         location: args.location,
         mark,
@@ -475,8 +560,13 @@ pub async fn sign_document(
             }))
         }
         Err(e) => {
-            // Not signed: the certificate stays open for another try, unless the signer is gone.
-            state(&certificate).signer = Some(signer);
+            // Not signed: the certificate stays open for another try, unless the signer is gone
+            // (it ends after the one signature it makes, also when the file was not written).
+            if signer.certificate().is_some() {
+                state(&certificate).signer = Some(signer);
+            } else {
+                signer.close();
+            }
             Err(CommandError::from(e))
         }
     }

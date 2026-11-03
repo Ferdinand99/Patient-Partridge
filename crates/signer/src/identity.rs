@@ -146,12 +146,14 @@ fn open_error(error: P12Error) -> SignerError {
         P12Error::MacError(_) | P12Error::UnpadError | P12Error::Pkcs5Error(_) => {
             SignerError::new(ErrorCode::WrongPassword, "the password is wrong")
         }
-        P12Error::UnsupportedEncryptionScheme | P12Error::UnsupportedMacAlgorithm => {
-            SignerError::new(
-                ErrorCode::NotACertificateFile,
-                "the file is protected in a way this program cannot open",
-            )
-        }
+        // A method the library does not know, or a file that asks for more rounds of work than the
+        // library allows (a million).
+        P12Error::UnsupportedEncryptionScheme
+        | P12Error::UnsupportedMacAlgorithm
+        | P12Error::InvalidParameters => SignerError::new(
+            ErrorCode::ProtectionUnsupported,
+            "the file is protected in a way this program does not open (a method it does not know, or more than a million rounds of work)",
+        ),
         _ => SignerError::new(
             ErrorCode::NotACertificateFile,
             "the file is not a certificate file, or it is damaged",
@@ -204,7 +206,9 @@ fn classify(pkcs8: &[u8]) -> Option<(Kind, &[u8])> {
     } else if is(OID_EC) {
         let curve = der::read(name.rest)?;
         let curve_is = |dotted: &str| curve.tag == 0x06 && curve.content == oid_content(dotted);
-        if curve_is(OID_P256) {
+        if curve.tag == 0x30 {
+            Kind::Other("ECDSA with the curve written out in full, not named".to_string())
+        } else if curve_is(OID_P256) {
             Kind::Ec(
                 &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
                 32,
@@ -233,6 +237,37 @@ fn classify(pkcs8: &[u8]) -> Option<(Kind, &[u8])> {
     Some((kind, private.content))
 }
 
+/// Why ring does not take an RSA private key (`private` is the `RSAPrivateKey` inside the PKCS #8
+/// wrapper): too short, too long, or an exponent that other programs do not accept.
+fn why_rsa(private: &[u8]) -> String {
+    let numbers = (|| {
+        let outer = der::read(private)?;
+        let version = der::read(outer.content)?;
+        let n = der::read(version.rest)?;
+        let e = der::read(n.rest)?;
+        (outer.tag == 0x30 && n.tag == 0x02 && e.tag == 0x02).then(|| {
+            let exponent = der::unsigned(e.content);
+            let value = exponent
+                .iter()
+                .take(9)
+                .fold(0u128, |acc, byte| (acc << 8) | u128::from(*byte));
+            (der::bit_length(der::unsigned(n.content)), value)
+        })
+    })();
+    match numbers {
+        Some((bits, _)) if bits < 2048 => {
+            "RSA keys shorter than 2048 bits are not supported".to_string()
+        }
+        Some((bits, _)) if bits > 4096 => {
+            "RSA keys longer than 4096 bits are not supported".to_string()
+        }
+        Some((_, exponent)) if exponent < 65537 => {
+            "RSA keys whose public exponent is smaller than 65537 are not supported".to_string()
+        }
+        _ => "this RSA key is not one that the signer can use".to_string(),
+    }
+}
+
 fn unsupported(what: &str) -> Paired {
     Paired::Unsupported(SignerError::new(
         ErrorCode::KeyUnsupported,
@@ -248,12 +283,13 @@ fn pair(pkcs8: &[u8], certs: &[&[u8]]) -> Result<(Key, usize), Paired> {
     match kind {
         Kind::Other(name) => Err(unsupported(&name)),
         Kind::Rsa => {
-            let pair = RsaKeyPair::from_pkcs8(pkcs8)
-                .map_err(|_| unsupported("RSA keys of 2048 to 4096 bits are supported"))?;
+            let pair = RsaKeyPair::from_pkcs8(pkcs8).map_err(|_| unsupported(&why_rsa(private)))?;
             let public = pair.public().as_ref();
             let (n, e) = rsa_numbers(public).ok_or_else(|| unsupported("RSA key"))?;
             if der::bit_length(&n) > 4096 {
-                return Err(unsupported("RSA keys of 2048 to 4096 bits are supported"));
+                return Err(unsupported(
+                    "RSA keys longer than 4096 bits are not supported",
+                ));
             }
             let at = certs
                 .iter()
@@ -380,13 +416,9 @@ fn hex(bytes: &[u8]) -> String {
 /// The chain from the holder's certificate: each next one is the one that issued the one before,
 /// found by name among the certificates of the file. It ends at a certificate that signed itself
 /// or at the last one the file has.
-fn chain_of(leaf: usize, certs: &[&[u8]]) -> Vec<Vec<u8>> {
+fn chain_of(leaf: usize, certs: &[&[u8]]) -> Result<Vec<Vec<u8>>, SignerError> {
     let mut chain = vec![leaf];
-    loop {
-        if chain.len() as u32 >= MAX_CHAIN {
-            break;
-        }
-        let Some(&last) = chain.last() else { break };
+    while let Some(&last) = chain.last() {
         let Ok((_, current)) = X509Certificate::from_der(certs[last]) else {
             break;
         };
@@ -399,15 +431,26 @@ fn chain_of(leaf: usize, certs: &[&[u8]]) -> Vec<Vec<u8>> {
                     .is_ok_and(|(_, c)| c.subject().as_raw() == current.issuer().as_raw())
         });
         match issuer {
-            Some((at, _)) => chain.push(at),
+            Some((at, _)) => {
+                // Another certificate would be needed: a chain that is cut short is not made, it
+                // is refused, so that a program that opens the file is not left with a chain that
+                // does not lead to its root.
+                if chain.len() as u32 >= MAX_CHAIN {
+                    return Err(SignerError::new(
+                        ErrorCode::ChainTooLong,
+                        "the certificates of the file lead through more of them than the signature can carry (12)",
+                    ));
+                }
+                chain.push(at)
+            }
             None => break,
         }
     }
-    chain.into_iter().map(|at| certs[at].to_vec()).collect()
+    Ok(chain.into_iter().map(|at| certs[at].to_vec()).collect())
 }
 
 fn finish(key: Key, leaf: usize, certs: &[&[u8]]) -> Result<Identity, SignerError> {
-    let chain = chain_of(leaf, certs);
+    let chain = chain_of(leaf, certs)?;
     let (_, cert) = X509Certificate::from_der(&chain[0]).map_err(|_| {
         SignerError::new(
             ErrorCode::NotACertificateFile,

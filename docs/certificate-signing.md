@@ -6,8 +6,8 @@ How Patient Partridge adds a digital signature made with a certificate file, wha
 
 1. Presses Sign with a certificate. A document with changes that are not saved is saved first.
 2. Chooses a certificate file (`.p12` or `.pfx`) in the dialog of the system and types its password. The box shows the name, the issuer, the period, the key and what is off about the certificate.
-3. Chooses where the signature shows (a box dragged on a preview of a page, a signature field of the file, or nothing), and what it says (name, reason, place, an optional picture).
-4. Names the signed copy. The copy is written, checked and opened in a tab with editing off.
+3. Chooses where the signature shows (a box dragged on a preview of a page, a signature field of the file, or nothing), and what it says (reason, place, an optional picture). The name in the signature is the name in the certificate: a page that says "Digitally signed by" and a program that reads the signature name the same holder.
+4. Names the signed copy. The copy is written, checked and opened in a tab where nothing can be changed.
 
 ## What happens
 
@@ -38,6 +38,9 @@ window ── password ──▶ app process ── file + password ──▶ si
 | Not a certificate file, no key, key and certificate not a pair | one line each |
 | Ed25519, RSA-PSS, a short RSA key, another curve | "This kind of key is not supported", with the kinds that are |
 | Encrypted document, XFA form | refused |
+| A field with a seed value or a lock | "asks for settings that Patient Partridge does not apply" |
+| A chain of more than 12 certificates | "The chain of certificates is too long" (it is not cut) |
+| A certificate file protected in a way that is not opened (more than a million rounds) | "cannot be opened here" |
 | A document that holds signatures already | "Signing it again would remove them, so Patient Partridge does not do it in this version." |
 | A document with changes not saved | saved first, or the signature is not made |
 | The signed copy named like the open file | "Choose another name" |
@@ -47,14 +50,20 @@ An expired certificate, one that is not in use yet, one that its owner made, and
 
 ## After signing
 
-The signed file is opened as a document of its own, with editing held (annotations, form fields and the form designer wait; they stay held whatever a page tool does). A save of a signed file is refused unless the person agrees that the signature breaks; a copy is the way out. Nothing in the program writes the signed file after it is in place.
+The signed file is opened as a document of its own and held: annotations, form fields, the form designer and the page tools are off in that tab, each with a short note that says why. The signed file is never saved over; if a save is asked for, only "Save a copy" is offered. The tab follows the copy, which is an ordinary document and can be changed again. Nothing in the program writes the signed file after it is in place.
+
+The signer ends after the one signature it makes, so the key is not kept. If the signing fails after that (a name already taken, a disk that is full), the password is asked for again. A key that is opened and not used is let go after five minutes, and a key opened for one document signs no other.
+
+## Fields the document already has
+
+A signature field that nobody has signed is a place to sign. The document may have several: one is used, or a new box, or none, and the others stay empty. A field that carries a seed value (`/SV`) or a lock (`/Lock`) is not signed (this program applies neither, and a signature that ignores them is not what the field asks for); a box on the page is the way round. A field too small to hold a look gets an empty look, so a mark the file had on it ("sign here") is not left on a field that is signed.
 
 ## Tests
 
 - `crates/signer/tests`: every kind of certificate file (made by `scripts/make-signing-fixtures.py`, committed, password `test`), wrong passwords, damaged files, the process in its sandbox.
 - `crates/engine/tests/sign.rs`: the real engine and PDFium: each key kind, intact and trusted with a list, every shape of document (forms, turned pages, inherited boxes, existing and designed fields), the refusals, the pages unchanged.
 - `crates/engine/tests/sign_readers.rs`: `qpdf --check`, Poppler's `pdfsig` and `pdftoppm`, `openssl cms -verify` (with and without the chain), pyHanko (`tests/sign_readers/pyhanko_check.py`).
-- `crates/engine-client/tests/sign.rs`: the whole pipeline with the real engine and signer processes, a hostile signer, a failing disk, a save after signing.
+- `crates/engine/tests/sign_process.rs` and `crates/engine-client/tests/hostile_signer.rs`: the whole pipeline with the real engine and signer processes, a hostile signer, a failing disk, a save after signing, documents that have signature fields nobody signed, and strings that are not text.
 - Fuzz targets `signer_protocol`, `signer_load` and `sign_prepare` (see `docs/fuzzing.md`).
 - `src/lib/certsign.test.ts`, `src/app/certsign.test.ts`, `e2e/certsign.spec.ts` for the window.
 
