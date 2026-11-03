@@ -18,6 +18,7 @@ use std::sync::Mutex;
 use partridge_protocol::{ErrorCode, ResponseBody, MAX_SAVE_BYTES};
 use pdfium_render::prelude::*;
 
+use crate::metadata;
 use crate::source::{fnv, Problem, SourceGuard};
 use crate::Failure;
 
@@ -117,6 +118,15 @@ pub fn serialise_up_to(
         return Err((
             ErrorCode::SaveFailed,
             "the document was written in a form that is not a PDF".to_string(),
+        ));
+    }
+    // PDFium writes the XMP metadata of a protected document without encryption (see the module
+    // `metadata`). The bytes are not handed over when they hold such a stream.
+    if security_revision(document) != 0 && metadata::leaves_metadata_in_the_clear(&out.bytes) {
+        return Err((
+            ErrorCode::SaveMetadataNotEncrypted,
+            "the document is password protected and has XMP metadata, which would be written without encryption, so it was not written"
+                .to_string(),
         ));
     }
     Ok(out.bytes)

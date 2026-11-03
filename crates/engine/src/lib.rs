@@ -29,6 +29,7 @@ pub mod fonts;
 pub mod form_actions;
 pub mod forms;
 pub mod limits;
+pub mod metadata;
 pub mod sandbox;
 pub mod save;
 pub mod source;
