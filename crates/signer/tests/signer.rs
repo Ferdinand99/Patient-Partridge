@@ -191,6 +191,21 @@ fn each_key_that_is_refused_says_why() {
 }
 
 #[test]
+fn a_curve_written_out_and_a_file_that_asks_for_too_much_work_are_refused_with_their_own_words() {
+    let e = load(&fixture("p256-explicit-curve.p12"), "test")
+        .err()
+        .unwrap();
+    assert_eq!(e.code, ErrorCode::KeyUnsupported);
+    assert!(e.message.contains("written out in full"), "{}", e.message);
+    // More than a million rounds of work: refused before the work is done.
+    let e = load(&fixture("p256-many-rounds.p12"), "test")
+        .err()
+        .unwrap();
+    assert_eq!(e.code, ErrorCode::ProtectionUnsupported, "{}", e.message);
+    assert!(e.message.contains("million rounds"), "{}", e.message);
+}
+
+#[test]
 fn a_chain_is_carried_whole_or_the_file_is_refused() {
     // Twelve certificates are the most a signature carries.
     let identity = load(&fixture("rsa2048-chain12.p12"), "test").unwrap();

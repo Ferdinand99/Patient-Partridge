@@ -551,11 +551,24 @@ async fn save_pdf_as(
             message: "the document is not open".into(),
         }));
     };
+    // A copy of a document that holds a signature starts from a name of its own, and never replaces
+    // the signed file itself: writing it again is what breaks the signature.
+    let signed = {
+        let pool = pool.clone();
+        blocking(move || Ok(pool.is_signed(doc))).await?
+    };
+    let start = if signed { copy_name(&current) } else { current };
     // The dialog is the user's to answer for as long as they like; the gate (which an update
     // install closes) is entered only afterwards, so the dialog never holds an update back.
-    let Some(target) = choose_save_target(&app, current).await? else {
+    let Some(target) = choose_save_target(&app, start).await? else {
         return Ok(None);
     };
+    if signed && pool.is_own_file(doc, &target) {
+        return Err(CommandError {
+            code: "save_same_file".into(),
+            message: "a copy of a signed document needs a name of its own".into(),
+        });
+    }
     // Not while an update is being installed: it would end the engine in the middle of the save.
     let _permit = update_state
         .gate()
@@ -569,6 +582,15 @@ async fn save_pdf_as(
     let info = SavedInfo::from(outcome);
     update_state.move_doc(doc, &info.path);
     Ok(Some(info))
+}
+
+/// `name.pdf` as `name (copy).pdf`, in the same folder.
+fn copy_name(current: &std::path::Path) -> PathBuf {
+    let stem = current
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "document".to_string());
+    current.with_file_name(format!("{stem} (copy).pdf"))
 }
 
 /// Asks the user where to write a file, with the dialog of the system, which the app opens itself:

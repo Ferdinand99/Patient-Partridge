@@ -3868,6 +3868,41 @@ describe("App: a file that was signed here", () => {
     expect(api.save).toHaveBeenLastCalledWith(expect.any(Number), false, false);
   });
 
+  it("has nothing to take back or make again, whatever the history of a tab of that name held", async () => {
+    const { app } = await signedTab();
+    const undo = vi.fn();
+    app.recordEdit({ label: "Change", undo, redo: () => undefined });
+    key("z", { ctrlKey: true });
+    await flush();
+    expect(undo).not.toHaveBeenCalled();
+    key("y", { ctrlKey: true });
+    await flush();
+    expect(notice()).toBeNull();
+  });
+
+  it("is never replaced by the question about a file that changed on the disk", async () => {
+    const { app, api } = await signedTab();
+    app.recordEdit({ label: "Change", undo: () => undefined, redo: () => undefined });
+    api.save.mockImplementationOnce(() => Promise.reject({ code: "save_changed", message: "changed" }));
+    key("s", { ctrlKey: true });
+    await flush();
+    const labels = [...(notice()?.querySelectorAll("button") ?? [])].map((b) => b.textContent);
+    expect(labels).toContain("Save a copy…");
+    expect(labels).not.toContain("Replace the file");
+    click(button("Cancel"));
+    await flush();
+    expect(api.save).toHaveBeenCalledTimes(1);
+    expect(api.save).toHaveBeenLastCalledWith(expect.any(Number), false, false);
+  });
+
+  it("lets pages be copied out to a new file, which leaves the signed file as it is", async () => {
+    const { pages, ops } = await signedTab();
+    await ops.extract([0]);
+    await flush();
+    expect(pages.pagesExtract).toHaveBeenCalledTimes(1);
+    expect(notice()).toBeNull();
+  });
+
   it("a copy of it is an ordinary document again, and can be changed", async () => {
     const { app, api, pages, ops } = await signedTab();
     app.recordEdit({ label: "Change", undo: () => undefined, redo: () => undefined });

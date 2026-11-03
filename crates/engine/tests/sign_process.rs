@@ -689,3 +689,66 @@ fn strings_that_are_not_text_reach_the_signed_file_as_they_were() {
     );
     client.kill();
 }
+
+#[test]
+fn a_document_whose_metadata_is_mended_is_saved_mended_signed_and_checked() {
+    let dir = Dir::new("mended");
+    let pool = EnginePool::new(config(), 4);
+    for (n, (what, pdf)) in sign_support::mended_documents().into_iter().enumerate() {
+        let source = dir.write(&format!("m{n}.pdf"), &pdf);
+        let target = dir.0.join(format!("m{n} (signed).pdf"));
+        let (handle, _) = pool.open(&text(&source), None).unwrap();
+        let mut signer = loaded_signer("rsa2048.p12");
+        // The whole path, with the check of the new file by a second engine in its sandbox.
+        pool.sign_as(
+            handle,
+            &target,
+            &mut signer,
+            &options(),
+            SaveOptions::default(),
+        )
+        .unwrap_or_else(|e| panic!("{what}: {e:?}"));
+        let signed = fs::read(&target).unwrap();
+        assert!(has(&signed, b"%%EOF"), "{what}");
+        let client = EngineClient::new(config());
+        let opened = client.open(&text(&target), None).unwrap();
+        let report = client.signatures(opened.doc, 1_781_524_800).unwrap();
+        assert_eq!(report.items.len(), 1, "{what}");
+        assert_eq!(
+            report.items[0].state,
+            SignatureState::UnknownSigner,
+            "{what}"
+        );
+        client.kill();
+    }
+}
+
+#[test]
+fn a_file_that_another_document_reads_is_not_a_target_and_a_signed_one_knows_its_own_file() {
+    let dir = Dir::new("open-elsewhere");
+    let first = dir.write("a.pdf", &kit::simple_pdf(1));
+    let other_bytes = kit::simple_pdf(2);
+    let other = dir.write("b.pdf", &other_bytes);
+    let pool = EnginePool::new(config(), 4);
+    let (a, _) = pool.open(&text(&first), None).unwrap();
+    let (b, _) = pool.open(&text(&other), None).unwrap();
+    let mut signer = loaded_signer("p256.p12");
+    // b.pdf is open as a document of its own: the signed copy would replace what it shows.
+    let error = pool
+        .sign_as(a, &other, &mut signer, &options(), SaveOptions::default())
+        .unwrap_err();
+    assert_eq!(code_of(&error), "sign_target_open");
+    assert_eq!(fs::read(&other).unwrap(), other_bytes);
+    assert!(
+        signer.certificate().is_some(),
+        "the key is still there for another try"
+    );
+    assert!(pool.read_by_another(a, &other) && !pool.read_by_another(a, &first));
+    // A name of its own works, and the signed file knows that it is the signed file.
+    let target = dir.0.join("a (signed).pdf");
+    pool.sign_as(a, &target, &mut signer, &options(), SaveOptions::default())
+        .unwrap();
+    let (signed, _) = pool.open(&text(&target), None).unwrap();
+    assert!(pool.is_signed(signed) && !pool.is_signed(a) && !pool.is_signed(b));
+    assert!(pool.is_own_file(signed, &target) && !pool.is_own_file(signed, &first));
+}

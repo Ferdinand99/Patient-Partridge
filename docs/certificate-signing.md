@@ -50,7 +50,7 @@ An expired certificate, one that is not in use yet, one that its owner made, and
 
 ## After signing
 
-The signed file is opened as a document of its own and held: annotations, form fields, the form designer and the page tools are off in that tab, each with a short note that says why. The signed file is never saved over; if a save is asked for, only "Save a copy" is offered. The tab follows the copy, which is an ordinary document and can be changed again. Nothing in the program writes the signed file after it is in place.
+The signed file is opened as a document and held: annotations, form fields, the form designer, the page tools and Undo and Redo are off in that tab, each with a short note that says why (copying pages out to a new file is allowed, as it does not change the signed file). The signed file is never saved over; if a save is asked for, only "Save a copy" is offered. The tab follows the copy, which is an ordinary document and can be changed again. Nothing in the program writes the signed file after it is in place.
 
 The signer ends after the one signature it makes, so the key is not kept. If the signing fails after that (a name already taken, a disk that is full), the password is asked for again. A key that is opened and not used is let go after five minutes, and a key opened for one document signs no other.
 

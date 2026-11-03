@@ -12,6 +12,7 @@ use partridge_protocol::{
 };
 use partridge_signer::Identity;
 use partridge_signer_protocol::HashKind;
+use partridge_testkit as kit;
 use ring::digest;
 
 use crate::common::{ask, open, save_all};
@@ -309,4 +310,28 @@ pub fn one_field_pdf(field_extra: &[u8], shared_annots: bool) -> Vec<u8> {
         objects.push(b"[5 0 R]".to_vec());
     }
     raw_pdf(&objects)
+}
+
+/// Documents whose XMP stream PDFium writes out damaged (the filter is lost), so that the save of
+/// the engine mends it with an update added to the file: Flate, hex and both together.
+pub fn mended_documents() -> Vec<(&'static str, Vec<u8>)> {
+    let packet = kit::xmp_packet(kit::XMP_CATALOG_TITLE);
+    let flated = kit::flate(packet.as_bytes());
+    vec![
+        ("flate", kit::xmp_pdf_with(true, true, true)),
+        (
+            "hex",
+            kit::xmp_pdf_raw(
+                "/Filter /ASCIIHexDecode",
+                &kit::ascii_hex(packet.as_bytes()),
+            ),
+        ),
+        (
+            "hex and flate",
+            kit::xmp_pdf_raw(
+                "/Filter [/ASCIIHexDecode /FlateDecode]",
+                &kit::ascii_hex(&flated),
+            ),
+        ),
+    ]
 }

@@ -105,7 +105,7 @@ export const CERT_WORDS = {
   pageLabel: "Page",
   textsTitle: "What the signature says",
   signerName: "The signature carries the name in the certificate.",
-  keyLetGo: "The key was let go after one signature. Type the password again to try once more.",
+  keyLetGo: "The key is no longer open. Type the password again to try once more.",
   reason: "Reason (optional)",
   location: "Place (optional)",
   pictureTitle: "Picture of your signature (optional)",
@@ -280,6 +280,11 @@ export function describeSignError(error: AppErrorLike, fileName = "this file"): 
       return {
         title: "Save the document first",
         detail: `${fileName} has changes that are not saved. Save it, then sign.`,
+      };
+    case "sign_target_open":
+      return {
+        title: "That file is open",
+        detail: "The name you chose is a file that is open in another tab, and the signed copy would replace it. Close that tab, or choose another name.",
       };
     case "sign_same_file":
       return {

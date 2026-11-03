@@ -485,7 +485,7 @@ export class App {
           const tab = this.tabs.find((t) => t.doc === doc);
           if (tab) await this.documentLost(tab, error);
         },
-        settle: (doc) => this.settleBeforePages(doc),
+        settle: (doc, options) => this.settleBeforePages(doc, options?.copies === true),
         keepsRefusedText: (doc) => this.keepRefusedText(doc),
         pickFiles: () => deps.pickFiles(),
         announce: (text) => this.announcePages(text),
@@ -579,11 +579,12 @@ export class App {
    * field refused is not in the document and would be lost with the pages it was typed on: the tool
    * does not begin until the reader has dealt with it.
    */
-  private async settleBeforePages(doc: number): Promise<boolean> {
+  private async settleBeforePages(doc: number, copies = false): Promise<boolean> {
     const tab = this.tabs.find((t) => t.doc === doc);
     if (!tab) return true;
-    // The file that was just signed is not changed: a page tool would break the signature.
-    if (tab.signedHere) {
+    // The file that was just signed is not changed: a page tool would break the signature. Copying
+    // pages out writes a new file and leaves the signed one as it is.
+    if (tab.signedHere && !copies) {
       await this.tellSigned("page changes");
       return false;
     }
@@ -2011,7 +2012,8 @@ export class App {
       buttons: [
         { id: "cancel", label: "Cancel", safe: true },
         { id: "copy", label: "Save a copy…", primary: true },
-        { id: "overwrite", label: "Replace the file" },
+        // Never over the file that was signed here: that file is the signature.
+        ...(tab.signedHere ? [] : [{ id: "overwrite", label: "Replace the file" }]),
       ],
     });
     return answer.button === "copy" || answer.button === "overwrite" ? answer.button : "cancel";
@@ -2123,7 +2125,8 @@ export class App {
 
   private async stepHistory(direction: "undo" | "redo"): Promise<void> {
     const tab = this.active;
-    if (!tab || tab.saving || this.pageOps?.busy) return;
+    // The file that was signed here has nothing to take back, and nothing to make again.
+    if (!tab || tab.saving || this.pageOps?.busy || tab.signedHere) return;
     const run = async (): Promise<void> => {
       // A form change that is on its way is part of the history first: Undo takes back that one,
       // not the one before it.

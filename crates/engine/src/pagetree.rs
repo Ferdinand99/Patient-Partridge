@@ -376,6 +376,10 @@ pub(crate) fn number(b: &[u8], value: &Range<usize>) -> Option<i64> {
     (real.is_finite() && real.abs() < 1e15).then_some(real as i64)
 }
 
+/// Most tables of objects a file may be written in (the first, and the parts added after it), when
+/// they are followed.
+const MAX_PARTS: usize = 16;
+
 /// The keys a page can inherit from the nodes above it.
 pub const INHERITED: [&str; 4] = ["Resources", "MediaBox", "CropBox", "Rotate"];
 
@@ -402,6 +406,17 @@ struct Section {
 
 impl<'a> Table<'a> {
     pub(crate) fn read(bytes: &'a [u8], limit: usize) -> Found<Table<'a>> {
+        Table::read_parts(bytes, limit, 1)
+    }
+
+    /// As [`Table::read`], for a file that was written in more than one part: a table whose trailer
+    /// has `/Prev` is followed back to the table before it, at most `MAX_PARTS` tables in all, and
+    /// the newest entry for an object wins. A table of another kind (a stream) is refused.
+    pub(crate) fn read_parts_followed(bytes: &'a [u8], limit: usize) -> Found<Table<'a>> {
+        Table::read_parts(bytes, limit, MAX_PARTS)
+    }
+
+    fn read_parts(bytes: &'a [u8], limit: usize, most_parts: usize) -> Found<Table<'a>> {
         let unreadable = |why| Err(TreeError::Unreadable(why));
         let tail = bytes.len().saturating_sub(TAIL);
         let Some(word) = bytes[tail..]
@@ -413,57 +428,80 @@ impl<'a> Table<'a> {
         };
         let p = skip_white(bytes, word + 9);
         let q = token_end(bytes, p);
-        let Some(start) = uint(&bytes[p..q]).and_then(|n| usize::try_from(n).ok()) else {
+        let Some(first_start) = uint(&bytes[p..q]).and_then(|n| usize::try_from(n).ok()) else {
             return unreadable("the place of the table of objects is not a number");
         };
-        if !bytes.get(start..).is_some_and(|t| t.starts_with(b"xref")) {
-            return unreadable("the table of objects is of another kind");
-        }
         let mut sections = Vec::new();
-        let mut p = start + 4;
+        let mut newest_trailer: Option<Vec<Entry>> = None;
+        let mut seen: Vec<usize> = Vec::new();
+        let mut start = first_start;
+        let mut parts = 0usize;
         loop {
-            p = skip_white(bytes, p);
-            if bytes.get(p..).is_some_and(|t| t.starts_with(b"trailer")) {
-                p += 7;
-                break;
+            if seen.contains(&start) {
+                return unreadable("the tables of the objects lead back to themselves");
             }
-            let q = token_end(bytes, p);
-            let Some(first) = uint(&bytes[p..q]) else {
-                return unreadable("a part of the table of objects cannot be read");
-            };
-            let p2 = skip_white(bytes, q);
-            let q2 = token_end(bytes, p2);
-            let Some(count) = uint(&bytes[p2..q2]) else {
-                return unreadable("a part of the table of objects cannot be read");
-            };
-            let at = skip_white(bytes, q2);
-            let Some(size) = usize::try_from(count).ok().and_then(|c| c.checked_mul(20)) else {
-                return unreadable("the table of objects is too long");
-            };
-            if at.checked_add(size).is_none_or(|end| end > bytes.len()) {
-                return unreadable("the table of objects is cut short");
+            seen.push(start);
+            parts += 1;
+            if !bytes.get(start..).is_some_and(|t| t.starts_with(b"xref")) {
+                return unreadable("the table of objects is of another kind");
             }
-            if sections.len() >= 100_000 {
-                return unreadable("the table of objects has too many parts");
+            let mut p = start + 4;
+            loop {
+                p = skip_white(bytes, p);
+                if bytes.get(p..).is_some_and(|t| t.starts_with(b"trailer")) {
+                    p += 7;
+                    break;
+                }
+                let q = token_end(bytes, p);
+                let Some(first) = uint(&bytes[p..q]) else {
+                    return unreadable("a part of the table of objects cannot be read");
+                };
+                let p2 = skip_white(bytes, q);
+                let q2 = token_end(bytes, p2);
+                let Some(count) = uint(&bytes[p2..q2]) else {
+                    return unreadable("a part of the table of objects cannot be read");
+                };
+                let at = skip_white(bytes, q2);
+                let Some(size) = usize::try_from(count).ok().and_then(|c| c.checked_mul(20)) else {
+                    return unreadable("the table of objects is too long");
+                };
+                if at.checked_add(size).is_none_or(|end| end > bytes.len()) {
+                    return unreadable("the table of objects is cut short");
+                }
+                if sections.len() >= 100_000 {
+                    return unreadable("the table of objects has too many parts");
+                }
+                sections.push(Section { first, count, at });
+                p = at + size;
             }
-            sections.push(Section { first, count, at });
-            p = at + size;
-        }
-        let value_start = skip_white(bytes, p);
-        let Some(end) = skip_value(bytes, value_start) else {
-            return unreadable("the trailer cannot be read");
-        };
-        let Some(trailer) = dictionary(bytes, &(value_start..end)) else {
-            return unreadable("the trailer cannot be read");
-        };
-        if entry(&trailer, b"Prev").is_some() || entry(&trailer, b"XRefStm").is_some() {
-            return unreadable("the file is written in more than one part");
+            let value_start = skip_white(bytes, p);
+            let Some(end) = skip_value(bytes, value_start) else {
+                return unreadable("the trailer cannot be read");
+            };
+            let Some(trailer) = dictionary(bytes, &(value_start..end)) else {
+                return unreadable("the trailer cannot be read");
+            };
+            if entry(&trailer, b"XRefStm").is_some() {
+                return unreadable("the file is written in more than one part");
+            }
+            let before = entry(&trailer, b"Prev").cloned();
+            if newest_trailer.is_none() {
+                newest_trailer = Some(trailer);
+            }
+            let Some(before) = before else { break };
+            if parts >= most_parts {
+                return unreadable("the file is written in more than one part");
+            }
+            let Some(next) = number(bytes, &before).and_then(|n| usize::try_from(n).ok()) else {
+                return unreadable("the place of the table before is not a number");
+            };
+            start = next;
         }
         Ok(Table {
             bytes,
             sections,
-            trailer,
-            start,
+            trailer: newest_trailer.unwrap_or_default(),
+            start: first_start,
             read: RefCell::new(HashMap::new()),
             scanned: Cell::new(0),
             limit,
@@ -851,6 +889,16 @@ pub fn read_with(bytes: &[u8], pages: usize, parents: bool, tick: &mut dyn FnMut
     read_within(bytes, pages, parents, limit, tick)
 }
 
+/// As [`read`], for a file that was written in more than one part (a repair of the metadata is
+/// added to PDFium's file as an update): the tables are followed back, at most 16 of them.
+pub fn read_followed(bytes: &[u8], pages: usize, parents: bool) -> Found<Tree> {
+    let limit = bytes
+        .len()
+        .saturating_mul(WORK_TIMES)
+        .saturating_add(WORK_EXTRA);
+    read_tree(bytes, pages, parents, limit, &mut || {}, true)
+}
+
 /// As [`read_with`], with the most bytes that the walk may read given.
 pub fn read_within(
     bytes: &[u8],
@@ -859,7 +907,22 @@ pub fn read_within(
     limit: usize,
     tick: &mut dyn FnMut(),
 ) -> Found<Tree> {
-    let table = Table::read(bytes, limit)?;
+    read_tree(bytes, pages, parents, limit, tick, false)
+}
+
+fn read_tree(
+    bytes: &[u8],
+    pages: usize,
+    parents: bool,
+    limit: usize,
+    tick: &mut dyn FnMut(),
+    follow: bool,
+) -> Found<Tree> {
+    let table = if follow {
+        Table::read_parts_followed(bytes, limit)?
+    } else {
+        Table::read(bytes, limit)?
+    };
     let Some(root_entry) = entry(&table.trailer, b"Root") else {
         return Err(TreeError::Unreadable("the file names no catalog"));
     };
@@ -1861,5 +1924,45 @@ mod tests {
         // A chain that loops and holds an entry is still seen.
         let bytes = outside("/Parent 5 0 R", &format!("/Parent 4 0 R {held}"), "4 0 R");
         assert!(matches!(read(&bytes, 2, true), Err(TreeError::Damaged(_))));
+    }
+
+    /// A file of `parts` tables, each with an entry for object 1 that says where it was written.
+    fn written_in_parts(parts: usize, loops: bool) -> Vec<u8> {
+        let mut out = b"%PDF-1.7\n".to_vec();
+        let mut previous: Option<usize> = None;
+        let mut starts = Vec::new();
+        for part in 0..parts {
+            let at = out.len();
+            starts.push(at);
+            out.extend_from_slice(b"xref\n1 1\n");
+            out.extend_from_slice(format!("{:010} 00000 n \n", 9 + part).as_bytes());
+            out.extend_from_slice(b"trailer\n<< /Size 2");
+            if let Some(p) = previous {
+                out.extend_from_slice(format!(" /Prev {p}").as_bytes());
+            } else if loops {
+                out.extend_from_slice(format!(" /Prev {at}").as_bytes());
+            }
+            out.extend_from_slice(b" >>\n");
+            previous = Some(at);
+        }
+        out.extend_from_slice(format!("startxref\n{}\n%%EOF\n", previous.unwrap_or(0)).as_bytes());
+        out
+    }
+
+    #[test]
+    fn tables_written_in_parts_are_followed_a_few_at_a_time_and_the_newest_entry_wins() {
+        let ok = written_in_parts(MAX_PARTS, false);
+        let table = Table::read_parts_followed(&ok, 1 << 20).expect("sixteen parts are followed");
+        // The newest part names object 1 first.
+        let (offset, _) = table.place(1).unwrap().expect("an entry");
+        assert_eq!(offset, 9 + MAX_PARTS - 1);
+        // One more is refused, a table that leads back to itself is refused, and the plain reader
+        // does not follow at all.
+        let many = written_in_parts(MAX_PARTS + 1, false);
+        assert!(Table::read_parts_followed(&many, 1 << 20).is_err());
+        let looping = written_in_parts(1, true);
+        assert!(Table::read_parts_followed(&looping, 1 << 20).is_err());
+        assert!(Table::read(&written_in_parts(2, false), 1 << 20).is_err());
+        assert!(Table::read(&written_in_parts(1, false), 1 << 20).is_ok());
     }
 }

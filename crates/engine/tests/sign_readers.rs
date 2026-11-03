@@ -641,3 +641,42 @@ mod serde_like {
         Fields(out)
     }
 }
+
+#[test]
+fn a_document_whose_metadata_is_mended_signs_and_other_readers_accept_it() {
+    if !have("qpdf") && !have("pdfsig") {
+        return;
+    }
+    let dir = Dir::new("mended");
+    let mut guard = engine();
+    let e = &mut guard.0;
+    for (what, pdf) in mended_documents() {
+        let (signed, _) = sign_with(e, &pdf, "p256.p12", rect_place(0));
+        let path = dir.write("mended.pdf", &signed);
+        if have("qpdf") {
+            let (ok, output) = run("qpdf", &["--check", path.to_str().unwrap()]);
+            assert!(ok, "{what}: qpdf --check failed:\n{output}");
+            // The metadata can be read by another program: the title is in what it writes out.
+            let readable = dir.0.join("readable.pdf");
+            let (ok, output) = run(
+                "qpdf",
+                &["--qdf", path.to_str().unwrap(), readable.to_str().unwrap()],
+            );
+            assert!(ok, "{what}: qpdf --qdf failed:\n{output}");
+            let text = std::fs::read(&readable).unwrap();
+            assert!(
+                text.windows(kit::XMP_CATALOG_TITLE.len())
+                    .any(|w| w == kit::XMP_CATALOG_TITLE.as_bytes()),
+                "{what}: the metadata cannot be read after signing"
+            );
+        }
+        if have("pdfsig") {
+            let (_, output) = run("pdfsig", &[path.to_str().unwrap()]);
+            assert!(output.contains("Signature is Valid"), "{what}:\n{output}");
+            assert!(
+                output.contains("Total document signed"),
+                "{what}:\n{output}"
+            );
+        }
+    }
+}

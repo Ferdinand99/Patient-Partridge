@@ -45,6 +45,8 @@ struct Inner {
     opened: Option<Instant>,
     /// Counts the openings, so that the watch of an earlier one knows it is not the last.
     generation: u64,
+    /// A signature is being made: the signer is out of this state for the time it takes.
+    signing: bool,
     /// An imported picture for the box, as pixels (the window decoded it).
     image: Option<SignatureMark>,
 }
@@ -75,12 +77,19 @@ impl CertificateState {
 
     /// Lets the key go when it has been open longer than [`KEY_LIFETIME`]. The file that was
     /// picked stays, so that the person can type the password again.
+    ///
+    /// The watch goes on while a signature is being made (the signer is out of the state then,
+    /// and comes back if the signing fails before it signs), and ends when the key is gone, was
+    /// forgotten, or belongs to a later opening.
     fn let_go_if_old(&self, generation: u64) -> bool {
         let mut inner = state(self);
-        if inner.generation != generation || inner.signer.is_none() {
+        if inner.generation != generation || inner.opened.is_none() {
             return true;
         }
         if inner.opened.is_some_and(|at| at.elapsed() >= KEY_LIFETIME) {
+            if inner.signing {
+                return false;
+            }
             inner.opened = None;
             if let Some(signer) = inner.signer.take() {
                 signer.close();
@@ -523,7 +532,12 @@ pub async fn sign_document(
         .gate()
         .enter()
         .map_err(|_| updates::updating_error())?;
-    let Some(mut signer) = state(&certificate).signer.take() else {
+    let Some(mut signer) = ({
+        let mut inner = state(&certificate);
+        let taken = inner.signer.take();
+        inner.signing = taken.is_some();
+        taken
+    }) else {
         return Err(error("signer_not_loaded", "No certificate file is open."));
     };
     let options = SignOptions {
@@ -542,6 +556,7 @@ pub async fn sign_document(
     .await
     .map_err(|e| error("internal", &e.to_string()))?;
     let (signer, result) = task;
+    state(&certificate).signing = false;
     match result {
         Ok(outcome) => {
             // Signed: the key is let go at once.

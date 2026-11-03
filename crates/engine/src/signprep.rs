@@ -535,11 +535,11 @@ pub fn prepare(base: Vec<u8>, pages: usize, spec: &Spec<'_>) -> Result<Prepared,
         .len()
         .saturating_mul(WORK_TIMES)
         .saturating_add(WORK_EXTRA);
-    let table = Table::read(b, limit)?;
+    let table = Table::read_parts_followed(b, limit)?;
     if entry(&table.trailer, b"Encrypt").is_some() {
         return Err(Refusal::Encrypted);
     }
-    let tree = pagetree::read(b, pages, false)?;
+    let tree = pagetree::read_followed(b, pages, false)?;
     if tree.encrypted {
         return Err(Refusal::Encrypted);
     }

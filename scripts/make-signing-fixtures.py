@@ -222,6 +222,33 @@ def extra(out):
     write(out, "rsa2048-exponent3.p12", key3,
           certificate(name("Test Signer Exponent 3"), key3, root_name, root_key, 3001, long_ago, far_off), [root])
 
+    # Made by the openssl program: a P-256 key whose curve is written out in full instead of being
+    # named, and a file that asks for more rounds of work than the signer allows (a million).
+    work = out / "work-extra"
+    work.mkdir(exist_ok=True)
+    key, cert = work / "k.pem", work / "c.pem"
+    subprocess.run(["openssl", "ecparam", "-name", "prime256v1", "-param_enc", "explicit", "-genkey",
+                    "-noout", "-out", str(work / "ec.pem")], check=True)
+    subprocess.run(["openssl", "pkcs8", "-topk8", "-nocrypt", "-in", str(work / "ec.pem"),
+                    "-out", str(key)], check=True)
+    subprocess.run(["openssl", "req", "-new", "-x509", "-key", str(key), "-subj", "/CN=Test Signer Explicit Curve",
+                    "-days", "36500", "-out", str(cert)], check=True)
+    subprocess.run(["openssl", "pkcs12", "-export", "-inkey", str(key), "-in", str(cert),
+                    "-passout", "pass:test", "-out", str(out / "p256-explicit-curve.p12")], check=True)
+    plain = ec.generate_private_key(ec.SECP256R1())
+    (work / "p.pem").write_bytes(plain.private_bytes(serialization.Encoding.PEM,
+                                                     serialization.PrivateFormat.PKCS8,
+                                                     serialization.NoEncryption()))
+    holder = certificate(name("Test Signer Many Rounds"), plain, root_name, root_key, 3002, long_ago, far_off)
+    (work / "h.pem").write_bytes(holder.public_bytes(serialization.Encoding.PEM))
+    subprocess.run(["openssl", "pkcs12", "-export", "-inkey", str(work / "p.pem"), "-in", str(work / "h.pem"),
+                    "-passout", "pass:test", "-iter", "1000001", "-out", str(out / "p256-many-rounds.p12")],
+                   check=True)
+    for file in work.iterdir():
+        file.unlink()
+    work.rmdir()
+    print("p256-explicit-curve.p12, p256-many-rounds.p12")
+
 
 if __name__ == "__main__":
     args = [a for a in sys.argv[1:] if not a.startswith("--")]

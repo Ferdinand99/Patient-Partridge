@@ -1101,3 +1101,32 @@ fn a_list_of_annotations_that_pages_share_is_not_changed_for_the_other_pages() {
         "the new field shows on the second page too"
     );
 }
+
+// ---- a document whose metadata the save mends ----------------------------------------------------------
+
+#[test]
+fn a_document_whose_metadata_is_mended_is_signed_after_the_mend() {
+    let mut shared = engine();
+    let e = &mut shared.0;
+    for (what, pdf) in mended_documents() {
+        for place in [rect_place(0), SignPlace::Invisible] {
+            let (signed, r) = sign_with(e, &pdf, "p256.p12", place.clone());
+            assert_eq!(r.items.len(), 1, "{what}: {:?}", r.items);
+            assert_eq!(r.items[0].state, S::UnknownSigner, "{what} {place:?}");
+            // PDFium's file, the update that mends the stream, and the signature: three ends. The
+            // signature comes last and covers the mended file.
+            assert!(
+                count(&signed, b"%%EOF") >= 3,
+                "{what}: {}",
+                count(&signed, b"%%EOF")
+            );
+            let range = &r.items[0].byte_range;
+            assert_eq!(range[2] + range[3], signed.len() as u64, "{what}");
+            // The stream keeps its filter in the file the signature covers.
+            assert!(
+                has(&signed, b"FlateDecode") || has(&signed, b"ASCIIHexDecode"),
+                "{what}: the metadata lost its filter"
+            );
+        }
+    }
+}

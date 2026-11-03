@@ -51,7 +51,7 @@ export interface PageHost {
    * is sent, the box of a note is saved, running changes are made). Resolves with false, after saying
    * why, when the tool must not begin.
    */
-  settle?(doc: number): Promise<boolean>;
+  settle?(doc: number, options?: { copies: boolean }): Promise<boolean>;
   /**
    * Asked before a step back or forward changes the pages: resolves with false, after saying why,
    * when text a field refused would be lost with the pages it was typed on.
@@ -613,7 +613,7 @@ export class PageOps {
         this.settling = true;
         let ready: boolean;
         try {
-          ready = await this.host.settle(t.doc);
+          ready = await this.host.settle(t.doc, { copies: options.copies === true });
         } finally {
           this.settling = false;
         }
