@@ -402,7 +402,7 @@ describe("importing an image", () => {
     expect(status()).toBe(PICTURE_WORDS.imageFailed);
     expect(t.decode).not.toHaveBeenCalled();
     // At the limit it is read.
-    pick(form, pngFile("limit.png", 6_000, 6_000));
+    pick(form, pngFile("limit.png", 4_000, 4_000));
     await flush();
     expect(t.decode).toHaveBeenCalledTimes(1);
   });

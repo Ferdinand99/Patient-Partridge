@@ -480,17 +480,30 @@ describe("the size an image file declares", () => {
     const hiddenFrame = new Uint8Array([0xff, 0xd8, 0xff, 0x00, ...be16(2 + covered.length), ...covered, ...small, ...scan(1_000_000)]);
     expect(hiddenFrame.length).toBeGreaterThan(1_000_000);
     expect(imageSizeOf(hiddenFrame)).toBeNull();
-    // The same where the 0xFF 0x00 is not in the way of the walk: the start of frame is still found.
-    const behind = new Uint8Array([0xff, 0xd8, ...quant, ...frame(100, 100), ...segment(0xfe, [0xff, 0xc0, 0, 17, 8, ...be16(16_000), ...be16(16_000), 1, 1, 0x11, 0]), ...scan(50)]);
-    expect(judgeImageSize(imageSizeOf(behind))).toBe("too-big");
+    // After the start of the scan every start of frame counts: in the data, and after the end.
+    expect(judgeImageSize(imageSizeOf(file(quant, frame(100, 100), tables, scan(50), frame(16_000, 16_000))))).toBe("too-big");
+    expect(judgeImageSize(imageSizeOf(file(quant, frame(100, 100), tables, scan(50).slice(0, 30), frame(16_000, 16_000, 0xc2))))).toBe("too-big");
+    // Before it the segments are skipped by their lengths, as a decoder does: what a comment
+    // holds is not a start of frame.
+    const comment = segment(0xfe, [0xff, 0xc0, 0, 17, 8, ...be16(16_000), ...be16(16_000), 1, 1, 0x11, 0]);
+    expect(imageSizeOf(file(quant, frame(100, 100), comment, tables, scan(50)))).toEqual({ width: 100, height: 100 });
+    // A segment whose length is a number from 0xFFC0 to 0xFFCF (an extended XMP segment that is
+    // full, say) is not a start of frame.
+    const full = [0xff, 0xe1, 0xff, 0xc5, ...new Array(0xffc5 - 2).fill(0x61)];
+    expect(full.length).toBe(0xffc5 + 2);
+    expect(imageSizeOf(file(full, full, quant, frame(3_840, 2_160), tables, scan(50)))).toEqual({ width: 3_840, height: 2_160 });
+    expect(imageSizeOf(file(full, quant, frame(100, 100), tables, scan(50)))).toEqual({ width: 100, height: 100 });
     // A start of frame that is cut short, or has no size, is not read.
     expect(imageSizeOf(new Uint8Array([...file(quant, frame(10, 10), scan(5)), 0xff, 0xc2, 0, 11]))).toBeNull();
-    expect(imageSizeOf(file(quant, frame(10, 10), segment(0xfe, [0xff, 0xc1, 0, 11, 8, 0, 0, 0, 5, 1, 1, 0x11, 0]), scan(5)))).toBeNull();
+    expect(imageSizeOf(file(quant, frame(10, 10), scan(5), [0xff, 0xc1, 0, 11, 8, 0, 0, 0, 5, 1, 1, 0x11, 0]))).toBeNull();
   });
 
   it("is judged against the side and the pixel limit of the decoder", () => {
     expect(judgeImageSize({ width: 1, height: 1 })).toBe("ok");
-    expect(judgeImageSize({ width: MAX_DECODE_SIDE, height: 4_000 })).toBe("ok");
+    expect(judgeImageSize({ width: MAX_DECODE_SIDE, height: 1_900 })).toBe("ok");
+    expect(judgeImageSize({ width: 4_000, height: 4_000 })).toBe("ok");
+    expect(judgeImageSize({ width: 4_001, height: 4_000 })).toBe("too-big");
+    expect(judgeImageSize({ width: MAX_DECODE_SIDE, height: 2_000 })).toBe("too-big");
     expect(judgeImageSize({ width: MAX_DECODE_SIDE + 1, height: 1 })).toBe("too-big");
     expect(judgeImageSize({ width: 1, height: MAX_DECODE_SIDE + 1 })).toBe("too-big");
     expect(judgeImageSize({ width: 7_000, height: 7_000 })).toBe("too-big");
@@ -510,7 +523,7 @@ describe("the size an image file declares", () => {
     const jpegSegment = (marker: number, payload: number[]) => [0xff, marker, (2 + payload.length) >> 8, (2 + payload.length) & 255, ...payload];
     const jpegFrame = (w: number, h: number) => jpegSegment(0xc0, [8, h >> 8, h & 255, w >> 8, w & 255, 1, 1, 0x11, 0]);
     const padding = jpegSegment(0xfe, new Array(60_000).fill(0));
-    const lateJpeg = new Uint8Array([0xff, 0xd8, ...jpegFrame(100, 100), ...Array.from({ length: 40 }, () => padding).flat(), ...jpegSegment(0xfe, [0xff, 0xc0, 0, 17, 8, 0x3e, 0x80, 0x3e, 0x80, 1, 1, 0x11, 0]), 0xff, 0xd9]);
+    const lateJpeg = new Uint8Array([0xff, 0xd8, ...jpegFrame(100, 100), ...Array.from({ length: 40 }, () => padding).flat(), ...jpegSegment(0xda, [1, 1, 0, 0, 0x3f, 0]), 0, 0, 0xff, 0xd9, ...jpegFrame(16_000, 16_000)]);
     expect(lateJpeg.length).toBeGreaterThan(HEADER_BYTES);
     expect(await checkImageHeader(new Blob([lateJpeg]))).toBe("too-big");
     // The frame that is too big comes after more than the first bytes that are read for a header.

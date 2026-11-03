@@ -35,10 +35,11 @@ export const MAX_IMAGE_FILE_BYTES = 12 * 1024 * 1024;
  * Largest side and most pixels an image file may declare in its header and still be decoded. A
  * file of a few kilobytes can declare a picture of many gigabytes, and the decoder makes all of
  * it before the window can scale it down. The signature picture is scaled to a much smaller size
- * afterwards, so these only guard the decoder.
+ * afterwards (to at most half a million pixels), so these only guard the decoder and are far
+ * above what a signature needs.
  */
 export const MAX_DECODE_SIDE = 8_192;
-export const MAX_DECODE_PIXELS = 40_000_000;
+export const MAX_DECODE_PIXELS = 16_000_000;
 
 /** How much of the start of an image file is read to find its size in the header. */
 export const HEADER_BYTES = 2 * 1024 * 1024;
@@ -474,17 +475,18 @@ export function imageSizeOf(bytes: Uint8Array): ImageSize | null {
     return null;
   }
   // JPEG: segments that each start with 0xFF and a marker; a "start of frame" holds the size.
-  // The walk finds the frame the way a strict reader does; a lenient decoder (libjpeg skips a
-  // 0xFF 0x00 and scans on) may find another one, so the whole file is searched for every
-  // start of frame too, and the largest size counts. In the data of a picture a 0xFF is always
-  // followed by 0x00 or by a restart marker, so a real picture holds no start of frame but its own
-  // (and those of thumbnails, which are small).
+  // The walk goes over the segments up to the start of the scan (it reads lengths only), the way
+  // libjpeg does: a 0xFF 0x00 or a byte that is not 0xFF where a marker belongs is refused, so
+  // that both find the same segments. What it skips by their lengths (the lengths and the
+  // contents of segments) is not read for markers. What follows the start of the scan (the data,
+  // and whatever comes after the end of the picture) is searched for every start of frame, since
+  // a decoder acts on a marker wherever it finds one there, and the largest size counts.
   if (u8(0) === 0xff && u8(1) === 0xd8) {
     const walked = jpegWalk();
     if (!walked) return null;
     let width = walked.width;
     let height = walked.height;
-    for (let i = 0; i + 1 < bytes.length; i++) {
+    for (let i = walked.rest; i + 1 < bytes.length; i++) {
       if (bytes[i] !== 0xff) continue;
       const marker = bytes[i + 1];
       if (marker < 0xc0 || marker > 0xcf || marker === 0xc4 || marker === 0xc8 || marker === 0xcc) continue;
@@ -500,8 +502,13 @@ export function imageSizeOf(bytes: Uint8Array): ImageSize | null {
   }
   return null;
 
-  function jpegWalk(): ImageSize | null {
+  /** The largest of the starts of frame before the scan, and where the rest of the file starts. */
+  function jpegWalk(): { width: number; height: number; rest: number } | null {
     let at = 2;
+    let width = 0;
+    let height = 0;
+    let frames = 0;
+    let rest = bytes.length;
     while (at + 3 < bytes.length) {
       if (bytes[at] !== 0xff) return null;
       let marker = bytes[at + 1];
@@ -515,15 +522,29 @@ export function imageSizeOf(bytes: Uint8Array): ImageSize | null {
       if (marker === 0x00) return null;
       // Markers that stand alone: no length follows.
       if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd8)) continue;
-      // The end of the picture or the start of the data, and no size before it.
-      if (marker === 0xd9 || marker === 0xda) return null;
+      // The end of the picture: what follows is not a segment.
+      if (marker === 0xd9) {
+        rest = at;
+        break;
+      }
       const length = be16(at);
       if (length < 2) return null;
+      // The start of the scan: its header is skipped, and the data follows.
+      if (marker === 0xda) {
+        rest = at + length;
+        break;
+      }
       const frame = marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc;
-      if (frame) return length >= 7 ? size(be16(at + 5), be16(at + 3)) : null;
+      if (frame) {
+        const found = length >= 7 ? size(be16(at + 5), be16(at + 3)) : null;
+        if (!found) return null;
+        width = Math.max(width, found.width);
+        height = Math.max(height, found.height);
+        frames += 1;
+      }
       at += length;
     }
-    return null;
+    return frames > 0 ? { width, height, rest: Math.min(rest, bytes.length) } : null;
   }
 }
 
