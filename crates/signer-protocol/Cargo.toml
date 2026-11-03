@@ -1,0 +1,10 @@
+[package]
+name = "partridge-signer-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "The messages between the Patient Partridge app and its signer process (a certificate file in, a signature out)"
+
+[dependencies]

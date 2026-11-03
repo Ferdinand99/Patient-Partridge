@@ -1,0 +1,35 @@
+[package]
+name = "partridge-signer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "The Patient Partridge signer: reads a certificate file and signs a digest, in a process of its own with no file and no network"
+
+[lib]
+name = "partridge_signer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "partridge-signer"
+path = "src/main.rs"
+
+[dependencies]
+partridge-signer-protocol = { path = "../signer-protocol" }
+partridge-sandbox = { path = "../sandbox" }
+# Reads PKCS #12 files (the password-protected file that holds a key and its certificates). It is
+# the only part of the program that takes such a file, and it is pinned exactly.
+p12-keystore = "=0.4.1"
+# The signature arithmetic. The same library the engine uses to check signatures.
+ring = "=0.17.14"
+# Passwords and key bytes are overwritten when they are let go.
+zeroize = "=1.9.1"
+# Reads the fields of a certificate (names, validity, key usage). Already part of the tree through p12-keystore.
+x509-parser = "=0.18.1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.191"
+
+[dev-dependencies]
+partridge-testkit = { path = "../testkit" }
