@@ -24,6 +24,10 @@ The browser tests (`e2e/`) run the real window code in Chromium with the content
 
 The protocol decoders and the engine (with PDFium) are also fuzzed: see [fuzzing.md](fuzzing.md). The app and the engine sandbox are also run on Windows as a standard user, not only as the administrator of the CI runner: see [windows-standard-user.md](windows-standard-user.md).
 
+## TypeScript versions
+
+`npm run typecheck` (and so `npm run build`) runs TypeScript 7, the native compiler, installed as `typescript-native` in `package.json`. ESLint (typescript-eslint) needs the JavaScript compiler API that TypeScript 7 does not have, so `typescript` stays on 6.0.x, the newest version that typescript-eslint accepts. Both packages ship a `tsc` program, so the typecheck script starts the one in `node_modules/typescript-native` by its path. Once typescript-eslint supports TypeScript 7.1, drop the alias, set `typescript` to 7.x, change the two scripts back to `tsc --noEmit` and remove the `typescript` ignore from `.github/dependabot.yml`. Dependabot does not update npm aliases, so raise `typescript-native` by hand until then.
+
 ## Installers and releases
 
 Installers for testing (not signed, no update files): `npm run bundle`. Releases are made by the release workflow, with the macOS app signed and notarised ([signing.md](signing.md)) and the update files signed ([updates.md](updates.md)). An update can be tried from start to end on one computer with `node scripts/update-e2e.mjs` (it makes a throwaway key, builds two versions and lets the old one update itself; see [updates.md](updates.md)).
