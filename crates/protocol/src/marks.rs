@@ -162,6 +162,17 @@ pub fn mark_char_ok(c: char) -> bool {
         )
 }
 
+/// True for the text of a typed signature: one to forty characters, none of them a control or
+/// direction character, and not only spaces.
+pub fn mark_text_ok(text: &str) -> bool {
+    text_ok(text)
+}
+
+/// True for the size of an imported picture, in pixels.
+pub fn mark_image_size_ok(width: u32, height: u32) -> bool {
+    image_ok(width, height)
+}
+
 fn text_ok(text: &str) -> bool {
     let chars = text.chars().count();
     chars > 0

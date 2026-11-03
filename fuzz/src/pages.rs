@@ -13,11 +13,7 @@ use crate::{chance, count_up_to};
 fn bounded(u: &mut Unstructured) -> Result<f32> {
     if chance(u, 12)? {
         // Exactly on the bound, which the decoder must accept.
-        return Ok(if u.arbitrary()? {
-            MAX_BOX_VALUE
-        } else {
-            -MAX_BOX_VALUE
-        });
+        return Ok(if u.arbitrary()? { MAX_BOX_VALUE } else { -MAX_BOX_VALUE });
     }
     Ok(u.int_in_range(-4000..=4000i32)? as f32 / 8.0)
 }
@@ -59,7 +55,10 @@ pub fn arb_pages_request(u: &mut Unstructured) -> Result<PagesRequest> {
         },
         4 => {
             let pages = page_list(u)?;
-            let boxes = pages.iter().map(|_| a_box(u)).collect::<Result<Vec<_>>>()?;
+            let boxes = pages
+                .iter()
+                .map(|_| a_box(u))
+                .collect::<Result<Vec<_>>>()?;
             PagesRequest::SetBoxes { doc, pages, boxes }
         }
         5 => PagesRequest::InsertBlank {
@@ -132,8 +131,12 @@ pub fn arb_pages_response(u: &mut Unstructured) -> Result<PagesResponse> {
         },
         1 => {
             let count = count_up_to(u, MAX_EDIT_PAGES)?;
-            let before = (0..count).map(|_| a_box(u)).collect::<Result<Vec<_>>>()?;
-            let after = (0..count).map(|_| a_box(u)).collect::<Result<Vec<_>>>()?;
+            let before = (0..count)
+                .map(|_| a_box(u))
+                .collect::<Result<Vec<_>>>()?;
+            let after = (0..count)
+                .map(|_| a_box(u))
+                .collect::<Result<Vec<_>>>()?;
             PagesResponse::Cropped {
                 pages: sizes(u, 8)?,
                 before,
@@ -194,21 +197,12 @@ pub fn check_pages_request_caps(request: &PagesRequest) {
             }
         }
         PagesRequest::ImportBegin { size, .. } => {
-            assert!(
-                *size as usize <= MAX_IMPORT_BYTES,
-                "a document of {size} bytes"
-            );
+            assert!(*size as usize <= MAX_IMPORT_BYTES, "a document of {size} bytes");
         }
         PagesRequest::ImportChunk { data, .. } => {
-            assert!(
-                data.len() <= MAX_SAVE_CHUNK,
-                "piece of {} bytes",
-                data.len()
-            );
+            assert!(data.len() <= MAX_SAVE_CHUNK, "piece of {} bytes", data.len());
         }
-        PagesRequest::Restore { .. }
-        | PagesRequest::ImportEnd { .. }
-        | PagesRequest::ImportAbort { .. } => {}
+        PagesRequest::Restore { .. } | PagesRequest::ImportEnd { .. } | PagesRequest::ImportAbort { .. } => {}
     }
 }
 
@@ -338,16 +332,8 @@ pub fn pages_over_cap_response_case(case: usize, id: u32) -> (&'static str, Vec<
         p
     };
     match case % PAGES_OVER_RESPONSES {
-        0 => (
-            "changed document with one page too many",
-            changed(MAX_PAGES + 1),
-            false,
-        ),
-        1 => (
-            "changed document with the most pages",
-            changed(MAX_PAGES),
-            true,
-        ),
+        0 => ("changed document with one page too many", changed(MAX_PAGES + 1), false),
+        1 => ("changed document with the most pages", changed(MAX_PAGES), true),
         2 => {
             let mut p = header(201, id);
             push_u32(&mut p, 0);
@@ -375,11 +361,7 @@ pub fn pages_over_cap_response_case(case: usize, id: u32) -> (&'static str, Vec<
             let mut p = header(200, id);
             push_u32(&mut p, 1000);
             p.resize(p.len() + 24, 0);
-            (
-                "changed document that says more pages than it holds",
-                p,
-                false,
-            )
+            ("changed document that says more pages than it holds", p, false)
         }
     }
 }

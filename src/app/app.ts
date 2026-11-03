@@ -27,9 +27,18 @@ import { zoomLabel, type ZoomMode } from "../viewer/zoom";
 import { FindBar } from "./find";
 import type { PageToolsApi } from "../lib/pagesapi";
 import { describePageError } from "../lib/pageerrors";
+import { PICTURE_WORDS, type SavedBody, type SavedPicture } from "../lib/signpicture";
 import { PageOps, REFUSED_FIELD_CODE, type PageHost } from "./pageops";
 import { PagePanel, type PagePanelHost } from "./pagepanel";
 import { Annotator, CLEAN_REFUSALS, annotationNotice, type AnnotatorApi } from "./annotator";
+import {
+  askSignaturePicture,
+  decodeImage,
+  encodePng,
+  measureTyped,
+  scaleImage,
+  type PictureTools,
+} from "./signpicture";
 import { AnnotBar } from "./annotbar";
 import { EditHistory, type Edit } from "./history";
 import { MenuController } from "./menu";
@@ -72,6 +81,12 @@ export interface AppDeps {
       value: FormValueIn,
     ): Promise<FormFieldInfo[]>;
     openLink(doc: number, url: string): Promise<void>;
+    /** The signatures kept for later on this computer (the five go together). Without them nothing is kept. */
+    listSignatureMarks?(): Promise<SavedPicture[]>;
+    addSignatureMark?(name: string, mark: SavedBody): Promise<SavedPicture>;
+    renameSignatureMark?(id: string, name: string): Promise<SavedPicture>;
+    deleteSignatureMark?(id: string): Promise<void>;
+    clearSignatureMarks?(): Promise<void>;
     /** The scripts the engine of a document had no font for when PDFium asked. */
     missedFonts?(doc: number): Promise<string[]>;
     measureMode(): Promise<boolean>;
@@ -113,6 +128,8 @@ export interface AppDeps {
   signaturesDelayMs?: number;
   /** Limits on the text kept for each document. For tests; the defaults are meant for the app. */
   viewLimits?: ViewerOptions["limits"];
+  /** How the box for a picture of a signature reads and writes images and measures a typed name. For tests. */
+  pictureTools?: Partial<Pick<PictureTools, "decode" | "encodePng" | "scale" | "measure">>;
   /** The page tools (delete, move, turn, crop, insert, copy out). Without it the page panel only shows the pages. */
   pages?: PageToolsApi;
   /** How long a page tool may work before the box with the bar shows, in milliseconds. For tests. */
@@ -409,6 +426,7 @@ export class App {
         this.active?.annotator?.setStamp(stamp);
         this.active?.view.element.focus({ preventScroll: true });
       },
+      openSignature: () => void this.openSignature(),
       editText: () => {
         const a = this.active?.annotator;
         if (a?.selected) void a.editText(a.selected.page, a.selected.id);
@@ -573,6 +591,7 @@ export class App {
     this.initTheme();
     this.initReopenSetting();
     byId(this.root, "forget-positions").addEventListener("click", () => void this.forgetPositions());
+    byId(this.root, "forget-signatures").addEventListener("click", () => void this.forgetSignatures());
     // The reader's place is saved when they rest, and again when the window goes away.
     this.root.addEventListener("visibilitychange", () => {
       if (this.root.visibilityState === "hidden") this.saveAll();
@@ -1441,10 +1460,86 @@ export class App {
     if (open && focus) this.annotbar.focusBar();
   }
 
+  /** The box for making or picking a picture of a signature is open. */
+  private pictureOpen = false;
+
+  /**
+   * Opens the box for a picture of a signature, and when a picture is made or picked, switches the
+   * tool on so that the next click on a page places it. It does nothing while the pages of the
+   * document are being changed, or while the box is already open.
+   */
+  private async openSignature(): Promise<void> {
+    const tab = this.active;
+    const annotator = tab?.annotator;
+    if (!tab || !annotator || this.pictureOpen) return;
+    if (!this.annotOpen) this.setAnnotating(true);
+    if (annotator.blockedReason !== null) {
+      this.announce(annotator.blockedReason);
+      return;
+    }
+    this.pictureOpen = true;
+    try {
+      const answer = await askSignaturePicture({ layer: this.noticeLayer, tools: this.pictureTools() });
+      if (!answer || !this.tabs.includes(tab)) return;
+      annotator.setSignature(answer.picture);
+      if (this.active === tab) tab.view.element.focus({ preventScroll: true });
+    } finally {
+      this.pictureOpen = false;
+    }
+  }
+
+  /** What the box for a picture of a signature uses: the kept signatures, and the image functions of the window. */
+  private pictureTools(): PictureTools {
+    const api = this.deps.api;
+    const store =
+      api.listSignatureMarks && api.addSignatureMark && api.renameSignatureMark && api.deleteSignatureMark
+        ? {
+            list: () => api.listSignatureMarks!(),
+            add: (name: string, body: SavedBody) => api.addSignatureMark!(name, body),
+            rename: (id: string, name: string) => api.renameSignatureMark!(id, name),
+            remove: (id: string) => api.deleteSignatureMark!(id),
+          }
+        : null;
+    return {
+      store,
+      decode: this.deps.pictureTools?.decode ?? decodeImage,
+      encodePng: this.deps.pictureTools?.encodePng ?? encodePng,
+      scale: this.deps.pictureTools?.scale ?? scaleImage,
+      measure: this.deps.pictureTools?.measure ?? measureTyped,
+    };
+  }
+
+  /** Asks, and then forgets every signature that was kept for later. Pictures already on pages stay. */
+  private async forgetSignatures(): Promise<void> {
+    this.menu.close();
+    const answer = await showNotice(this.noticeLayer, {
+      title: PICTURE_WORDS.forgetTitle,
+      detail: PICTURE_WORDS.forgetDetail,
+      buttons: [
+        { id: "cancel", label: "Keep them", safe: true },
+        { id: "forget", label: "Forget signatures", primary: true },
+      ],
+    });
+    if (answer.button !== "forget") return;
+    try {
+      await this.deps.api.clearSignatureMarks?.();
+    } catch {
+      await showNotice(this.noticeLayer, {
+        title: "The saved signatures were not forgotten",
+        detail: "They could not be removed from this computer. Nothing was changed.",
+        buttons: [{ id: "ok", label: "OK", primary: true }],
+      });
+    }
+  }
+
   /** Picks a tool from the keyboard: the bar opens if it was closed. */
   private chooseTool(tool: Tool): void {
     const annotator = this.active?.annotator;
     if (!annotator) return;
+    if (tool === "signature") {
+      void this.openSignature();
+      return;
+    }
     if (!this.annotOpen) this.setAnnotating(true);
     if (tool === "stamp" && annotator.tool === "stamp") {
       this.annotbar.openStampMenu();

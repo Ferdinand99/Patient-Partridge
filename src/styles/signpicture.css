@@ -1,0 +1,268 @@
+/* The picture of a signature: the box for making or picking one, and the corner of a picture on a
+   page that can be dragged to make it bigger or smaller. The three script fonts are the same
+   files the engine reads the outlines of a typed signature from. */
+
+@font-face {
+  font-family: "Partridge Great Vibes";
+  src: url("../../assets/fonts/signature/GreatVibes-Regular.ttf") format("truetype");
+  font-display: block;
+}
+
+@font-face {
+  font-family: "Partridge Allura";
+  src: url("../../assets/fonts/signature/Allura-Regular.ttf") format("truetype");
+  font-display: block;
+}
+
+@font-face {
+  font-family: "Partridge Kristi";
+  src: url("../../assets/fonts/signature/Kristi-Regular.ttf") format("truetype");
+  font-display: block;
+}
+
+.sigpic {
+  width: min(34rem, calc(100vw - 32px));
+}
+
+.sigpic-note {
+  margin-bottom: var(--sp-1);
+}
+
+.sigpic-tabs {
+  align-self: stretch;
+}
+
+.sigpic-tabs > button {
+  flex: 1;
+}
+
+.sigpic-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  min-height: 12rem;
+  padding-top: var(--sp-2);
+}
+
+.sigpic-panel[hidden],
+.sigpic [hidden] {
+  display: none;
+}
+
+.sigpic-hint {
+  margin: 0;
+  font-size: 0.8125rem;
+  line-height: 1.4;
+}
+
+.sigpic-surface {
+  width: 100%;
+  aspect-ratio: 520 / 180;
+  border: 1px solid var(--control-border);
+  border-radius: var(--r-sm);
+  background: var(--paper);
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.sigpic-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.sigpic-status {
+  font-size: 0.8125rem;
+  line-height: 1.4;
+}
+
+.sigpic-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  font-size: 0.8125rem;
+}
+
+.sigpic-text {
+  width: 100%;
+  min-height: 40px;
+  font-size: 1rem;
+}
+
+.sigpic-fonts {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--sp-2);
+}
+
+.sigpic-font {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: var(--sp-2);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-sm);
+  background: var(--field);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.sigpic-font[aria-checked="true"] {
+  border-color: var(--brand);
+  box-shadow: 0 0 0 1px var(--brand);
+}
+
+.sigpic-font:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
+.sigpic-font-sample {
+  font-size: 1.75rem;
+  line-height: 1.3;
+}
+
+.sigpic-font-name {
+  font-size: 0.75rem;
+}
+
+.sigpic-preview {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 4.5rem;
+  padding: var(--sp-2);
+  border: 1px solid var(--control-border);
+  border-radius: var(--r-sm);
+  background: var(--paper);
+  color: #141416;
+  font-size: 2.5rem;
+  line-height: 1.3;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  /* The engine sets the letters side by side without kerning or ligatures: so does the preview. */
+  font-kerning: none;
+  font-variant-ligatures: none;
+}
+
+.sigpic-check {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: 0.8125rem;
+}
+
+.sigpic-image {
+  max-width: 100%;
+  max-height: 9rem;
+  align-self: flex-start;
+  border: 1px solid var(--control-border);
+  border-radius: var(--r-xs);
+  background:
+    repeating-conic-gradient(var(--fill) 0% 25%, transparent 0% 50%) 50% / 12px 12px;
+}
+
+.sigpic-colours {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sigpic-ink-black {
+  background: #141416;
+}
+
+.sigpic-ink-blue {
+  background: #183896;
+}
+
+.sigpic-keep {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.sigpic-name {
+  flex: 1;
+  min-width: 8rem;
+}
+
+.sigpic-saved {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sigpic-saved-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.sigpic-sample {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 6rem;
+  height: 2.75rem;
+  overflow: hidden;
+  border-radius: var(--r-xs);
+  background: var(--paper);
+  color: #141416;
+}
+
+.sigpic-sample svg,
+.sigpic-sample-image {
+  max-width: 100%;
+  max-height: 100%;
+}
+
+.sigpic-sample-text {
+  font-size: 1.25rem;
+  white-space: nowrap;
+}
+
+.sigpic-saved-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sigpic-rename {
+  flex: 1;
+  min-width: 0;
+}
+
+/* The corner of a picked picture of a signature. */
+.annot-handle {
+  position: absolute;
+  right: -7px;
+  bottom: -7px;
+  display: none;
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--brand);
+  border-radius: 3px;
+  background: var(--card);
+  cursor: nwse-resize;
+  touch-action: none;
+}
+
+.annot[aria-pressed="true"] .annot-handle {
+  display: block;
+  pointer-events: auto;
+}
+
+.annot-layer[data-tool="signature"] .annot-capture {
+  pointer-events: auto;
+  cursor: crosshair;
+}
