@@ -816,7 +816,8 @@ describe("what the engine refuses or holds back", () => {
     expect(asked[0]).toContain("not redaction");
     expect(asked[0]).not.toContain("gone from the file");
     expect(asked[0]).not.toContain("words of a text box");
-    expect(asked[1]).toContain("words of a text box can stay");
+    expect(asked[1]).toContain("not redaction");
+    expect(asked[1]).not.toContain("words of a text box");
   });
 
   it("a flush also waits for work that was asked for while it waited", async () => {
