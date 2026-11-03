@@ -587,6 +587,11 @@ fn rfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
 
+    /// The time a check of a big file may take. One pass takes about a second in a debug build on a
+    /// busy runner; a pass that reads the file again for every key takes minutes. The limit is wide
+    /// enough for the first and narrow enough to catch the second.
+    const LIMIT_MS: u128 = 5000;
+
     fn unsafe_file(file: &[u8]) -> bool {
         leaves_metadata_in_the_clear(file, &mut |_| {})
     }
@@ -887,7 +892,7 @@ endstream";
         assert!(!unsafe_file(&f));
         let took = start.elapsed();
         eprintln!("an encryption dictionary of 200 000 keys: {took:?}");
-        assert!(took.as_millis() < 1000, "took {took:?}");
+        assert!(took.as_millis() < LIMIT_MS, "took {took:?}");
         let f = file(
             &[&catalog("4"), CLEAR, "<</Type/Pages>>", XMP],
             &format!("{PROTECTED} {keys}"),
@@ -896,7 +901,7 @@ endstream";
         assert!(!unsafe_file(&f));
         let took = start.elapsed();
         eprintln!("a trailer of 200 000 keys: {took:?}");
-        assert!(took.as_millis() < 1000, "took {took:?}");
+        assert!(took.as_millis() < LIMIT_MS, "took {took:?}");
         // A key twice is still found among them.
         let f = file(
             &[&catalog("4"), CLEAR, "<</Type/Pages>>", XMP],
@@ -938,14 +943,14 @@ endstream";
         eprintln!("a hundred thousand objects: {took:?}");
         // A debug build is slow; the bound is far from what a pass over the file takes, and far
         // from what a search from every object to the next stream took (minutes).
-        assert!(took.as_millis() < 1000, "took {took:?}");
+        assert!(took.as_millis() < LIMIT_MS, "took {took:?}");
         // And when the metadata is encrypted no object is read at all.
         bodies[1] = ENCRYPTED.to_string();
         let refs: Vec<&str> = bodies.iter().map(String::as_str).collect();
         let f = file(&refs, "/Root 1 0 R /Encrypt 2 0 R /Size 100005");
         let start = std::time::Instant::now();
         assert!(unsafe_file(&f));
-        assert!(start.elapsed().as_millis() < 1000);
+        assert!(start.elapsed().as_millis() < LIMIT_MS);
     }
 
     #[test]
