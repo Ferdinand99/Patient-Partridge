@@ -424,10 +424,7 @@ export class App {
     });
     this.designbar = new DesignBar(root, {
       toggle: (open) => void this.setDesigning(open),
-      setTool: (tool) => {
-        this.designer?.setTool(tool);
-        this.active?.view.designLayer?.setTool(tool);
-      },
+      setTool: (tool) => this.designer?.setTool(tool),
       remove: () => this.designer?.removeSelectedWidget(),
       undo: () => void this.undoActive(),
       redo: () => void this.redoActive(),
@@ -513,8 +510,9 @@ export class App {
     const tab = this.tabs.find((t) => t.doc === doc);
     if (!tab) return;
     tab.sidebarDoc.pages = pages;
-    tab.view.replacePages(pages, show);
+    // The designer reads the fields again: it is told before the new layers ask for them.
     this.designer?.pagesChanged(doc);
+    tab.view.replacePages(pages, show);
     // What the annotations of the tab keep by page number and by id means other things now.
     tab.annotator?.pagesChanged();
     this.find.forget(tab.view);

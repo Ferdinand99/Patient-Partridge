@@ -9,6 +9,10 @@
 //   - /docs/locked-doc.pdf: four pages, protected by a password (it is open already)
 //   - /docs/signed-doc.pdf: three pages, signed
 //   - /docs/form-ten.pdf: four Letter pages, a form with one text field ("Full name") on every
+//   - /docs/design.pdf: two Letter pages and no form, for the form designer: the commands
+//     author_check, author_list and author_apply keep a list of widgets and follow the rules of the
+//     engine (a name is free, has no dot and is not empty; a batch is all or nothing). Page 1 has the
+//     word "Name:" at 72, 100, so the lines of the text can be snapped to.
 //
 // and the files that pages can be inserted from (the file dialog answers with the paths in
 // `__E2E__.dialog`):
@@ -68,6 +72,7 @@
     "/docs/locked-doc.pdf": { sizes: Array.from({ length: 4 }, () => LETTER), protected: true },
     "/docs/signed-doc.pdf": { sizes: Array.from({ length: 3 }, () => LETTER), signed: true },
     "/docs/form-ten.pdf": { sizes: Array.from({ length: 4 }, () => LETTER), form: true },
+    "/docs/design.pdf": { sizes: [LETTER, LETTER], design: true },
   };
   const SOURCES = {
     "/docs/second.pdf": { pages: 2 },
@@ -99,6 +104,8 @@
       signed: Boolean(spec.signed),
       // The made-up form: one text field on every page.
       fields: spec.form ? [textField()] : null,
+      // The widgets the form designer made, in the order of the annotations: { page, name, kind, rect, export, props }.
+      design: spec.design ? [] : null,
     });
     return {
       doc,
@@ -153,8 +160,125 @@
 
   function keep(m) {
     const token = m.nextSnap++;
-    m.snaps.set(token, copyPages(m));
+    m.snaps.set(token, { pages: copyPages(m), design: structuredClone(m.design) });
     return token;
+  }
+
+  // ---- the form designer -----------------------------------------------------
+
+  const refuse = (message) => {
+    throw { code: "author_refused", message };
+  };
+  const designError = (m) => {
+    if (!m.design) throw { code: "author_unsupported", message: "this document is encrypted, so fields cannot be added to it" };
+  };
+  const emptyProps = () => ({
+    tooltip: "",
+    required: false,
+    readOnly: false,
+    multiline: false,
+    password: false,
+    comb: false,
+    maxLen: 0,
+    editable: false,
+    multiselect: false,
+    fontSize: 0,
+    defaultValue: "",
+    choices: [],
+    exportValue: "",
+  });
+  const widgetsOf = (list, name) => list.filter((w) => w.name === name);
+
+  function listPage(m, page) {
+    designError(m);
+    return m.design
+      .filter((w) => w.page === page)
+      .map((w) => {
+        const mine = widgetsOf(m.design, w.name);
+        return {
+          name: w.name,
+          kind: w.kind,
+          widget: mine.indexOf(w),
+          widgets: mine.length,
+          rect: w.rect,
+          export: w.export,
+          editable: true,
+          props: structuredClone(w.props),
+        };
+      });
+  }
+
+  function applyDesign(m, ops) {
+    designError(m);
+    const list = structuredClone(m.design);
+    const taken = (name) => list.some((w) => w.name === name);
+    const need = (name, widget = 0) => {
+      const w = widgetsOf(list, name)[widget];
+      if (!w) refuse("There is no field called \u201c" + name + "\u201d that can be changed here.");
+      return w;
+    };
+    for (const op of ops) {
+      switch (op.op) {
+        case "add": {
+          const f = op.field;
+          if (f.name.trim() === "") refuse("Give the field a name.");
+          if (f.name.includes(".")) refuse("A field name cannot contain a dot, because a dot makes the field a part of another field. Use a dash or an underscore instead.");
+          if (taken(f.name)) refuse("There is already a field called \u201c" + f.name + "\u201d. Every field needs a name of its own.");
+          for (const w of f.widgets) {
+            list.push({ page: w.page, name: f.name, kind: f.kind, rect: w.rect, export: w.export ?? "", props: { ...emptyProps(), ...f.props } });
+          }
+          break;
+        }
+        case "remove":
+          need(op.name);
+          for (let i = list.length - 1; i >= 0; i--) if (list[i].name === op.name) list.splice(i, 1);
+          break;
+        case "removeWidget": {
+          const w = need(op.name, op.widget);
+          list.splice(list.indexOf(w), 1);
+          break;
+        }
+        case "addWidget": {
+          const first = need(op.name);
+          list.push({ ...structuredClone(first), page: op.widget.page, rect: op.widget.rect, export: op.widget.export ?? "" });
+          break;
+        }
+        case "move": {
+          const w = need(op.name, op.widget);
+          w.page = op.page;
+          w.rect = op.rect;
+          break;
+        }
+        case "update": {
+          const mine = widgetsOf(list, op.name);
+          need(op.name);
+          if (op.newName !== "" && op.newName !== op.name) {
+            if (op.newName.includes(".")) refuse("A field name cannot contain a dot, because a dot makes the field a part of another field. Use a dash or an underscore instead.");
+            if (taken(op.newName)) refuse("There is already a field called \u201c" + op.newName + "\u201d. Every field needs a name of its own.");
+          }
+          mine.forEach((w, i) => {
+            w.props = { ...op.props };
+            if (op.exports && op.exports.length === mine.length) w.export = op.exports[i];
+            if (op.newName !== "") w.name = op.newName;
+          });
+          break;
+        }
+        case "reorder": {
+          const onPage = list.filter((w) => w.page === op.page);
+          const wanted = op.order.map((r) => widgetsOf(list, r.name)[r.widget]);
+          if (wanted.some((w) => !w || w.page !== op.page)) refuse("A field in the order is not on that page.");
+          const slots = wanted.map((w) => list.indexOf(w)).sort((a, b) => a - b);
+          const copy = [...list];
+          slots.forEach((slot, k) => (copy[slot] = wanted[k]));
+          list.splice(0, list.length, ...copy);
+          void onPage;
+          break;
+        }
+        default:
+          refuse("That change is not known.");
+      }
+    }
+    return list;
   }
 
   function uniqueSorted(list, limit) {
@@ -199,9 +323,13 @@
     return { changed: changed(m, snapshot, source.pages), inserted: source.pages };
   }
 
+  pg.designWidgets = (doc) => structuredClone(models.get(doc)?.design ?? []);
+
   async function invoke(cmd, args = {}) {
     if (cmd === "open_pdf" && SPECS[args.path]) return open(args.path);
     const isMine = cmd.startsWith("pages_") || (typeof args.doc === "number" && models.has(args.doc));
+    // The form designer works on the documents of this file only.
+    if (cmd.startsWith("author_") && !models.has(args.doc)) return baseInvoke(cmd, args);
     if (!isMine) return baseInvoke(cmd, args);
     pg.calls.push({ cmd, args });
     if (pg.failNext && pg.failNext.cmd === cmd) {
@@ -257,8 +385,30 @@
       case "get_page_links":
       case "search_page":
         return [];
-      case "get_page_text":
+      case "get_page_text": {
+        const m = model(args.doc);
+        if (m.design && args.page === 0) {
+          // "Name:" at 72, 100: six points a letter, ten points tall.
+          return { text: "Name:", rects: Array.from({ length: 5 }, (_, i) => [72 + i * 6, 100, 78 + i * 6, 110]).flat() };
+        }
         return { text: "", rects: [] };
+      }
+      case "author_check": {
+        const m = model(args.doc);
+        designError(m);
+        return [...new Set(m.design.map((w) => w.name))].sort();
+      }
+      case "author_list": {
+        const m = model(args.doc);
+        return listPage(m, args.page);
+      }
+      case "author_apply": {
+        const m = model(args.doc);
+        const next = applyDesign(m, args.ops);
+        const snapshot = keep(m);
+        m.design = next;
+        return changed(m, snapshot, args.ops.length);
+      }
       case "missed_fonts":
         return [];
       case "set_dirty":
@@ -350,7 +500,8 @@
         if (!wanted) throw { code: "snapshot_gone", message: "the copy is gone" };
         m.snaps.delete(args.snapshot);
         const leaving = keep(m);
-        m.pages = wanted;
+        m.pages = wanted.pages;
+        m.design = wanted.design;
         return changed(m, leaving, 0);
       }
       case "pages_insert_pdf": {

@@ -37,11 +37,13 @@ function setup(initial: DesignWidgetInfo[] = []): Setup {
   page.getBoundingClientRect = () => ({ left: 0, top: 0, width: SIZE.width, height: SIZE.height, right: SIZE.width, bottom: SIZE.height, x: 0, y: 0, toJSON: () => ({}) });
   const state = { listed: initial };
   const applied: Setup["applied"] = [];
-  const view = {
-    currentPageIndex: 0,
-    designLayer: null as DesignLayer | null,
-    setDesign: vi.fn(),
-  };
+  const view: {
+    currentPageIndex: number;
+    designLayer: DesignLayer | null;
+    setDesign: ReturnType<typeof vi.fn>;
+    setDesignTool: ReturnType<typeof vi.fn>;
+  } = { currentPageIndex: 0, designLayer: null, setDesign: vi.fn(), setDesignTool: vi.fn() };
+  view.setDesignTool.mockImplementation((tool: Parameters<DesignLayer["setTool"]>[0]) => view.designLayer?.setTool(tool));
   view.setDesign.mockImplementation((make: ((pages: typeof SIZE[]) => DesignLayer) | null) => {
     view.designLayer?.destroy();
     view.designLayer = make ? make([SIZE]) : null;

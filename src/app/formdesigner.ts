@@ -224,7 +224,7 @@ export class FormDesigner {
       (pages) => this.makeLayer(s, pages),
       { pending: () => this.hasPending(s.doc), flush: async () => void (await this.flush(s.doc)) },
     );
-    this.layerOf(s)?.setTool(this.toolNow);
+    tab.view.setDesignTool(this.toolNow);
     this.refreshPanel();
   }
 
@@ -280,8 +280,7 @@ export class FormDesigner {
   setTool(tool: DesignTool): void {
     this.toolNow = tool;
     if (tool !== "radio") this.radioGroup = null;
-    const s = this.session();
-    if (s) this.layerOf(s)?.setTool(tool);
+    this.host.target()?.view.setDesignTool(tool);
     if (tool !== "select") this.host.announce(`${tool === "radio" ? "Radio button" : KIND_LABELS[tool]} tool. Click on the page, or drag to size the box.`);
     this.host.changed();
   }

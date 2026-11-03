@@ -546,6 +546,7 @@ export class DesignLayer {
     const s = this.scale(page);
     if (!s) return;
     e.preventDefault();
+    e.stopPropagation();
     const at = clientToPage(s.box, s.size, e.clientX, e.clientY);
     this.placing = { page, pointerId: e.pointerId, start: at, client: [e.clientX, e.clientY], moved: false, rect: [at[0], at[1], at[0], at[1]] };
     (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);

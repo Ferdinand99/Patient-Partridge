@@ -25,7 +25,7 @@ import {
 } from "./layout";
 import { FormLayer, type FormEdit, type FormsApi } from "./forms";
 import { AnnotationLayer, type AnnotLayerEvents } from "./annotlayer";
-import type { DesignLayer } from "./designlayer";
+import type { DesignLayer, DesignTool } from "./designlayer";
 import { PageOverlays, type CopyResult, type OverlayApi, type OverlayLimits, type PageLinkInfo } from "./overlays";
 import { RenderScheduler, type RenderJob } from "./scheduler";
 import type { SearchMatch } from "./search";
@@ -262,6 +262,7 @@ export class DocumentView {
     this.designHooks = make ? hooks : null;
     this.design = make ? make(this.info.pages) : null;
     this.element.classList.toggle("viewer-designing", make !== null);
+    this.overlays.setSuspended(this.suspendsText());
     if (this.design) {
       this.design.setHeld(this.editsHeld);
       for (const [index, m] of this.mounted) this.design.mount(index, m.el);
@@ -271,6 +272,20 @@ export class DocumentView {
   /** The layer of the designer, while it is on. */
   get designLayer(): DesignLayer | null {
     return this.design;
+  }
+
+  /**
+   * The tool of the designer. A tool that places a field takes the pointer, so the selection of
+   * text, which also takes it, steps aside while it is picked.
+   */
+  setDesignTool(tool: DesignTool): void {
+    this.design?.setTool(tool);
+    this.overlays.setSuspended(this.suspendsText());
+  }
+
+  /** True while a tool of the annotation bar or of the designer has the pointer. */
+  private suspendsText(): boolean {
+    return this.pointerTool || (this.design !== null && this.design.currentTool !== "select");
   }
 
   /** The layer of the annotations for the pages now in the view. */
@@ -322,7 +337,6 @@ export class DocumentView {
     for (const done of waiting) done();
     this.info = { doc: this.info.doc, pages };
     this.overlays = this.makeOverlays();
-    this.overlays.setSuspended(this.pointerTool);
     this.forms = this.makeForms();
     this.forms?.start();
     replacedForms?.retire(this.forms);
@@ -335,6 +349,7 @@ export class DocumentView {
     this.design = this.designMaker ? this.designMaker(pages) : null;
     if (replacedDesign && this.design) this.design.inherit(replacedDesign);
     this.design?.setHeld(this.editsHeld);
+    this.overlays.setSuspended(this.suspendsText());
     this.lastPage = -1;
     const page = pages.length === 0 ? 0 : Math.min(Math.max(0, show ?? had), pages.length - 1);
     this.hiddenAnchor = { page, fraction: 0 };
@@ -542,7 +557,7 @@ export class DocumentView {
   setAnnotationTool(tool: Tool): void {
     this.annots.setTool(tool);
     this.pointerTool = tool === "pen" || tool === "note" || tool === "stamp";
-    this.overlays.setSuspended(this.pointerTool);
+    this.overlays.setSuspended(this.suspendsText());
   }
 
   /** The selected stretches of text, page by page: characters `start..end` of the page text. */
