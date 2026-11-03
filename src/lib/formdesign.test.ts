@@ -1,10 +1,15 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_SIZES,
+  BOX_MIN,
   MIN_SIDE,
   applyLocal,
+  describeBox,
   describeWidget,
   emptyProps,
+  exportProblem,
+  exportsProblem,
   fieldLines,
   freeName,
   joinLines,
@@ -18,13 +23,16 @@ import {
   placeBox,
   propsProblem,
   resizeBox,
+  roundBox,
   sameSizeHints,
   snapMove,
   snapResize,
   textBoxes,
   textLines,
   textProblem,
+  tooltipProblem,
   type DesignModel,
+  type DesignProps,
   type DesignWidgetInfo,
   type Rect,
 } from "./formdesign";
@@ -112,8 +120,28 @@ describe("boxes", () => {
   it("gives a drag its own size, from any corner, and no side thinner than the least", () => {
     expect(placeBox("text", [100, 100], [300, 140], PAGE)).toEqual([100, 100, 300, 140]);
     expect(placeBox("text", [300, 140], [100, 100], PAGE)).toEqual([100, 100, 300, 140]);
+    // A drag that stays thin gets a little more than the least side: a box that is exactly the least
+    // can come out of the engine's arithmetic a hair under it and be refused.
     const thin = placeBox("text", [100, 100], [300, 101], PAGE);
-    expect(thin[3] - thin[1]).toBe(MIN_SIDE);
+    expect(thin[3] - thin[1]).toBeGreaterThan(MIN_SIDE);
+    expect(thin[3] - thin[1]).toBeCloseTo(BOX_MIN, 5);
+  });
+
+  it("cuts a drag that goes past the edge of the page at the edge, and does not slide the box", () => {
+    expect(placeBox("text", [500, 700], [700, 900], PAGE)).toEqual([500, 700, 612, 792]);
+    expect(placeBox("text", [-50, -20], [100, 60], PAGE)).toEqual([0, 0, 100, 60]);
+    // Next to the edge there is still room for the least side.
+    const edge = placeBox("text", [611, 300], [700, 340], PAGE);
+    expect(edge[2]).toBe(612);
+    expect(edge[2] - edge[0]).toBeGreaterThanOrEqual(BOX_MIN);
+  });
+
+  it("gives every box numbers in hundredths, so that no side comes out a hair short", () => {
+    const moved = moveBox([10.123456, 10.987654, 110.123456, 40.987654], 0.333333, 0.333333, PAGE);
+    for (const v of moved) expect(Math.round(v * 100) / 100).toBe(v);
+    const resized = resizeBox([100, 100, 104.1, 150], "w", 0.0000001, 0, PAGE);
+    expect(resized[2] - resized[0]).toBeGreaterThanOrEqual(MIN_SIDE);
+    expect(roundBox([1.234, 2.006, 3.1, 4])).toEqual([1.23, 2.01, 3.1, 4]);
   });
 
   it("moves a box and keeps its size at the edge of the page", () => {
@@ -126,8 +154,8 @@ describe("boxes", () => {
     const r: Rect = [100, 100, 200, 150];
     expect(resizeBox(r, "se", 20, 10, PAGE)).toEqual([100, 100, 220, 160]);
     expect(resizeBox(r, "nw", -20, -10, PAGE)).toEqual([80, 90, 200, 150]);
-    expect(resizeBox(r, "e", -500, 0, PAGE)).toEqual([100, 100, 100 + MIN_SIDE, 150]);
-    expect(resizeBox(r, "n", 0, 500, PAGE)).toEqual([100, 150 - MIN_SIDE, 200, 150]);
+    expect(resizeBox(r, "e", -500, 0, PAGE)).toEqual([100, 100, 100 + BOX_MIN, 150]);
+    expect(resizeBox(r, "n", 0, 500, PAGE)).toEqual([100, 150 - BOX_MIN, 200, 150]);
     expect(resizeBox(r, "s", 0, 5000, PAGE)).toEqual([100, 100, 200, 792]);
     expect(resizeBox(r, "w", -5000, 0, PAGE)).toEqual([0, 100, 200, 150]);
   });
@@ -294,5 +322,126 @@ describe("the model, changed the way the engine changes the document", () => {
       "size, radio button, button 2 of 3",
     );
     expect(describeWidget(widget("x", [0, 0, 1, 1], { editable: false }))).toMatch(/cannot be changed here/);
+  });
+});
+
+// ---- the rules are the engine's -------------------------------------------------------------------
+
+/**
+ * crates/engine/src/author/rules.rs reads the same file and holds the engine to it: a line is
+ * `kind <tab> ok|no <tab> text`, with \uXXXX for a character that is not typed.
+ */
+function cases(): { kind: string; ok: boolean; text: string }[] {
+  const file = readFileSync(new URL("./formrules.cases.txt", import.meta.url), "utf8");
+  return file
+    .split("\n")
+    .map((raw) => raw.replace(/\r$/, ""))
+    .filter((line) => line.trim() !== "" && !line.startsWith("#"))
+    .map((line) => {
+      const [kind, verdict, ...rest] = line.split("\t");
+      const text = rest.join("\t").replace(/\\u([0-9a-fA-F]{4})/g, (_, h: string) => String.fromCharCode(parseInt(h, 16))).replace(/\\n/g, "\n");
+      return { kind, ok: verdict === "ok", text };
+    });
+}
+
+describe("the rules of the window and of the engine", () => {
+  const props = (over: Partial<DesignProps>): DesignProps => ({ ...emptyProps(), ...over });
+  const verdict = (kind: string, text: string): string | null => {
+    switch (kind) {
+      case "name":
+        return nameProblem(text, new Set());
+      case "tooltip":
+        return tooltipProblem(text);
+      case "export":
+        return exportProblem(text);
+      case "drawn":
+        return textProblem("x", text);
+      case "multiline":
+        return textProblem("x", text, true);
+      case "fontsize":
+        return propsProblem("text", props({ fontSize: Number(text) }));
+      case "maxlen":
+        return propsProblem("text", props({ maxLen: Number(text) }));
+      default:
+        throw new Error(`a kind of case that is not known: ${kind}`);
+    }
+  };
+
+  it("agree on every case of the file the engine is held to", () => {
+    const all = cases();
+    expect(all.length).toBeGreaterThan(40);
+    for (const c of all) {
+      const problem = verdict(c.kind, c.text);
+      expect(problem === null, `${c.kind} ${JSON.stringify(c.text)}: ${problem ?? "accepted"}`).toBe(c.ok);
+    }
+  });
+
+  it("let the joiners of Persian through and refuse the mark that reverses Arabic", () => {
+    expect(nameProblem("a\u200cb", new Set())).toBeNull();
+    expect(nameProblem("a\u200db", new Set())).toBeNull();
+    expect(nameProblem("a\u061cb", new Set())).not.toBeNull();
+  });
+
+  it("check the tooltip, the words of the buttons, the limits and the default of a list", () => {
+    expect(propsProblem("text", props({ tooltip: "x".repeat(513) }))).toMatch(/tooltip is too long/);
+    expect(propsProblem("text", props({ maxLen: 32768 }))).toMatch(/at most 32767/);
+    expect(propsProblem("text", props({ fontSize: 97 }))).toMatch(/between 1 and 96/);
+    expect(propsProblem("text", props({ fontSize: 0.5 }))).toMatch(/between 1 and 96/);
+    expect(propsProblem("checkbox", props({ exportValue: "Off" }))).toMatch(/Off/);
+    expect(propsProblem("checkbox", props({ exportValue: "J\u00e5" }))).toMatch(/cannot be used/);
+    expect(propsProblem("checkbox", props({ defaultValue: "maybe" }))).toMatch(/on or off/);
+    const list = props({ choices: ["a", "b"], defaultValue: "z" });
+    expect(propsProblem("list", list)).toMatch(/not one of the choices/);
+    expect(propsProblem("combo", { ...list, editable: true })).toBeNull();
+    expect(propsProblem("list", { ...list, defaultValue: "a\nb" })).toMatch(/several/);
+    expect(propsProblem("list", { ...list, defaultValue: "a\nb", multiselect: true })).toBeNull();
+    expect(propsProblem("list", props({ choices: Array.from({ length: 501 }, (_, i) => String(i)) }))).toMatch(/at most 500/);
+    expect(propsProblem("list", props({ choices: ["x".repeat(257)] }))).toMatch(/too long/);
+    expect(propsProblem("text", props({ defaultValue: "x".repeat(8193) }))).toMatch(/too long/);
+    expect(exportsProblem(["S", "M"], "M")).toBeNull();
+    expect(exportsProblem(["S", "M"], "XL")).toMatch(/not one of the buttons/);
+    expect(exportsProblem(["S", "S"], "")).toMatch(/twice|its own/);
+    expect(exportsProblem(["S", ""], "")).toMatch(/Give each/);
+  });
+});
+
+describe("a radio group when only some of its pages are known", () => {
+  const w = (name: string, widget: number, widgets: number, rect: Rect): DesignWidgetInfo => ({
+    name,
+    kind: "radio",
+    widget,
+    widgets,
+    rect,
+    export: `C${widget + 1}`,
+    editable: true,
+    props: emptyProps(),
+  });
+
+  it("keeps the engine's count and order when a button is added or taken away", () => {
+    // A group of five buttons: the buttons 0 and 4 are on page 0, the rest on pages that were not read.
+    const model: DesignModel = new Map([[0, [w("g", 0, 5, [10, 10, 24, 24]), w("g", 4, 5, [40, 10, 54, 24])]]]);
+    applyLocal(model, { op: "removeWidget", name: "g", widget: 0 });
+    let list = model.get(0) as DesignWidgetInfo[];
+    // The button that was the fifth is the fourth now, and the group has four.
+    expect(list.map((x) => [x.widget, x.widgets])).toEqual([[3, 4]]);
+    applyLocal(model, { op: "removeWidget", name: "g", widget: 3 });
+    list = model.get(0) as DesignWidgetInfo[];
+    expect(list).toHaveLength(0);
+    // A button added to a group that is only partly known goes after all of them.
+    const known: DesignModel = new Map([[0, [w("g", 1, 5, [10, 10, 24, 24])]]]);
+    applyLocal(known, { op: "addWidget", name: "g", widget: { page: 0, rect: [60, 10, 74, 24], export: "C6" } });
+    const after = known.get(0) as DesignWidgetInfo[];
+    expect(after.map((x) => [x.widget, x.widgets])).toEqual([
+      [1, 6],
+      [5, 6],
+    ]);
+  });
+});
+
+describe("what a screen reader is told", () => {
+  it("says where a box is and how big", () => {
+    expect(describeBox("Text 1", [170.4, 439.2, 330.4, 461.2], 1)).toBe(
+      "Text 1 is on page 2, 170 points from the left and 439 from the top, 160 points wide and 22 tall.",
+    );
   });
 });

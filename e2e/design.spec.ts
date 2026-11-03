@@ -95,7 +95,7 @@ test("places a text field with a click, names it, picks it and sends it as one c
   const box = page.locator(".design-box");
   await expect(box).toHaveCount(1);
   await expect(box).toHaveAttribute("data-name", "Text 1");
-  await expect(box).toHaveAttribute("aria-pressed", "true");
+  await expect(box).toHaveAttribute("aria-current", "true");
   await expect(box.locator(".design-handle")).toHaveCount(8);
   await expect(page.locator("#design-panel input[id$='-name']")).toHaveValue("Text 1");
   // The tool is back to picking after one field.
@@ -299,6 +299,75 @@ test("puts the fields of the page in a new Tab order", async ({ page }) => {
     },
   ]);
   await expect(page.locator(".design-order-item").first()).toContainText("Text 2");
+});
+
+test("a field placed, and then another tab in front within the rest, lands in the first document only", async ({ page }) => {
+  await openDesign(page);
+  const first = await stand(page, (s) => s.pages.lastDoc);
+  await place(page, "text", 250, 450);
+  await expect(page.locator(".design-box")).toHaveCount(1);
+  // The other document comes to the front before the rest is over.
+  await page.evaluate(() => ((window as unknown as { __E2E__: Stand }).__E2E__.dialog = ["/docs/design2.pdf"]));
+  await page.locator("#open-button").click();
+  await expect(page.locator('.tab-title[aria-selected="true"]')).toHaveText("design2.pdf");
+  const second = await stand(page, (s) => s.pages.lastDoc);
+  expect(second).not.toBe(first);
+  await rested(page, 1);
+  const docs = await stand(page, (s) => s.pages.calls.filter((c) => c.cmd === "author_apply").map((c) => (c.args as { doc: number }).doc));
+  expect(docs).toEqual([first]);
+  const inDoc = (d: number) => page.evaluate((doc) => (window as unknown as { __E2E__: Stand }).__E2E__.pages.designWidgets(doc), d);
+  expect(await inDoc(first)).toHaveLength(1);
+  expect(await inDoc(second)).toHaveLength(0);
+  // Nothing was said to the reader: the change was made, to the right document.
+  await expect(page.getByRole("alertdialog")).toHaveCount(0);
+  // The first tab shows its field when the reader is back.
+  await page.locator(".tab-title").first().click();
+  await expect(page.locator(".design-box")).toHaveCount(1);
+});
+
+test("makes the fields that a reader fills in after the mode is left", async ({ page }) => {
+  await openDesign(page);
+  await place(page, "text", 250, 450);
+  await rested(page, 1);
+  await page.locator("#design-button").click();
+  await expect(page.locator("#designbar")).toBeHidden();
+  await expect(page.locator(".form-field")).toHaveCount(1);
+  await expect(page.locator(".form-field")).toBeVisible();
+});
+
+test("places a field from the keyboard, and says where it is and where it goes", async ({ page }) => {
+  await openDesign(page);
+  await page.locator("#dtool-text").focus();
+  await page.keyboard.press("Enter");
+  await expect(page.locator(".design-box")).toHaveCount(1);
+  await expect(page.locator("#annot-status")).toContainText(/Added a text field\. Text 1 is on page 1, \d+ points from the left/);
+  // The box has the focus (and is a group, so that its handles are buttons a reader can find).
+  await expect(page.locator(".design-box")).toBeFocused();
+  await expect(page.locator(".design-box")).toHaveAttribute("role", "group");
+  await page.keyboard.press("ArrowRight");
+  await expect(page.locator("#annot-status")).toContainText(/Text 1 is on page 1, \d+ points from the left and \d+ from the top, 160 points wide and 22 tall/);
+  await rested(page, 1);
+  // The box still has the focus after the document was loaded again.
+  await expect(page.locator(".design-box")).toBeFocused();
+  const [ops] = await applies(page);
+  expect(ops.map((o) => (o as { op: string }).op)).toEqual(["add", "move"]);
+});
+
+test("does not send a tooltip the engine would refuse, so that the move before it is not rolled back with it", async ({ page }) => {
+  await openDesign(page);
+  await place(page, "text", 250, 450);
+  await rested(page, 1);
+  await page.locator(".design-box").focus();
+  await page.keyboard.press("ArrowDown");
+  await page.locator("#design-panel input[id$='-tooltip']").fill("x".repeat(600));
+  await page.locator("#design-panel input[id$='-tooltip']").press("Tab");
+  await expect(page.locator("#design-panel .design-error")).toContainText("The tooltip is too long");
+  await rested(page, 2);
+  const all = await applies(page);
+  expect(all[1].map((o) => (o as { op: string }).op)).toEqual(["move"]);
+  await expect(page.getByRole("alertdialog")).toHaveCount(0);
+  const [w] = await widgets(page);
+  expect(w.rect[1]).toBeGreaterThan(439);
 });
 
 test("deletes the picked field with the Delete key and the button", async ({ page }) => {

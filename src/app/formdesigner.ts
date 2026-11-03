@@ -5,21 +5,30 @@
 // The engine makes the fields (see crates/engine/src/author). The window keeps a model of the
 // widgets of the pages it has shown, changes the model at once so that the page answers the pointer,
 // and sends the changes to the engine in batches: after a short rest, and before anything looks at
-// the document (a save, a print, a page tool, a step back). A batch is one reload of the document and
-// one step in the history, so the usual Undo and Redo take it back and bring it again. When the
-// engine refuses a batch, the reader is told why and the model is read again from the engine.
+// the document (a save, a print, a page tool, a step back, another tab). A batch is one reload of the
+// document and one step in the history, so the usual Undo and Redo take it back and bring it again.
+//
+// Every batch is sent for the document it was made for, never for the tab that happens to be in
+// front when the rest is over. A change the reader makes while a batch is on its way waits behind it.
+// When the engine refuses a batch, the reader is told why and the model is read again from the engine.
+// The window checks the engine's rules before it sends (see lib/formdesign.ts), so a batch is refused
+// for what the window could not know, not for a bad tooltip typed after a move.
 //
 // Names, tooltips and choices came from a file or from the reader: they are used as text only.
 
 import { toAppError } from "../lib/errors";
 import {
   KIND_LABELS,
+  LIMITS,
   applyLocal,
   cloneModel,
+  describeBox,
+  exportsProblem,
   freeName,
   moveEntry,
   namesIn,
   nameProblem,
+  placeBox,
   propsProblem,
   textBoxes,
   textLines,
@@ -35,12 +44,12 @@ import {
 import { describePageError } from "../lib/pageerrors";
 import type { PageToolsApi } from "../lib/pagesapi";
 import type { PageSizePt } from "../viewer/layout";
-import { DesignLayer, type DesignTool, type WidgetKey, sameKey } from "../viewer/designlayer";
+import { DesignLayer, type DesignFocus, type DesignTool, type WidgetKey, sameKey } from "../viewer/designlayer";
 import type { DocumentView } from "../viewer/viewer";
 import { DesignPanel } from "./designpanel";
 import type { EditHistory } from "./history";
 import type { NoticeOptions, NoticeResult } from "./notice";
-import type { PageOps } from "./pageops";
+import type { DesignResult, PageOps } from "./pageops";
 
 /** The document in front, as far as the designer cares. */
 export interface DesignTarget {
@@ -89,6 +98,10 @@ interface Session {
   applying: boolean;
   flushing: Promise<boolean> | null;
   lines: Map<number, Promise<SnapLines>>;
+  /** Nothing is sent while this is above 0 (a file is being written). */
+  holds: number;
+  /** Where the keyboard focus was on the boxes when a batch went; it is given back after the reload. */
+  refocus: DesignFocus | null;
 }
 
 function el<K extends keyof HTMLElementTagNameMap>(root: Document, id: string): HTMLElementTagNameMap[K] {
@@ -96,6 +109,9 @@ function el<K extends keyof HTMLElementTagNameMap>(root: Document, id: string): 
   if (!e) throw new Error(`missing element #${id}`);
   return e as HTMLElementTagNameMap[K];
 }
+
+/** What the reader is told when another tool is working on the pages. */
+const WAIT_FOR_PAGES = "The pages are being changed. Try again in a moment.";
 
 export class FormDesigner {
   private readonly sessions = new Map<number, Session>();
@@ -106,6 +122,7 @@ export class FormDesigner {
   /** The group the next click of the radio tool adds a button to. */
   private radioGroup: string | null = null;
   private hintText = "";
+  /** Another tool is working on the document (a page tool, a step back). */
   private working = false;
 
   constructor(
@@ -137,8 +154,9 @@ export class FormDesigner {
 
   /** True when the picked widget can be deleted. */
   get canRemove(): boolean {
+    const s = this.session();
     const w = this.pickedWidget();
-    return this.isOpen && !this.working && w !== null && w.editable;
+    return this.isOpen && s !== null && !this.blocked(s) && w !== null && w.editable;
   }
 
   /** The designer has changes it has not sent yet (or is sending them). */
@@ -150,6 +168,15 @@ export class FormDesigner {
   private session(): Session | null {
     const t = this.host.target();
     return t ? (this.sessions.get(t.doc) ?? null) : null;
+  }
+
+  /**
+   * Another tool is working on the pages, so no change can be taken: it would be made to pages that
+   * are about to be other pages. A batch of the designer's own that is on its way is not in the way:
+   * what is changed meanwhile waits behind it.
+   */
+  private blocked(s: Session): boolean {
+    return this.working && !s.applying;
   }
 
   private layerOf(s: Session): DesignLayer | null {
@@ -210,6 +237,8 @@ export class FormDesigner {
       applying: false,
       flushing: null,
       lines: new Map(),
+      holds: 0,
+      refocus: null,
     };
     this.sessions.set(tab.doc, session);
     this.attach(tab, session);
@@ -276,13 +305,21 @@ export class FormDesigner {
     this.refreshPanel();
   }
 
-  /** The tool of the bar. */
-  setTool(tool: DesignTool): void {
+  /**
+   * The tool of the bar. With `place` (the tool button was pressed with the keyboard) a field of the
+   * default size is placed in the middle of the page in view at once, because there is no pointer to
+   * click on the page with.
+   */
+  setTool(tool: DesignTool, options: { place?: boolean } = {}): void {
     this.toolNow = tool;
     if (tool !== "radio") this.radioGroup = null;
     this.host.target()?.view.setDesignTool(tool);
-    if (tool !== "select") this.host.announce(`${tool === "radio" ? "Radio button" : KIND_LABELS[tool]} tool. Click on the page, or drag to size the box.`);
+    const place = options.place === true && tool !== "select";
+    if (tool !== "select" && !place) {
+      this.host.announce(`${tool === "radio" ? "Radio button" : KIND_LABELS[tool]} tool. Click on the page, or drag to size the box.`);
+    }
     this.host.changed();
+    if (place) this.placeInMiddle(tool);
   }
 
   /** The pages or the document changed under the designer (a step back, a page tool): read the fields again. */
@@ -291,6 +328,10 @@ export class FormDesigner {
     if (!s) return;
     s.fresh.clear();
     s.lines.clear();
+    // What the window knows of the widgets is about pages that are other pages now. The changes of
+    // the designer itself leave the model as it is (it is what the engine has made), and so does a
+    // batch that is waiting (its changes are in the model and not in the document yet).
+    if (!s.applying && s.pending === null) s.model.clear();
     void this.refreshNames(s);
   }
 
@@ -299,7 +340,7 @@ export class FormDesigner {
     if (!check) return;
     try {
       s.names = new Set(await check.call(this.host.api, s.doc));
-      s.gone.clear();
+      if (s.pending === null) s.gone.clear();
     } catch {
       // The names are asked for again by the next change.
     }
@@ -308,7 +349,29 @@ export class FormDesigner {
   /** The tools wait while a change to the document is made. */
   setBusy(busy: boolean): void {
     this.working = busy;
+    this.refreshPanel();
     this.host.changed();
+  }
+
+  /**
+   * Nothing is sent to the engine until the returned function is called: a file is being written
+   * from the document, and the engine must not be changed in the middle of that. Changes made
+   * meanwhile are kept and sent after, and count as unsaved.
+   */
+  hold(doc: number): () => void {
+    const s = this.sessions.get(doc);
+    if (!s) return () => undefined;
+    s.holds += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      s.holds -= 1;
+      if (s.holds === 0 && s.pending !== null && this.sessions.get(doc) === s) {
+        clearTimeout(s.timer);
+        s.timer = setTimeout(() => void this.flush(doc), BATCH_REST_MS);
+      }
+    };
   }
 
   // ---- the layer ---------------------------------------------------------------------------
@@ -323,6 +386,8 @@ export class FormDesigner {
       edit: () => this.panel.focus(),
       textLines: (page) => this.textLinesOf(s, page),
       hint: (text) => {
+        // The bar is drawn again only when the words change, not at every move of the pointer.
+        if (text === this.hintText) return;
         this.hintText = text;
         this.host.changed();
       },
@@ -346,13 +411,22 @@ export class FormDesigner {
     return known;
   }
 
+  /** Gives the keyboard focus back to the picked box when a reload took it away. */
+  private refocusLayer(s: Session): void {
+    if (!s.refocus) return;
+    if (this.layerOf(s)?.restoreFocus(s.refocus)) s.refocus = null;
+  }
+
   /** Shows the widgets of a page, reading them from the engine when they are not fresh. */
   private async load(s: Session, page: number, force = false): Promise<void> {
     const list = this.host.api.designList;
     const layer = this.layerOf(s);
     if (!list || !layer) return;
     // What is known shows at once; the engine's word replaces it when it comes.
-    if (s.model.has(page)) layer.show(page, s.model.get(page) as DesignWidgetInfo[]);
+    if (s.model.has(page)) {
+      layer.show(page, s.model.get(page) as DesignWidgetInfo[]);
+      this.refocusLayer(s);
+    }
     if (s.fresh.has(page) && !force) {
       this.refreshPanel();
       return;
@@ -360,10 +434,11 @@ export class FormDesigner {
     try {
       const items = await list.call(this.host.api, s.doc, page);
       // A change that is not sent yet is not in the engine's list: it is shown from the model.
-      if (s.pending) return;
+      if (s.pending || s.applying) return;
       s.model.set(page, items);
       s.fresh.add(page);
       this.layerOf(s)?.show(page, items);
+      this.refocusLayer(s);
       this.reconcileSelection(s);
       this.refreshPanel();
     } catch (e) {
@@ -418,10 +493,37 @@ export class FormDesigner {
     return all;
   }
 
+  /** A field of the default size in the middle of the page in view, away from the fields that are there. */
+  private placeInMiddle(tool: DesignKind): void {
+    const s = this.session();
+    const t = this.host.target();
+    if (!s || !t) return;
+    const page = Math.min(Math.max(0, t.view.currentPageIndex), Math.max(0, t.pages.length - 1));
+    const size = t.pages[page];
+    if (!size) return;
+    const taken = (s.model.get(page) ?? []).map((w) => w.rect);
+    let [x, y] = [size.width / 2, size.height / 2];
+    let rect = placeBox(tool, [x, y], [x, y], size);
+    // A second field does not land exactly on the first.
+    for (let i = 0; i < 40 && taken.some((r) => r.every((v, k) => Math.abs(v - rect[k]) < 0.5)); i++) {
+      x += 14;
+      y += 14;
+      rect = placeBox(tool, [x, y], [x, y], size);
+    }
+    this.place(s, page, rect);
+  }
+
   private place(s: Session, page: number, rect: Rect): void {
-    if (this.working) return;
+    if (this.blocked(s)) {
+      this.host.announce(WAIT_FOR_PAGES);
+      return;
+    }
     const kind = this.toolNow;
     if (kind === "select") return;
+    if ((s.model.get(page)?.length ?? 0) >= LIMITS.fieldsPerPage) {
+      this.host.announce(`A page can have at most ${LIMITS.fieldsPerPage} fields.`);
+      return;
+    }
     const taken = this.taken(s);
     let op: DesignOp;
     let key: WidgetKey;
@@ -429,11 +531,18 @@ export class FormDesigner {
     const group = this.radioGroup;
     if (kind === "radio" && group && taken.has(group) && namesIn(s.model).has(group)) {
       const mine = [...s.model.values()].flat().filter((w) => w.name === group);
+      // The number of buttons the group has is the engine's, not what this window has loaded: the
+      // new button goes after all of them.
+      const count = Math.max(...mine.map((w) => w.widgets), ...mine.map((w) => w.widget + 1));
+      if (count >= LIMITS.widgets) {
+        this.host.announce(`A group can have at most ${LIMITS.widgets} buttons.`);
+        return;
+      }
       const used = new Set(mine.map((w) => w.export));
-      let n = mine.length + 1;
+      let n = count + 1;
       while (used.has(`Choice${n}`)) n++;
       op = { op: "addWidget", name: group, widget: { page, rect, export: `Choice${n}` } };
-      key = { name: group, widget: mine.length };
+      key = { name: group, widget: count };
       label = "Add a radio button";
     } else {
       const name = freeName(kind, taken);
@@ -452,17 +561,24 @@ export class FormDesigner {
     this.layerOf(s)?.select(page, key);
     if (kind !== "radio") this.setTool("select");
     this.layerOf(s)?.focusPicked();
-    this.host.announce(`${label.replace(/^Add a/, "Added a")}. Its name is ${key.name}.`);
+    this.host.announce(`${label.replace(/^Add a/, "Added a")}. ${describeBox(key.name, rect, page)}`);
   }
 
   private transform(s: Session, page: number, key: WidgetKey, rect: Rect): void {
-    if (this.working) return;
+    if (this.blocked(s)) {
+      this.host.announce(WAIT_FOR_PAGES);
+      return;
+    }
     this.enqueue(s, [{ op: "move", name: key.name, widget: key.widget, page, rect }], "Move or resize a field");
+    this.host.announce(describeBox(key.name, rect, page));
   }
 
   private removeKey(s: Session, page: number, key: WidgetKey): void {
     void page;
-    if (this.working) return;
+    if (this.blocked(s)) {
+      this.host.announce(WAIT_FOR_PAGES);
+      return;
+    }
     const found = this.widgetAt(s, key);
     if (!found || !found.item.editable) return;
     const op: DesignOp =
@@ -491,14 +607,21 @@ export class FormDesigner {
 
   private updateSelected(newName: string, props: DesignProps, exports: string[] | undefined): string | null {
     const s = this.session();
-    if (!s?.selected || this.working) return null;
+    if (!s?.selected) return null;
+    // Another tool is working on the pages: the reader is told, and the panel shows the field as it is.
+    if (this.blocked(s)) return WAIT_FOR_PAGES;
     const found = this.widgetAt(s, s.selected.key);
     if (!found || !found.item.editable) return null;
     const w = found.item;
+    // A size or a limit that another program chose is not asked about again while it is left as it is
+    // (the engine holds the same rule).
+    const asked: DesignProps = { ...props };
+    if (props.fontSize === w.props.fontSize) asked.fontSize = 0;
+    if (props.maxLen === w.props.maxLen && props.maxLen > LIMITS.maxLen) asked.maxLen = 0;
     const problem =
       nameProblem(newName, this.taken(s), w.name) ??
-      propsProblem(w.kind, props) ??
-      this.exportsProblem(w.kind, exports);
+      propsProblem(w.kind, asked) ??
+      (w.kind === "radio" && exports ? exportsProblem(exports, props.defaultValue) : null);
     if (problem) return problem;
     const sameProps = JSON.stringify(props) === JSON.stringify(w.props);
     const sameExports = exports === undefined || exports.every((e, i) => e === (this.group(s, w.name)[i]?.export ?? ""));
@@ -516,16 +639,6 @@ export class FormDesigner {
     return null;
   }
 
-  private exportsProblem(kind: DesignKind, exports: string[] | undefined): string | null {
-    if (kind !== "radio" || !exports) return null;
-    for (const [i, e] of exports.entries()) {
-      if (e.trim() === "") return "Give each radio button a value.";
-      if (e === "Off") return "“Off” means a button that is not picked. Use another word.";
-      if (exports.indexOf(e) !== i) return `Two radio buttons have the value “${e}”. Give each its own.`;
-    }
-    return null;
-  }
-
   private group(s: Session, name: string): DesignWidgetInfo[] {
     return [...s.model.values()]
       .flat()
@@ -535,7 +648,11 @@ export class FormDesigner {
 
   private moveInOrder(from: number, to: number): void {
     const s = this.session();
-    if (!s || this.working) return;
+    if (!s) return;
+    if (this.blocked(s)) {
+      this.host.announce(WAIT_FOR_PAGES);
+      return;
+    }
     const page = s.selected?.page ?? this.host.target()?.view.currentPageIndex ?? 0;
     const list = s.model.get(page) ?? [];
     const next = moveEntry(list, from, to);
@@ -545,6 +662,8 @@ export class FormDesigner {
       [{ op: "reorder", page, order: next.map((w) => ({ name: w.name, widget: w.widget })) }],
       "Change the Tab order",
     );
+    const moved = list[from];
+    this.host.announce(`${moved.name} is number ${to + 1} of ${list.length} in the Tab order.`);
   }
 
   // ---- keys --------------------------------------------------------------------------------
@@ -594,42 +713,21 @@ export class FormDesigner {
   }
 
   /**
-   * Sends what is waiting. Resolves with true when nothing is left that the engine did not make.
-   * Called by the rest timer and by everything that looks at the document.
+   * Sends what is waiting for the document `doc`. Resolves with true when nothing is left that the engine
+   * did not make. Called by the rest timer and by everything that looks at the document, with the number
+   * of the document the changes were made for: the tab in front does not matter.
    */
   flush(doc: number): Promise<boolean> {
     const s = this.sessions.get(doc);
     if (!s) return Promise.resolve(true);
     // The engine's change calls this very function (through the settling before a page tool): the
-    // change that is under way is the one that was asked for.
-    if (s.applying) return Promise.resolve(true);
+    // change that is under way is the one that was asked for, and waiting for it would wait for itself.
+    // A caller from outside waits for the change that is on its way.
+    if (s.applying && this.host.ops.isSettling) return Promise.resolve(true);
     const run = async (): Promise<boolean> => {
       if (s.flushing) await s.flushing.catch(() => false);
       clearTimeout(s.timer);
-      const batch = s.pending;
-      if (!batch) return true;
-      s.pending = null;
-      s.applying = true;
-      let ok: boolean;
-      try {
-        ok = await this.host.ops.applyDesign(batch.ops, batch.label);
-      } finally {
-        s.applying = false;
-      }
-      s.gone.clear();
-      this.host.pendingChanged(s.doc);
-      if (!ok) {
-        // The reader was told why. What the window showed is not what the document holds.
-        s.fresh.clear();
-        const layer = this.layerOf(s);
-        for (const page of layer?.mountedPages ?? []) await this.load(s, page, true);
-        s.selected = s.selected && this.widgetAt(s, s.selected.key) ? s.selected : null;
-        this.refreshPanel();
-      } else {
-        await this.refreshNames(s);
-      }
-      this.host.changed();
-      return ok;
+      return this.send(s);
     };
     const flushing = run();
     s.flushing = flushing;
@@ -637,6 +735,74 @@ export class FormDesigner {
       if (s.flushing === flushing) s.flushing = null;
     });
     return flushing;
+  }
+
+  /** Sends the batches one after the other, until nothing is waiting or one is not made. */
+  private async send(s: Session): Promise<boolean> {
+    for (;;) {
+      const batch = s.pending;
+      if (!batch) {
+        s.refocus = null;
+        await this.refreshNames(s);
+        this.host.changed();
+        return true;
+      }
+      // A file is being written from the document: the changes wait, and go when it is done.
+      if (s.holds > 0) return false;
+      const ops = batch.ops.slice(0, LIMITS.opsPerBatch);
+      const rest = batch.ops.slice(LIMITS.opsPerBatch);
+      s.pending = rest.length > 0 ? { ops: rest, label: batch.label } : null;
+      s.refocus = this.layerOf(s)?.focusState() ?? null;
+      s.applying = true;
+      let result: DesignResult;
+      try {
+        result = await this.host.ops.applyDesign(s.doc, ops, batch.label);
+      } catch {
+        result = "refused";
+      } finally {
+        s.applying = false;
+      }
+      this.host.pendingChanged(s.doc);
+      if (result === "done") {
+        if (s.pending === null) s.gone.clear();
+        this.refocusLayer(s);
+        continue;
+      }
+      s.refocus = null;
+      if (result === "busy" || result === "unsettled") {
+        // The batch never reached the engine: it is kept, in front of what came after it. When another
+        // tool was working it is sent again after a rest; when the reader has to deal with something
+        // first (and was told) it waits for the next time the document is looked at.
+        s.pending = { ops: [...ops, ...(s.pending?.ops ?? [])], label: batch.label };
+        if (result === "busy" && this.sessions.get(s.doc) === s) {
+          clearTimeout(s.timer);
+          s.timer = setTimeout(() => void this.flush(s.doc), BATCH_REST_MS);
+        }
+        this.host.pendingChanged(s.doc);
+        this.host.changed();
+        return false;
+      }
+      if (result === "gone") {
+        s.pending = null;
+        this.host.pendingChanged(s.doc);
+        this.host.changed();
+        return false;
+      }
+      // Refused: the reader was told why. What the window showed is not what the document holds, on
+      // the pages that are on the screen and on the ones that are not: all of it is read again.
+      s.pending = null;
+      s.gone.clear();
+      s.fresh.clear();
+      s.model.clear();
+      const layer = this.layerOf(s);
+      for (const page of layer?.mountedPages ?? []) await this.load(s, page, true);
+      s.selected = s.selected && this.widgetAt(s, s.selected.key) ? s.selected : null;
+      this.layerOf(s)?.select(s.selected?.page ?? null, s.selected?.key ?? null);
+      this.refreshPanel();
+      this.host.pendingChanged(s.doc);
+      this.host.changed();
+      return false;
+    }
   }
 
   // ---- the panel ---------------------------------------------------------------------------
@@ -653,6 +819,7 @@ export class FormDesigner {
       order: s.model.get(page) ?? [],
       pageNumber: page + 1,
       note: w && !w.editable ? "This field was made with another program and has an action or a structure that cannot be changed here." : null,
+      busy: this.blocked(s),
     });
   }
 

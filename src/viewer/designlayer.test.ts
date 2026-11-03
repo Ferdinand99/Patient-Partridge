@@ -97,7 +97,7 @@ describe("picking and moving", () => {
     expect(boxes()[0]).toBe(first);
     expect(boxes()[0].querySelectorAll(".design-handle")).toHaveLength(8);
     expect(boxes()[1].querySelectorAll(".design-handle")).toHaveLength(0);
-    expect(boxes()[0].getAttribute("aria-pressed")).toBe("true");
+    expect(boxes()[0].getAttribute("aria-current")).toBe("true");
   });
 
   it("moves a box by the distance the pointer went, and tells it once, at the end", () => {
@@ -207,6 +207,67 @@ describe("the keyboard", () => {
     expect(events.edit).toHaveBeenCalledWith(0, { name: "a", widget: 0 });
     key({ key: "Escape" });
     expect(events.select).toHaveBeenLastCalledWith(0, null);
+  });
+
+  it("leaves Escape to the window while a tool that places fields is on, and lets go of the pick otherwise", () => {
+    layer.select(0, { name: "a", widget: 0 });
+    layer.setTool("radio");
+    events.select.mockClear();
+    const escape = new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+    boxes()[0].dispatchEvent(escape);
+    // Not taken: it goes on up to the window, which ends the tool.
+    expect(escape.defaultPrevented).toBe(false);
+    expect(events.select).not.toHaveBeenCalled();
+    layer.setTool("select");
+    key({ key: "Escape" });
+    expect(events.select).toHaveBeenLastCalledWith(0, null);
+  });
+
+  it("says where the keyboard is on the picked box, and gives it back after the boxes are made again", () => {
+    layer.select(0, { name: "a", widget: 0 });
+    expect(layer.focusState()).toBeNull();
+    boxes()[0].focus();
+    expect(layer.focusState()).toEqual({ handle: null });
+    layer.show(0, [item("a", [100, 100, 200, 150])]);
+    expect(document.activeElement).toBe(boxes()[0]);
+    const handle = boxes()[0].querySelector<HTMLElement>('[data-handle="se"]')!;
+    handle.focus();
+    expect(layer.focusState()).toEqual({ handle: "se" });
+    // The layer is made again (the pages were laid out again): the pick is the same, the focus is lost.
+    const again = new DesignLayer([SIZE], events);
+    again.inherit(layer);
+    layer.destroy();
+    const next = makePage();
+    again.mount(0, next);
+    again.show(0, [item("a", [100, 100, 200, 150])]);
+    expect(document.activeElement).not.toBe(next.querySelector(".design-box"));
+    expect(again.restoreFocus({ handle: "se" })).toBe(true);
+    expect(document.activeElement).toBe(next.querySelector('[data-handle="se"]'));
+    // A layer that waits for a change takes no focus.
+    again.setHeld(true);
+    expect(again.restoreFocus({ handle: null })).toBe(false);
+  });
+
+  it("is a group of a box and its handles, so that the handles are buttons a screen reader finds", () => {
+    layer.select(0, { name: "a", widget: 0 });
+    expect(boxes()[0].getAttribute("role")).toBe("group");
+    expect(boxes()[0].getAttribute("aria-current")).toBe("true");
+    expect(boxes()[0].querySelectorAll('[role="button"]').length).toBe(8);
+    layer.select(null, null);
+    expect(boxes()[0].hasAttribute("aria-current")).toBe(false);
+  });
+
+  it("ends a drag whose box was made again, so that the next press starts a new one", () => {
+    const box = boxes()[0];
+    box.dispatchEvent(pointer("pointerdown", 150, 120));
+    box.dispatchEvent(pointer("pointermove", 190, 160));
+    // The page is shown again meanwhile: the box under the pointer is gone.
+    layer.show(0, [item("a", [100, 100, 200, 150])]);
+    expect(events.transform).not.toHaveBeenCalled();
+    boxes()[0].dispatchEvent(pointer("pointerdown", 150, 120));
+    boxes()[0].dispatchEvent(pointer("pointermove", 190, 160));
+    boxes()[0].dispatchEvent(pointer("pointerup", 190, 160));
+    expect(events.transform).toHaveBeenCalledTimes(1);
   });
 
   it("resizes from a handle with the arrow keys", () => {

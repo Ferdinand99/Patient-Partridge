@@ -117,8 +117,33 @@ export const DEFAULT_SIZES: Record<DesignKind, [number, number]> = {
 /** The smallest side of a box in points (the engine holds the same). */
 export const MIN_SIDE = 4;
 
+/**
+ * The smallest side the window makes. A box that is exactly the smallest side can come out of the
+ * engine's arithmetic a hair under it and be refused, so the window keeps a little above it.
+ */
+export const BOX_MIN = MIN_SIDE + 0.1;
+
+/** The limits the engine holds (crates/protocol and crates/engine/src/author/rules.rs). */
+export const LIMITS = {
+  /** Most widgets a field has. */
+  widgets: 64,
+  /** Most fields on a page. */
+  fieldsPerPage: 1000,
+  /** Most changes in one batch. */
+  opsPerBatch: 100,
+  nameBytes: 255,
+  tooltipBytes: 512,
+  exportBytes: 128,
+  valueBytes: 8 * 1024,
+  choices: 500,
+  choiceBytes: 256,
+  maxLen: 32767,
+  comb: 200,
+  fontSize: 96,
+} as const;
+
 /** The most widgets a field has (the engine holds the same). */
-export const MAX_WIDGETS = 64;
+export const MAX_WIDGETS = LIMITS.widgets;
 
 const NAME_BASES: Record<DesignKind, string> = {
   text: "Text",
@@ -138,9 +163,28 @@ export function freeName(kind: DesignKind, taken: ReadonlySet<string>): string {
   }
 }
 
-/** Controls, and the characters that change the direction of the text around them or hide. */
+/**
+ * Controls, and the characters that change the direction of the text around them or hide. This is
+ * the engine's list (author/rules.rs `is_unsafe_in_text`): the joiners U+200C and U+200D are not on
+ * it, because Persian is written with them, and U+061C is. `formrules.cases.txt` holds cases that
+ * both sides are tried with.
+ */
 function unsafeChar(c: number): boolean {
-  return c < 0x20 || (c >= 0x7f && c <= 0x9f) || (c >= 0x200b && c <= 0x200f) || (c >= 0x2028 && c <= 0x202e) || (c >= 0x2066 && c <= 0x2069) || c === 0xfeff;
+  return (
+    c < 0x20 ||
+    (c >= 0x7f && c <= 0x9f) ||
+    c === 0x200b ||
+    c === 0x200e ||
+    c === 0x200f ||
+    c === 0x061c ||
+    (c >= 0x2028 && c <= 0x202e) ||
+    (c >= 0x2066 && c <= 0x2069) ||
+    c === 0xfeff
+  );
+}
+
+function bytesOf(text: string): number {
+  return new TextEncoder().encode(text).length;
 }
 
 /** What is wrong with a name, in words for the reader, or null. `taken` holds every name in use. */
@@ -150,7 +194,7 @@ export function nameProblem(name: string, taken: ReadonlySet<string>, current?: 
     return "A field name cannot contain a dot, because a dot makes the field a part of another field. Use a dash or an underscore instead.";
   }
   if (name !== name.trim()) return "A field name cannot start or end with a space.";
-  if (new TextEncoder().encode(name).length > 255) return "The field name is too long. Keep it under 255 bytes.";
+  if (bytesOf(name) > LIMITS.nameBytes) return "The field name is too long. Keep it under 255 bytes.";
   if ([...name].some((ch) => unsafeChar(ch.codePointAt(0) ?? 0))) {
     return "The field name has a character that cannot be used.";
   }
@@ -177,28 +221,90 @@ export function textProblem(what: string, text: string, newline = false): string
   return null;
 }
 
-/** The first thing wrong with a set of properties for a kind, or null. */
+/** What is wrong with a tooltip, or null. */
+export function tooltipProblem(text: string): string | null {
+  if (bytesOf(text) > LIMITS.tooltipBytes) return "The tooltip is too long. Keep it under 512 bytes.";
+  if ([...text].some((ch) => ch !== "\n" && unsafeChar(ch.codePointAt(0) ?? 0))) {
+    return "The tooltip has a character that cannot be used.";
+  }
+  return null;
+}
+
+/** What is wrong with the word a check box or a radio button stands for, or null. */
+export function exportProblem(value: string): string | null {
+  if (value === "") return "Give each radio button a value.";
+  if (value === "Off") return "“Off” means a button that is not picked, so it cannot be the value of a button. Use another word.";
+  if (bytesOf(value) > LIMITS.exportBytes) return "A button value is too long.";
+  const bad = [...value].find((ch) => (ch.codePointAt(0) ?? 0) < 0x20 || (ch.codePointAt(0) ?? 0) > 0x7e);
+  if (bad !== undefined) {
+    return `A button value can only use the letters a to z, digits and ordinary signs, so ${(bad.codePointAt(0) ?? 0) < 0x20 ? "a control character" : `“${bad}”`} cannot be used. Use a word without accents.`;
+  }
+  return null;
+}
+
+/** What is wrong with the words of the buttons of a radio group, or null. */
+export function exportsProblem(exports: readonly string[], picked: string): string | null {
+  for (const [i, e] of exports.entries()) {
+    const bad = exportProblem(e);
+    if (bad) return bad;
+    if (exports.indexOf(e) !== i) return `Two radio buttons have the value “${e}”. Give each its own.`;
+  }
+  if (picked !== "" && !exports.includes(picked)) return "The button that starts picked is not one of the buttons.";
+  return null;
+}
+
+/** The first thing wrong with a set of properties for a kind, or null. The engine holds the same rules. */
 export function propsProblem(kind: DesignKind, p: DesignProps): string | null {
+  const tip = tooltipProblem(p.tooltip);
+  if (tip) return tip;
+  if (!(p.fontSize === 0 || (p.fontSize >= 1 && p.fontSize <= LIMITS.fontSize))) {
+    return `The size of the text has to be between 1 and ${LIMITS.fontSize} points, or automatic.`;
+  }
+  if (bytesOf(p.defaultValue) > LIMITS.valueBytes) return "The default value is too long.";
   if (kind === "text") {
-    if (p.comb && (p.maxLen < 1 || p.maxLen > 200)) {
-      return "A field with a box for each character needs a longest text between 1 and 200.";
+    if (p.maxLen > LIMITS.maxLen) return `The longest text can be at most ${LIMITS.maxLen} characters.`;
+    if (p.comb && (p.maxLen < 1 || p.maxLen > LIMITS.comb)) {
+      return `A field with a box for each character needs a longest text between 1 and ${LIMITS.comb}.`;
     }
     if (p.comb && (p.multiline || p.password)) {
       return "A field with a box for each character cannot also be a password or have several lines.";
     }
     if (p.password && p.multiline) return "A password field has one line.";
+    const bad = textProblem("The default value", p.defaultValue, p.multiline);
+    if (bad) return bad;
     if (p.maxLen > 0 && [...p.defaultValue].length > p.maxLen) {
       return "The default value is longer than the longest text the field takes.";
     }
-    return textProblem("The default value", p.defaultValue, p.multiline);
+    return null;
+  }
+  if (kind === "checkbox") {
+    if (p.exportValue !== "") {
+      const bad = exportProblem(p.exportValue);
+      if (bad) return bad;
+    }
+    if (!(p.defaultValue === "" || p.defaultValue === "on")) return "A check box starts either on or off.";
+    return null;
   }
   if (kind === "combo" || kind === "list") {
     if (p.choices.length === 0) return "Give the list at least one choice.";
+    if (p.choices.length > LIMITS.choices) return `A list can have at most ${LIMITS.choices} choices.`;
     for (const [i, c] of p.choices.entries()) {
       if (c.trim() === "") return "A choice cannot be empty.";
+      if (bytesOf(c) > LIMITS.choiceBytes) return "A choice is too long.";
       const bad = textProblem("A choice", c);
       if (bad) return bad;
       if (p.choices.indexOf(c) !== i) return `The choice “${c}” is there twice.`;
+    }
+    const picked = p.defaultValue === "" ? [] : p.defaultValue.split("\n");
+    if (picked.length > 1 && !(kind === "list" && p.multiselect)) {
+      return "Only a list that takes several choices can start with several picked.";
+    }
+    for (const label of picked) {
+      if (!p.choices.includes(label) && !(kind === "combo" && p.editable)) {
+        return "The choice that starts picked is not one of the choices.";
+      }
+      const bad = textProblem("The choice that starts picked", label);
+      if (bad) return bad;
     }
     return null;
   }
@@ -243,13 +349,32 @@ function clamp(v: number, lo: number, hi: number): number {
   return Math.min(Math.max(v, lo), hi);
 }
 
+/** A number to hundredths of a point: what the window sends, so that no side comes out a hair short. */
+function round2(v: number): number {
+  return Math.round(v * 100) / 100;
+}
+
+/** A box with every number rounded to hundredths of a point. */
+export function roundBox(r: Rect): Rect {
+  return [round2(r[0]), round2(r[1]), round2(r[2]), round2(r[3])];
+}
+
 /** The box moved so that it lies on the page, with its size kept. A box bigger than the page is cut to it. */
 export function keepOnPage(r: Rect, page: PageBox): Rect {
   const w = Math.min(width(r), page.width);
   const h = Math.min(height(r), page.height);
   const left = clamp(r[0], 0, page.width - w);
   const top = clamp(r[1], 0, page.height - h);
-  return [left, top, left + w, top + h];
+  return roundBox([left, top, left + w, top + h]);
+}
+
+/** A box cut to the page, not moved: what is outside is left out, and what is left is at least `BOX_MIN` on each side. */
+export function clipBox(r: Rect, page: PageBox): Rect {
+  const l = clamp(Math.min(r[0], r[2]), 0, page.width - BOX_MIN);
+  const t = clamp(Math.min(r[1], r[3]), 0, page.height - BOX_MIN);
+  const rt = clamp(Math.max(r[0], r[2]), l + BOX_MIN, page.width);
+  const b = clamp(Math.max(r[1], r[3]), t + BOX_MIN, page.height);
+  return roundBox([l, t, rt, b]);
 }
 
 /** A box for a new field: a click gives the default size around the point, a drag gives its own. */
@@ -259,11 +384,9 @@ export function placeBox(kind: DesignKind, from: [number, number], to: [number, 
     const [w, h] = DEFAULT_SIZES[kind];
     return keepOnPage([from[0] - w / 2, from[1] - h / 2, from[0] + w / 2, from[1] + h / 2], page);
   }
-  const r = normalize(from, to);
-  // A drag that stays thin still makes a box that can be used.
-  const w = Math.max(width(r), MIN_SIDE);
-  const h = Math.max(height(r), MIN_SIDE);
-  return keepOnPage([r[0], r[1], r[0] + w, r[1] + h], page);
+  // A drag that goes past the edge of the page is cut at the edge, so the box is where it was
+  // drawn; one that stays thin still makes a box that can be used.
+  return clipBox(normalize(from, to), page);
 }
 
 /** A box moved by (`dx`, `dy`), kept on the page. */
@@ -274,11 +397,11 @@ export function moveBox(r: Rect, dx: number, dy: number, page: PageBox): Rect {
 /** A box with one handle moved by (`dx`, `dy`): no smaller than `MIN_SIDE`, kept on the page. */
 export function resizeBox(r: Rect, handle: Handle, dx: number, dy: number, page: PageBox): Rect {
   let [l, t, rt, b] = r;
-  if (handle.includes("w")) l = clamp(l + dx, 0, rt - MIN_SIDE);
-  if (handle.includes("e")) rt = clamp(rt + dx, l + MIN_SIDE, page.width);
-  if (handle.includes("n")) t = clamp(t + dy, 0, b - MIN_SIDE);
-  if (handle.includes("s")) b = clamp(b + dy, t + MIN_SIDE, page.height);
-  return [l, t, rt, b];
+  if (handle.includes("w")) l = clamp(l + dx, 0, rt - BOX_MIN);
+  if (handle.includes("e")) rt = clamp(rt + dx, l + BOX_MIN, page.width);
+  if (handle.includes("n")) t = clamp(t + dy, 0, b - BOX_MIN);
+  if (handle.includes("s")) b = clamp(b + dy, t + BOX_MIN, page.height);
+  return roundBox([l, t, rt, b]);
 }
 
 // ---- snapping ----------------------------------------------------------------------------------
@@ -449,13 +572,6 @@ function withProps(base: Partial<DesignProps>): DesignProps {
  */
 export function applyLocal(model: DesignModel, op: DesignOp): void {
   const all = () => [...model.values()].flat();
-  const reindex = (name: string) => {
-    const mine = all().filter((w) => w.name === name);
-    mine.forEach((w, i) => {
-      w.widget = i;
-      w.widgets = mine.length;
-    });
-  };
   switch (op.op) {
     case "add": {
       const n = op.field.widgets.length;
@@ -479,17 +595,26 @@ export function applyLocal(model: DesignModel, op: DesignOp): void {
       for (const [page, list] of model) model.set(page, list.filter((w) => w.name !== op.name));
       break;
     case "removeWidget": {
+      // The places of the other buttons follow the engine's order and count, which the window does not
+      // have for the pages it has not read: the ones after the removed button move up by one, and
+      // every button of the group knows there is one less. Nothing is counted from what is loaded.
       for (const [page, list] of model) model.set(page, list.filter((w) => !(w.name === op.name && w.widget === op.widget)));
-      reindex(op.name);
+      for (const w of all().filter((x) => x.name === op.name)) {
+        if (w.widget > op.widget) w.widget -= 1;
+        w.widgets = Math.max(1, w.widgets - 1);
+      }
       break;
     }
     case "addWidget": {
-      const template = all().find((w) => w.name === op.name);
+      const mine = all().filter((w) => w.name === op.name);
+      const template = mine[0];
       if (!template) break;
+      // A new button goes last in the group, after as many as the engine says there are.
+      const places = Math.max(template.widgets, ...mine.map((w) => w.widget + 1));
       const list = model.get(op.widget.page) ?? [];
-      list.push({ ...template, rect: [...op.widget.rect], export: op.widget.export ?? "", props: { ...template.props } });
+      list.push({ ...template, widget: places, widgets: places + 1, rect: [...op.widget.rect], export: op.widget.export ?? "", props: { ...template.props } });
       model.set(op.widget.page, list);
-      reindex(op.name);
+      for (const w of mine) w.widgets = places + 1;
       break;
     }
     case "move": {
@@ -547,6 +672,12 @@ export function describeWidget(w: DesignWidgetInfo): string {
   const kind = KIND_LABELS[w.kind];
   const part = w.widgets > 1 ? `, button ${w.widget + 1} of ${w.widgets}` : "";
   return `${w.name}, ${kind.toLowerCase()}${part}${w.editable ? "" : ", cannot be changed here"}`;
+}
+
+/** What a screen reader is told after a box was placed, moved or resized: where it is and how big. */
+export function describeBox(name: string, rect: Rect, page: number): string {
+  const n = (v: number) => String(Math.round(v));
+  return `${name} is on page ${page + 1}, ${n(rect[0])} points from the left and ${n(rect[1])} from the top, ${n(width(rect))} points wide and ${n(height(rect))} tall.`;
 }
 
 /** Moves one entry of a list to another place (for the tab order). */

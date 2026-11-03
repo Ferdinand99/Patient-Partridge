@@ -424,7 +424,7 @@ export class App {
     });
     this.designbar = new DesignBar(root, {
       toggle: (open) => void this.setDesigning(open),
-      setTool: (tool) => this.designer?.setTool(tool),
+      setTool: (tool, viaKeyboard) => this.designer?.setTool(tool, { place: viaKeyboard }),
       remove: () => this.designer?.removeSelectedWidget(),
       undo: () => void this.undoActive(),
       redo: () => void this.redoActive(),
@@ -446,6 +446,11 @@ export class App {
       const host: PageHost & PagePanelHost = {
         target: () => {
           const t = this.active;
+          return t ? { doc: t.doc, name: t.name, history: t.history, pages: t.sidebarDoc.pages } : null;
+        },
+        // A change made for a document is made to that document, whichever tab is in front.
+        targetOf: (doc) => {
+          const t = this.tabs.find((x) => x.doc === doc);
           return t ? { doc: t.doc, name: t.name, history: t.history, pages: t.sidebarDoc.pages } : null;
         },
         applyPages: (doc, pages, show) => this.applyPages(doc, pages, show),
@@ -1182,6 +1187,9 @@ export class App {
     if (!next) return;
     const previous = this.active;
     if (previous && previous !== next) {
+      // What the designer holds for the tab that is left is sent for that tab, before the tab in front
+      // changes (the batch names its document, so it reaches the right one either way).
+      void this.designer?.flush(previous.doc);
       this.saveNow(previous);
       previous.view.setActive(false);
     }
@@ -1714,11 +1722,13 @@ export class App {
     const began = tab.history.revision;
     // The engine is not changed while the file is written; changes made meanwhile wait.
     const release = tab.annotator?.hold();
+    const releaseDesign = this.designer?.hold(tab.doc);
     let saved: SavedFile | null;
     try {
       saved = asCopy ? await this.runSaveAs(tab, false) : await this.runSave(tab);
     } finally {
       release?.();
+      releaseDesign?.();
     }
     if (!saved) return false;
     // The file that was written is not the one the signatures were checked on, whatever the tab

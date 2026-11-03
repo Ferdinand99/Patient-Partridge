@@ -24,6 +24,8 @@ export interface PanelState {
   pageNumber: number;
   /** A line about the document or the picked field that the reader should know, or null. */
   note: string | null;
+  /** Another tool is working on the pages: nothing can be changed until it is done. */
+  busy?: boolean;
 }
 
 export interface PanelHandlers {
@@ -57,7 +59,8 @@ export class DesignPanel {
   private readonly groups = new Map<string, HTMLElement>();
   private readonly removeButton = el("button", "btn btn-plain design-remove", "Delete the field");
   private state: PanelState | null = null;
-  private busy = false;
+  /** The panel is being drawn: the controls change by themselves, which is not a change by the reader. */
+  private rendering = false;
 
   constructor(
     private readonly root: HTMLElement,
@@ -151,10 +154,13 @@ export class DesignPanel {
     row("defaultChoice", "Starts with", pick, "choice");
 
     this.form.addEventListener("change", (e) => {
-      if (this.busy) return;
-      // The choices change the list of the default: it is rebuilt first.
-      if (e.target === choices) this.fillDefaultChoice(this.valuesOfChoices(), "");
-      this.send();
+      if (this.rendering) return;
+      // The choices change the list of the default: it is rebuilt first, and the choice that was
+      // picked stays picked when it is still in the list.
+      if (e.target === choices) {
+        this.fillDefaultChoice(this.valuesOfChoices(), this.input<HTMLSelectElement>("defaultChoice").value);
+      }
+      this.send(e.target instanceof HTMLElement ? e.target : null);
     });
 
     this.root.append(this.title, this.empty, this.note, this.form, this.error, this.removeButton);
@@ -253,19 +259,30 @@ export class DesignPanel {
     return { name: value("name"), props: p, exports };
   }
 
-  private send(): void {
+  private send(changed: HTMLElement | null): void {
     const w = this.state?.widget;
     if (!w || !w.editable) return;
     const { name, props, exports } = this.read(w);
     const problem = this.handlers.update(name, props, exports);
     this.error.textContent = problem ?? "";
     this.error.hidden = problem === null;
+    // What was refused is not kept in the control: when the reader leaves it, it shows what the field
+    // has, and the words that say why stay until the next change.
+    if (problem !== null && changed && (changed instanceof HTMLInputElement || changed instanceof HTMLTextAreaElement || changed instanceof HTMLSelectElement)) {
+      changed.addEventListener(
+        "blur",
+        () => {
+          if (this.state) this.render(this.state);
+        },
+        { once: true },
+      );
+    }
   }
 
   /** Shows the state. Controls the reader is in are left alone, so that typing is not interrupted. */
   render(state: PanelState): void {
     this.state = state;
-    this.busy = true;
+    this.rendering = true;
     try {
       const w = state.widget;
       this.empty.hidden = w !== null;
@@ -274,7 +291,7 @@ export class DesignPanel {
       this.note.hidden = state.note === null;
       this.form.hidden = w === null;
       this.removeButton.hidden = w === null;
-      this.removeButton.disabled = !w?.editable;
+      this.removeButton.disabled = !w?.editable || state.busy === true;
       this.removeButton.textContent = w && w.widgets > 1 ? "Delete this button" : "Delete the field";
       if (!w) {
         this.error.hidden = true;
@@ -283,7 +300,7 @@ export class DesignPanel {
       }
       this.renderOrder(state);
     } finally {
-      this.busy = false;
+      this.rendering = false;
     }
   }
 
@@ -303,7 +320,16 @@ export class DesignPanel {
     set("password", p.password);
     set("comb", p.comb);
     set("maxLen", String(p.maxLen));
-    set("fontSize", String(FONT_SIZES.includes(p.fontSize) ? p.fontSize : 0));
+    // A size another program chose is shown as it is (and kept when nothing else about it changes).
+    const size = this.input<HTMLSelectElement>("fontSize");
+    for (const o of [...size.options]) if (o.dataset.custom === "1" && o.value !== String(p.fontSize)) o.remove();
+    if (!FONT_SIZES.includes(p.fontSize) && ![...size.options].some((o) => o.value === String(p.fontSize))) {
+      const custom = el("option", undefined, `${p.fontSize} points`);
+      custom.value = String(p.fontSize);
+      custom.dataset.custom = "1";
+      size.append(custom);
+    }
+    set("fontSize", String(p.fontSize));
     set("defaultText", p.defaultValue);
     set("exportValue", p.exportValue);
     set("startsOn", p.defaultValue === "on");
@@ -323,18 +349,31 @@ export class DesignPanel {
       list: w.kind === "list",
     };
     for (const [key, group] of this.groups) group.hidden = !showing[key];
-    for (const input of this.inputs.values()) input.disabled = !w.editable;
+    for (const input of this.inputs.values()) input.disabled = !w.editable || state.busy === true;
     // A comb needs a length; the field for it says so.
     this.input<HTMLInputElement>("maxLen").min = "0";
     void state;
   }
 
   private renderOrder(state: PanelState): void {
+    // The list is made again at every change; the button the reader is on is found again after.
+    const active = document.activeElement;
+    const was =
+      active instanceof HTMLElement && this.orderList.contains(active)
+        ? {
+            name: active.closest<HTMLElement>(".design-order-item")?.dataset.name ?? "",
+            widget: active.closest<HTMLElement>(".design-order-item")?.dataset.widget ?? "0",
+            role: active.dataset.role ?? "pick",
+          }
+        : null;
     this.orderTitle.textContent = `Tab order on page ${state.pageNumber}`;
     this.orderList.replaceChildren();
     state.order.forEach((item, i) => {
       const li = el("li", "design-order-item");
+      li.dataset.name = item.name;
+      li.dataset.widget = String(item.widget);
       const pick = el("button", "btn btn-plain design-order-pick");
+      pick.dataset.role = "pick";
       pick.type = "button";
       pick.textContent = item.widgets > 1 ? `${item.name} (${item.widget + 1})` : item.name;
       pick.setAttribute("aria-label", describeWidget(item));
@@ -343,16 +382,18 @@ export class DesignPanel {
       }
       pick.addEventListener("click", () => this.handlers.pick(item.name, item.widget));
       const up = el("button", "btn btn-icon btn-plain design-order-up");
+      up.dataset.role = "up";
       up.type = "button";
       up.textContent = "↑";
       up.setAttribute("aria-label", `Move ${item.name} earlier in the Tab order`);
-      up.disabled = i === 0 || !item.editable;
+      up.disabled = i === 0 || !item.editable || state.busy === true;
       up.addEventListener("click", () => this.handlers.move(i, i - 1));
       const down = el("button", "btn btn-icon btn-plain design-order-down");
+      down.dataset.role = "down";
       down.type = "button";
       down.textContent = "↓";
       down.setAttribute("aria-label", `Move ${item.name} later in the Tab order`);
-      down.disabled = i === state.order.length - 1 || !item.editable;
+      down.disabled = i === state.order.length - 1 || !item.editable || state.busy === true;
       down.addEventListener("click", () => this.handlers.move(i, i + 1));
       li.append(pick, up, down);
       this.orderList.append(li);
@@ -360,6 +401,15 @@ export class DesignPanel {
     if (state.order.length === 0) {
       const li = el("li", "muted", "No fields on this page yet.");
       this.orderList.append(li);
+    }
+    if (was) {
+      const li = [...this.orderList.querySelectorAll<HTMLElement>(".design-order-item")].find(
+        (x) => x.dataset.name === was.name && x.dataset.widget === was.widget,
+      );
+      const again = li?.querySelector<HTMLButtonElement>(`[data-role="${was.role}"]`);
+      // A button that cannot be pressed any more (the field is at the end of the list) gives the
+      // focus to the name of the field, which is still there.
+      (again && !again.disabled ? again : li?.querySelector<HTMLButtonElement>('[data-role="pick"]'))?.focus();
     }
   }
 

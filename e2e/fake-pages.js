@@ -73,6 +73,7 @@
     "/docs/signed-doc.pdf": { sizes: Array.from({ length: 3 }, () => LETTER), signed: true },
     "/docs/form-ten.pdf": { sizes: Array.from({ length: 4 }, () => LETTER), form: true },
     "/docs/design.pdf": { sizes: [LETTER, LETTER], design: true },
+    "/docs/design2.pdf": { sizes: [LETTER, LETTER], design: true },
   };
   const SOURCES = {
     "/docs/second.pdf": { pages: 2 },
@@ -208,8 +209,22 @@
       });
   }
 
+  const bytesOf = (text) => new TextEncoder().encode(text).length;
+
+  // What the engine holds a field to besides its name (crates/engine/src/author/rules.rs).
+  function checkProps(kind, props) {
+    if (bytesOf(props.tooltip ?? "") > 512) refuse("The tooltip is too long. Keep it under 512 bytes.");
+    if ((props.maxLen ?? 0) > 32767) refuse("The longest text can be at most 32767 characters.");
+    const size = props.fontSize ?? 0;
+    if (!(size === 0 || (size >= 1 && size <= 96))) refuse("The size of the text has to be between 1 and 96 points, or automatic.");
+    if (kind === "checkbox" && props.exportValue && /[^\x20-\x7e]/.test(props.exportValue)) {
+      refuse("A button value can only use the letters a to z, digits and ordinary signs. Use a word without accents.");
+    }
+  }
+
   function applyDesign(m, ops) {
     designError(m);
+    if (ops.length > 100) refuse("A batch holds at most 100 changes.");
     const list = structuredClone(m.design);
     const taken = (name) => list.some((w) => w.name === name);
     const need = (name, widget = 0) => {
@@ -224,7 +239,9 @@
           if (f.name.trim() === "") refuse("Give the field a name.");
           if (f.name.includes(".")) refuse("A field name cannot contain a dot, because a dot makes the field a part of another field. Use a dash or an underscore instead.");
           if (taken(f.name)) refuse("There is already a field called \u201c" + f.name + "\u201d. Every field needs a name of its own.");
+          checkProps(f.kind, f.props ?? {});
           for (const w of f.widgets) {
+            if (list.filter((x) => x.page === w.page).length >= 1000) refuse("A page can have at most 1000 fields.");
             list.push({ page: w.page, name: f.name, kind: f.kind, rect: w.rect, export: w.export ?? "", props: { ...emptyProps(), ...f.props } });
           }
           break;
@@ -256,6 +273,7 @@
             if (op.newName.includes(".")) refuse("A field name cannot contain a dot, because a dot makes the field a part of another field. Use a dash or an underscore instead.");
             if (taken(op.newName)) refuse("There is already a field called \u201c" + op.newName + "\u201d. Every field needs a name of its own.");
           }
+          checkProps(mine[0].kind, op.props);
           mine.forEach((w, i) => {
             w.props = { ...op.props };
             if (op.exports && op.exports.length === mine.length) w.export = op.exports[i];
@@ -366,10 +384,17 @@
         models.delete(args.doc);
         return null;
       case "form_info":
+        // A document the designer made fields in has a form: the fields are what a reader fills in.
+        if (model(args.doc).design?.length) return { kind: "acro", actions: false };
         if (!model(args.doc).fields) return baseInvoke(cmd, args);
         return { kind: "acro", actions: false };
       case "get_form_fields": {
-        const { fields } = model(args.doc);
+        const { fields, design } = model(args.doc);
+        if (design?.length) {
+          return design
+            .filter((w) => w.page === args.page && w.kind === "text")
+            .map((w, i) => ({ ...textField(), index: i, name: w.name, tooltip: w.props.tooltip ?? "", rect: w.rect, value: "" }));
+        }
         if (!fields) return baseInvoke(cmd, args);
         return structuredClone(fields);
       }

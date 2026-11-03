@@ -44,6 +44,11 @@ export interface WidgetKey {
   widget: number;
 }
 
+/** Where the keyboard focus is on the picked box: on the box (`handle` null) or on one of its handles. */
+export interface DesignFocus {
+  handle: Handle | null;
+}
+
 export function sameKey(a: WidgetKey | null, b: WidgetKey | null): boolean {
   return a !== null && b !== null && a.name === b.name && a.widget === b.widget;
 }
@@ -236,7 +241,10 @@ export class DesignLayer {
 
   private mark(box: HTMLElement, page: number, item: DesignWidgetInfo, picked: boolean): void {
     box.classList.toggle("design-box-picked", picked);
-    box.setAttribute("aria-pressed", String(picked));
+    // The box holds the handles, which are buttons: a button inside a button is not shown to a screen
+    // reader, so the box is a group, and a picked one says so with its state.
+    if (picked) box.setAttribute("aria-current", "true");
+    else box.removeAttribute("aria-current");
     const handles = box.querySelectorAll(".design-handle");
     if (!picked || !item.editable) {
       for (const h of handles) h.remove();
@@ -267,6 +275,27 @@ export class DesignLayer {
   focusPicked(): void {
     if (!this.selected) return;
     this.boxElement(this.selected.page, this.selected.key)?.focus({ preventScroll: true });
+  }
+
+  /** Where the keyboard focus is on the picked box, or null when it is not there. */
+  focusState(): DesignFocus | null {
+    if (!this.selected) return null;
+    const box = this.boxElement(this.selected.page, this.selected.key);
+    const active = document.activeElement;
+    if (!box || !(active instanceof HTMLElement) || !box.contains(active)) return null;
+    const handle = active.dataset.handle as Handle | undefined;
+    return { handle: handle ?? null };
+  }
+
+  /** Gives the focus back to the picked box (or the handle of it) after the boxes were made again. Resolves with whether it could. */
+  restoreFocus(state: DesignFocus): boolean {
+    // While a change is under way the layer is inert and takes no focus; it is asked again when it is not.
+    if (!this.selected || this.held) return false;
+    const box = this.boxElement(this.selected.page, this.selected.key);
+    if (!box) return false;
+    const target = (state.handle ? box.querySelector<HTMLElement>(`[data-handle="${state.handle}"]`) : null) ?? box;
+    target.focus({ preventScroll: true });
+    return document.activeElement === target;
   }
 
   destroy(): void {
@@ -320,7 +349,7 @@ export class DesignLayer {
       box.dataset.widget = String(item.widget);
       box.dataset.kind = item.kind;
       box.tabIndex = 0;
-      box.setAttribute("role", "button");
+      box.setAttribute("role", "group");
       box.setAttribute("aria-label", describeWidget(item));
       this.place(box, page, item.rect);
       const label = document.createElement("span");
@@ -335,6 +364,13 @@ export class DesignLayer {
       box.addEventListener("keydown", (e) => this.onBoxKey(e, page, item));
       this.mark(box, page, item, picked);
       state.boxes.append(box);
+    }
+    // A drag whose box was made again (the page was shown again meanwhile) has nothing to follow any
+    // more: it ends, and the pointer is let go, so that the next press starts a new one.
+    if (this.drag && this.drag.page === page && !state.boxes.contains(this.drag.box)) {
+      this.drag = null;
+      this.clearGuides(page);
+      this.events.hint?.("");
     }
     if (focusKey) {
       const el = this.boxElement(page, { name: focusKey.name, widget: focusKey.widget });
@@ -492,6 +528,9 @@ export class DesignLayer {
       return;
     }
     if (e.key === "Escape") {
+      // A tool that places fields is still on (a group of radio buttons being made): Escape ends the
+      // tool first, which the window does, not the pick.
+      if (this.tool !== "select") return;
       e.preventDefault();
       e.stopPropagation();
       this.selected = null;

@@ -110,8 +110,9 @@ function signed(): SignaturesInfo {
   } as unknown as SignaturesInfo;
 }
 
-function make(options: { withDesign?: boolean; signatures?: SignaturesInfo; listed?: DesignWidgetInfo[] } = {}) {
+function make(options: { withDesign?: boolean; signatures?: SignaturesInfo; listed?: DesignWidgetInfo[]; distinctDocs?: boolean } = {}) {
   const state = { listed: options.listed ?? [] };
+  let nextDoc = 0;
   const calls: string[] = [];
   const pages = {
     pagesDelete: vi.fn(() => Promise.resolve(changed())),
@@ -136,7 +137,9 @@ function make(options: { withDesign?: boolean; signatures?: SignaturesInfo; list
         }),
   };
   const api = {
-    open: vi.fn((path: string) => Promise.resolve<OpenedDocument>({ doc: 1, name: path.split("/").pop() ?? "", pages: [letter, letter], position: null })),
+    open: vi.fn((path: string) =>
+      Promise.resolve<OpenedDocument>({ doc: options.distinctDocs ? ++nextDoc : 1, name: path.split("/").pop() ?? "", pages: [letter, letter], position: null }),
+    ),
     render: vi.fn((_d: number, _p: number, w: number, h: number) => Promise.resolve(new ArrayBuffer(w * h * 4))),
     close: vi.fn(() => Promise.resolve()),
     setPosition: vi.fn(() => Promise.resolve()),
@@ -363,5 +366,127 @@ describe("while a page tool works", () => {
     await flush();
     expect(document.querySelector(".design-layer")).not.toBeNull();
     expect((document.querySelector(".design-layer") as HTMLElement).inert).toBe(false);
+  });
+});
+
+describe("the changes of a tab that was left", () => {
+  const tabs = (app: App) => (app as unknown as { tabs: { id: number; doc: number; history: { undoDepth: number } }[] }).tabs;
+
+  it("go to that document and to no other when the reader goes to another tab before the rest is over", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"], shouldAdvanceTime: true });
+    try {
+      const m = make({ distinctDocs: true });
+      await m.app.openPath("/docs/first.pdf");
+      await flush();
+      designButton().click();
+      await flush();
+      $("dtool-text").click();
+      place(300, 400);
+      expect(boxes()).toHaveLength(1);
+      expect(m.pages.designApply?.mock.calls).toHaveLength(0);
+      // The second document is opened (it comes to the front) within the rest.
+      await m.app.openPath("/docs/second.pdf");
+      await flush();
+      vi.advanceTimersByTime(BATCH_REST_MS + 10);
+      await flush();
+      // One call, for the first document. The second document got nothing.
+      expect(m.pages.designApply?.mock.calls.map((c) => c[0])).toEqual([1]);
+      expect(m.pages.designApply?.mock.calls[0][1].map((o: DesignOp) => o.op)).toEqual(["add"]);
+      const [first, second] = tabs(m.app);
+      expect(first.history.undoDepth).toBe(1);
+      expect(second.history.undoDepth).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("go to that document when the rest is over while the other tab is in front", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"], shouldAdvanceTime: true });
+    try {
+      const m = make({ distinctDocs: true });
+      await m.app.openPath("/docs/first.pdf");
+      await flush();
+      designButton().click();
+      await flush();
+      $("dtool-text").click();
+      place(300, 400);
+      // The tab is left through the page tools of the other, which hold the timer of the first back.
+      const first = tabs(m.app)[0];
+      m.pages.designApply?.mockImplementationOnce((d: number, ops: DesignOp[]) => {
+        m.calls.push(`apply:${d}:${ops.length}`);
+        return Promise.resolve(changed(21, ops.length));
+      });
+      await m.app.openPath("/docs/second.pdf");
+      await flush();
+      vi.advanceTimersByTime(BATCH_REST_MS + 10);
+      await flush();
+      expect(m.calls).toEqual(["apply:1:1"]);
+      expect(first.history.undoDepth).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("a field made with the keyboard", () => {
+  it("is placed when a tool button is pressed with Enter, and the reader is told where it is", async () => {
+    const m = make();
+    await openDesigner(m);
+    const button = $<HTMLButtonElement>("dtool-text");
+    button.focus();
+    button.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    button.click();
+    expect(boxes()).toHaveLength(1);
+    expect(document.getElementById("designbar")!.hidden).toBe(false);
+    expect($("dtool-select").getAttribute("aria-pressed")).toBe("true");
+    await (m.app as unknown as { flushForms(): Promise<void> }).flushForms();
+    const ops = m.pages.designApply?.mock.calls[0][1] ?? [];
+    expect(ops[0].op).toBe("add");
+    expect(ops[0].op === "add" && ops[0].field.widgets[0].rect).toEqual([226, 385, 386, 407]);
+  });
+
+  it("takes the tool, and waits for a click on the page, when the button is pressed with the pointer", async () => {
+    const m = make();
+    await openDesigner(m);
+    $("dtool-text").click();
+    expect(boxes()).toHaveLength(0);
+    expect($("dtool-text").getAttribute("aria-pressed")).toBe("true");
+  });
+});
+
+describe("while a file is written", () => {
+  it("nothing is sent to the engine until it is done, and the document stays changed", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"], shouldAdvanceTime: true });
+    try {
+      const m = make();
+      let finish!: () => void;
+      m.api.save.mockImplementationOnce(() => {
+        m.calls.push("save");
+        return new Promise<SavedFile>((resolve) => {
+          finish = () => resolve({ path: "/docs/form.pdf", name: "form.pdf" });
+        });
+      });
+      await openDesigner(m);
+      $("dtool-text").click();
+      place(300, 400);
+      // The first field goes before the file is written, as it always does.
+      keyOn(document.body, "s", { ctrlKey: true });
+      await flush();
+      expect(m.calls).toEqual(["apply:1", "save"]);
+      // Another field is placed while the file is written.
+      $("dtool-text").click();
+      place(300, 500);
+      vi.advanceTimersByTime(BATCH_REST_MS + 10);
+      await flush();
+      expect(m.pages.designApply?.mock.calls).toHaveLength(1);
+      finish();
+      await flush();
+      // Now it goes, after the save.
+      vi.advanceTimersByTime(BATCH_REST_MS + 10);
+      await flush();
+      expect(m.calls).toEqual(["apply:1", "save", "apply:1"]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -8,7 +8,8 @@ import type { DesignTool } from "../viewer/designlayer";
 
 export interface DesignBarHandlers {
   toggle(open: boolean): void;
-  setTool(tool: DesignTool): void;
+  /** `viaKeyboard`: the button was pressed with Enter or Space, so there is no click on a page to come. */
+  setTool(tool: DesignTool, viaKeyboard: boolean): void;
   remove(): void;
   undo(): void;
   redo(): void;
@@ -76,7 +77,19 @@ export class DesignBar {
       const button = byId<HTMLButtonElement>(root, info.id);
       button.title = toolTitle(info.tool);
       this.tools.set(info.tool, button);
-      button.addEventListener("click", () => this.handlers.setTool(info.tool));
+      // A button pressed with the keyboard places a field of the default size in the middle of the page
+      // (there is no pointer to click on the page with); one pressed with the pointer takes the tool.
+      let viaKey = false;
+      button.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") viaKey = true;
+      });
+      button.addEventListener("pointerdown", () => (viaKey = false));
+      button.addEventListener("blur", () => (viaKey = false));
+      button.addEventListener("click", () => {
+        const keyboard = viaKey;
+        viaKey = false;
+        this.handlers.setTool(info.tool, keyboard);
+      });
     }
     this.deleteButton.addEventListener("click", () => this.handlers.remove());
     this.undoButton.addEventListener("click", () => this.handlers.undo());
