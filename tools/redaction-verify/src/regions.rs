@@ -45,7 +45,7 @@ use crate::tools;
 use crate::walk::{
     bounds, matrix_of, numbers, overlaps, Budget, Found, Placement, Source, Target, Walker, M,
 };
-use crate::{Hit, Layer, NeedleKind, Region, Report, Result, Subject, RENDER_DPI, RENDER_MARGIN};
+use crate::{Hit, Layer, Region, Report, Result, Subject, RENDER_DPI, RENDER_MARGIN};
 
 /// The most device pixels one render may have.
 const MAX_RENDER_PIXELS: usize = 80_000_000;
@@ -1201,6 +1201,7 @@ pub fn check(ctx: &Ctx, bytes: &[u8], rep: &mut Report) -> Result<()> {
     }
     let mut cache: Cache = HashMap::new();
     let mut budget = Budget::new(ctx.opts.walk_steps, ctx.opts.walk_budget);
+    let acro = acroform(&doc);
     // The regions of each page, in the order of the spec: a page is walked once.
     let mut by_page: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for (ri, region) in ctx.spec.regions.iter().enumerate() {
@@ -1220,9 +1221,6 @@ pub fn check(ctx: &Ctx, bytes: &[u8], rep: &mut Report) -> Result<()> {
         }
         by_page.entry(region.page).or_default().push(ri);
     }
-    // The glyphs of ordinary fonts are the business of the text layers when the spec has a text to
-    // look for; when it has none, a glyph under a region is a leak.
-    let glyphs_leak = !ctx.spec.needles.iter().any(|n| n.kind == NeedleKind::Text);
     for (page_no, ris) in by_page {
         let (page, res) = &pages[page_no - 1];
         // Nothing is painted outside the media box.
@@ -1247,12 +1245,12 @@ pub fn check(ctx: &Ctx, bytes: &[u8], rep: &mut Report) -> Result<()> {
                 }
             })
             .collect();
-        let mut w = Walker::new(&doc, container, targets, glyphs_leak, budget);
+        let mut w = Walker::new(&doc, container, targets, budget);
         match contents(&doc, page) {
             Ok(data) => w.page(&data, &doc.resolve(res).clone()),
             Err(why) => w.problem(why),
         }
-        annotations(&mut w, page, container);
+        annotations(&mut w, page, container, &doc.resolve(res).clone(), &acro);
         budget = w.budget;
         for p in w.problems.drain(..) {
             rep.problems.push(format!("images: page {page_no}: {p}"));
@@ -1375,7 +1373,12 @@ fn has_entry_text(doc: &Doc, ad: &Obj, depth: usize) -> bool {
         Obj::Array(a) => !a.is_empty(),
         Obj::Dict(_) | Obj::Ref(_) => true,
     };
-    if TEXT_KEYS.iter().any(|k| ad.get(k).is_some_and(text)) {
+    // The caption of a button is text too.
+    let caption = ad
+        .get("MK")
+        .and_then(|m| doc.resolve(m).get("CA"))
+        .is_some_and(text);
+    if caption || TEXT_KEYS.iter().any(|k| ad.get(k).is_some_and(text)) {
         return true;
     }
     depth < 2
@@ -1384,13 +1387,46 @@ fn has_entry_text(doc: &Doc, ad: &Obj, depth: usize) -> bool {
             .is_some_and(|p| has_entry_text(doc, doc.resolve(p), depth + 1))
 }
 
+/// The form of the document (`/AcroForm` of the catalog), or null.
+fn acroform(doc: &Doc) -> Obj {
+    let root = doc
+        .trailers()
+        .iter()
+        .rev()
+        .find_map(|t| match t.get("Root") {
+            Some(Obj::Ref(n)) => Some(*n),
+            _ => None,
+        })
+        .and_then(|n| doc.latest(n));
+    root.map(|r| doc.dget(&r.value, "AcroForm").clone())
+        .unwrap_or(Obj::Null)
+}
+
+/// Whether a stream holds no content at all (an appearance that draws nothing).
+fn blank_form(doc: &Doc, n: u32) -> bool {
+    doc.latest(n)
+        .and_then(|e| doc.stream_data(e))
+        .is_some_and(|d| d.problem.is_none() && d.data.iter().all(|b| crate::strings::is_space(*b)))
+}
+
 /// Walks every form that a viewer can draw for an annotation: all states of the normal, rollover
 /// and down appearances, and the icons of a widget (`/MK /I`, `/RI`, `/IX`), each fitted to the
-/// rectangle of the annotation as a viewer does.
-fn annotations(w: &mut Walker, page: &Entry, container: [f64; 4]) {
+/// rectangle of the annotation as a viewer does. A form with no resources of its own uses those of
+/// the page, and then the default resources of the document form.
+///
+/// A widget that a viewer draws again from its value (the form says `/NeedAppearances true`, or the
+/// widget has no appearance, or an empty one) has the text of its value drawn in its rectangle: a
+/// leak when it has text and meets a region, "could not check" when it has none.
+fn annotations(w: &mut Walker, page: &Entry, container: [f64; 4], page_res: &Obj, acro: &Obj) {
     let doc = w.doc();
     let Obj::Array(annots) = doc.dget(&page.value, "Annots") else {
         return;
+    };
+    let need_app = matches!(doc.dget(acro, "NeedAppearances"), Obj::Bool(true));
+    let fallback = if page_res.is_dict() && !page_res.entries().is_empty() {
+        page_res.clone()
+    } else {
+        doc.dget(acro, "DR").clone()
     };
     for a in annots {
         let ad = doc.resolve(a);
@@ -1410,10 +1446,26 @@ fn annotations(w: &mut Walker, page: &Entry, container: [f64; 4]) {
             }
         }
         let rect = ad.get("Rect").map(|r| numbers(r, doc)).unwrap_or_default();
+        let sub = doc.dget(ad, "Subtype").name().unwrap_or("");
+        let text = has_entry_text(doc, ad, 0);
+        // A widget that a viewer draws again from its value.
+        let blank = forms.iter().all(|n| blank_form(doc, *n));
+        let redrawn = sub == "Widget" && (need_app || blank);
+        if redrawn && !rect.is_empty() {
+            if rect.len() != 4 {
+                w.problem("a widget that is drawn again from its value has no usable /Rect, so where its text is drawn is not known".to_owned());
+                continue;
+            }
+            let r = normalised([rect[0], rect[1], rect[2], rect[3]]);
+            if text {
+                w.bare_text.push((r, sub.to_owned()));
+            } else if need_app || forms.is_empty() {
+                w.bare.push((r, sub.to_owned()));
+            }
+        }
         if forms.is_empty() {
             // No appearance stream: a viewer draws these from their own entries.
-            let sub = doc.dget(ad, "Subtype").name().unwrap_or("");
-            if !DRAWN_BY_VIEWER.contains(&sub) {
+            if !DRAWN_BY_VIEWER.contains(&sub) || (redrawn && !rect.is_empty()) {
                 continue;
             }
             if rect.len() != 4 {
@@ -1423,7 +1475,7 @@ fn annotations(w: &mut Walker, page: &Entry, container: [f64; 4]) {
                 continue;
             }
             let r = normalised([rect[0], rect[1], rect[2], rect[3]]);
-            if has_entry_text(doc, ad, 0) {
+            if text {
                 w.bare_text.push((r, sub.to_owned()));
             } else {
                 w.bare.push((r, sub.to_owned()));
@@ -1475,7 +1527,7 @@ fn annotations(w: &mut Walker, page: &Entry, container: [f64; 4]) {
                 .value
                 .get("Resources")
                 .map(|r| doc.resolve(r).clone())
-                .unwrap_or(Obj::Null);
+                .unwrap_or_else(|| fallback.clone());
             w.appearance(n, &res, a_m, container);
         }
     }

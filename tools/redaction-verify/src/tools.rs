@@ -98,32 +98,117 @@ fn program(var: &str, name: &str) -> String {
     std::env::var(var).unwrap_or_else(|_| name.to_owned())
 }
 
-/// Stops everything that a tool started: the processes of its group on Unix (the tool leads a
-/// group of its own), its tree on Windows.
-fn kill_tree(pid: u32) {
-    #[cfg(unix)]
-    {
-        let _ = Command::new("kill")
-            .args(["-KILL", "--", &format!("-{pid}")])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+/// A Windows job object that holds a tool and everything it starts, so that all of them can be
+/// ended at once, whatever they do with their parents. It also ends them when the handle is closed.
+#[cfg(windows)]
+mod job {
+    use std::process::Child;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    pub struct Job(HANDLE);
+
+    impl Job {
+        /// A job that kills its processes when it is closed, with the child in it. `None` when
+        /// the system refuses; the caller falls back to ending the tree by process number.
+        pub fn holding(child: &Child) -> Option<Job> {
+            use std::os::windows::io::AsRawHandle;
+            // SAFETY: plain calls into the Win32 API with a handle that this function creates and
+            // owns (closed by `Drop`), a zeroed information block of the type the call names, and
+            // the raw handle of a child that is alive and owned by `child`.
+            unsafe {
+                let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if h.is_null() {
+                    return None;
+                }
+                let job = Job(h);
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                let set = SetInformationJobObject(
+                    h,
+                    JobObjectExtendedLimitInformation,
+                    std::ptr::addr_of!(info).cast(),
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                );
+                if set == 0 || AssignProcessToJobObject(h, child.as_raw_handle() as HANDLE) == 0 {
+                    return None;
+                }
+                Some(job)
+            }
+        }
+
+        /// Ends every process of the job.
+        pub fn terminate(&self) {
+            // SAFETY: the handle is a job object that this value owns.
+            unsafe {
+                TerminateJobObject(self.0, 1);
+            }
+        }
     }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // SAFETY: the handle is owned by this value and closed once.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+/// What ends a tool and everything it started: its process group on Unix, a job object on Windows
+/// (or its process tree by `taskkill` where no job could be made).
+struct Tree {
+    pid: u32,
     #[cfg(windows)]
-    {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+    job: Option<job::Job>,
+}
+
+impl Tree {
+    fn of(child: &std::process::Child) -> Tree {
+        Tree {
+            pid: child.id(),
+            #[cfg(windows)]
+            job: job::Job::holding(child),
+        }
     }
-    #[cfg(not(any(unix, windows)))]
-    let _ = pid;
+
+    /// Stops everything that the tool started that is still running.
+    fn stop(&self) {
+        #[cfg(unix)]
+        {
+            let _ = Command::new("kill")
+                .args(["-KILL", "--", &format!("-{}", self.pid)])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        #[cfg(windows)]
+        {
+            match &self.job {
+                Some(j) => j.terminate(),
+                None => {
+                    let _ = Command::new("taskkill")
+                        .args(["/PID", &self.pid.to_string(), "/T", "/F"])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                }
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        let _ = self.pid;
+    }
 }
 
 /// Stops the child and everything it started.
-fn kill(child: &mut std::process::Child) {
-    kill_tree(child.id());
+fn kill(child: &mut std::process::Child, tree: &Tree) {
+    tree.stop();
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -175,6 +260,7 @@ fn run(var: &str, name: &str, args: &[&OsStr]) -> Result<Output, Error> {
              or {var} set to the program"
         ))
     })?;
+    let tree = Tree::of(&child);
     // The output is read while the tool runs, or a tool that writes a lot would block.
     let (tx, rx) = mpsc::channel::<(bool, Vec<u8>)>();
     let pipes: [(bool, Option<Box<dyn Read + Send>>); 2] = [
@@ -206,7 +292,7 @@ fn run(var: &str, name: &str, args: &[&OsStr]) -> Result<Output, Error> {
     drop(tx);
     let started = Instant::now();
     let timed_out = |child: &mut std::process::Child| {
-        kill(child);
+        kill(child, &tree);
         stop(if by_budget {
             format!(
                 "the time budget of {} s for this file ran out while {prog} was running, and it was killed ({FILE_BUDGET_VAR} or --file-budget sets the budget); the file was not fully checked",
@@ -231,7 +317,7 @@ fn run(var: &str, name: &str, args: &[&OsStr]) -> Result<Output, Error> {
                 wait = (wait * 2).min(Duration::from_millis(25));
             }
             Err(e) => {
-                kill(&mut child);
+                kill(&mut child, &tree);
                 return Err(Error(format!("cannot wait for {prog}: {e}")));
             }
         }
@@ -246,9 +332,9 @@ fn run(var: &str, name: &str, args: &[&OsStr]) -> Result<Output, Error> {
             Err(_) => return Err(timed_out(&mut child)),
         }
     }
-    // Whatever the tool left running in its group (a child that holds no pipe) is stopped too.
-    #[cfg(unix)]
-    kill_tree(child.id());
+    // Whatever the tool left running in its group or job (a child that holds no pipe) is stopped
+    // too.
+    tree.stop();
     Ok(Output {
         status: status.code().unwrap_or(-1),
         stdout,

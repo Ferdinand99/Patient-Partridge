@@ -41,6 +41,10 @@ pub enum Operand {
     Str(Vec<u8>),
     Array(Vec<Operand>),
     Other,
+    /// A token that a strict reader refuses: a number with a stray sign or letter, a name with a
+    /// bad escape, a string that does not end. Poppler reads some of these as something, and the
+    /// tool does not try to guess which: the content is "could not check".
+    Bad,
 }
 
 /// One operator with its operands.
@@ -55,6 +59,8 @@ pub struct Op<'a> {
     /// For `BI`: where the data of the image ends is in doubt (no length that fits, and no `EI`
     /// that the content after it confirms), so what follows may have been read wrongly.
     pub inline_unsure: bool,
+    /// An operand is [`Operand::Bad`] (also inside an array).
+    pub bad: bool,
 }
 
 impl Op<'_> {
@@ -76,24 +82,67 @@ impl Op<'_> {
     }
 }
 
-fn unescape(raw: &[u8]) -> Vec<u8> {
+/// The bytes of a name with its `#xx` escapes undone; `None` when a `#` is not followed by two
+/// hex digits.
+fn unescape(raw: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(raw.len());
     let mut j = 0;
     while j < raw.len() {
-        if raw[j] == b'#' && j + 2 < raw.len() {
-            if let Some(v) = std::str::from_utf8(&raw[j + 1..j + 3])
-                .ok()
-                .and_then(|h| u8::from_str_radix(h, 16).ok())
-            {
-                out.push(v);
-                j += 3;
-                continue;
-            }
+        if raw[j] == b'#' {
+            let v = raw
+                .get(j + 1..j + 3)
+                .and_then(|h| std::str::from_utf8(h).ok())
+                .filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))
+                .and_then(|h| u8::from_str_radix(h, 16).ok())?;
+            out.push(v);
+            j += 3;
+            continue;
         }
         out.push(raw[j]);
         j += 1;
     }
-    out
+    Some(out)
+}
+
+fn name(raw: &[u8]) -> Operand {
+    unescape(raw).map_or(Operand::Bad, Operand::Name)
+}
+
+fn is_bad(o: &Operand) -> bool {
+    match o {
+        Operand::Bad => true,
+        Operand::Array(a) => a.iter().any(is_bad),
+        _ => false,
+    }
+}
+
+/// A number as the grammar of PDF has it: an optional sign, digits with at most one point, at
+/// least one digit, and nothing else. Poppler's lexer ends a number at a second sign and skips a
+/// minus after the point, so it reads `1+19000` as two numbers and `110.-0` as 110; this reads
+/// them as what they are, a token that is not a number.
+pub fn strict_number(tok: &[u8]) -> Option<f64> {
+    let mut i = 0;
+    if matches!(tok.first(), Some(b'+' | b'-')) {
+        i = 1;
+    }
+    let digits = |from: usize| {
+        tok[from..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count()
+    };
+    let int = digits(i);
+    i += int;
+    let mut frac = 0;
+    if tok.get(i) == Some(&b'.') {
+        i += 1;
+        frac = digits(i);
+        i += frac;
+    }
+    if i != tok.len() || int + frac == 0 {
+        return None;
+    }
+    std::str::from_utf8(tok).ok()?.parse::<f64>().ok()
 }
 
 fn token_end(buf: &[u8], mut i: usize) -> usize {
@@ -130,10 +179,7 @@ fn skip_dict(buf: &[u8], i: usize) -> usize {
 }
 
 fn number(tok: &[u8]) -> Operand {
-    std::str::from_utf8(tok)
-        .ok()
-        .and_then(|t| t.parse::<f64>().ok())
-        .map_or(Operand::Other, Operand::Num)
+    strict_number(tok).map_or(Operand::Bad, Operand::Num)
 }
 
 fn parse_array(buf: &[u8], mut i: usize, depth: usize) -> (Vec<Operand>, usize) {
@@ -149,7 +195,10 @@ fn parse_array(buf: &[u8], mut i: usize, depth: usize) -> (Vec<Operand>, usize) 
                     items.push(Operand::Str(b));
                     i = e;
                 }
-                None => i += 1,
+                None => {
+                    items.push(Operand::Bad);
+                    i += 1;
+                }
             },
             b'<' if buf.get(i + 1) == Some(&b'<') => {
                 items.push(Operand::Other);
@@ -160,7 +209,10 @@ fn parse_array(buf: &[u8], mut i: usize, depth: usize) -> (Vec<Operand>, usize) 
                     items.push(Operand::Str(b));
                     i = e;
                 }
-                None => i += 1,
+                None => {
+                    items.push(Operand::Bad);
+                    i += 1;
+                }
             },
             b'[' if depth < 8 => {
                 let (inner, e) = parse_array(buf, i + 1, depth + 1);
@@ -169,7 +221,7 @@ fn parse_array(buf: &[u8], mut i: usize, depth: usize) -> (Vec<Operand>, usize) 
             }
             b'/' => {
                 let e = token_end(buf, i + 1);
-                items.push(Operand::Name(unescape(&buf[i + 1..e])));
+                items.push(name(&buf[i + 1..e]));
                 i = e;
             }
             _ if is_delim(c) => i += 1,
@@ -202,6 +254,14 @@ pub fn has_unsure_inline_image(buf: &[u8]) -> bool {
     unsure
 }
 
+/// Whether some operand of the content is a token that a strict reader refuses (see
+/// [`Operand::Bad`]).
+pub fn has_bad_operand(buf: &[u8]) -> bool {
+    let mut bad = false;
+    for_each_op(buf, &mut |op| bad |= op.bad);
+    bad
+}
+
 /// Calls `f` for each operator of the content stream `buf` until it returns `false`.
 pub fn for_each_op_while<'a>(buf: &'a [u8], f: &mut dyn FnMut(&Op<'a>) -> bool) {
     let n = buf.len();
@@ -227,7 +287,11 @@ pub fn for_each_op_while<'a>(buf: &'a [u8], f: &mut dyn FnMut(&Op<'a>) -> bool) 
                     args.push(Operand::Str(b));
                     i = e;
                 }
-                None => i += 1,
+                None => {
+                    first.get_or_insert(start);
+                    args.push(Operand::Bad);
+                    i += 1;
+                }
             },
             b'<' if buf.get(i + 1) == Some(&b'<') => {
                 first.get_or_insert(start);
@@ -240,7 +304,11 @@ pub fn for_each_op_while<'a>(buf: &'a [u8], f: &mut dyn FnMut(&Op<'a>) -> bool) 
                     args.push(Operand::Str(b));
                     i = e;
                 }
-                None => i += 1,
+                None => {
+                    first.get_or_insert(start);
+                    args.push(Operand::Bad);
+                    i += 1;
+                }
             },
             b'[' => {
                 first.get_or_insert(start);
@@ -251,7 +319,7 @@ pub fn for_each_op_while<'a>(buf: &'a [u8], f: &mut dyn FnMut(&Op<'a>) -> bool) 
             b'/' => {
                 first.get_or_insert(start);
                 let e = token_end(buf, i + 1);
-                args.push(Operand::Name(unescape(&buf[i + 1..e])));
+                args.push(name(&buf[i + 1..e]));
                 i = e;
             }
             _ if is_delim(c) => i += 1,
@@ -279,14 +347,17 @@ pub fn for_each_op_while<'a>(buf: &'a [u8], f: &mut dyn FnMut(&Op<'a>) -> bool) 
                         offset,
                         inline: Some((img.dict, img.data)),
                         inline_unsure: img.unsure,
+                        bad: false,
                     })
                 } else {
+                    let args_bad = args.iter().any(is_bad);
                     f(&Op {
                         name: tok,
                         args: std::mem::take(&mut args),
                         offset,
                         inline: None,
                         inline_unsure: false,
+                        bad: args_bad,
                     })
                 };
                 if !go {
@@ -734,5 +805,37 @@ mod tests {
         assert!(ops[0].1);
         assert!(has_unsure_inline_image(b"BI /W 1 /H 1 /F /Fl ID abcdef"));
         assert!(!has_unsure_inline_image(b"BI /W 1 /H 1 /F /Fl ID abc EI Q"));
+    }
+
+    #[test]
+    fn a_number_is_a_number_as_the_grammar_has_it() {
+        for ok in [
+            "0", "12", "+5", "-5", "5.", ".5", "-.5", "+.5", "0.25", "007",
+        ] {
+            assert!(strict_number(ok.as_bytes()).is_some(), "{ok}");
+        }
+        assert_eq!(strict_number(b"-.5"), Some(-0.5));
+        // Poppler reads the first as two numbers and the second as 110.
+        for bad in [
+            "1+19000", "110.-0", "--1", "1e5", "+", "-", ".", "1.2.3", "0x10", "+nan", "inf", "1_0",
+        ] {
+            assert!(strict_number(bad.as_bytes()).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_token_that_does_not_parse_cleanly_marks_the_operator() {
+        let bad = |s: &[u8]| has_bad_operand(s);
+        assert!(bad(b"BT [(X) 1+19000 (Y)] TJ ET"));
+        assert!(bad(b"BT 110.-0 Ts ET"));
+        assert!(bad(b"BT /F#1 12 Tf ET"));
+        assert!(bad(b"BT /F#zz 12 Tf ET"));
+        assert!(bad(b"BT (never ends Tj ET"));
+        assert!(bad(b"BT <00zz> Tj ET"));
+        assert!(!bad(
+            br"BT /F#31 12 Tf [(X) -20.5 (Y)] TJ (a\)b) Tj <0041> Tj ET"
+        ));
+        // An operator that is not known is no operand.
+        assert!(!bad(b"BX /Foo 1 2 zork EX"));
     }
 }

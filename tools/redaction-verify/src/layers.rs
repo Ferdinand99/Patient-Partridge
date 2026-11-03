@@ -507,6 +507,11 @@ impl Pass<'_, '_> {
                 "decode: {place} has an inline image whose end is not certain (no length that fits, and no EI that the content after it confirms), so the text after it may not have been read"
             ));
         }
+        if self.ctx.on(Layer::Decode) && crate::content::has_bad_operand(data) {
+            self.rep.problem(format!(
+                "decode: {place} has an operand that is not a clean PDF token (a number with a stray sign or letter, a name with a bad escape, a string that does not end), and a viewer may read it differently, so the text may not have been read as it is drawn"
+            ));
+        }
         let pieces = textdec::pieces(data);
         if !pieces
             .iter()

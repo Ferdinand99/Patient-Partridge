@@ -36,7 +36,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use crate::content::{apply, for_each_op_while, mul, shown, Matrix, Op, ShownItem, IDENTITY};
+use crate::content::{
+    apply, for_each_op_while, mul, shown, Matrix, Op, Operand, ShownItem, IDENTITY,
+};
 use crate::pdfobj::{Doc, Entry, Obj};
 use crate::{RENDER_DPI, RENDER_MARGIN};
 
@@ -191,11 +193,8 @@ enum Class {
     FillStroke,
     Shading,
     Clip,
-    /// A glyph. `paints`: the glyph procedure of a Type 3 font that paints, which is geometry
-    /// that no text layer reads.
-    Glyph {
-        paints: bool,
-    },
+    /// A glyph of any font.
+    Glyph,
 }
 
 /// The shape of a painted path, as far as the exceptions need it.
@@ -220,6 +219,13 @@ struct Event {
     width: f64,
     clip: ([f64; 4], bool),
     smask: bool,
+    /// The stroke has a dash pattern: it puts ink only where the pattern says.
+    dashed: bool,
+    /// The state has a constant alpha below 1 or a blend mode other than Normal.
+    translucent: bool,
+    /// A glyph whose place is known: it counts when the centre of its cell is inside a region.
+    /// Every other event counts when its box meets the region.
+    centre: bool,
 }
 
 /// The graphics state.
@@ -234,6 +240,10 @@ struct Gs {
     clip_box: [f64; 4],
     clip_exact: bool,
     smask: bool,
+    /// The dash pattern is not solid (`d`, or `/D` of a state).
+    dashed: bool,
+    /// A constant alpha below 1 (`/ca`, `/CA`) or a blend mode other than Normal (`/BM`).
+    translucent: bool,
     // The text state.
     font: Option<Rc<Font>>,
     size: f64,
@@ -256,6 +266,8 @@ impl Gs {
             clip_box,
             clip_exact: true,
             smask: false,
+            dashed: false,
+            translucent: false,
             font: None,
             size: 0.0,
             char_space: 0.0,
@@ -282,6 +294,9 @@ struct PathState {
     segs: Vec<[f64; 4]>,
     cur: Option<(f64, f64)>,
     start: Option<(f64, f64)>,
+    /// The subpath that is open has a segment (a subpath of one point still paints a dot with
+    /// round or square caps).
+    sub_segs: bool,
 }
 
 impl PathState {
@@ -290,6 +305,24 @@ impl PathState {
             self.segs.push([c.0, c.1, p.0, p.1]);
         }
         self.cur = Some(p);
+        self.sub_segs = true;
+    }
+
+    /// `m`: a new subpath. The one before it, if it had no segment, is a point.
+    fn move_to(&mut self, p: (f64, f64)) {
+        self.finish_subpath();
+        self.cur = Some(p);
+        self.start = Some(p);
+        self.sub_segs = false;
+    }
+
+    /// The open subpath ends: a subpath with no segment is a zero-length segment, because a
+    /// stroke with round or square caps paints a dot there.
+    fn finish_subpath(&mut self) {
+        if let (Some(s), false) = (self.start, self.sub_segs) {
+            self.segs.push([s.0, s.1, s.0, s.1]);
+            self.sub_segs = true;
+        }
     }
 }
 
@@ -315,6 +348,7 @@ fn close_path(p: &mut PathState) {
     if let (Some(c), Some(s)) = (p.cur, p.start) {
         if c != s {
             p.segs.push([c.0, c.1, s.0, s.1]);
+            p.sub_segs = true;
         }
         p.cur = Some(s);
     }
@@ -414,8 +448,12 @@ enum FontKind {
 /// of the text space for a font size of 1.
 pub struct Font {
     kind: FontKind,
-    /// Type 3: some glyph procedure paints a path or a shading.
-    paints: bool,
+    /// Type 3: the glyph procedure of each code that has one (object numbers), the matrix of the
+    /// glyph space, the resources of the font, and what stops the procedures from being placed.
+    procs: HashMap<u32, u32>,
+    t3_matrix: M,
+    t3_res: Option<Obj>,
+    problem: Option<String>,
     /// The bounding box of the glyphs, if the font has a plausible one.
     bbox: Option<[f64; 4]>,
     first: i64,
@@ -447,7 +485,10 @@ impl Font {
     fn plain() -> Font {
         Font {
             kind: FontKind::Simple,
-            paints: false,
+            procs: HashMap::new(),
+            t3_matrix: [0.001, 0.0, 0.0, 0.001, 0.0, 0.0],
+            t3_res: None,
+            problem: None,
             bbox: None,
             first: 0,
             widths: Vec::new(),
@@ -522,8 +563,6 @@ pub struct Walker<'a, 'd> {
     pub targets: Vec<Target>,
     /// What met each target.
     pub found: Vec<Found>,
-    /// Glyphs of ordinary fonts are leaks too (the spec has no text to look for).
-    glyphs_leak: bool,
     pub out: Vec<Placement>,
     pub problems: Vec<String>,
     /// The bounds of the page, form, pattern or glyph that is being walked, in points: nothing
@@ -532,6 +571,10 @@ pub struct Walker<'a, 'd> {
     /// Where in the file the walk is, for the places in messages.
     trail: Vec<String>,
     fonts: HashMap<u32, Rc<Font>>,
+    /// The decoded glyph procedures of Type 3 fonts, by object number.
+    procs: HashMap<u32, Option<Rc<Vec<u8>>>>,
+    /// Whether a tiling pattern draws an image, by object number.
+    patterns: HashMap<u32, bool>,
     /// Annotations that a viewer draws from their own entries (an ink path, a line) because they
     /// have no appearance stream: their rectangle and subtype.
     pub bare: Vec<([f64; 4], String)>,
@@ -560,7 +603,6 @@ impl<'a, 'd> Walker<'a, 'd> {
         doc: &'a Doc<'d>,
         container: [f64; 4],
         targets: Vec<Target>,
-        glyphs_leak: bool,
         budget: Budget,
     ) -> Self {
         let found = targets.iter().map(|_| Found::default()).collect();
@@ -568,12 +610,13 @@ impl<'a, 'd> Walker<'a, 'd> {
             doc,
             targets,
             found,
-            glyphs_leak,
             out: Vec::new(),
             problems: Vec::new(),
             container,
             trail: Vec::new(),
             fonts: HashMap::new(),
+            procs: HashMap::new(),
+            patterns: HashMap::new(),
             bare: Vec::new(),
             bare_text: Vec::new(),
             budget,
@@ -637,7 +680,8 @@ impl<'a, 'd> Walker<'a, 'd> {
     /// Whether `e` is geometry that carries nothing about the region `t`.
     fn is_free(&self, e: &Event, t: &Target) -> bool {
         match e.class {
-            Class::Glyph { paints } => !paints && !self.glyphs_leak,
+            // A glyph of a known place counts by its centre (see emit_segs), the others by their box.
+            Class::Glyph => false,
             Class::Shading => false,
             Class::Clip => matches!(e.shape, Shape::Rect(r) if holds(&r, &t.rect, BOX_TOLERANCE)),
             Class::FillStroke => false,
@@ -658,12 +702,16 @@ impl<'a, 'd> Walker<'a, 'd> {
                                 .is_none_or(|f| c.iter().zip(&f).all(|(a, b)| a.abs_diff(*b) <= 2));
                         // One colour over the whole region, or a thin strip across it.
                         let covers = holds(&r, &t.rect, BOX_TOLERANCE);
-                        is_box || covers || crosses_thin_rect(&r, &t.rect)
+                        let strip = crosses_thin_rect(&r, &t.rect)
+                            .is_some_and(|horizontal| rule_is_plain(e, &t.rect, horizontal));
+                        is_box || covers || strip
                     }
                     (Class::Stroke, Shape::Line(l)) => {
                         matches!(e.stroke, Colour::Rgb(_))
                             && e.width <= THIN
+                            && !e.dashed
                             && crosses_line(&l, &t.rect)
+                                .is_some_and(|horizontal| rule_is_plain(e, &t.rect, horizontal))
                     }
                     _ => false,
                 }
@@ -681,7 +729,7 @@ impl<'a, 'd> Walker<'a, 'd> {
     fn emit_segs(&mut self, e: Event, segs: &[[f64; 4]], reach: f64) {
         if e.bbox.iter().any(|v| !v.is_finite()) {
             let what = match e.class {
-                Class::Glyph { .. } => "text",
+                Class::Glyph => "text",
                 _ => "a path",
             };
             self.problem(format!(
@@ -694,6 +742,14 @@ impl<'a, 'd> Walker<'a, 'd> {
             let t = self.targets[i].clone();
             if !overlaps(&e.bbox, &t.rect) {
                 continue;
+            }
+            // A glyph of a known place is in the region when the centre of its cell is. The ink of a
+            // glyph that straddles the edge, with less than half of its cell inside, is not counted.
+            if e.class == Class::Glyph && e.centre {
+                let (cx, cy) = ((e.bbox[0] + e.bbox[2]) / 2.0, (e.bbox[1] + e.bbox[3]) / 2.0);
+                if cx < t.rect[0] || cx > t.rect[2] || cy < t.rect[1] || cy > t.rect[3] {
+                    continue;
+                }
             }
             if !segs.is_empty() {
                 let wide = [
@@ -796,6 +852,9 @@ impl<'a, 'd> Walker<'a, 'd> {
                 width,
                 clip: (gs.clip_box, gs.clip_exact),
                 smask: gs.smask,
+                dashed: gs.dashed,
+                translucent: gs.translucent,
+                centre: false,
             },
             segs,
             reach,
@@ -825,6 +884,9 @@ impl<'a, 'd> Walker<'a, 'd> {
             width: 0.0,
             clip: (gs.clip_box, gs.clip_exact),
             smask: gs.smask,
+            dashed: gs.dashed,
+            translucent: gs.translucent,
+            centre: false,
         });
         let g = &mut f.gs;
         g.clip_box = [
@@ -874,6 +936,9 @@ impl<'a, 'd> Walker<'a, 'd> {
             width: 0.0,
             clip: (gs.clip_box, gs.clip_exact),
             smask: gs.smask,
+            dashed: gs.dashed,
+            translucent: gs.translucent,
+            centre: false,
         });
     }
 
@@ -901,6 +966,13 @@ impl<'a, 'd> Walker<'a, 'd> {
             if op.inline_unsure {
                 self.problem(format!(
                     "an inline image in {} has an end that is not certain (no length that fits, and no EI that the content after it confirms), so the content after it may have been read wrongly",
+                    self.place()
+                ));
+            }
+            if op.bad {
+                self.problem(format!(
+                    "an operand of the operator {} in {} is not a clean PDF token (a number with a stray sign or letter, a name with a bad escape, a string that does not end), and a viewer may read it differently, so the content was not checked",
+                    String::from_utf8_lossy(op.name),
                     self.place()
                 ));
             }
@@ -985,8 +1057,7 @@ impl<'a, 'd> Walker<'a, 'd> {
                     f.path.pts.push(p);
                     if op.name == b"m" {
                         f.path.moves += 1;
-                        f.path.cur = Some(p);
-                        f.path.start = Some(p);
+                        f.path.move_to(p);
                     } else {
                         f.path.lines += 1;
                         f.path.line_to(p);
@@ -1002,6 +1073,7 @@ impl<'a, 'd> Walker<'a, 'd> {
                     }
                     f.path.curves += 1;
                     f.path.cur = f.path.pts.last().copied();
+                    f.path.sub_segs = true;
                 } else {
                     self.malformed("a path operator");
                 }
@@ -1013,6 +1085,7 @@ impl<'a, 'd> Walker<'a, 'd> {
                     }
                     f.path.curves += 1;
                     f.path.cur = f.path.pts.last().copied();
+                    f.path.sub_segs = true;
                 } else {
                     self.malformed("a path operator");
                 }
@@ -1027,6 +1100,7 @@ impl<'a, 'd> Walker<'a, 'd> {
                         apply(&f.gs.ctm, x + w, y + h),
                         apply(&f.gs.ctm, x, y + h),
                     ];
+                    f.path.finish_subpath();
                     f.path.pts.extend_from_slice(&c);
                     for i in 0..4 {
                         let (a, b) = (c[i], c[(i + 1) % 4]);
@@ -1035,6 +1109,7 @@ impl<'a, 'd> Walker<'a, 'd> {
                     f.path.rects += 1;
                     f.path.cur = Some(c[0]);
                     f.path.start = Some(c[0]);
+                    f.path.sub_segs = true;
                 } else {
                     self.malformed("a path operator");
                 }
@@ -1074,14 +1149,31 @@ impl<'a, 'd> Walker<'a, 'd> {
                 }
             }
             b"Do" => {
-                let Some(name) = op.name_arg() else { return };
+                let Some(name) = op.name_arg() else {
+                    self.problem(format!(
+                        "a Do operator in {} has no name, so what it draws is not known",
+                        self.place()
+                    ));
+                    return;
+                };
                 let name: String = name.iter().map(|b| char::from(*b)).collect();
                 let xo = self.doc.dget(f.res, "XObject");
                 let Some(Obj::Ref(n)) = self.doc.resolve(xo).get(&name) else {
+                    self.problem(format!(
+                        "the XObject /{name} drawn in {} cannot be found in the resources, so what it draws is not known",
+                        self.place()
+                    ));
                     return;
                 };
                 let n = *n;
                 self.xobject(n, f.res, &f.gs, f.depth);
+            }
+            // The dash pattern: a line that is dashed puts ink only where the pattern says.
+            b"d" => {
+                f.gs.dashed = op.args.iter().any(|a| match a {
+                    Operand::Array(items) => dash_array_is_dashed(items),
+                    _ => false,
+                });
             }
             b"gs" => self.ext_gstate(f, op),
             // Text.
@@ -1150,6 +1242,7 @@ impl<'a, 'd> Walker<'a, 'd> {
     }
 
     fn painted(&mut self, f: &mut Frame, class: Class) {
+        f.path.finish_subpath();
         self.paint_path(f, class);
         if f.pending_clip {
             self.apply_clip(f);
@@ -1158,9 +1251,53 @@ impl<'a, 'd> Walker<'a, 'd> {
     }
 
     fn ext_gstate(&mut self, f: &mut Frame, op: &Op) {
-        let Some(name) = op.name_arg() else { return };
+        let Some(name) = op.name_arg() else {
+            self.problem(format!(
+                "a gs operator in {} has no name, so the state it sets is not known",
+                self.place()
+            ));
+            return;
+        };
         let name: String = name.iter().map(|b| char::from(*b)).collect();
         let state = self.doc.dget(self.doc.dget(f.res, "ExtGState"), &name);
+        if !state.is_dict() {
+            self.problem(format!(
+                "the graphics state /{name} set in {} cannot be found, so the state it sets is not known",
+                self.place()
+            ));
+            return;
+        }
+        // The dash pattern, the constant alpha and the blend mode decide whether a rule carries
+        // only its position.
+        if let Some(a) = self.doc.dget(state, "D").array() {
+            if let Some(Obj::Array(items)) = a.first().map(|x| self.doc.resolve(x)) {
+                let ops: Vec<Operand> = items
+                    .iter()
+                    .map(|x| self.doc.resolve(x).num().map_or(Operand::Bad, Operand::Num))
+                    .collect();
+                f.gs.dashed = dash_array_is_dashed(&ops);
+            }
+        }
+        for key in ["ca", "CA"] {
+            if self.doc.dget(state, key).num().is_some_and(|v| v < 1.0) {
+                f.gs.translucent = true;
+            }
+        }
+        if let Some(bm) = state.get("BM").map(|b| self.doc.resolve(b)) {
+            let normal = match bm {
+                Obj::Name(n) => matches!(n.as_str(), "Normal" | "Compatible"),
+                Obj::Array(a) => a.first().is_some_and(|x| {
+                    matches!(
+                        self.doc.resolve(x).name(),
+                        Some("Normal") | Some("Compatible")
+                    )
+                }),
+                _ => false,
+            };
+            if !normal {
+                f.gs.translucent = true;
+            }
+        }
         if let Some(w) = self.doc.dget(state, "LW").num() {
             f.gs.line_width = w;
         }
@@ -1199,6 +1336,13 @@ impl<'a, 'd> Walker<'a, 'd> {
     /// Shown text: every glyph is an event at its place. The position follows the text matrix, the
     /// advance of each glyph, the spacing, the scale and the kerning of a `TJ`. Where the width of
     /// a glyph is not known, the position is an interval, and the box covers it.
+    ///
+    /// The cell of a glyph is the larger of what the font says (the advance, the bounding box) and
+    /// a floor that does not depend on the file: one em square from the origin, at the font size,
+    /// scaled by the horizontal scale and the matrices. A font that the file describes can say
+    /// anything about its metrics, and a viewer that does not embed the font uses its own. The
+    /// standard fonts that the file does not describe have the widths of the standard tables, which
+    /// are not the word of the file, so their cells have no floor across.
     fn show(&mut self, f: &mut Frame, items: &[ShownItem]) {
         let font = f.gs.font.clone().unwrap_or_else(|| Rc::new(Font::plain()));
         let gs = f.gs.clone();
@@ -1206,14 +1350,19 @@ impl<'a, 'd> Walker<'a, 'd> {
         if (4..=7).contains(&gs.render) {
             f.text_clip = true;
         }
-        let paints = font.kind == FontKind::Type3 && font.paints;
-        if paints && font.bbox.is_none() {
+        if font.vertical {
             self.problem(format!(
-                "a Type 3 font in {} that paints has no usable /FontBBox, so where its glyphs paint is not known",
+                "text in {} is set in a vertical writing mode, which this check does not place (the advance, the position vector and the spacing differ), so where it is drawn is not known",
                 self.place()
             ));
         }
-        let [bx0, by0, bx1, by1] = font.glyph_box();
+        if let Some(why) = &font.problem {
+            self.problem(format!("text in {}: {why}", self.place()));
+        }
+        let floor_x = !(font.kind == FontKind::Simple && !font.have_widths && font.std.is_some());
+        let declared = font.glyph_box();
+        let (cell_y0, cell_y1) = (declared[1].min(0.0), declared[3].max(1.0));
+        let (cell_x0, cell_x1) = (declared[0].min(0.0), declared[2].max(1.0));
         for it in items {
             match it {
                 ShownItem::Kern(k) => {
@@ -1239,6 +1388,7 @@ impl<'a, 'd> Walker<'a, 'd> {
                         // Where the glyph is, in the text space of the line.
                         let (ax, ay) = (f.text.ax, f.text.ay);
                         let (x, y);
+                        let known = matches!(w, Some(v) if v > 0.0 || floor_x);
                         if font.vertical {
                             x = [ax[0] - size.abs() * h, ax[1] + size.abs() * h];
                             y = [
@@ -1247,11 +1397,14 @@ impl<'a, 'd> Walker<'a, 'd> {
                             ];
                         } else {
                             let xs = match w {
-                                Some(w) if w > 0.0 && !paints => [ax[0], ax[1] + w * size * h],
-                                _ => [ax[0] + bx0 * size * h, ax[1] + bx1 * size * h],
+                                Some(w) if known => {
+                                    let across = if floor_x { w.max(1.0) } else { w };
+                                    [ax[0], ax[1] + across * size * h]
+                                }
+                                _ => [ax[0] + cell_x0 * size * h, ax[1] + cell_x1 * size * h],
                             };
                             x = [xs[0].min(xs[1]), xs[0].max(xs[1])];
-                            let ys = [gs.rise + by0 * size, gs.rise + by1 * size];
+                            let ys = [gs.rise + cell_y0 * size, gs.rise + cell_y1 * size];
                             y = [ys[0].min(ys[1]), ys[0].max(ys[1])];
                         }
                         let m = mul(&f.text.tm, &gs.ctm);
@@ -1263,22 +1416,38 @@ impl<'a, 'd> Walker<'a, 'd> {
                         ];
                         // The space of a font that is not in the file is drawn as nothing.
                         let blank = font.kind == FontKind::Simple && !font.embedded && code == 32;
+                        // The place is known when the width is and the interval of the pen is
+                        // narrow.
+                        let pen_known = (ax[1] - ax[0]).abs() <= 0.25 * (size * h).abs();
+                        let certain = known && !font.vertical && pen_known;
                         if !blank {
                             self.emit(Event {
-                                class: Class::Glyph { paints },
+                                class: Class::Glyph,
                                 bbox: bounds(&pts),
                                 shape: Shape::Other,
-                                kind: if paints {
-                                    "glyphs of a Type 3 font"
-                                } else {
-                                    "glyph of text"
-                                },
+                                kind: "glyph of text",
                                 fill: gs.fill,
                                 stroke: gs.stroke,
                                 width: 0.0,
                                 clip: (gs.clip_box, gs.clip_exact),
                                 smask: gs.smask,
+                                dashed: gs.dashed,
+                                translucent: gs.translucent,
+                                centre: certain,
                             });
+                        }
+                        // The glyph procedure of a Type 3 font is walked, to place what it paints.
+                        if font.kind == FontKind::Type3 && font.procs.contains_key(&code) {
+                            if pen_known {
+                                let origin = [size * h, 0.0, 0.0, size, ax[0], gs.rise];
+                                let glyph_to_page = mul(&font.t3_matrix, &mul(&origin, &m));
+                                self.type3_glyph(&font, code, &gs, glyph_to_page, f.res, f.depth);
+                            } else {
+                                self.problem(format!(
+                                    "Type 3 text in {} has a position that is not known, so what its glyphs paint was not placed",
+                                    self.place()
+                                ));
+                            }
                         }
                         // The advance.
                         let adv = |wv: f64| (wv * size + gs.char_space + space) * h;
@@ -1306,17 +1475,97 @@ impl<'a, 'd> Walker<'a, 'd> {
         }
     }
 
+    /// The glyph procedure of a Type 3 font for a code is walked with the matrix that takes its
+    /// glyph space to the page: what it paints (paths, images, forms) is placed like any content.
+    fn type3_glyph(
+        &mut self,
+        font: &Font,
+        code: u32,
+        gs: &Gs,
+        glyph_to_page: M,
+        page_res: &Obj,
+        depth: usize,
+    ) {
+        let Some(&obj) = font.procs.get(&code) else {
+            return;
+        };
+        let Some(data) = self.proc_data(obj) else {
+            return;
+        };
+        let res = font.t3_res.clone().unwrap_or_else(|| page_res.clone());
+        let mut inner = gs.clone();
+        inner.ctm = glyph_to_page;
+        self.trail
+            .push("a glyph procedure of a Type 3 font".to_owned());
+        self.content(&data, &res, inner, depth + 1);
+        self.trail.pop();
+    }
+
+    /// The decoded content of a glyph procedure, read once. A procedure that cannot be read is a
+    /// problem: what it paints is not known.
+    fn proc_data(&mut self, obj: u32) -> Option<Rc<Vec<u8>>> {
+        if let Some(c) = self.procs.get(&obj) {
+            return c.clone();
+        }
+        let doc = self.doc;
+        let read = doc.latest(obj).and_then(|e| doc.stream_data(e));
+        let data = match read {
+            Some(d) if d.problem.is_none() && d.stopped_at.is_none() => {
+                // Reading a procedure is work: counted against the budget.
+                if !self.tick(1 + d.data.len() as u64 / 256) {
+                    return None;
+                }
+                Some(Rc::new(d.data))
+            }
+            _ => {
+                self.problem(format!(
+                    "the glyph procedure object {obj} of a Type 3 font cannot be read, so what it paints is not known"
+                ));
+                None
+            }
+        };
+        self.procs.insert(obj, data.clone());
+        data
+    }
+
     /// A tiling pattern that draws an image: where it is painted is not followed (that needs the
     /// path), so the image is not placed. The render check sees the pixels; the object-level check
-    /// cannot, and says so.
+    /// cannot, and says so. A pattern that cannot be found is "could not check", and what is read
+    /// of a pattern is counted against the budget and kept.
     fn pattern(&mut self, name: &[u8], res: &Obj) {
         let name: String = name.iter().map(|b| char::from(*b)).collect();
         let pats = self.doc.dget(res, "Pattern");
         let Some(Obj::Ref(n)) = self.doc.resolve(pats).get(&name) else {
+            self.problem(format!(
+                "the pattern /{name} in {} cannot be found, so what it paints is not known",
+                self.place()
+            ));
             return;
         };
-        let Some(e) = self.doc.latest(*n) else { return };
-        if e.stream.is_some() && draws_image(self.doc, e, res, 0) {
+        let n = *n;
+        let draws = match self.patterns.get(&n) {
+            Some(d) => *d,
+            None => {
+                let Some(e) = self.doc.latest(n) else {
+                    self.problem(format!(
+                        "the pattern /{name} in {} cannot be found, so what it paints is not known",
+                        self.place()
+                    ));
+                    return;
+                };
+                let mut work = Work {
+                    used: 0,
+                    limit: self.budget.steps_left,
+                };
+                let d = e.stream.is_some() && draws_image(self.doc, e, res, 0, &mut work);
+                if !self.tick(work.used.max(1)) {
+                    return;
+                }
+                self.patterns.insert(n, d);
+                d
+            }
+        };
+        if draws {
             let msg = format!(
                 "an image is drawn through the tiling pattern /{name}: where the pattern is painted is not followed, so the pixels of that image were checked only in the render"
             );
@@ -1324,10 +1573,18 @@ impl<'a, 'd> Walker<'a, 'd> {
         }
     }
 
+    /// The font of a resource name. A name that is not there is "could not check": the text shown
+    /// with it has no font to place it by.
     fn font_named(&mut self, name: &[u8], res: &Obj) -> Option<Rc<Font>> {
         let name: String = name.iter().map(|b| char::from(*b)).collect();
         let fonts = self.doc.dget(res, "Font");
-        let entry = fonts.get(&name)?;
+        let Some(entry) = fonts.get(&name) else {
+            self.problem(format!(
+                "the font /{name} selected in {} cannot be found, so the text shown with it cannot be placed",
+                self.place()
+            ));
+            return None;
+        };
         Some(self.font_from(entry, &format!("/{name}"), res))
     }
 
@@ -1380,7 +1637,10 @@ impl<'a, 'd> Walker<'a, 'd> {
                 let two_byte = matches!(enc_name, "Identity-H" | "Identity-V")
                     || (enc_name.starts_with("Uni")
                         && (enc_name.contains("UCS2") || enc_name.contains("UTF16")));
-                let vertical = enc_name.ends_with("-V");
+                // Vertical writing: a name that ends in -V, or an embedded character map that
+                // says /WMode 1.
+                let vertical =
+                    enc_name.ends_with("-V") || doc.dget(enc, "WMode").int().unwrap_or(0) == 1;
                 let desc = doc
                     .dget(font, "DescendantFonts")
                     .array()
@@ -1393,6 +1653,8 @@ impl<'a, 'd> Walker<'a, 'd> {
                 let mut w_map: HashMap<u32, f64> = HashMap::new();
                 let mut max_w = dw;
                 if let Some(w) = doc.dget(desc, "W").array() {
+                    // Reading the widths is work.
+                    self.tick(w.len() as u64 / 16 + 1);
                     let mut i = 0;
                     while i < w.len() && w_map.len() < 200_000 {
                         let Some(c) = doc.resolve(&w[i]).int() else {
@@ -1414,6 +1676,7 @@ impl<'a, 'd> Walker<'a, 'd> {
                                 let v = w.get(i + 2).and_then(|x| doc.resolve(x).num());
                                 if let (Some(c2), Some(v)) = (c2, v) {
                                     let span = (c2 - c).clamp(0, 70_000);
+                                    self.tick(span as u64 / 64 + 1);
                                     for k in 0..=span {
                                         w_map.insert((c + k) as u32, v / 1000.0);
                                     }
@@ -1463,31 +1726,11 @@ impl<'a, 'd> Walker<'a, 'd> {
         }
     }
 
-    /// A Type 3 font: whether its glyph procedures paint geometry, and the numbers that place its
-    /// glyphs. A font whose glyphs draw an image is said, like a pattern, because where the glyphs
-    /// are shown is not followed for images.
-    fn load_type3(&mut self, font: &Obj, label: &str, res: &Obj) -> Font {
+    /// A Type 3 font: the numbers that place its glyphs, and the glyph procedure of each code
+    /// (through the names of `/Encoding /Differences` and `/CharProcs`), which is walked where the
+    /// glyph is shown. A font with no widths or no glyph names cannot be placed.
+    fn load_type3(&mut self, font: &Obj, label: &str, _res: &Obj) -> Font {
         let doc = self.doc;
-        let own = font.get("Resources").map(|r| doc.resolve(r).clone());
-        let font_res = own.unwrap_or_else(|| res.clone());
-        let procs: Vec<&Entry> = doc
-            .dget(font, "CharProcs")
-            .entries()
-            .iter()
-            .filter_map(|(_, v)| match v {
-                Obj::Ref(n) => doc.latest(*n),
-                _ => None,
-            })
-            .filter(|e| e.stream.is_some())
-            .collect();
-        let draws = procs.iter().any(|e| draws_image(doc, e, &font_res, 0));
-        let paints = procs.iter().any(|e| paints_geometry(doc, e, &font_res, 0));
-        if draws {
-            let msg = format!(
-                "an image is drawn by the glyphs of the Type 3 font {label}: where the glyphs are shown is not followed, so the pixels of that image were checked only in the render"
-            );
-            self.problem(msg);
-        }
         let matrix = {
             let m = numbers(font.get("FontMatrix").unwrap_or(&Obj::Null), doc);
             if m.len() == 6 {
@@ -1505,49 +1748,71 @@ impl<'a, 'd> Walker<'a, 'd> {
             ];
             bounds(&pts)
         };
-        let mut bbox = {
+        let bbox = {
             let b = numbers(font.get("FontBBox").unwrap_or(&Obj::Null), doc);
             (b.len() == 4 && (b[2] - b[0]).abs() > 0.0 && (b[3] - b[1]).abs() > 0.0)
                 .then(|| to_em([b[0], b[1], b[2], b[3]]))
         };
-        // The boxes that the glyph procedures declare (`d1`) widen it.
-        for e in &procs {
-            let Some(d) = doc.stream_data(e) else {
-                continue;
-            };
-            for_each_op_while(&d.data, &mut |op: &Op| {
-                if op.name == b"d1" {
-                    let v = op.nums();
-                    if v.len() == 6 {
-                        let g = to_em([v[2], v[3], v[4], v[5]]);
-                        bbox = Some(match bbox {
-                            Some(b) => [
-                                b[0].min(g[0]),
-                                b[1].min(g[1]),
-                                b[2].max(g[2]),
-                                b[3].max(g[3]),
-                            ],
-                            None => g,
-                        });
+        let widths = numbers(font.get("Widths").unwrap_or(&Obj::Null), doc);
+        let charprocs = doc.dget(font, "CharProcs");
+        let mut procs: HashMap<u32, u32> = HashMap::new();
+        let mut problem = None;
+        let diffs = doc.dget(doc.dget(font, "Encoding"), "Differences").array();
+        match diffs {
+            Some(a) => {
+                let mut code: i64 = 0;
+                for x in a {
+                    match doc.resolve(x) {
+                        Obj::Name(nm) => {
+                            if let (Some(Obj::Ref(p)), Ok(c)) =
+                                (charprocs.get(nm), u32::try_from(code))
+                            {
+                                procs.insert(c, *p);
+                            }
+                            code += 1;
+                        }
+                        other => {
+                            if let Some(c) = other.int() {
+                                code = c;
+                            }
+                        }
                     }
                 }
-                op.name != b"d0"
-            });
+            }
+            None if !charprocs.entries().is_empty() => {
+                problem = Some(format!(
+                    "the Type 3 font {label} has no /Encoding with /Differences, so the glyph that a code shows is not known"
+                ));
+            }
+            None => {}
         }
-        let widths = numbers(font.get("Widths").unwrap_or(&Obj::Null), doc);
+        if widths.is_empty() && !procs.is_empty() {
+            problem = Some(format!(
+                "the Type 3 font {label} has no /Widths, so where its glyphs are shown is not known"
+            ));
+        }
         Font {
             kind: FontKind::Type3,
-            paints,
             bbox: bbox.filter(|b| b.iter().all(|v| v.is_finite())),
             first: doc.dget(font, "FirstChar").int().unwrap_or(0),
             have_widths: !widths.is_empty(),
             widths: widths.iter().map(|w| w * matrix[0]).collect(),
+            procs,
+            t3_matrix: matrix,
+            t3_res: font.get("Resources").map(|r| doc.resolve(r).clone()),
+            problem,
             ..Font::plain()
         }
     }
 
     fn xobject(&mut self, n: u32, res: &Obj, gs: &Gs, depth: usize) {
-        let Some(e) = self.doc.latest(n) else { return };
+        let Some(e) = self.doc.latest(n) else {
+            self.problem(format!(
+                "the XObject object {n} drawn in {} cannot be found, so what it draws is not known",
+                self.place()
+            ));
+            return;
+        };
         match self.doc.dget(&e.value, "Subtype").name() {
             Some("Image") => {
                 let bb = unit_bounds(&gs.ctm);
@@ -1614,7 +1879,11 @@ impl<'a, 'd> Walker<'a, 'd> {
                 self.trail.pop();
                 self.container = saved;
             }
-            _ => {}
+            other => self.problem(format!(
+                "the XObject object {n} drawn in {} is neither an image nor a form ({}), so what it draws is not known",
+                self.place(),
+                other.unwrap_or("no subtype")
+            )),
         }
     }
 
@@ -1632,6 +1901,14 @@ impl<'a, 'd> Walker<'a, 'd> {
         self.xobject(n, res, &gs, 0);
         self.trail.pop();
     }
+}
+
+/// Whether a dash array puts gaps in a line: a solid line is an empty array (or one of zeros).
+fn dash_array_is_dashed(items: &[Operand]) -> bool {
+    items.iter().any(|x| match x {
+        Operand::Num(v) => *v != 0.0,
+        _ => true,
+    })
 }
 
 /// The bounds on the page of the unit square under `ctm`.
@@ -1662,23 +1939,59 @@ fn plausible(b: [f64; 4]) -> Option<[f64; 4]> {
 }
 
 /// A horizontal or vertical rectangle at most [`THIN`] thick that crosses the region from one side
-/// to the other.
-fn crosses_thin_rect(r: &[f64; 4], t: &[f64; 4]) -> bool {
+/// to the other: `Some(true)` when it runs along x.
+fn crosses_thin_rect(r: &[f64; 4], t: &[f64; 4]) -> Option<bool> {
     let (w, h) = (r[2] - r[0], r[3] - r[1]);
-    (h <= THIN && r[0] <= t[0] + BOX_TOLERANCE && r[2] >= t[2] - BOX_TOLERANCE)
-        || (w <= THIN && r[1] <= t[1] + BOX_TOLERANCE && r[3] >= t[3] - BOX_TOLERANCE)
+    if h <= THIN && r[0] <= t[0] + BOX_TOLERANCE && r[2] >= t[2] - BOX_TOLERANCE {
+        Some(true)
+    } else if w <= THIN && r[1] <= t[1] + BOX_TOLERANCE && r[3] >= t[3] - BOX_TOLERANCE {
+        Some(false)
+    } else {
+        None
+    }
 }
 
-/// A horizontal or vertical segment that crosses the region from one side to the other.
-fn crosses_line(l: &[f64; 4], t: &[f64; 4]) -> bool {
+/// A horizontal or vertical segment that crosses the region from one side to the other:
+/// `Some(true)` when it runs along x.
+fn crosses_line(l: &[f64; 4], t: &[f64; 4]) -> Option<bool> {
     let (dx, dy) = (l[2] - l[0], l[3] - l[1]);
-    (dy.abs() < 0.01 && l[0] <= t[0] + BOX_TOLERANCE && l[2] >= t[2] - BOX_TOLERANCE)
-        || (dx.abs() < 0.01 && l[1] <= t[1] + BOX_TOLERANCE && l[3] >= t[3] - BOX_TOLERANCE)
+    if dy.abs() < 0.01 && l[0] <= t[0] + BOX_TOLERANCE && l[2] >= t[2] - BOX_TOLERANCE {
+        Some(true)
+    } else if dx.abs() < 0.01 && l[1] <= t[1] + BOX_TOLERANCE && l[3] >= t[3] - BOX_TOLERANCE {
+        Some(false)
+    } else {
+        None
+    }
 }
 
-/// Whether the content of a form, pattern or glyph procedure draws an image (also through a form
-/// it draws). It uses its own resources, or `fallback` where it has none.
-pub fn draws_image(doc: &Doc, e: &Entry, fallback: &Obj, depth: usize) -> bool {
+/// A rule that crosses a region carries one dimension, and only if it is painted plainly: with
+/// no constant alpha or blend mode, and through no clip that ends at the region on the rule's own
+/// axis (a clip that is the region turns a set of rules into a picture that nothing else shows).
+fn rule_is_plain(e: &Event, t: &[f64; 4], along_x: bool) -> bool {
+    let c = &e.clip.0;
+    let reaches = if along_x {
+        c[0] <= t[0] - 1.0 && c[2] >= t[2] + 1.0
+    } else {
+        c[1] <= t[1] - 1.0 && c[3] >= t[3] + 1.0
+    };
+    !e.translucent && reaches
+}
+
+/// How much a scan over content has done, and how much it may do: what a helper reads before the
+/// walk proper is work too, and counts against the same budget.
+pub struct Work {
+    pub used: u64,
+    pub limit: u64,
+}
+
+/// Whether the content of a form or pattern draws an image (also through a form it draws). It uses
+/// its own resources, or `fallback` where it has none. Every stream and every operator read is one
+/// unit of `work`; past the limit the scan stops (and the caller finds the budget used up).
+pub fn draws_image(doc: &Doc, e: &Entry, fallback: &Obj, depth: usize, work: &mut Work) -> bool {
+    work.used += 1;
+    if work.used > work.limit {
+        return false;
+    }
     let Some(d) = doc.stream_data(e) else {
         return false;
     };
@@ -1688,6 +2001,10 @@ pub fn draws_image(doc: &Doc, e: &Entry, fallback: &Obj, depth: usize) -> bool {
         .map_or_else(|| fallback.clone(), |r| doc.resolve(r).clone());
     let mut found = false;
     for_each_op_while(&d.data, &mut |op: &Op| {
+        work.used += 1;
+        if work.used > work.limit {
+            return false;
+        }
         match op.name {
             b"BI" => found = true,
             b"Do" => {
@@ -1699,46 +2016,9 @@ pub fn draws_image(doc: &Doc, e: &Entry, fallback: &Obj, depth: usize) -> bool {
                             match doc.dget(&x.value, "Subtype").name() {
                                 Some("Image") => found = true,
                                 Some("Form") if depth < 4 => {
-                                    found |= draws_image(doc, x, &res, depth + 1);
+                                    found |= draws_image(doc, x, &res, depth + 1, work);
                                 }
                                 _ => {}
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-        !found
-    });
-    found
-}
-
-/// Whether the content of a glyph procedure paints a path or a shading (also through a form it
-/// draws).
-pub fn paints_geometry(doc: &Doc, e: &Entry, fallback: &Obj, depth: usize) -> bool {
-    let Some(d) = doc.stream_data(e) else {
-        // Content that cannot be read may paint anything.
-        return true;
-    };
-    let res = e
-        .value
-        .get("Resources")
-        .map_or_else(|| fallback.clone(), |r| doc.resolve(r).clone());
-    let mut found = false;
-    for_each_op_while(&d.data, &mut |op: &Op| {
-        match op.name {
-            b"f" | b"F" | b"f*" | b"S" | b"s" | b"B" | b"B*" | b"b" | b"b*" | b"sh" => {
-                found = true;
-            }
-            b"Do" => {
-                if let Some(name) = op.name_arg() {
-                    let name: String = name.iter().map(|b| char::from(*b)).collect();
-                    let xo = doc.dget(&res, "XObject");
-                    if let Some(Obj::Ref(n)) = doc.resolve(xo).get(&name) {
-                        if let Some(x) = doc.latest(*n) {
-                            if doc.dget(&x.value, "Subtype").name() == Some("Form") {
-                                found |= depth >= 4 || paints_geometry(doc, x, &res, depth + 1);
                             }
                         }
                     }
@@ -1758,14 +2038,17 @@ mod tests {
     #[test]
     fn a_rule_that_crosses_the_region_carries_nothing() {
         let t = [100.0, 100.0, 150.0, 130.0];
-        assert!(crosses_line(&[50.0, 110.0, 200.0, 110.0], &t));
-        assert!(crosses_line(&[120.0, 0.0, 120.0, 500.0], &t));
+        assert_eq!(crosses_line(&[50.0, 110.0, 200.0, 110.0], &t), Some(true));
+        assert_eq!(crosses_line(&[120.0, 0.0, 120.0, 500.0], &t), Some(false));
         // Ends inside the region, or slanted.
-        assert!(!crosses_line(&[50.0, 110.0, 120.0, 110.0], &t));
-        assert!(!crosses_line(&[50.0, 100.0, 200.0, 140.0], &t));
+        assert_eq!(crosses_line(&[50.0, 110.0, 120.0, 110.0], &t), None);
+        assert_eq!(crosses_line(&[50.0, 100.0, 200.0, 140.0], &t), None);
         // A thin strip, and a thick one.
-        assert!(crosses_thin_rect(&[50.0, 110.0, 200.0, 111.5], &t));
-        assert!(!crosses_thin_rect(&[50.0, 110.0, 200.0, 114.0], &t));
+        assert_eq!(
+            crosses_thin_rect(&[50.0, 110.0, 200.0, 111.5], &t),
+            Some(true)
+        );
+        assert_eq!(crosses_thin_rect(&[50.0, 110.0, 200.0, 114.0], &t), None);
     }
 
     #[test]
