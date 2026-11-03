@@ -105,6 +105,17 @@ told from a region that was not redacted.
   box of its font, so text that ends at the edge of a region can meet it. A font with no widths
   (a standard font that the file does not describe) gives intervals, wider boxes and more false
   alarms.
+- A simple font with no `/Widths` is placed with the widths of the standard font that its name stands
+  for (Helvetica, Arial, Times, Courier), within 1.5 %. A font that is not in the tables (Symbol,
+  ZapfDingbats, anything else without widths) gives intervals and boxes that can be much wider than
+  the text. The space of a font that is not in the file draws nothing and is no event.
+- The end of an inline image is taken from `/L` or `/Length`, from the size of the samples when the
+  image has no filter, or else from the first `EI` that white space and content follow, as Poppler
+  finds it. Where none of these fits, the image is "could not check". The regions are read from a
+  copy of the file in which qpdf has not normalised the content, because qpdf reads the end of an
+  inline image in its own way.
+- A tool that starts a process of its own session is out of reach of the time limit: only its
+  process group (on Windows its tree) is stopped.
 - Images drawn through a tiling pattern or by Type 3 glyphs are checked by the render only, and the
   check says so.
 - A region is compared at 144 dpi with an edge of two pixels, so a redaction whose edge is more than
