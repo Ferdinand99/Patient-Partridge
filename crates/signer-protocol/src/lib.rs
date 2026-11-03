@@ -185,6 +185,9 @@ impl KeyKind {
         match kind {
             1 if (2048..=4096).contains(&bits) => Ok(KeyKind::Rsa(bits)),
             1 => Err(ProtocolError::InvalidLength),
+            // A curve has no number of bits to give: a message that gives one is not read, so that a
+            // message has one encoding only.
+            2 | 3 if bits != 0 => Err(ProtocolError::InvalidLength),
             2 => Ok(KeyKind::EcdsaP256),
             3 => Ok(KeyKind::EcdsaP384),
             other => Err(ProtocolError::UnknownValue(other)),
@@ -710,6 +713,23 @@ mod tests {
         assert!(refused(|c| c.usage = 0x80));
         // The same certificate with sound values is taken.
         assert!(!refused(|_| {}));
+    }
+
+    #[test]
+    fn a_curve_with_a_number_of_bits_is_not_a_message_that_could_have_been_written() {
+        // Found by the fuzz target: the bits of an EC key were read and then not written back, so
+        // two messages meant the same thing.
+        let mut c = certificate();
+        c.key = KeyKind::EcdsaP256;
+        let good = Response::Loaded(c).encode();
+        assert_eq!(
+            Response::decode(&good).map(|r| r.encode()),
+            Ok(good.clone())
+        );
+        let at = good.len() - 4 - 4 - 1 - 4;
+        let mut odd = good.clone();
+        odd[at..at + 4].copy_from_slice(&7u32.to_le_bytes());
+        assert_eq!(Response::decode(&odd), Err(ProtocolError::InvalidLength));
     }
 
     #[test]

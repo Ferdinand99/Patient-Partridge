@@ -22,23 +22,21 @@ fn fake_signer() -> PathBuf {
         .join(format!("fake_signer{}", std::env::consts::EXE_SUFFIX))
 }
 
-/// The stand-in takes its mode on the command line, which a signer never does, so the test starts it
-/// through a small shell script on Unix. On Windows the tests of this file are skipped.
+/// The stand-in takes its mode from the name it is started under, because a signer is started
+/// without arguments: each mode has a link of its own to the program (a link, and not a file that is
+/// written, so that no other test can be holding it open for writing while it starts).
 fn config(mode: &str) -> SignerConfig {
-    use std::os::unix::fs::PermissionsExt;
+    // A folder for each call: tests that run at the same time do not share a link.
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let dir = std::env::temp_dir().join(format!(
-        "partridge-fakesigner-{}-{mode}",
-        std::process::id()
+        "partridge-fakesigner-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    let script = dir.join("signer");
-    std::fs::write(
-        &script,
-        format!("#!/bin/sh\nexec '{}' {mode}\n", fake_signer().display()),
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let mut config = SignerConfig::new(script);
+    let link = dir.join(format!("fake_signer-{mode}"));
+    std::os::unix::fs::symlink(fake_signer(), &link).unwrap();
+    let mut config = SignerConfig::new(link);
     config.sandbox = SandboxPolicy::BestEffort;
     config.timeout = Duration::from_secs(5);
     config.load_timeout = Duration::from_secs(5);

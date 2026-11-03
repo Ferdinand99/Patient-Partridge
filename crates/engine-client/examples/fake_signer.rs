@@ -1,5 +1,6 @@
 //! A stand-in for the signer that misbehaves on purpose, for the tests of the client.
-//! Usage: `fake_signer <mode>`.
+//! Usage: `fake_signer <mode>`, or started through a link named `fake_signer-<mode>` (a signer is
+//! started without arguments, so the tests give the mode in the name).
 //!
 //! Every mode greets correctly first, except where the mode says otherwise.
 //!
@@ -46,7 +47,23 @@ fn send(output: &mut impl Write, response: Response) {
 }
 
 fn main() {
-    let mode = std::env::args().nth(1).unwrap_or_else(|| "good".into());
+    // The mode is in the name the program was started under (`fake_signer-<mode>`), or is the first
+    // argument that is not an option (the app puts `--memory-limit` on every program it starts).
+    let mode = std::env::args()
+        .next()
+        .and_then(|path| {
+            std::path::Path::new(&path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_prefix("fake_signer-"))
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            std::env::args()
+                .skip(1)
+                .find(|a| !a.starts_with("--") && a.parse::<u64>().is_err())
+        })
+        .unwrap_or_else(|| "good".into());
     let mut input = BufReader::new(io::stdin().lock());
     let mut output = BufWriter::new(io::stdout().lock());
     loop {
