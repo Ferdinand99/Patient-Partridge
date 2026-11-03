@@ -867,3 +867,51 @@ fn the_pictures_kept_for_an_undo_are_held_to_a_bound() {
     // Nothing was left behind by the refusal.
     assert_eq!(list(e, doc, 0).len(), made);
 }
+
+/// A move or a resize does not draw the page: nothing draws it between the move and the save here,
+/// and the saved file must still hold the picture at the place it was moved to, drawn.
+#[test]
+fn a_picture_moved_and_saved_without_the_page_drawn_is_saved_where_it_was_moved_to() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    for (name, mark) in [
+        ("drawn", scribble()),
+        ("typed", typed(SignatureFont::GreatVibes, "Ola Nordmann")),
+        ("image", half_red(80, 30)),
+    ] {
+        let doc = open_simple(e);
+        let item = added(e, doc, [100.0, 100.0, 340.0, 200.0], mark);
+        let w = item.rect[2] - item.rect[0];
+        // Two steps of a drag and then a resize, with no page drawn in between.
+        let first = annot(place(e, doc, item.id, [150.0, 220.0, 150.0 + w, 240.0]));
+        let last = annot(place(
+            e,
+            doc,
+            item.id,
+            [300.0, 500.0, 300.0 + w / 2.0, 520.0],
+        ));
+        assert_ne!(first.rect, last.rect, "{name}");
+        let bytes = save_all(e, doc);
+        let again = open(e, &bytes, None).unwrap();
+        let shot = page_shot(e, again);
+        assert!(
+            shot.inked(grown(last.rect, 2.0)) > 40,
+            "{name}: no picture at the new place"
+        );
+        assert_eq!(
+            shot.inked(grown(item.rect, 2.0)),
+            0,
+            "{name}: ink left at the first place"
+        );
+        assert_eq!(
+            shot.inked(grown(first.rect, 2.0)),
+            0,
+            "{name}: ink left at the middle place"
+        );
+        assert_eq!(
+            shot.inked([0.0, 0.0, 612.0, 792.0]),
+            shot.inked(grown(last.rect, 2.0)),
+            "{name}: ink outside the new box"
+        );
+    }
+}
