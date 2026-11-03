@@ -33,6 +33,8 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
+pub mod repair;
+
 /// How many bytes are read between two reports of progress.
 const PROGRESS_STEP: usize = 4 * 1024 * 1024;
 
@@ -314,6 +316,8 @@ enum Value<'a> {
     Name(Cow<'a, [u8]>),
     Ref(u32),
     Bool(bool),
+    /// A whole number that is not the start of a reference.
+    Int(u32),
     Other,
 }
 
@@ -321,6 +325,8 @@ enum Value<'a> {
 #[derive(Debug, Clone)]
 struct Dict<'a> {
     entries: Vec<(Cow<'a, [u8]>, Value<'a>)>,
+    /// Where the opening `<<` is.
+    start: usize,
     end: usize,
 }
 
@@ -345,6 +351,7 @@ fn parse_dictionary(bytes: &[u8], at: usize) -> Option<Dict<'_>> {
     if bytes.get(pos..pos + 2)? != b"<<" {
         return None;
     }
+    let start = pos;
     pos += 2;
     let mut entries: Vec<(Cow<'_, [u8]>, Value<'_>)> = Vec::new();
     // A key twice is not a dictionary to trust. A short dictionary is searched; a long one gets a
@@ -355,6 +362,7 @@ fn parse_dictionary(bytes: &[u8], at: usize) -> Option<Dict<'_>> {
         if bytes.get(pos..pos + 2)? == b">>" {
             return Some(Dict {
                 entries,
+                start,
                 end: pos + 2,
             });
         }
@@ -399,6 +407,7 @@ fn value<'a>(bytes: &'a [u8], pos: &mut usize) -> Option<Value<'a>> {
                     *pos = ahead;
                     return Some(Value::Ref(object));
                 }
+                return Some(Value::Int(object));
             }
             Some(Value::Other)
         }

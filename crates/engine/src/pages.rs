@@ -2036,7 +2036,10 @@ fn export_begin(
         let written = save::serialise_up_to(&fresh, MAX_SAVE_BYTES, progress)?;
         fresh = load_copy(pdfium, written, None, pages.len(), None)?;
     }
+    // These bytes are handed to the app like a save, so a compressed XMP stream that was copied
+    // with a page is mended as it is there.
     let bytes = save::serialise_up_to(&fresh, MAX_SAVE_BYTES, progress)?;
+    let bytes = save::mended(bytes, MAX_SAVE_BYTES, progress)?;
     let (size, print) = (bytes.len(), save::fingerprint(&fresh, progress));
     let ResponseBody::Fingerprint {
         pages: printed,

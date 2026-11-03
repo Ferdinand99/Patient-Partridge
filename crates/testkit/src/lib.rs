@@ -1570,21 +1570,61 @@ pub fn xmp_pdf(catalog_xmp: bool, page_xmp: bool) -> Vec<u8> {
 
 /// As [`xmp_pdf`]; with `compressed` the XMP streams are Flate compressed, as some writers make them.
 pub fn xmp_pdf_with(catalog_xmp: bool, page_xmp: bool, compressed: bool) -> Vec<u8> {
-    xmp_pdf_impl(catalog_xmp, page_xmp, compressed, false, "")
+    xmp_pdf_impl(catalog_xmp, page_xmp, compressed, false, "", None)
 }
 
 /// As [`xmp_pdf`] with a catalog stream whose `/Type` is an indirect reference to the name
 /// `/Metadata` (object 11). A reader that does not follow the reference does not take the stream
 /// for a metadata stream, and encrypts it like any other.
 pub fn xmp_indirect_type_pdf() -> Vec<u8> {
-    xmp_pdf_impl(true, false, false, true, "")
+    xmp_pdf_impl(true, false, false, true, "", None)
 }
 
 /// As [`xmp_pdf`] with a catalog stream and `keys` keys of no meaning in the trailer. A writer
 /// copies the keys of a trailer that it does not know, so their number is the file's own.
 pub fn xmp_pdf_with_trailer_keys(keys: usize) -> Vec<u8> {
     let extra: String = (0..keys).map(|i| format!(" /K{i} 1")).collect();
-    xmp_pdf_impl(true, false, false, false, &extra)
+    xmp_pdf_impl(true, false, false, false, &extra, None)
+}
+
+/// As [`xmp_pdf`] with a catalog XMP stream that holds `data` as it is, with `dict` (more keys,
+/// such as a `/Filter`) in its dictionary next to `/Type /Metadata /Subtype /XML`.
+pub fn xmp_pdf_raw(dict: &str, data: &[u8]) -> Vec<u8> {
+    xmp_pdf_impl(true, false, false, false, "", Some((dict, data)))
+}
+
+/// `data` compressed the way a PDF Flate filter does.
+pub fn flate(data: &[u8]) -> Vec<u8> {
+    deflate(data)
+}
+
+/// `data` the way the PDF filter `ASCIIHexDecode` writes it.
+pub fn ascii_hex(data: &[u8]) -> Vec<u8> {
+    let mut text: String = data.iter().map(|b| format!("{b:02X}")).collect();
+    text.push('>');
+    text.into_bytes()
+}
+
+/// `data` the way the PDF filter `ASCII85Decode` writes it.
+pub fn ascii_85(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for chunk in data.chunks(4) {
+        let mut block = [0u8; 4];
+        block[..chunk.len()].copy_from_slice(chunk);
+        let mut value = u32::from_be_bytes(block);
+        if chunk.len() == 4 && value == 0 {
+            out.push(b'z');
+            continue;
+        }
+        let mut digits = [0u8; 5];
+        for slot in digits.iter_mut().rev() {
+            *slot = (value % 85) as u8 + b'!';
+            value /= 85;
+        }
+        out.extend_from_slice(&digits[..chunk.len() + 1]);
+    }
+    out.extend_from_slice(b"~>");
+    out
 }
 
 fn xmp_pdf_impl(
@@ -1593,6 +1633,7 @@ fn xmp_pdf_impl(
     compressed: bool,
     indirect_type: bool,
     trailer_extra: &str,
+    raw: Option<(&str, &[u8])>,
 ) -> Vec<u8> {
     let catalog_id = 10;
     let page_id = if catalog_xmp { 11 } else { 10 };
@@ -1652,7 +1693,13 @@ endcmap CMapName currentdict /CMap defineresource pop end end\n% {}\n",
         }
     };
     if catalog_xmp {
-        objects.push(xmp_stream(XMP_CATALOG_TITLE));
+        match raw {
+            Some((dict, data)) => objects.push(binary_stream(
+                &format!("/Type /Metadata /Subtype /XML {dict}"),
+                data,
+            )),
+            None => objects.push(xmp_stream(XMP_CATALOG_TITLE)),
+        }
     }
     if page_xmp {
         objects.push(xmp_stream(XMP_PAGE_TITLE));
@@ -1661,6 +1708,55 @@ endcmap CMapName currentdict /CMap defineresource pop end end\n% {}\n",
         objects.push(b"/Metadata".to_vec());
     }
     assemble(&objects, trailer_extra)
+}
+
+/// What [`flate_streams_pdf`] holds in its streams once they are inflated.
+pub const FLATE_STREAM_PAYLOADS: [&str; 4] = [
+    "BT /F1 24 Tf 72 700 Td (Flate Content 6612) Tj ET",
+    "Font Program Marker 1187",
+    "Icc Profile Marker 4451",
+    "Image Samples Marker 9034",
+];
+
+/// A one page document whose page content, font program, colour profile and picture are all Flate
+/// compressed, with a Flate compressed XMP stream on the catalog ([`XMP_CATALOG_TITLE`]). The
+/// payloads, inflated, are [`FLATE_STREAM_PAYLOADS`].
+pub fn flate_streams_pdf() -> Vec<u8> {
+    let flated = |extra: &str, text: &str| {
+        binary_stream(
+            &format!("/Filter /FlateDecode {extra}"),
+            &deflate(text.as_bytes()),
+        )
+    };
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R /Metadata 8 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> /XObject << /Im0 7 0 R >> /ColorSpace << /CS0 [/ICCBased 6 0 R] >> >> >>"
+            .to_vec(),
+        // The picture and the colour profile are used, so that a page whose content is written
+        // again (an edit) keeps them.
+        flated(
+            "",
+            &format!(
+                "{}\n/CS0 cs 0.1 0.2 0.3 sc q 50 0 0 50 100 600 cm /Im0 Do Q",
+                FLATE_STREAM_PAYLOADS[0]
+            ),
+        ),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FontDescriptor 9 0 R >>".to_vec(),
+        flated("/N 3 /Alternate /DeviceRGB", FLATE_STREAM_PAYLOADS[2]),
+        flated(
+            "/Type /XObject /Subtype /Image /Width 5 /Height 5 /ColorSpace /DeviceGray /BitsPerComponent 8",
+            FLATE_STREAM_PAYLOADS[3],
+        ),
+        binary_stream(
+            "/Type /Metadata /Subtype /XML /Filter /FlateDecode",
+            &deflate(xmp_packet(XMP_CATALOG_TITLE).as_bytes()),
+        ),
+        b"<< /Type /FontDescriptor /FontName /Helvetica /Flags 32 /FontBBox [0 0 1000 1000] /ItalicAngle 0 /Ascent 900 /Descent -200 /CapHeight 700 /StemV 80 /FontFile 10 0 R >>"
+            .to_vec(),
+        flated("/Length1 24", FLATE_STREAM_PAYLOADS[1]),
+    ];
+    assemble(&objects, "")
 }
 
 /// Folder name used for a platform in `vendor/pdfium` and in the pinned PDFium list.

@@ -188,6 +188,13 @@ export function describeError(error: AppErrorLike, fileName?: string): Described
         action: "none",
       };
     case "save_failed":
+      if (/XMP metadata/i.test(error.message)) {
+        return {
+          title: "The document details are too big to be saved safely",
+          detail: `${file} has a compressed block of document details (XMP metadata) that is far bigger than any ordinary one, and Patient Partridge will not write it out, because it could not be sure to write it correctly. Nothing was saved, and the file on the disk was not changed. Your changes are still in the open document.`,
+          action: "none",
+        };
+      }
       return {
         title: "The document could not be written",
         detail: `The PDF engine could not write ${file} out. Nothing was saved, and the file on the disk was not changed. Your changes are still in the open document.`,
