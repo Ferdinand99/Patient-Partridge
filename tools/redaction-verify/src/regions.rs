@@ -37,6 +37,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
+use std::path::Path;
 
 use crate::carve;
 use crate::content::apply;
@@ -45,9 +46,10 @@ use crate::pdfobj::{Doc, Entry, Obj};
 use crate::profile::exact_numbers;
 use crate::tools;
 use crate::walk::{
-    bounds, matrix_of, overlaps, Budget, Found, Placement, Source, Target, Walker, M,
+    bounds, matrix_of, overlaps, Budget, Marks, Placement, Source, Target, Walker, M,
 };
-use crate::{Hit, Layer, Region, Report, Result, Subject, RENDER_DPI, RENDER_MARGIN};
+use crate::xray;
+use crate::{Hit, Layer, Region, Report, Result, Subject, RENDER_DPI, RENDER_MARGIN, XRAY_MARGIN};
 
 /// The most device pixels one render may have.
 const MAX_RENDER_PIXELS: usize = 80_000_000;
@@ -64,7 +66,7 @@ fn invert(m: &M) -> Option<M> {
 }
 
 /// The decoded content of a page (its streams, one after the other), or why it cannot be read.
-fn contents(doc: &Doc, page: &Entry) -> std::result::Result<Vec<u8>, String> {
+pub(crate) fn contents(doc: &Doc, page: &Entry) -> std::result::Result<Vec<u8>, String> {
     let Some(c) = page.value.get("Contents") else {
         return Err("the page has no content".to_owned());
     };
@@ -877,7 +879,8 @@ fn parse_ppm(b: &[u8]) -> Option<Rendered> {
     })
 }
 
-fn render_page(ctx: &Ctx, page: usize) -> std::result::Result<Rendered, String> {
+/// Page `page` of the file `path`, drawn by Poppler. The x-ray copy has no password.
+fn render_page(ctx: &Ctx, path: &Path, page: usize) -> std::result::Result<Rendered, String> {
     let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
     let prefix = dir.path().join("page");
     let n = page.to_string();
@@ -886,8 +889,10 @@ fn render_page(ctx: &Ctx, page: usize) -> std::result::Result<Rendered, String> 
         .iter()
         .map(OsString::from)
         .collect();
-    args.extend(ctx.poppler_password());
-    args.push(ctx.path.as_os_str().to_owned());
+    if path == ctx.path {
+        args.extend(ctx.poppler_password());
+    }
+    args.push(path.as_os_str().to_owned());
     args.push(prefix.as_os_str().to_owned());
     let refs: Vec<&OsStr> = args.iter().map(OsString::as_os_str).collect();
     let out = tools::pdftoppm(&refs).map_err(|e| e.0)?;
@@ -1022,7 +1027,7 @@ fn check_render(
         if pw * s * ph * s > MAX_RENDER_PIXELS as f64 {
             return Err("the page is too large to render for the region check".to_owned());
         }
-        render_page(ctx, page_no)
+        render_page(ctx, ctx.path, page_no)
     });
     let img = match rendered {
         Ok(i) => i,
@@ -1164,31 +1169,16 @@ fn check_render(
     }
 }
 
-/// Geometry that meets a redaction region is in the file whatever its colour, clip, transparency,
-/// blend mode or visibility: a reader that shows it later (a layer turned on, the fill taken away)
-/// shows what was to be redacted. The walk has already left out the geometry that carries nothing
-/// (see [`crate::walk`]); what is left is reported here.
-fn report_found(found: &Found, region: &Region, ri: usize, rep: &mut Report) {
-    let Some((place, bbox)) = &found.first else {
-        return;
-    };
-    let kinds: Vec<&str> = found.kinds.iter().copied().collect();
-    rep.hits.push(Hit {
-        layer: Layer::Images,
-        subject: Subject::Rule(format!(
-            "painted geometry inside a redaction region: {} object(s) ({}) are painted there, and stay in the file whatever their colour, clip, transparency or visibility; the first is in {} and reaches from ({:.1}, {:.1}) to ({:.1}, {:.1}) points",
-            found.count,
-            kinds.join(", "),
-            place,
-            bbox[0],
-            bbox[1],
-            bbox[2],
-            bbox[3]
-        )),
-        offset: None,
-        location: format!("page {}, region {}", region.page, ri + 1),
-        form: None,
-    });
+//// Merges what one walk learned about the operators into what all walks learned.
+fn merge(into: &mut Marks, from: Marks) {
+    for (k, (free, kept)) in from.paint {
+        let e = into.paint.entry(k).or_insert((false, false));
+        e.0 |= free;
+        e.1 |= kept;
+    }
+    for (k, v) in from.sh {
+        *into.sh.entry(k).or_insert(false) |= v;
+    }
 }
 
 /// Checks the regions against the pages of the normalised copy of a file. `bytes` is that copy.
@@ -1222,7 +1212,12 @@ pub fn check(ctx: &Ctx, bytes: &[u8], rep: &mut Report) -> Result<()> {
         }
         by_page.entry(region.page).or_default().push(ri);
     }
-    for (page_no, ris) in by_page {
+    // What the x-ray copy needs: the content of the pages, and what the walks found about it.
+    let mut marks = Marks::default();
+    let mut contents_of: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+    let mut xray_ok = true;
+    for (page_no, ris) in &by_page {
+        let page_no = *page_no;
         let (page, res) = &pages[page_no - 1];
         // Nothing is painted outside the media box.
         let container = match exact_numbers(inherited(&doc, page, "MediaBox"), &doc, 4) {
@@ -1236,6 +1231,7 @@ pub fn check(ctx: &Ctx, bytes: &[u8], rep: &mut Report) -> Result<()> {
                 rep.problems.push(format!(
                     "images: page {page_no}: the page has no MediaBox of four numbers, so where it paints is not known"
                 ));
+                xray_ok = false;
                 [f64::MIN, f64::MIN, f64::MAX, f64::MAX]
             }
         };
@@ -1251,15 +1247,24 @@ pub fn check(ctx: &Ctx, bytes: &[u8], rep: &mut Report) -> Result<()> {
             .collect();
         let mut w = Walker::new(&doc, container, targets, budget);
         match contents(&doc, page) {
-            Ok(data) => w.page(&data, &doc.resolve(res).clone()),
-            Err(why) => w.problem(why),
+            Ok(data) => {
+                w.page(page.num, &data, &doc.resolve(res).clone());
+                contents_of.insert(page.num, data);
+            }
+            Err(why) => {
+                w.problem(why);
+                xray_ok = false;
+            }
         }
         annotations(&mut w, page, container, &doc.resolve(res).clone(), &acro);
         budget = w.budget;
+        if w.aborted() {
+            xray_ok = false;
+        }
         for p in w.problems.drain(..) {
             rep.problems.push(format!("images: page {page_no}: {p}"));
         }
-        for (k, ri) in ris.iter().enumerate() {
+        for ri in ris {
             let region = &ctx.spec.regions[*ri];
             let rect = normalised(region.rect);
             let zones: Vec<Zone> = w
@@ -1267,7 +1272,6 @@ pub fn check(ctx: &Ctx, bytes: &[u8], rep: &mut Report) -> Result<()> {
                 .iter()
                 .flat_map(|pl| check_placement(&doc, region, *ri, pl, rep))
                 .collect();
-            report_found(&w.found[k], region, *ri, rep);
             for (r, sub) in &w.bare_text {
                 if overlaps(r, &rect) {
                     rep.hits.push(Hit {
@@ -1302,8 +1306,229 @@ pub fn check(ctx: &Ctx, bytes: &[u8], rep: &mut Report) -> Result<()> {
                 rep,
             );
         }
+        merge(&mut marks, std::mem::take(&mut w.marks));
     }
+    if !xray_ok {
+        rep.problem(
+            "images: the x-ray copy was not made, because the walk over the pages could not be completed, so what is drawn under the regions was not checked in a render of it"
+                .to_owned(),
+        );
+        return Ok(());
+    }
+    xray_check(ctx, &doc, &by_page, &contents_of, &marks, rep);
     Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// The x-ray render: the authority for what is drawn inside a region.
+
+/// A page drawn by PDFium: the helper program writes a PPM, like `pdftoppm`.
+fn render_pdfium(
+    ctx: &Ctx,
+    path: &Path,
+    page: usize,
+    w: usize,
+    h: usize,
+) -> std::result::Result<Rendered, String> {
+    let Some(dir) = ctx
+        .opts
+        .pdfium_dir
+        .clone()
+        .or_else(tools::default_pdfium_dir)
+    else {
+        return Err("no PDFium library was found (--pdfium-dir, the variable VERIFIER_PDFIUM_DIR or vendor/pdfium in the repository)".to_owned());
+    };
+    let out_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let out = out_dir.path().join("page.ppm");
+    let (n, ws, hs) = (page.to_string(), w.to_string(), h.to_string());
+    let args: [&OsStr; 12] = [
+        OsStr::new("--dir"),
+        dir.as_os_str(),
+        OsStr::new("--pdf"),
+        path.as_os_str(),
+        OsStr::new("--page"),
+        OsStr::new(&n),
+        OsStr::new("--width"),
+        OsStr::new(&ws),
+        OsStr::new("--height"),
+        OsStr::new(&hs),
+        OsStr::new("--out"),
+        out.as_os_str(),
+    ];
+    let o = tools::pdfium_render(&args).map_err(|e| e.0)?;
+    if o.status != 0 {
+        let first = o
+            .stderr
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("");
+        return Err(format!(
+            "the PDFium helper failed (exit {}): {first}",
+            o.status
+        ));
+    }
+    let bytes = std::fs::read(&out).map_err(|e| e.to_string())?;
+    parse_ppm(&bytes).ok_or_else(|| "the image that PDFium drew cannot be read".to_owned())
+}
+
+/// How many pixels of the rectangle `[x0, x1) x [y0, y1)` are not white, and the first of them.
+fn ink(
+    img: &Rendered,
+    x0: usize,
+    x1: usize,
+    y0: usize,
+    y1: usize,
+) -> (usize, Option<(usize, usize)>) {
+    let (mut n, mut first) = (0usize, None);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let p = &img.rgb[(y * img.w + x) * 3..][..3];
+            if p != [255, 255, 255] {
+                n += 1;
+                first.get_or_insert((x, y));
+            }
+        }
+    }
+    (n, first)
+}
+
+/// Writes the x-ray copy, draws each page of the regions with Poppler and with PDFium, and reports
+/// every pixel inside a region that is not the colour of the page. Both renders must be clean.
+fn xray_check(
+    ctx: &Ctx,
+    doc: &Doc,
+    by_page: &BTreeMap<usize, Vec<usize>>,
+    contents_of: &BTreeMap<u32, Vec<u8>>,
+    marks: &Marks,
+    rep: &mut Report,
+) {
+    let plan = xray::Plan {
+        pages: contents_of,
+        marks,
+    };
+    let bytes = match xray::build(doc, &plan) {
+        Ok(b) => b,
+        Err(problems) => {
+            for p in problems {
+                rep.problem(format!(
+                    "images: the x-ray copy of the file could not be made, so what is drawn under the regions was not checked in a render of it: {p}"
+                ));
+            }
+            return;
+        }
+    };
+    let dir = match tempfile::tempdir() {
+        Ok(d) => d,
+        Err(e) => {
+            rep.problem(format!("images: the x-ray copy could not be written: {e}"));
+            return;
+        }
+    };
+    let path = dir.path().join("xray.pdf");
+    if let Err(e) = std::fs::write(&path, &bytes) {
+        rep.problem(format!("images: the x-ray copy could not be written: {e}"));
+        return;
+    }
+    let pages = doc.pages();
+    for (page_no, ris) in by_page {
+        let page_no = *page_no;
+        let page = pages[page_no - 1].0;
+        let place = format!("page {page_no}");
+        let geo = match geometry(doc, page) {
+            Ok(g) => g,
+            Err(why) => {
+                rep.problem(format!(
+                    "images: {place}: the x-ray render could not place the regions: {why}"
+                ));
+                continue;
+            }
+        };
+        let (pw, ph) = (geo.media[2] - geo.media[0], geo.media[3] - geo.media[1]);
+        let s = f64::from(RENDER_DPI) / 72.0;
+        if pw * s * ph * s > MAX_RENDER_PIXELS as f64 {
+            rep.problem(format!(
+                "images: {place}: the page is too large to render for the x-ray check"
+            ));
+            continue;
+        }
+        let poppler = match render_page(ctx, &path, page_no) {
+            Ok(r) => r,
+            Err(why) => {
+                rep.problem(format!(
+                    "images: {place}: the x-ray render by pdftoppm could not be done: {why}"
+                ));
+                continue;
+            }
+        };
+        let pdfium = match render_pdfium(ctx, &path, page_no, poppler.w, poppler.h) {
+            Ok(r) => r,
+            Err(why) => {
+                rep.problem(format!(
+                    "images: {place}: the x-ray render by PDFium could not be done: {why}"
+                ));
+                continue;
+            }
+        };
+        if (pdfium.w, pdfium.h) != (poppler.w, poppler.h) {
+            rep.problem(format!(
+                "images: {place}: the x-ray renders are not the same size (pdftoppm {} x {}, PDFium {} x {} pixels)",
+                poppler.w, poppler.h, pdfium.w, pdfium.h
+            ));
+            continue;
+        }
+        let map = match geo.mapper(poppler.w, poppler.h) {
+            Ok(m) => m,
+            Err(why) => {
+                rep.problem(format!(
+                    "images: {place}: the x-ray render could not place the regions: {why}"
+                ));
+                continue;
+            }
+        };
+        for ri in ris {
+            let region = &ctx.spec.regions[*ri];
+            let rect = normalised(region.rect);
+            let c = bounds(&[
+                map(rect[0], rect[1]),
+                map(rect[2], rect[1]),
+                map(rect[0], rect[3]),
+                map(rect[2], rect[3]),
+            ]);
+            let margin = XRAY_MARGIN as i64;
+            let lo_x = (c[0].ceil() as i64 + margin).max(0);
+            let hi_x = (c[2].floor() as i64 - margin).min(poppler.w as i64);
+            let lo_y = (c[1].ceil() as i64 + margin).max(0);
+            let hi_y = (c[3].floor() as i64 - margin).min(poppler.h as i64);
+            if hi_x <= lo_x || hi_y <= lo_y {
+                rep.problem(format!(
+                    "images: {place}, region {}: the region is smaller than {} device pixels at {RENDER_DPI} dpi (or outside the page), so no pixel is left to check in the x-ray render after the edge of {XRAY_MARGIN} pixel is left out",
+                    ri + 1,
+                    2 * XRAY_MARGIN + 1
+                ));
+                continue;
+            }
+            let (lo_x, hi_x, lo_y, hi_y) =
+                (lo_x as usize, hi_x as usize, lo_y as usize, hi_y as usize);
+            for (name, img) in [("pdftoppm", &poppler), ("PDFium", &pdfium)] {
+                let (n, first) = ink(img, lo_x, hi_x, lo_y, hi_y);
+                if let Some((bx, by)) = first {
+                    rep.hits.push(Hit {
+                        layer: Layer::Images,
+                        subject: Subject::Rule(format!(
+                            "x-ray render: {n} of {} pixels inside a redaction region are not the colour of the page when everything that could hide content is taken away and the box is left out; something is drawn there",
+                            (hi_x - lo_x) * (hi_y - lo_y)
+                        )),
+                        offset: None,
+                        location: format!(
+                            "{place}, region {}, drawn by {name} at {RENDER_DPI} dpi, first at pixel ({bx}, {by})",
+                            ri + 1
+                        ),
+                        form: None,
+                    });
+                }
+            }
+        }
+    }
 }
 
 fn normalised(r: [f64; 4]) -> [f64; 4] {
@@ -1317,7 +1542,7 @@ fn normalised(r: [f64; 4]) -> [f64; 4] {
 
 /// The streams of an appearance, in every state: `/N`, `/R` and `/D` hold a stream or a dictionary
 /// of streams (one per state, nested as deep as a file makes it).
-fn appearance_streams(doc: &Doc, v: &Obj, out: &mut Vec<u32>, depth: usize) {
+pub(crate) fn appearance_streams(doc: &Doc, v: &Obj, out: &mut Vec<u32>, depth: usize) {
     if depth > 4 {
         return;
     }
@@ -1489,8 +1714,13 @@ fn annotations(w: &mut Walker, page: &Entry, container: [f64; 4], page_res: &Obj
             }
         }
         let text = has_entry_text(doc, ad, 0);
+        // The appearance that Poppler draws: the normal one, or the state of /AS in it. When there
+        // is none, a viewer draws the annotation from its own entries, whatever other streams the
+        // appearance dictionary holds (they are still walked, below).
+        let picked = picked_normal(doc, ad);
+        let has_ap = picked.is_some();
         // A widget that a viewer draws again from its value.
-        let blank = forms.iter().all(|n| blank_form(doc, *n));
+        let blank = picked.is_none_or(|n| blank_form(doc, n));
         let redrawn = sub == "Widget" && (need_app || blank);
         if redrawn && !rect.is_empty() {
             if rect.len() != 4 {
@@ -1500,28 +1730,29 @@ fn annotations(w: &mut Walker, page: &Entry, container: [f64; 4], page_res: &Obj
             let r = normalised([rect[0], rect[1], rect[2], rect[3]]);
             if text {
                 w.bare_text.push((r, sub.to_owned()));
-            } else if need_app || forms.is_empty() {
+            } else if need_app || !has_ap {
                 w.bare.push((r, sub.to_owned()));
             }
         }
-        if forms.is_empty() {
+        if !has_ap {
             // No appearance stream: a viewer draws these from their own entries.
-            if !DRAWN_BY_VIEWER.contains(&sub) || (redrawn && !rect.is_empty()) {
+            if DRAWN_BY_VIEWER.contains(&sub) && !(redrawn && !rect.is_empty()) {
+                if rect.len() != 4 {
+                    w.problem(format!(
+                        "a {sub} annotation with no appearance stream has no /Rect, so where a viewer draws it is not known"
+                    ));
+                    continue;
+                }
+                let r = normalised([rect[0], rect[1], rect[2], rect[3]]);
+                if text {
+                    w.bare_text.push((r, sub.to_owned()));
+                } else {
+                    w.bare.push((r, sub.to_owned()));
+                }
+            }
+            if forms.is_empty() {
                 continue;
             }
-            if rect.len() != 4 {
-                w.problem(format!(
-                    "a {sub} annotation with no appearance stream has no /Rect, so where a viewer draws it is not known"
-                ));
-                continue;
-            }
-            let r = normalised([rect[0], rect[1], rect[2], rect[3]]);
-            if text {
-                w.bare_text.push((r, sub.to_owned()));
-            } else {
-                w.bare.push((r, sub.to_owned()));
-            }
-            continue;
         }
         if rect.len() != 4 {
             w.problem("an annotation with an appearance has no /Rect, so where a viewer draws it is not known".to_owned());
@@ -1574,6 +1805,32 @@ fn annotations(w: &mut Walker, page: &Entry, container: [f64; 4], page_res: &Obj
                 .unwrap_or_else(|| fallback.clone());
             w.appearance(n, &res, a_m, container);
         }
+    }
+}
+
+/// The normal appearance that Poppler draws for an annotation: `/N` when it is a stream, else the
+/// entry of `/N` that `/AS` names, or the only entry when there is no `/AS`. `None` when there is
+/// none (a viewer draws the annotation from its own entries then).
+fn picked_normal(doc: &Doc, ad: &Obj) -> Option<u32> {
+    let ap = doc.dget(ad, "AP");
+    let n = ap.get("N")?;
+    let stream = |o: &Obj| match o {
+        Obj::Ref(r) if doc.latest(*r).is_some_and(|e| e.stream.is_some()) => Some(*r),
+        _ => None,
+    };
+    if let Some(r) = stream(n) {
+        return Some(r);
+    }
+    let states = doc.resolve(n);
+    if !states.is_dict() {
+        return None;
+    }
+    match doc.dget(ad, "AS").name() {
+        Some(state) => states.get(state).and_then(stream),
+        None => match states.entries() {
+            [(_, only)] => stream(only),
+            _ => None,
+        },
     }
 }
 

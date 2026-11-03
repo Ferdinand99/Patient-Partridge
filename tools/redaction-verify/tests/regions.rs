@@ -12,7 +12,9 @@ use common::*;
 
 const IMAGE_MESSAGE: &str = "inside a redaction region is not blank";
 const RENDER_MESSAGE: &str = "rendered pixels inside a redaction region";
-const PAINTED_MESSAGE: &str = "painted geometry inside a redaction region";
+const PAINTED_MESSAGE: &str = "x-ray render: ";
+/// What the report says of the text or the shape of an annotation that has no appearance stream.
+const BARE_MESSAGE: &str = "painted geometry inside a redaction region";
 
 /// 8 x 8 RGB samples that differ from each other everywhere.
 fn original() -> Vec<u8> {
@@ -417,7 +419,7 @@ fn vector_shapes_are_seen_by_the_render() {
         "covered by a fill",
         &plain_page(&covered, &[]),
         &black,
-        Leak(&[PAINTED_MESSAGE, "fill of a path"], &[RENDER_MESSAGE]),
+        Leak(&[PAINTED_MESSAGE], &[RENDER_MESSAGE]),
     );
     check(
         "covered, no fill named",
@@ -757,7 +759,7 @@ fn a_signature_under_the_box_is_a_leak() {
         "under a black box, fill named",
         &plain_page(&under, &[]),
         &black_region(),
-        Leak(&[PAINTED_MESSAGE, "fill of a path"], &[RENDER_MESSAGE]),
+        Leak(&[PAINTED_MESSAGE], &[RENDER_MESSAGE]),
     );
     check(
         "under a black box, no fill named",
@@ -799,7 +801,7 @@ fn a_signature_under_the_box_is_a_leak() {
         "the box and its outline",
         &plain_page(b"0 g 72 400 50 50 re B\n", &[]),
         &black_region(),
-        Leak(&[PAINTED_MESSAGE, "fill and stroke of a path"], &[]),
+        Leak(&[PAINTED_MESSAGE], &[]),
     );
 }
 
@@ -862,7 +864,7 @@ fn geometry_that_is_not_under_the_region_is_not_a_leak() {
         "a wide line that reaches in",
         &plain_page(b"0 0 1 RG 6 w 80 451 m 110 451 l S\n", &[]),
         &white_region(),
-        Leak(&[PAINTED_MESSAGE, "stroke of a path"], &[]),
+        Leak(&[PAINTED_MESSAGE], &[]),
     );
     // A path that is built and not painted paints nothing.
     check(
@@ -891,7 +893,7 @@ fn geometry_in_a_form_follows_the_matrices() {
         "a form drawn on the region",
         &page("72 400"),
         &white_region(),
-        Leak(&[PAINTED_MESSAGE, "form object "], &[]),
+        Leak(&[PAINTED_MESSAGE], &[]),
     );
     check(
         "a form drawn elsewhere",
@@ -914,7 +916,7 @@ fn a_shading_is_painted_where_its_box_is() {
         "a shading with a box over the region",
         &drawn(b"/Sh1 sh\n", &shading("/BBox [72 400 122 450] ")),
         &white_region(),
-        Leak(&[PAINTED_MESSAGE, "shading"], &[]),
+        Leak(&[PAINTED_MESSAGE], &[]),
     );
     check(
         "a shading with a box elsewhere",
@@ -927,7 +929,7 @@ fn a_shading_is_painted_where_its_box_is() {
         "a shading with no box",
         &drawn(b"/Sh1 sh\n", &shading("")),
         &white_region(),
-        Leak(&[PAINTED_MESSAGE, "shading"], &[]),
+        Leak(&[PAINTED_MESSAGE], &[]),
     );
     // A shading that is not there: where it paints is not known.
     let r = cli(
@@ -958,14 +960,14 @@ fn what_the_glyphs_of_a_type3_font_paint_is_placed_where_they_are_shown() {
         "shown on the region",
         &page("BT /F2 12 Tf 80 410 Td (A) Tj ET\n"),
         &white_region(),
-        Leak(&[PAINTED_MESSAGE, "fill of a path"], &[]),
+        Leak(&[PAINTED_MESSAGE], &[]),
     );
     // The position is the one after the moves of the text.
     check(
         "shown on the region after a move",
         &page("BT /F2 12 Tf 14 TL 80 560 Td 0 -150 Td (A) Tj ET\n"),
         &white_region(),
-        Leak(&[PAINTED_MESSAGE, "fill of a path"], &[]),
+        Leak(&[PAINTED_MESSAGE], &[]),
     );
     check(
         "shown elsewhere",
@@ -1069,7 +1071,7 @@ fn every_state_of_every_appearance_is_walked_for_geometry() {
             name,
             &button_page(ap, mk, &[blank.clone(), painter.clone()]),
             &white_region(),
-            Leak(&[PAINTED_MESSAGE, "an annotation appearance"], &[]),
+            Leak(&[PAINTED_MESSAGE], &[]),
         );
     }
 }
@@ -1701,7 +1703,7 @@ fn the_glyphs_of_a_type3_font_are_placed_like_all_others() {
             .insert(20, stream_obj("", b"500 0 d0 0 0 400 400 re f", false));
         fx.build()
     };
-    let type3 = || Leak(&[PAINTED_MESSAGE, "fill of a path"], &[]);
+    let type3 = || Leak(&[PAINTED_MESSAGE], &[]);
     check(
         "a glyph under the box",
         &page("BT /F2 12 Tf 80 420 Td (A) Tj ET"),
@@ -1872,7 +1874,7 @@ fn a_clip_path_is_geometry() {
         "a signature as a clip, filled by the box, then the box",
         &boxed(&shaped),
         &black_region(),
-        Leak(&[PAINTED_MESSAGE, "clip path"], &[]),
+        Leak(&[PAINTED_MESSAGE], &[]),
     );
     check(
         "the same without a box on top",
@@ -1886,7 +1888,7 @@ fn a_clip_path_is_geometry() {
         "the box and a hairline that does not cross",
         &plain_page(&[BOX, b"0 w 0 g 80 430 m 110 430 l S\n"].concat(), &[]),
         &black_region(),
-        Leak(&[PAINTED_MESSAGE, "stroke of a path"], &[]),
+        Leak(&[PAINTED_MESSAGE], &[]),
     );
     check(
         "the box and a small rectangle in one path",
@@ -1912,7 +1914,7 @@ fn a_clip_path_is_geometry() {
         "a clip inside the region",
         &boxed(b"q 80 410 20 20 re W n 0 g 72 400 50 50 re f Q\n"),
         &black_region(),
-        Leak(&[PAINTED_MESSAGE, "clip path"], &[]),
+        Leak(&[PAINTED_MESSAGE], &[]),
     );
     // A clip of two rectangles is not one rectangle.
     check(
@@ -1926,7 +1928,7 @@ fn a_clip_path_is_geometry() {
         "a box after the clip ended",
         &boxed(b"q 80 410 20 20 re W n Q 0 g 72 400 50 50 re f\n"),
         &black_region(),
-        Leak(&[PAINTED_MESSAGE, "clip path"], &[]),
+        Leak(&[PAINTED_MESSAGE], &[]),
     );
     // A soft mask shapes what the box paints.
     let mask = stream_obj(
@@ -1947,7 +1949,7 @@ fn a_clip_path_is_geometry() {
         "a box under a soft mask",
         &masked,
         &black_region(),
-        Leak(&[PAINTED_MESSAGE, "fill of a path"], &[]),
+        Leak(&[PAINTED_MESSAGE], &[]),
     );
     // The group of the mask paints a fill that holds the region, which carries nothing: set and
     // not used, the mask is no leak.
@@ -2047,31 +2049,31 @@ fn geometry_that_carries_nothing_about_the_region_is_not_a_leak() {
         "a rule that ends in the region",
         &page(b"", b"0.5 w 0 G 60 424 m 150 424 l S\n"),
         &spec,
-        Leak(&[PAINTED_MESSAGE, "stroke of a path"], &[]),
+        Leak(&[PAINTED_MESSAGE], &[]),
     );
     check(
         "a rule thicker than two points",
         &page(b"", b"3 w 0 G 60 424 m 500 424 l S\n"),
         &spec,
-        Leak(&[PAINTED_MESSAGE, "stroke of a path"], &[]),
+        Leak(&[PAINTED_MESSAGE], &[]),
     );
     check(
         "a rule that is slanted",
         &page(b"", b"0.5 w 0 G 60 410 m 500 438 l S\n"),
         &spec,
-        Leak(&[PAINTED_MESSAGE, "stroke of a path"], &[]),
+        Leak(&[PAINTED_MESSAGE], &[]),
     );
     check(
         "a rule with a bend",
         &page(b"", b"0.5 w 0 G 60 424 m 150 424 l 500 424 l S\n"),
         &spec,
-        Leak(&[PAINTED_MESSAGE, "stroke of a path"], &[]),
+        Leak(&[PAINTED_MESSAGE], &[]),
     );
     check(
         "a thick rectangle across the row",
         &page(b"", b"0 g 60 420 440 6 re f\n"),
         &spec,
-        Leak(&[PAINTED_MESSAGE, "fill of a path"], &[]),
+        Leak(&[PAINTED_MESSAGE], &[]),
     );
     // A rectangle written as a path of lines is a rectangle, and the stroke of a frame is where
     // its sides are, not all over its bounds.
@@ -2100,13 +2102,13 @@ fn geometry_that_carries_nothing_about_the_region_is_not_a_leak() {
         "a frame with a side through the region",
         &page(b"", b"0.5 w 0 G 150 300 200 150 re S\n"),
         &spec,
-        Leak(&[PAINTED_MESSAGE, "stroke of a path"], &[]),
+        Leak(&[PAINTED_MESSAGE], &[]),
     );
     check(
         "a frame that is filled as well",
         &page(b"", b"0.5 w 0 G 60 405 440 40 re B\n"),
         &spec,
-        Leak(&[PAINTED_MESSAGE, "fill and stroke of a path"], &[]),
+        Leak(&[PAINTED_MESSAGE], &[]),
     );
     check(
         "a background that a shape clips",
@@ -2130,7 +2132,7 @@ fn geometry_that_carries_nothing_about_the_region_is_not_a_leak() {
         "a background and a stroke round it",
         &page(b"0.9 g 0 G 60 410 440 28 re B 0 g\n", b""),
         &spec,
-        Leak(&[PAINTED_MESSAGE, "fill and stroke of a path"], &[]),
+        Leak(&[PAINTED_MESSAGE], &[]),
     );
     let pattern = stream_obj(
         "/PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 4 4] /XStep 4 /YStep 4 \
@@ -2165,13 +2167,13 @@ fn a_page_with_a_great_deal_of_content_loses_no_geometry() {
         "99 000 fills and a signature",
         &page(99_000),
         &black_region(),
-        Leak(&[PAINTED_MESSAGE, "fill of a path"], &[]),
+        Leak(&[PAINTED_MESSAGE], &[]),
     );
     check(
         "100 000 fills and a signature",
         &page(100_000),
         &black_region(),
-        Leak(&[PAINTED_MESSAGE, "fill of a path"], &[]),
+        Leak(&[PAINTED_MESSAGE], &[]),
     );
     // The same page, with a budget that is too small: not a pass, but "could not check".
     let bytes = page(100_000);
@@ -2272,7 +2274,7 @@ fn inline_image_data_with_an_ei_in_it_does_not_hide_what_follows() {
         "a signature after an inline image, under the box",
         &plain_page(&[inline_image(&tricky_image_data()), after].concat(), &[]),
         &black_region(),
-        Leak(&[PAINTED_MESSAGE, "fill of a path"], &[]),
+        Leak(&[PAINTED_MESSAGE], &[]),
     );
     // Hidden text after such an image is read by the decode layer, as after any other.
     let cid = Fx::new(b"").show("Ola Nordmann");
@@ -2494,7 +2496,7 @@ fn a_type3_glyph_is_placed_by_what_its_procedure_paints() {
         "a procedure that paints outside the font box",
         &page("40 300"),
         &black_region(),
-        Leak(&[PAINTED_MESSAGE, "fill of a path"], &[]),
+        Leak(&[PAINTED_MESSAGE], &[]),
     );
     check(
         "the same glyph shown elsewhere",
@@ -2592,7 +2594,7 @@ fn an_appearance_without_resources_uses_the_resources_of_the_page() {
         "a form of the page, drawn by an appearance with no resources",
         &stamp_page(ap, ""),
         &black_region(),
-        Leak(&[PAINTED_MESSAGE, "fill of a path"], &[]),
+        Leak(&[PAINTED_MESSAGE], &[]),
     );
     // A name that nothing has is "could not check", in a page and in an appearance.
     for (what, bytes) in [
@@ -2821,7 +2823,7 @@ fn a_rule_that_is_dashed_carries_a_picture_and_is_not_the_exception() {
             what,
             &rule(setup),
             &black_region(),
-            Leak(&[PAINTED_MESSAGE, "stroke of a path"], &[]),
+            Leak(&[PAINTED_MESSAGE], &[]),
         );
     }
     // A solid dash array is a solid line, and the dash is part of the state that q and Q keep.
@@ -2884,7 +2886,7 @@ fn a_stroke_of_a_point_paints_a_dot_with_a_round_cap() {
         "dots of subpaths with no segment, and one far segment",
         &drawn(&[dots.as_bytes(), BOX].concat(), ""),
         &black_region(),
-        Leak(&[PAINTED_MESSAGE, "stroke of a path"], &[]),
+        Leak(&[PAINTED_MESSAGE], &[]),
     );
     check(
         "a lone move",
@@ -2893,7 +2895,7 @@ fn a_stroke_of_a_point_paints_a_dot_with_a_round_cap() {
             "",
         ),
         &black_region(),
-        Leak(&[PAINTED_MESSAGE, "stroke of a path"], &[]),
+        Leak(&[PAINTED_MESSAGE], &[]),
     );
     check(
         "the same far away",

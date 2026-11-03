@@ -1,10 +1,10 @@
-//! The strict profile of the geometry and glyph check of the redacted regions.
+//! The strict profile of the region check.
 //!
 //! The check of a region gives exit status 0 only when every page (its content, and the forms,
-//! annotation appearances, soft mask groups and Type 3 glyph procedures that it draws) lies inside
-//! this profile, which the tool understands fully. Whatever is outside it is "could not check"
-//! (exit status 2). The profile is an allow-list: a reader that does something else with a feature
-//! is of no concern, because the feature is not in it. When in doubt, a feature is left out.
+//! annotation appearances, soft mask groups, patterns and Type 3 glyph procedures that it draws)
+//! lies inside this profile, which the tool understands fully. Whatever is outside it is "could not
+//! check" (exit status 2). The profile is an allow-list: a reader that does something else with a
+//! feature is of no concern, because the feature is not in it. When in doubt, a feature is left out.
 //!
 //! What is inside:
 //!
@@ -12,76 +12,28 @@
 //!    specification (Table A.1), with exactly the number and the types of operands that the
 //!    specification gives: numbers are finite, an integer operand has no fraction, `TJ` shows
 //!    only strings and numbers. An operator that is not in the table is refused, except between
-//!    `BX` and `EX`. Readers differ on extra operands (Poppler takes the last, and says nothing),
-//!    so none are accepted ([`operand_problem`]).
+//!    `BX` and `EX` in the walk (the x-ray copy refuses it there too: it cannot be rewritten).
+//!    Readers differ on extra operands (Poppler takes the last, and says nothing), so none are
+//!    accepted ([`operand_problem`]).
 //! 2. **Matrices and boxes.** A `/Matrix`, `/BBox`, `/Rect` or `/FontMatrix` is exactly six (a
 //!    matrix) or four (a box) finite numbers, no more, no fewer, nothing else ([`exact_numbers`]).
 //!    A form has a `/BBox`.
-//! 3. **Fonts.** Text is shown only with
-//!    - one of the 14 standard fonts that the file does not embed, with no `/Differences` and an
-//!      `/Encoding` that is absent or `WinAnsiEncoding`, `MacRomanEncoding` or `StandardEncoding`,
-//!      and with no `/Widths`, or with `/Widths` that agree with the standard metrics to
-//!      [`STD_TOLERANCE`] for every code from 32 to 126;
-//!    - a simple font (Type 1, MMType1, TrueType) whose program is in the file (TrueType,
-//!      OpenType, CFF or Type 1) and has a bounding box that the tool can read, with `/Widths`
-//!      that are `/LastChar - /FirstChar + 1` numbers (a code outside that range is not shown),
-//!      and, for a TrueType program, widths that are advances of the program;
-//!    - a composite font (Type 0) with the encoding `Identity-H` (a name, not a stream), a
-//!      descendant font whose program is in the file, and, for a TrueType descendant, widths that
-//!      are the advances of the program for the glyph of the code, with the ink of that glyph
-//!      within [`INK_SLACK`] em of its advance box;
-//!    - a Type 3 font whose `/FontMatrix` has no rotation or skew, whose `/Widths` fit
-//!      `/FirstChar`..`/LastChar`, and in which every shown code is named by `/Differences`, has a
-//!      procedure in `/CharProcs` that can be read and is walked.
+//! 3. **Type 3 fonts.** The `/FontMatrix` has no rotation, skew or zero scale, the `/Widths` fit
+//!    `/FirstChar`..`/LastChar`, and every shown code is named by `/Differences` and has a glyph
+//!    procedure that can be read and is walked: a Type 3 glyph paints what its procedure says,
+//!    where the pen puts it, and the pen follows the widths that the file gives.
+//! 4. **Annotations.** An annotation with the NoRotate flag on a page that is turned is refused
+//!    when it lies near a region (the walk cannot place its appearance).
 //!
-//!    The bounding box of the program must lie within [`PROGRAM_SLACK_Y`] em above and below the
-//!    ascent and descent that the glyph cell uses, and within [`PROGRAM_SLACK_X`] em to the left of
-//!    the origin and to the right of the widest advance, so that the ink cannot be a long way from
-//!    the cell. Writing is horizontal: a `/WMode` of 1 in the font or in a character map, a name
-//!    that ends in `-V`, and every character map that is a stream or a name other than
-//!    `Identity-H` are refused.
-//! 4. **Annotations.** An annotation with the NoRotate flag on a page that is turned is refused.
-//! 5. **Strokes.** A miter limit above [`MAX_MITER`], and a dash pattern on a path with joins, are
-//!    refused when the stroke is near a region.
+//! Not in the profile, because the render of the x-ray copy decides it: where the glyphs of a font
+//! are drawn. Fonts are not read for their metrics, their programs are not parsed, and no font
+//! is refused.
 //!
-//! The glyph rule (the contract with the redaction engine) is in the README and in
-//! [`crate::walk`]: the cell of a glyph is its advance box across, from the origin by the width of
-//! the glyph (after `Tz`), and from the descent to the ascent of the font, within the bounding box
-//! of the font program. A glyph is under a region when its cell overlaps the region with positive
-//! area, in every spec.
+//! The contract with the redaction engine is in the README: once the box is taken away, no
+//! renderer may draw anything inside the region.
 
 use crate::content::{Op, Operand};
 use crate::pdfobj::{Doc, Obj};
-
-/// How far the width of a standard font in the file may be from the metrics of the standard font,
-/// as a fraction.
-pub const STD_TOLERANCE: f64 = 0.01;
-
-/// The highest miter limit that a stroke may have.
-pub const MAX_MITER: f64 = 10.0;
-
-/// How far the box of the font program may reach above the ascent and below the descent of the
-/// glyph cell, in em.
-pub const PROGRAM_SLACK_Y: f64 = 0.5;
-
-/// How far the box of the font program may reach left of the origin and right of the widest
-/// advance, in em.
-pub const PROGRAM_SLACK_X: f64 = 1.2;
-
-/// How far an advance of a TrueType program may be from a width in the file: this fraction of the
-/// width, or [`ADVANCE_ABS`] em, whichever is more.
-pub const ADVANCE_TOLERANCE: f64 = 0.02;
-pub const ADVANCE_ABS: f64 = 0.005;
-
-/// The least width of a shown glyph, in em (a simple font may show a space of no width).
-pub const MIN_WIDTH: f64 = 0.01;
-
-/// How far the ink of a glyph of a composite font with a TrueType program may reach left of its
-/// origin and right of its advance, in em.
-pub const INK_SLACK: f64 = 0.3;
-
-/// The most that the width of a glyph may be, in em.
-pub const MAX_WIDTH: f64 = 3.0;
 
 /// The kind of an operand that an operator takes.
 #[derive(Clone, Copy, PartialEq)]

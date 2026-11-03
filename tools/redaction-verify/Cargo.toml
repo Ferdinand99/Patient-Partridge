@@ -19,6 +19,12 @@ path = "src/lib.rs"
 name = "redaction-verify"
 path = "src/main.rs"
 
+# Draws one page with PDFium for the x-ray render. It is a program of its own, so that a PDFium that
+# crashes or hangs on a crafted file ends one render ("could not check") and not the verifier.
+[[bin]]
+name = "redaction-verify-pdfium"
+path = "src/pdfium_helper.rs"
+
 [dependencies]
 flate2 = "=1.1.10"
 sha2 = "=0.11.1"
@@ -26,6 +32,10 @@ serde_json = "=1.0.154"
 tempfile = "=3.27.0"
 jpeg-decoder = { version = "=0.3.2", default-features = false }
 unicode-normalization = "=0.1.26"
+
+# The second renderer of the x-ray check. The same crate, version and PDFium build as the engine of
+# the app (pdfium.lock.json); the library itself is fetched by scripts/fetch-pdfium.mjs.
+pdfium-render = { version = "=0.9.5", default-features = false, features = ["pdfium_8125"] }
 
 # A job object ends a tool and everything that it started, on Windows (already in the lock file
 # through tempfile).

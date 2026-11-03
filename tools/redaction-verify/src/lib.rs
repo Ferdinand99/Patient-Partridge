@@ -108,7 +108,6 @@ use std::path::Path;
 
 pub mod carve;
 pub mod content;
-pub mod fontprog;
 pub mod fonts;
 mod layers;
 pub mod pdfobj;
@@ -122,6 +121,7 @@ mod structure;
 pub mod textdec;
 pub mod tools;
 mod walk;
+pub mod xray;
 
 pub use search::{Encoding, Features, Form, Via};
 
@@ -267,6 +267,10 @@ pub const RENDER_DPI: u32 = 144;
 /// The device pixels at the edge of a region that the render check leaves out: the edge of a fill
 /// is anti-aliased, and the position of the region can be off by a fraction of a pixel.
 pub const RENDER_MARGIN: usize = 2;
+
+/// The device pixels at the edge of a region that the x-ray render leaves out: the antialiasing of
+/// the ink of whatever lies next to the region.
+pub const XRAY_MARGIN: usize = 1;
 
 /// A rectangle on a page, in the default user space of the page (points, y up), under which the
 /// pixels of every image must be blank and the rendered page must be the fill colour.
@@ -472,6 +476,9 @@ pub struct Options {
     pub walk_steps: u64,
     /// The most time that this walk may take for the file. The default is [`DEFAULT_WALK_BUDGET`].
     pub walk_budget: std::time::Duration,
+    /// The folder that holds the PDFium library for the x-ray render. The default is the variable
+    /// `VERIFIER_PDFIUM_DIR`, or `vendor/pdfium/<platform>` of the repository.
+    pub pdfium_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for Options {
@@ -485,6 +492,7 @@ impl Default for Options {
             file_budget: tools::file_budget_from_env(),
             walk_steps: DEFAULT_WALK_STEPS,
             walk_budget: DEFAULT_WALK_BUDGET,
+            pdfium_dir: None,
         }
     }
 }

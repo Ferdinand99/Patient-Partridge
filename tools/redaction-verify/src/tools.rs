@@ -9,6 +9,7 @@
 use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::io::Read;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -221,7 +222,10 @@ fn stop(why: String) -> Error {
 }
 
 fn run(var: &str, name: &str, args: &[&OsStr]) -> Result<Output, Error> {
-    let prog = program(var, name);
+    run_program(var, program(var, name), args)
+}
+
+fn run_program(var: &str, prog: String, args: &[&OsStr]) -> Result<Output, Error> {
     if let Some(why) = stopped() {
         return Err(Error(why));
     }
@@ -357,6 +361,56 @@ pub fn pdfimages(args: &[&OsStr]) -> Result<Output, Error> {
 /// Poppler's renderer. It draws the pages that the redacted regions are checked on.
 pub fn pdftoppm(args: &[&OsStr]) -> Result<Output, Error> {
     run("PDFTOPPM", "pdftoppm", args)
+}
+
+/// The program that draws a page with PDFium for the x-ray render: `redaction-verify-pdfium`,
+/// next to this program (or one folder up, where a test binary lives), or the one named by
+/// `VERIFIER_PDFIUM_HELPER`.
+fn pdfium_helper() -> String {
+    if let Ok(p) = std::env::var("VERIFIER_PDFIUM_HELPER") {
+        return p;
+    }
+    let name = format!("redaction-verify-pdfium{}", std::env::consts::EXE_SUFFIX);
+    if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf))
+    {
+        for d in [Some(dir.clone()), dir.parent().map(Path::to_path_buf)]
+            .into_iter()
+            .flatten()
+        {
+            let c = d.join(&name);
+            if c.is_file() {
+                return c.to_string_lossy().into_owned();
+            }
+        }
+    }
+    name
+}
+
+/// PDFium's renderer, through the helper program: it draws the x-ray copy of the pages.
+pub fn pdfium_render(args: &[&OsStr]) -> Result<Output, Error> {
+    run_program("VERIFIER_PDFIUM_HELPER", pdfium_helper(), args)
+}
+
+/// The folder with the PDFium library when the caller names none: the variable
+/// `VERIFIER_PDFIUM_DIR`, or `vendor/pdfium/<platform>` of the repository that this program was
+/// built in (the folder that `scripts/fetch-pdfium.mjs` fills).
+pub fn default_pdfium_dir() -> Option<std::path::PathBuf> {
+    if let Some(d) = std::env::var_os("VERIFIER_PDFIUM_DIR") {
+        return Some(std::path::PathBuf::from(d));
+    }
+    let id = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => "linux-x64",
+        ("linux", "aarch64") => "linux-arm64",
+        ("macos", "aarch64") => "mac-arm64",
+        ("macos", "x86_64") => "mac-x64",
+        ("windows", "x86_64") => "win-x64",
+        ("windows", "aarch64") => "win-arm64",
+        _ => return None,
+    };
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../vendor/pdfium")
+        .join(id);
+    dir.is_dir().then_some(dir)
 }
 
 /// Versions of the tools, for the report.

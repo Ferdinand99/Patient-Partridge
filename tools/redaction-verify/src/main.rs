@@ -16,6 +16,8 @@
 //!   --walk-steps N         the most steps (operators and glyphs) the walk over the content of a
 //!                          region page may take (default 100000000); over it, exit 2
 //!   --walk-budget SECS     the longest that walk may take (default 120); over it, exit 2
+//!   --pdfium-dir DIR       the folder with the PDFium library for the x-ray render (default: the
+//!                          variable VERIFIER_PDFIUM_DIR, or vendor/pdfium/<platform> of the repository)
 //!   --file-budget SECS     the longest all calls for the file may take (default 900, or the
 //!                          variable VERIFIER_FILE_BUDGET)
 //! ```
@@ -31,7 +33,7 @@ fn usage() -> ExitCode {
     eprintln!(
         "usage: redaction-verify [--spec FILE] [--text S].. [--metadata S].. [--field S].. \
          [--bookmark S].. [--attachment S].. [--image-sha256 HEX].. [--forbid-key /K].. \
-         [--scrubbed] [--single-revision] [--only LAYERS] [--skip LAYERS] [--show-values] [--tool-timeout SECS] [--file-budget SECS] [--walk-steps N] [--walk-budget SECS] FILE.pdf"
+         [--scrubbed] [--single-revision] [--only LAYERS] [--skip LAYERS] [--show-values] [--tool-timeout SECS] [--file-budget SECS] [--walk-steps N] [--walk-budget SECS] [--pdfium-dir DIR] FILE.pdf"
     );
     ExitCode::from(2)
 }
@@ -90,6 +92,7 @@ fn run() -> Result<ExitCode, String> {
     let mut file_budget = None;
     let mut walk_steps = None;
     let mut walk_budget = None;
+    let mut pdfium_dir: Option<PathBuf> = None;
     while let Some(a) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
         match a.as_str() {
@@ -136,6 +139,7 @@ fn run() -> Result<ExitCode, String> {
                 walk_budget = Some(seconds("--walk-budget", &value("--walk-budget")?)?);
             }
             "--region" => spec.regions.push(region(&value("--region")?)?),
+            "--pdfium-dir" => pdfium_dir = Some(PathBuf::from(value("--pdfium-dir")?)),
             "--password-file" => {
                 let path = value("--password-file")?;
                 let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
@@ -183,6 +187,7 @@ fn run() -> Result<ExitCode, String> {
     if let Some(b) = file_budget {
         opts.file_budget = b;
     }
+    opts.pdfium_dir = pdfium_dir;
     let report = verify(&file, &spec, &opts).map_err(|e| e.to_string())?;
     print!("{}", report.render(&spec, show));
     Ok(if !report.hits.is_empty() {
