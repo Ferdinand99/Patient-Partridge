@@ -7,10 +7,12 @@
 mod common;
 mod sign_support;
 
+use common::designer::{add, apply_ok, open as open_designer, widget};
+
 use common::*;
 use partridge_engine::sigcheck::TrustList;
 use partridge_protocol::{
-    ErrorCode, RequestBody, ResponseBody, SignPlace, SignRequest, SignResponse,
+    DesignField, DesignKind, DesignProps, ErrorCode, RequestBody, ResponseBody, SignPlace, SignRequest, SignResponse,
     SignatureFont, SignatureMark, SignatureReason as R, SignatureState as S,
 };
 use partridge_testkit as kit;
@@ -261,7 +263,7 @@ fn an_existing_empty_signature_field_is_signed_in_place() {
         panic!("no fields");
     };
     assert_eq!(fields.len(), 1);
-    assert_eq!(fields[0].name, "Sign here");
+    assert_eq!(fields[0].name, "empty_signature");
     ask(e, RequestBody::Close { doc });
 
     let (signed, r) = sign_with(
@@ -270,7 +272,7 @@ fn an_existing_empty_signature_field_is_signed_in_place() {
         "p256.p12",
         SignPlace::Field {
             page: 0,
-            name: "Sign here".into(),
+            name: "empty_signature".into(),
         },
     );
     assert_eq!(r.total, 1);
@@ -286,7 +288,7 @@ fn an_existing_empty_signature_field_is_signed_in_place() {
         panic!("no fields");
     };
     assert_eq!(fields.len(), 1);
-    assert_eq!(fields[0].name, "Sign here");
+    assert_eq!(fields[0].name, "empty_signature");
     ask(e, RequestBody::Close { doc });
 }
 
@@ -317,7 +319,7 @@ fn a_field_that_is_not_there_or_is_not_a_signature_field_is_refused() {
             doc,
             SignPlace::Field {
                 page: 3,
-                name: "Sign here".into(),
+                name: "empty_signature".into(),
             },
         ),
     );
@@ -697,4 +699,70 @@ fn a_signature_that_was_changed_after_it_was_made_is_not_intact() {
     signed.extend_from_slice(b"\n% after\n");
     let r = report(e, &signed);
     assert_eq!(r.items[0].state, S::Changed);
+}
+
+#[test]
+fn a_signature_field_made_by_the_form_designer_can_be_signed() {
+    let mut shared = engine();
+    let e = &mut shared.0;
+    let (doc, _file) = open_designer(e, &kit::simple_pdf(1));
+    apply_ok(
+        e,
+        doc,
+        vec![add(DesignField {
+            name: "approval".into(),
+            kind: DesignKind::Signature,
+            props: DesignProps::default(),
+            widgets: vec![widget(0, [72.0, 500.0, 272.0, 560.0])],
+        })],
+    );
+    let ResponseBody::Sign(SignResponse::Fields { fields }) =
+        ask(e, RequestBody::Sign(SignRequest::Fields { doc }))
+    else {
+        panic!("no fields");
+    };
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0].name, "approval");
+    let identity = identity("p256.p12");
+    let mut s = spec(
+        doc,
+        SignPlace::Field {
+            page: 0,
+            name: "approval".into(),
+        },
+    );
+    s.reserve = identity.certificate().signature_bytes + 64;
+    let signed = finish(begin(e, s).unwrap(), &identity);
+    ask(e, RequestBody::Close { doc });
+    let r = report(e, &signed);
+    assert_eq!(r.total, 1);
+    assert_eq!(r.items[0].state, S::UnknownSigner, "{:?}", r.items[0]);
+    // The field the designer made is the one that holds the signature: no second one.
+    assert_eq!(count(&signed, b"/Type /Sig"), 1);
+    assert!(!String::from_utf8_lossy(&signed).contains("Signature1"));
+    let doc = open(e, &signed, None).unwrap();
+    let ResponseBody::Sign(SignResponse::Fields { fields }) =
+        ask(e, RequestBody::Sign(SignRequest::Fields { doc }))
+    else {
+        panic!("no fields");
+    };
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0].name, "approval");
+    ask(e, RequestBody::Close { doc });
+
+    // A new field next to the designed one gets a name of its own.
+    let (doc, _file) = open_designer(e, &kit::simple_pdf(1));
+    apply_ok(
+        e,
+        doc,
+        vec![add(DesignField {
+            name: "Signature1".into(),
+            kind: DesignKind::Signature,
+            props: DesignProps::default(),
+            widgets: vec![widget(0, [72.0, 500.0, 272.0, 560.0])],
+        })],
+    );
+    let p = begin(e, spec(doc, rect_place(0))).unwrap();
+    assert_eq!(p.field, "Signature2");
+    ask(e, RequestBody::Close { doc });
 }

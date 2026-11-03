@@ -3036,6 +3036,8 @@ dependencies = [
  "partridge-engine-client",
  "partridge-protocol",
  "partridge-sandbox",
+ "partridge-signer",
+ "partridge-signer-protocol",
  "partridge-testkit",
  "pdfium-render",
  "ring",
@@ -3051,8 +3053,11 @@ version = "0.2.0"
 dependencies = [
  "libc",
  "partridge-protocol",
+ "partridge-signer-protocol",
  "partridge-testkit",
+ "ring",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -3110,6 +3115,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tauri-plugin-updater",
  "url",
+ "zeroize",
 ]
 
 [[package]]

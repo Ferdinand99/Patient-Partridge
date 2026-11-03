@@ -225,7 +225,7 @@ fn qpdf_accepts_the_other_shapes_of_signed_file() {
                 "p256.p12",
                 SignPlace::Field {
                     page: 0,
-                    name: "Sign here".into(),
+                    name: "empty_signature".into(),
                 },
             )
             .0,

@@ -36,7 +36,8 @@ pub struct FormOptions {
     pub xfa_full: bool,
     /// A signature field holding a signature dictionary, as `signed_pdf` has.
     pub signed: bool,
-    /// A signature field that nobody has signed (a place to sign): `Sign here`, 72 40 250 80.
+    /// A signature field that holds nothing, as a form has before anybody signs it. With
+    /// `signed` the form has both.
     pub empty_signature: bool,
     /// Fields that sit under a parent field: `person.first` and `person.last`.
     pub nested: bool,
@@ -346,8 +347,8 @@ pub fn forms_with(opts: &FormOptions) -> Vec<u8> {
     }
     if opts.empty_signature {
         let widget = objs.add(
-            "<< /Type /Annot /Subtype /Widget /FT /Sig /T (Sign here) /Rect [72 40 250 80]              /F 4 /P 4 0 R >>"
-                .to_string(),
+            "<< /Type /Annot /Subtype /Widget /FT /Sig /T (empty_signature) \
+             /Rect [72 100 250 140] /F 132 /P 4 0 R >>",
         );
         annots.push(widget);
         field_refs.push_str(&format!(" {widget} 0 R"));
@@ -431,7 +432,15 @@ pub fn xfa_full_pdf() -> Vec<u8> {
     })
 }
 
-/// A form with a signature field that nobody has signed, next to its ordinary fields.
+/// A form with a signature field that holds a signature (a save breaks it).
+pub fn forms_signed_pdf() -> Vec<u8> {
+    forms_with(&FormOptions {
+        signed: true,
+        ..FormOptions::default()
+    })
+}
+
+/// A form with a signature field that nobody has signed: no signature dictionary, no byte range.
 pub fn forms_empty_signature_pdf() -> Vec<u8> {
     forms_with(&FormOptions {
         empty_signature: true,
@@ -439,10 +448,11 @@ pub fn forms_empty_signature_pdf() -> Vec<u8> {
     })
 }
 
-/// A form with a signature field that holds a signature (a save breaks it).
-pub fn forms_signed_pdf() -> Vec<u8> {
+/// A form with one signature field that holds a signature and one that holds nothing.
+pub fn forms_signed_and_empty_signature_pdf() -> Vec<u8> {
     forms_with(&FormOptions {
         signed: true,
+        empty_signature: true,
         ..FormOptions::default()
     })
 }

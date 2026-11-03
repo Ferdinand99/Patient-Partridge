@@ -360,7 +360,37 @@ fn settle(page: &PdfPage) {
     let _ = page.render_with_config(&PdfRenderConfig::new().set_target_size(2, 2));
 }
 
+/// Draws a page once into a tiny bitmap so that PDFium makes the appearance streams of the
+/// annotations and form fields that have none.
+pub(crate) fn settle_page(document: &PdfDocument<'static>, index: u32) {
+    if let Ok(page) = load(document, index) {
+        settle(&page);
+    }
+}
+
 impl DocAnnots {
+    /// The list of annotations of some pages was changed by the form designer: widgets were added,
+    /// taken away or put in another order. `maps` has, for each such page and for each entry of its
+    /// new list, the place the entry had in the old list, or `None` for a new one. The ids of the
+    /// entries that were there go with them; new entries get new ids. No page counts as drawn any
+    /// more, because the document was loaded again.
+    pub fn reconcile(&mut self, maps: &std::collections::BTreeMap<usize, Vec<Option<usize>>>) {
+        for (page, map) in maps {
+            let page = *page as u32;
+            let old = self.pages.get(&page).cloned().unwrap_or_default();
+            let mut fresh = Vec::with_capacity(map.len());
+            for place in map {
+                let id = match place.and_then(|p| old.get(p)) {
+                    Some(id) => *id,
+                    None => self.fresh_id(),
+                };
+                fresh.push(id);
+            }
+            self.pages.insert(page, fresh);
+        }
+        self.settled.clear();
+    }
+
     /// The bytes of signature pictures made in PDFium so far (see [`MAX_MARK_MADE_BYTES`]).
     pub fn made_bytes(&self) -> usize {
         self.made_bytes

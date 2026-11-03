@@ -368,7 +368,7 @@ pub fn cropped_box(visible: [f32; 4], turns: u8, margins: [f32; 4]) -> [f32; 4] 
     ]
 }
 
-fn turns_of(rotation: PdfPageRenderRotation) -> u8 {
+pub(crate) fn turns_of(rotation: PdfPageRenderRotation) -> u8 {
     match rotation {
         PdfPageRenderRotation::None => 0,
         PdfPageRenderRotation::Degrees90 => 1,
@@ -415,7 +415,7 @@ fn usable(b: &[f32; 4]) -> bool {
 /// to a Letter page for a missing media box gets the wrong page. The call for the bounding box of
 /// the page gives the part that is shown, with the boxes of the nodes above taken in and the crop
 /// box cut down to the media box.
-fn visible_box(page: &PdfPage<'_>) -> Option<[f32; 4]> {
+pub(crate) fn visible_box(page: &PdfPage<'_>) -> Option<[f32; 4]> {
     let shown = page
         .boundaries()
         .bounding()
@@ -660,6 +660,41 @@ fn editable_with(engine: &Engine, doc: u32, sound: bool, right: Right) -> Result
 /// A page that can be found and has a size.
 fn page_is_sound(document: &PdfDocument<'_>, index: PdfPageIndex) -> bool {
     document.pages().page_size(index).is_ok()
+}
+
+/// The form designer may change the document: it is open, nothing holds its bytes, it is not too
+/// big, and its permissions allow its pages to be changed. Returns the number of pages.
+pub(crate) fn designer_ready(engine: &Engine, doc: u32) -> Result<usize, Failure> {
+    editable(engine, doc, Right::Modify)
+}
+
+/// Puts a document the form designer made in place of the open one. `before` is the document as
+/// it was, kept as the copy that a step back loads (`None` when it is too big to keep); the number
+/// of the copy is returned (0 when there is none). The new document must show the pages the old one
+/// did. When it does not read back, nothing is changed.
+pub(crate) fn replace_document(
+    engine: &mut Engine,
+    pdfium: &'static Pdfium,
+    doc: u32,
+    before: Option<Vec<u8>>,
+    after: Vec<u8>,
+) -> Result<u32, Failure> {
+    let sizes = page_sizes(engine.document(doc)?);
+    let count = sizes.len();
+    let digest = sizes_digest(&sizes);
+    let password = password_of(engine, doc);
+    let loaded = load_copy(pdfium, after, password_str(&password), count, Some(digest))?;
+    let annots = engine.annots.get(&doc).cloned();
+    let token = match before {
+        Some(bytes) if bytes.len() <= tools(engine, doc).max_undo_bytes => {
+            tools(engine, doc).keep(bytes, count, Some(digest), annots)
+        }
+        _ => 0,
+    };
+    // The form environment holds the handle of the document it was made for.
+    engine.forms.remove(&doc);
+    engine.docs.insert(doc, loaded);
+    Ok(token)
 }
 
 /// Reads the page tree out of a copy of the document as PDFium writes it, and refuses a change to

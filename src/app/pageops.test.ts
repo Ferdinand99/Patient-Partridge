@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { DesignOp } from "../lib/formdesign";
 import type { PageToolsApi, PagesChanged } from "../lib/pagesapi";
 import { EditHistory } from "./history";
 import type { NoticeOptions, NoticeResult } from "./notice";
@@ -40,11 +41,20 @@ function fakeApi() {
         Promise.resolve({ path: "/x/part.pdf", name: "part.pdf" }) as Promise<{ path: string; name: string } | null>,
     ),
     pagesCancel: vi.fn((_d: number) => Promise.resolve("handover" as const)),
+    designApply: vi.fn((_d: number, ops: unknown[]) => Promise.resolve(changed(10, 31, ops.length))),
   };
   return api;
 }
 
-function setup(over: { target?: Partial<PageTarget> | null; picked?: string[]; busyDelayMs?: number } = {}) {
+function setup(
+  over: {
+    target?: Partial<PageTarget> | null;
+    picked?: string[];
+    busyDelayMs?: number;
+    settle?: PageHost["settle"];
+    targetOf?: PageHost["targetOf"];
+  } = {},
+) {
   const api = fakeApi();
   const layer = document.createElement("div");
   layer.hidden = true;
@@ -71,6 +81,8 @@ function setup(over: { target?: Partial<PageTarget> | null; picked?: string[]; b
     pickFiles: () => Promise.resolve(over.picked ?? ["/in/a.pdf"]),
     announce: (text) => announced.push(text),
     busyLayer: layer,
+    ...(over.settle ? { settle: over.settle } : {}),
+    ...(over.targetOf ? { targetOf: over.targetOf } : {}),
   };
   const busy: boolean[] = [];
   const ops = new PageOps(api as unknown as PageToolsApi, host, {
@@ -718,5 +730,93 @@ describe("working", () => {
     await vi.advanceTimersByTimeAsync(0);
     await work;
     expect(seen).toBe("hidden");
+  });
+});
+
+describe("changes to the form of a document", () => {
+  const add: DesignOp = { op: "remove", name: "a" };
+
+  it("are made to the document they were made for, and put in its history", async () => {
+    // The document in front is 5. The changes were made for 6, a tab that was left a moment ago.
+    const behind = new EditHistory();
+    const t = setup({
+      targetOf: (doc) => (doc === 6 ? { doc: 6, name: "behind.pdf", history: behind, pages: sizes(10) } : null),
+    });
+    await expect(t.ops.applyDesign(6, [add], "Delete a field")).resolves.toBe("done");
+    expect(t.api.designApply).toHaveBeenCalledTimes(1);
+    expect(t.api.designApply.mock.calls[0][0]).toBe(6);
+    expect(behind.undoDepth).toBe(1);
+    expect(t.history.undoDepth).toBe(0);
+    expect(t.applied.map((a) => a.doc)).toEqual([6]);
+  });
+
+  it("are not made to the document in front when the one they were made for is not there", async () => {
+    const t = setup();
+    await expect(t.ops.applyDesign(6, [add], "Delete a field")).resolves.toBe("gone");
+    expect(t.api.designApply).not.toHaveBeenCalled();
+    expect(t.history.undoDepth).toBe(0);
+    // Without a way to find another tab, the document in front is the one that is found.
+    await expect(t.ops.applyDesign(5, [add], "Delete a field")).resolves.toBe("done");
+    expect(t.api.designApply.mock.calls[0][0]).toBe(5);
+  });
+
+  it("say that nothing was sent when another tool is working, so that they can be sent again", async () => {
+    const t = setup();
+    let finish!: () => void;
+    t.api.pagesDelete.mockImplementationOnce(() => new Promise((resolve) => (finish = () => resolve(changed(9, 7, 1)))));
+    const running = t.ops.remove([1]);
+    await new Promise((r) => setTimeout(r, 0));
+    await expect(t.ops.applyDesign(5, [add], "Delete a field")).resolves.toBe("busy");
+    expect(t.api.designApply).not.toHaveBeenCalled();
+    finish();
+    await running;
+  });
+
+  it("say that nothing was sent when what comes before a change was not settled", async () => {
+    const t = setup({ settle: () => Promise.resolve(false) });
+    await expect(t.ops.applyDesign(5, [add], "Delete a field")).resolves.toBe("unsettled");
+    expect(t.api.designApply).not.toHaveBeenCalled();
+  });
+
+  it("say that the engine refused, and tell the reader, when it did", async () => {
+    const t = setup();
+    t.api.designApply.mockRejectedValueOnce({ code: "author_refused", message: "a name is taken" });
+    await expect(t.ops.applyDesign(5, [add], "Delete a field")).resolves.toBe("refused");
+    expect(t.notices[0].title).toBe("That change to the form was not made");
+    expect(t.history.undoDepth).toBe(0);
+  });
+
+  it("are made inside the work of a tool that asks for them first", async () => {
+    const seen: string[] = [];
+    const holder: { ops?: PageOps } = {};
+    const t = setup({
+      settle: async (doc) => {
+        seen.push((await holder.ops?.applyDesign(doc, [add], "Delete a field")) ?? "none");
+        return true;
+      },
+    });
+    holder.ops = t.ops;
+    await t.ops.insertBlank(1, 612, 792);
+    expect(seen).toEqual(["done"]);
+    expect(t.api.designApply.mock.invocationCallOrder[0]).toBeLessThan(t.api.pagesInsertBlank.mock.invocationCallOrder[0]);
+    expect(t.history.undoDepth).toBe(2);
+  });
+
+  it("show the box with words about the form, not the pages", async () => {
+    vi.useFakeTimers();
+    try {
+      const t = setup({ busyDelayMs: 50 });
+      let finish!: () => void;
+      t.api.designApply.mockImplementationOnce(() => new Promise((resolve) => (finish = () => resolve(changed(10, 31, 1)))));
+      const running = t.ops.applyDesign(5, [add], "Delete a field");
+      await vi.advanceTimersByTimeAsync(100);
+      const box = t.layer.querySelector(".busy-box");
+      expect(box?.textContent).toMatch(/working on the form of "book.pdf"/);
+      expect(box?.textContent).toMatch(/change to the form cannot be stopped/);
+      finish();
+      await running;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

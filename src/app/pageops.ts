@@ -19,6 +19,7 @@ import { describePageError } from "../lib/pageerrors";
 import type { SavedFile } from "../lib/api";
 import type { InsertOptions, PageToolsApi } from "../lib/pagesapi";
 import type { PageSizePt } from "../viewer/layout";
+import type { DesignOp } from "../lib/formdesign";
 import { showBusyBox, type BusyBox } from "./busybox";
 import type { Edit, EditHistory } from "./history";
 import type { NoticeOptions, NoticeResult } from "./notice";
@@ -34,6 +35,12 @@ export interface PageTarget {
 
 export interface PageHost {
   target(): PageTarget | null;
+  /**
+   * The document with this number, whether or not it is the one in front. A change that was made for
+   * a document is made to that document: a tab that was left a moment ago still gets its changes.
+   * Without it only the document in front can be found.
+   */
+  targetOf?(doc: number): PageTarget | null;
   /** The pages of a document changed: the view and the side panel lay out again. */
   applyPages(doc: number, pages: PageSizePt[], show?: number): void;
   notice(options: NoticeOptions): Promise<NoticeResult>;
@@ -76,8 +83,19 @@ const OK = [{ id: "ok", label: "OK", primary: true }];
 /** The code of the quiet refusal of a step back or forward while a field holds refused text. */
 export const REFUSED_FIELD_CODE = "refused_field";
 
+/**
+ * What became of a batch of changes to the form. `done`: the engine made them. `refused`: the engine or
+ * the checks before it said no, the reader was told why, and the document is as it was. `busy`: another
+ * tool was working, nothing was sent, and the batch can be sent again. `unsettled`: what comes before a
+ * change to the document did not finish (the reader was told why), nothing was sent, and the batch can
+ * be sent again when the reader has dealt with it. `gone`: the document is not open any more.
+ */
+export type DesignResult = "done" | "refused" | "busy" | "unsettled" | "gone";
+
 /** How a tool runs: whether the user may stop it, and whether the box waits for a dialog. */
 interface RunOptions {
+  /** The tool changes the fields of the form, not the pages (only the words of the box differ). */
+  form?: boolean;
   /** The work can be stopped without a cost (bringing pages in, copying pages out). */
   stoppable?: boolean;
   /** The box is held back until `release()` (a dialog of the system is open). */
@@ -104,8 +122,10 @@ export class PageOps {
   private box: BusyBox | null = null;
   private readonly delay: number;
   /** What the running tool shows in its box, and whether the delay has run out. */
-  private running: { title: string; stoppable: boolean; doc: number; name: string } | null = null;
+  private running: { title: string; stoppable: boolean; doc: number; name: string; form: boolean } | null = null;
   private due = false;
+  /** The settling that comes before a tool is going on (the designer sends its changes then). */
+  private settling = false;
   /** A Stop was asked for during this run, whether or not it could end the step in hand. */
   private stopAsked = false;
   private holds = 0;
@@ -118,6 +138,14 @@ export class PageOps {
     private readonly hooks: PageOpsHooks = {},
   ) {
     this.delay = hooks.busyDelayMs ?? 400;
+  }
+
+  /**
+   * True while what comes before a tool is going on (the designer sends its changes then). A change the
+   * designer is asked for at that time is made inside the work of that tool.
+   */
+  get isSettling(): boolean {
+    return this.settling;
   }
 
   /** The document that a tool is changing right now (a step back or forward too), or null. */
@@ -313,6 +341,74 @@ export class PageOps {
     );
   }
 
+  /** True when the app process has the form designer. */
+  get canDesign(): boolean {
+    return this.api.designApply !== undefined;
+  }
+
+  /** The document with this number: the one the changes were made for, wherever the reader is now. */
+  private targetFor(doc: number): PageTarget | null {
+    if (this.host.targetOf) return this.host.targetOf(doc);
+    const t = this.host.target();
+    return t && t.doc === doc ? t : null;
+  }
+
+  /**
+   * Makes a batch of changes to the form fields of the document `doc`, with one reload of the document
+   * and one step in the history of that document. The changes are made to that document and to no
+   * other: it does not matter which tab is in front when they are sent. See `DesignResult`.
+   */
+  async applyDesign(doc: number, ops: DesignOp[], label: string): Promise<DesignResult> {
+    const apply = this.api.designApply;
+    if (!apply || ops.length === 0) return "refused";
+    // Another tool is about to begin and asks the designer to send what it holds first: the
+    // change is made inside the work of that tool, which is already marked as working.
+    if (this.settling) return this.applyDesignInside(apply, doc, ops, label);
+    // The document is found now, before anything is waited for.
+    const t = this.targetFor(doc);
+    if (!t) return "gone";
+    if (this.working) return "busy";
+    const ready = await this.start([], doc);
+    if (!ready) return "refused";
+    // Something started while the check of the size of the document was waiting.
+    if (this.working) return "busy";
+    let reached = false;
+    const done = await this.run(
+      ready,
+      "Changing the form",
+      async () => {
+        reached = true;
+        const r = await apply.call(this.api, ready.doc, ops);
+        ready.history.push(this.snapshotEdit(ready, label, r.snapshot));
+        this.host.applyPages(ready.doc, r.pages);
+        if (r.snapshot === 0) void this.host.notice({ title: "This cannot be taken back", detail: TOOL_NOTES.undoGone, buttons: OK });
+        return true;
+      },
+      { form: true },
+    );
+    if (done === true) return "done";
+    return reached ? "refused" : "unsettled";
+  }
+
+  private async applyDesignInside(
+    apply: NonNullable<PageToolsApi["designApply"]>,
+    doc: number,
+    ops: DesignOp[],
+    label: string,
+  ): Promise<DesignResult> {
+    const t = this.targetFor(doc);
+    if (!t) return "gone";
+    try {
+      const r = await apply.call(this.api, t.doc, ops);
+      t.history.push(this.snapshotEdit(t, label, r.snapshot));
+      this.host.applyPages(t.doc, r.pages);
+      return "done";
+    } catch (e) {
+      await this.fail(t, e);
+      return "refused";
+    }
+  }
+
   /** Copies pages into a new file the user chooses. Resolves with the file, or null when stopped. */
   async extract(pages: number[]): Promise<SavedFile | null> {
     const t = await this.start(pages);
@@ -486,8 +582,8 @@ export class PageOps {
   // ---- running a tool ---------------------------------------------------------------------------
 
   /** Checks that a tool may start: a document, nothing else working, a list that fits. */
-  private async start(pages: number[]): Promise<PageTarget | null> {
-    const t = this.host.target();
+  private async start(pages: number[], doc?: number): Promise<PageTarget | null> {
+    const t = doc === undefined ? this.host.target() : this.targetFor(doc);
     if (!t || this.working) return null;
     if (pages.length > MAX_EDIT_PAGES || t.pages.length > MAX_EDIT_PAGES) {
       await this.host.notice({
@@ -504,7 +600,7 @@ export class PageOps {
     if (this.working) return null;
     this.setWorking(true, t.doc);
     this.copying = options.copies === true;
-    this.running = { title, stoppable: options.stoppable === true, doc: t.doc, name: t.name };
+    this.running = { title, stoppable: options.stoppable === true, doc: t.doc, name: t.name, form: options.form === true };
     this.due = false;
     this.stopAsked = false;
     this.holds = options.held ? 1 : 0;
@@ -513,7 +609,16 @@ export class PageOps {
       this.showBox();
     }, this.delay);
     try {
-      if (this.host.settle && !(await this.host.settle(t.doc))) return null;
+      if (this.host.settle) {
+        this.settling = true;
+        let ready: boolean;
+        try {
+          ready = await this.host.settle(t.doc);
+        } finally {
+          this.settling = false;
+        }
+        if (!ready) return null;
+      }
       return await work();
     } catch (e) {
       await this.fail(t, e);
@@ -533,18 +638,19 @@ export class PageOps {
   private showBox(): void {
     const run = this.running;
     if (!run || !this.due || this.holds > 0 || this.box) return;
+    const what = run.form ? "the form" : "the pages";
     this.box = showBusyBox(
       this.host.busyLayer,
       run.stoppable
         ? {
             title: run.title,
-            detail: `Patient Partridge is working on the pages of "${run.name}".`,
+            detail: `Patient Partridge is working on ${what} of "${run.name}".`,
             cancelLabel: "Stop",
             onCancel: () => void this.stop(run.doc),
           }
         : {
             title: run.title,
-            detail: `Patient Partridge is working on the pages of "${run.name}". ${TOOL_NOTES.working}`,
+            detail: `Patient Partridge is working on ${what} of "${run.name}". ${run.form ? TOOL_NOTES.workingForm : TOOL_NOTES.working}`,
           },
     );
   }

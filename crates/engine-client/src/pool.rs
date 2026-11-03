@@ -340,6 +340,65 @@ impl EnginePool {
         Ok(outcome)
     }
 
+    /// The signature fields the pages of the document have.
+    pub fn sign_fields(&self, handle: u64) -> Result<Vec<crate::SignField>, ClientError> {
+        let (client, doc) = self.entry(handle)?;
+        client.sign_fields(doc)
+    }
+
+    /// Signs the document with the certificate the signer holds and writes the signed file to
+    /// `target`, a file that may exist already. The document itself is not changed and does not
+    /// belong to the new file: the caller opens the signed file as a document of its own. The
+    /// signed file cannot be the file this document was opened from.
+    pub fn sign_as(
+        &self,
+        handle: u64,
+        target: &Path,
+        signer: &mut crate::SignerSession,
+        options: &crate::SignOptions,
+        save_options: SaveOptions,
+    ) -> Result<crate::SignOutcome, ClientError> {
+        let (client, doc, source, saving) = {
+            let st = state(&self.state);
+            let entry = st.docs.get(&handle).ok_or_else(unknown)?;
+            (
+                entry.client.clone(),
+                entry.doc,
+                entry.source.clone(),
+                entry.saving.clone(),
+            )
+        };
+        // One save at a time per document, and a signature is one.
+        let _saving = saving
+            .try_lock()
+            .map_err(|_| ClientError::Save(SaveError::Busy))?;
+        let (current_path, original) = {
+            let source = source.lock().unwrap_or_else(|e| e.into_inner());
+            (source.path.clone(), source.original.clone())
+        };
+        if same_file(target, &current_path) || same_file(target, &original) {
+            return Err(ClientError::Signer {
+                code: "sign_same_file",
+                message: "the signed copy cannot replace the file that is open".into(),
+            });
+        }
+        // Whatever is there now is what the person chose to replace.
+        let expected = FileStamp::read(target).ok();
+        let mut outcome = crate::sign::sign_document(
+            &self.config,
+            &client,
+            doc,
+            signer,
+            options,
+            target,
+            expected.as_ref(),
+            save_options,
+            &|| state(&self.state).docs.contains_key(&handle),
+        )?;
+        outcome.path = target.to_path_buf();
+        Ok(outcome)
+    }
+
     /// Every other open document whose engine reads the file at `path` is told apart: what its
     /// engine holds is the file as it was, and the path now leads to something else. Like a document
     /// that was saved itself, it is not asked about its signatures any more. Their handles are
@@ -705,6 +764,13 @@ mod tests {
         );
         busy(pool.pages_insert_blank(handle, 0, 100.0, 100.0).map(|_| ()));
         busy(pool.pages_restore(handle, 1).map(|_| ()));
+        busy(
+            pool.author_apply(
+                handle,
+                &[partridge_protocol::AuthorOp::Remove { name: "a".into() }],
+            )
+            .map(|_| ()),
+        );
         busy(
             pool.insert_pdf(handle, 0, "x.pdf", None, Default::default(), &|_, _| {})
                 .map(|_| ()),

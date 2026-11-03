@@ -75,20 +75,20 @@ type Progress = Channel<[u64; 2]>;
 /// is on its way to the window: an update that waits for the commands in flight and then looks again
 /// at the documents with unsaved changes (it does, see `install_with_engines_stopped`) must not miss
 /// the one that has just been made. A document that was closed in the meantime gets no mark.
-fn unsaved(update_state: &UpdateState, doc: u64) {
+pub(crate) fn unsaved(update_state: &UpdateState, doc: u64) {
     update_state.mark_unsaved(doc);
 }
 
 /// Held while a page tool changes a document: the document counts as having unsaved changes from
 /// the start, so that a quit, a close or an update that looks at the documents while the tool works
 /// does not find a clean one and lose the change.
-struct Changing<'a> {
+pub(crate) struct Changing<'a> {
     state: &'a UpdateState,
     doc: u64,
 }
 
 impl<'a> Changing<'a> {
-    fn begin(state: &'a UpdateState, doc: u64) -> Changing<'a> {
+    pub(crate) fn begin(state: &'a UpdateState, doc: u64) -> Changing<'a> {
         state.unsaved().begin_change(doc);
         Changing { state, doc }
     }
@@ -102,7 +102,7 @@ impl Drop for Changing<'_> {
 
 /// Page changes are not made while an update is being installed: it would end the engine in the
 /// middle of the change.
-fn permit(update_state: &UpdateState) -> Result<updates::OpenPermit, CommandError> {
+pub(crate) fn permit(update_state: &UpdateState) -> Result<updates::OpenPermit, CommandError> {
     update_state
         .gate()
         .enter()

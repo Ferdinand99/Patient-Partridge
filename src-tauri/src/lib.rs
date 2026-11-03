@@ -10,6 +10,8 @@
 //! starts again (a reload, whatever the cause), every engine is ended and the window starts clean.
 
 mod annotations;
+mod author;
+mod certsign;
 mod forms;
 mod links;
 mod locate;
@@ -324,6 +326,10 @@ impl From<ClientError> for CommandError {
             ClientError::Save(why) => CommandError {
                 code: why.code().into(),
                 message: why.to_string(),
+            },
+            ClientError::Signer { code, message } => CommandError {
+                code: code.into(),
+                message,
             },
         }
     }
@@ -906,6 +912,7 @@ pub fn run() {
                 signatures_file,
                 earlier_signatures,
             ))));
+            app.manage(certsign::CertificateState::default());
             app.manage(Engine(Arc::new(EnginePool::new(
                 engine_config(app),
                 MAX_DOCUMENTS,
@@ -955,6 +962,9 @@ pub fn run() {
             pages::pages_set_boxes,
             pages::pages_insert_blank,
             pages::pages_restore,
+            author::author_check,
+            author::author_list,
+            author::author_apply,
             pages::pages_insert_pdf,
             pages::pages_extract,
             pages::pages_cancel,
@@ -970,6 +980,12 @@ pub fn run() {
             get_page_text,
             get_page_links,
             signatures::get_signatures,
+            certsign::sign_pick_certificate,
+            certsign::sign_load_certificate,
+            certsign::sign_forget_certificate,
+            certsign::sign_set_image_mark,
+            certsign::sign_list_fields,
+            certsign::sign_document,
             forms::form_info,
             forms::get_form_fields,
             forms::set_form_field,
@@ -1032,6 +1048,10 @@ pub fn run() {
         if let tauri::RunEvent::Exit = &event {
             if let Some(engine) = handle.try_state::<Engine>() {
                 engine.0.kill_all();
+            }
+            // The key does not outlive the app either.
+            if let Some(certificate) = handle.try_state::<certsign::CertificateState>() {
+                certificate.forget();
             }
         }
         // A file opened from the dock or Finder on macOS arrives as an event, not as an argument.

@@ -276,6 +276,21 @@ fn the_info_of_a_document_tells_pages_protection_and_signatures() {
 }
 
 #[test]
+fn an_empty_signature_field_is_not_a_signature() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    // A form with a place to sign that nobody has signed holds no signature.
+    let empty = open(e, &kit::forms_empty_signature_pdf(), None).unwrap();
+    assert_eq!(info(e, empty), (1, 0, 0));
+    // One signed field is one signature.
+    let signed = open(e, &kit::forms_signed_pdf(), None).unwrap();
+    assert_eq!(info(e, signed), (1, 0, 1));
+    // A signed field and an empty one together are still one signature.
+    let both = open(e, &kit::forms_signed_and_empty_signature_pdf(), None).unwrap();
+    assert_eq!(info(e, both), (1, 0, 1));
+}
+
+#[test]
 fn a_password_protected_document_stays_protected_when_it_is_saved() {
     let mut guard = engine();
     let e = &mut guard.0;

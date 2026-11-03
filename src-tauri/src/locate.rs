@@ -39,6 +39,11 @@ pub fn engine_program() -> PathBuf {
     exe_dir().join(format!("partridge-engine{}", std::env::consts::EXE_SUFFIX))
 }
 
+/// The signer program. It is installed next to the app, like the engine.
+pub fn signer_program() -> PathBuf {
+    exe_dir().join(format!("partridge-signer{}", std::env::consts::EXE_SUFFIX))
+}
+
 /// The `Contents/Resources` folder of the app bundle that `exe` sits in, when it is the app's
 /// own program (`<name>.app/Contents/MacOS/<program>`). Tauri's `resource_dir` gives up on macOS
 /// when the path of the program goes through a symlink (`/tmp` is one), so the library has to be

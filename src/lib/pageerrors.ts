@@ -35,6 +35,16 @@ export function describePageError(error: AppErrorLike, name: string, source?: st
     }
   }
   switch (error.code) {
+    case "author_refused":
+      return {
+        title: "That change to the form was not made",
+        detail: `${error.message ? capital(error.message) : "The form cannot be changed that way."}${/[.!?]$/.test(error.message) ? "" : "."} "${name}" was not changed.`,
+      };
+    case "author_unsupported":
+      return {
+        title: "Fields cannot be added to this document",
+        detail: `${error.message ? capital(error.message) : "The form designer cannot work on this document."}${/[.!?]$/.test(error.message) ? "" : "."}`,
+      };
     case "insert_source_failed":
       return {
         title: "The pages could not be added",
