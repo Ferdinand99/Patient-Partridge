@@ -160,7 +160,7 @@ export class AnnotBar {
     this.deleteButton.addEventListener("click", () => this.handlers.remove());
     this.undoButton.addEventListener("click", () => this.handlers.undo());
     this.redoButton.addEventListener("click", () => this.handlers.redo());
-    this.toggle.addEventListener("click", () => this.handlers.toggle(this.bar.hidden));
+    this.toggle.addEventListener("click", () => this.handlers.toggle(this.bar.hidden !== false));
     this.bar.addEventListener("keydown", (e) => this.onKey(e));
     this.bar.addEventListener("focusin", (e) => {
       if (e.target instanceof HTMLButtonElement && this.buttons().includes(e.target)) this.setStop(e.target);

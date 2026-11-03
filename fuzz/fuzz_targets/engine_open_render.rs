@@ -37,7 +37,8 @@
 //!   session can all read, and on which the last two agree, has the same size and the same text in
 //!   the saved file. (The original's fingerprint is not used: the fields and annotations added
 //!   before the save change the objects and annotations it counts.) A document that PDFium cannot
-//!   write fails only with `SaveFailed`.
+//!   write fails only with `SaveFailed`, or with `SaveMetadataNotEncrypted` when it is protected
+//!   and has an XMP metadata stream.
 //! - Forms: `FormInfo` answers, and for a form the reader fills in, the fields of each page are
 //!   listed (within the caps, with a place on the page) and the first three are set to a value of
 //!   their kind. A change is answered with the list or refused with `FormFieldRefused`; a form
@@ -879,6 +880,11 @@ impl State {
                 code: ErrorCode::SaveFailed,
                 ..
             } => return,
+            // Only a protected document may be refused for its metadata.
+            ResponseBody::Error {
+                code: ErrorCode::SaveMetadataNotEncrypted,
+                ..
+            } if security != 0 => return,
             other => panic!("unexpected answer to SaveBegin: {other:?}"),
         };
         assert!(size <= MAX_SAVE_BYTES);

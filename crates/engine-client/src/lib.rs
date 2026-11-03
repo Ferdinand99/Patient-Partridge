@@ -68,8 +68,10 @@ const IDLE_LIMIT: usize = 70 * 1024;
 /// Header of a `Rendered` answer in front of the pixels.
 const RENDERED_HEADER: usize = 17;
 /// How many times a long request (`DocInfo`, `FormInfo`, `Fingerprint`, `SaveBegin`) may have to
-/// read the whole document: the check of the file before and after, and the serialising itself.
-const SAVE_PASSES: u64 = 4;
+/// read the whole document: the check of the file before and after, the serialising itself, and
+/// for a save the second writing (the bytes are read in again and written once more) and the
+/// check of both.
+const SAVE_PASSES: u64 = 6;
 /// How many times the engine may have to read the whole document to check its signatures: the
 /// check of the file before and after, the scan for signature marks, and one pass for each of the
 /// 64 signatures it describes (the engine hashes at most 2 GiB in all).

@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.2.2](https://github.com/Ferdinand99/Patient-Partridge/compare/v0.2.1...v0.2.2) (2026-11-03)
+
+
+### Bug Fixes
+
+* never write the metadata of a protected file unencrypted, and leave deleted session objects out of saved files ([#62](https://github.com/Ferdinand99/Patient-Partridge/issues/62)) ([1c3f2b3](https://github.com/Ferdinand99/Patient-Partridge/commit/1c3f2b355c3952d6183b148079252feb43aa5c4b))
+
+## [0.2.1](https://github.com/Ferdinand99/Patient-Partridge/compare/v0.2.0...v0.2.1) (2026-11-03)
+
+
+### Bug Fixes
+
+* an empty signature field no longer counts as a signature ([#52](https://github.com/Ferdinand99/Patient-Partridge/issues/52)) ([9474eb2](https://github.com/Ferdinand99/Patient-Partridge/commit/9474eb2afef54f6981e194433064c65572989b28))
+
 ## [0.2.0](https://github.com/Ferdinand99/Patient-Partridge/compare/v0.1.0...v0.2.0) (2026-11-02)
 
 

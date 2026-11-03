@@ -40,7 +40,7 @@ The workflow has read-only rights. Only its last job, which opens or updates the
 
 ## What the annotation tests rely on
 
-Some of what the README promises about annotations is a fact about PDFium, and the engine tests (`crates/engine/tests/annots_from_files.rs`, `annots_readers.rs`) would show a change in it:
+Some of what [known-limits.md](known-limits.md#annotations) says about annotations is a fact about PDFium, and the engine tests (`crates/engine/tests/annots_from_files.rs`, `annots_readers.rs`) would show a change in it:
 
 - A save leaves out the objects of a loaded file that nothing refers to any more, and writes the objects made during the session as they are, whether or not anything refers to them. That is why the text of a deleted comment is not in the saved file, why the text of an annotation made in the session is overwritten before it is removed, and why a save writes the document, reads it in again and writes it a second time (`save::serialise_clean`): the second writing leaves out what was made in the session and then taken off. The tests in `crates/engine/tests/save_clean.rs` look at the streams of the saved file for a picture of a signature, a drawing, a stamp and a note that were put on and taken off, and fail if the second writing stops dropping them.
 - A free text box that came without an appearance stream gets one, with its words, when the page is first drawn, and no call can overwrite it. It is written in the session like the rest, so the second writing of a save leaves it out once the box is deleted. The test `a_free_text_box_without_an_appearance_leaves_its_words_out_of_the_saved_file_after_a_delete` states that.
