@@ -1267,15 +1267,21 @@ fn gray48_page(hex: &str) -> Bytes {
 #[test]
 fn a_jpeg_with_coarse_tables_is_could_not_check() {
     let spec = region(JPEG_REGION, Some("[0,0,0]"));
-    // Quality 10 is the coarsest that the check accepts.
-    check("quality 10", &gray48_page(BLACK_48_Q10_HEX), &spec, Clean);
-    let r = cli(&gray48_page(BLACK_48_Q5_HEX), Some(&spec), &[], &[]);
-    assert_eq!(r.code, 2, "{}", r.out);
-    assert!(
-        r.problems().iter().any(|p| p.contains("so coarse")),
-        "{}",
-        r.out
-    );
+    // Quality 15 is the coarsest that the check accepts; below it a scan is too coarse for the
+    // check to tell faint content from the rounding of the codec.
+    check("quality 15", &gray48_page(BLACK_48_Q15_HEX), &spec, Clean);
+    for (name, hex) in [
+        ("quality 10", BLACK_48_Q10_HEX),
+        ("quality 5", BLACK_48_Q5_HEX),
+    ] {
+        let r = cli(&gray48_page(hex), Some(&spec), &[], &[]);
+        assert_eq!(r.code, 2, "{name}\n{}", r.out);
+        assert!(
+            r.problems().iter().any(|p| p.contains("so coarse")),
+            "{name}\n{}",
+            r.out
+        );
+    }
 }
 
 #[test]
@@ -1560,6 +1566,61 @@ fn the_glyphs_of_a_text_are_placed_one_by_one() {
 }
 
 #[test]
+fn a_standard_font_without_widths_is_placed_by_the_widths_of_the_standard_font() {
+    // Helvetica A is 667 wide: at 20 points the third glyph ends at 60, the fourth at 73.4.
+    let page = |content: &str, font: &str| {
+        let mut fx = Fx::new(&[BENIGN, content.as_bytes()].concat());
+        fx.extra.insert(
+            5,
+            format!("<< /Type /Font /Subtype /Type1 /BaseFont /{font} >>").into_bytes(),
+        );
+        fx.build()
+    };
+    let leak = || Leak(&[PAINTED_MESSAGE, GLYPH_MESSAGE], &[]);
+    check(
+        "three glyphs end before the region",
+        &page("BT /F1 20 Tf 20 420 Td (AAA) Tj ET\n", "Helvetica"),
+        &white_region(),
+        Clean,
+    );
+    check(
+        "the fourth reaches into it",
+        &page("BT /F1 20 Tf 20 420 Td (AAAA) Tj ET\n", "Helvetica"),
+        &white_region(),
+        leak(),
+    );
+    // Times A is 722 wide, Courier is 600: the same text ends elsewhere.
+    check(
+        "Courier is narrower",
+        &page("BT /F1 20 Tf 20 420 Td (AAAA) Tj ET\n", "Courier"),
+        &white_region(),
+        Clean,
+    );
+    check(
+        "Courier, one more glyph",
+        &page("BT /F1 20 Tf 20 420 Td (AAAAA) Tj ET\n", "Courier"),
+        &white_region(),
+        leak(),
+    );
+    // A font that is not a standard font and has no widths: any glyph may be anywhere in an
+    // interval, so the third glyph may reach the region.
+    check(
+        "a font of unknown widths",
+        &page("BT /F1 20 Tf 20 420 Td (AAA) Tj ET\n", "Mystery"),
+        &white_region(),
+        leak(),
+    );
+    // The space of a font that is not in the file draws nothing: here it lies over the region
+    // and the letter before it does not.
+    check(
+        "a space over the region",
+        &page("BT /F1 12 Tf 66 420 Td (x ) Tj ET\n", "Helvetica"),
+        &white_region(),
+        Clean,
+    );
+}
+
+#[test]
 fn the_glyphs_of_a_type3_font_are_placed_like_all_others() {
     let names = vec!["a".to_owned()];
     let page = |text: &str| {
@@ -1815,7 +1876,31 @@ fn a_clip_path_is_geometry() {
         "a box under a soft mask",
         &masked,
         &black_region(),
-        Leak(&[PAINTED_MESSAGE], &[]),
+        Leak(&[PAINTED_MESSAGE, "fill of a path"], &[]),
+    );
+    // The group of the mask paints a fill that holds the region, which carries nothing: set and
+    // not used, the mask is no leak.
+    let unused = {
+        let mut fx = Fx::new(&[BENIGN, b"/GS0 gs\n".as_slice()].concat());
+        fx.resources_extra.push_str(
+            " /ExtGState << /GS0 << /SMask << /Type /Mask /S /Luminosity /G 10 0 R >> >> >>",
+        );
+        fx.extra.insert(
+            10,
+            stream_obj(
+                "/Type /XObject /Subtype /Form /BBox [0 0 612 792] \
+                 /Group << /S /Transparency /CS /DeviceGray >>",
+                b"1 g 0 0 612 792 re f",
+                false,
+            ),
+        );
+        fx.build()
+    };
+    check(
+        "a soft mask that paints nothing",
+        &unused,
+        &white_region(),
+        Clean,
     );
 }
 
@@ -1913,6 +1998,41 @@ fn geometry_that_carries_nothing_about_the_region_is_not_a_leak() {
         &page(b"", b"0 g 60 420 440 6 re f\n"),
         &spec,
         Leak(&[PAINTED_MESSAGE, "fill of a path"], &[]),
+    );
+    // A rectangle written as a path of lines is a rectangle, and the stroke of a frame is where
+    // its sides are, not all over its bounds.
+    check(
+        "a shading drawn as lines that holds the region",
+        &page(
+            b"0.9 g 60 410 m 500 410 l 500 438 l 60 438 l h f 0 g\n",
+            b"",
+        ),
+        &spec,
+        Clean,
+    );
+    check(
+        "a frame round the row",
+        &page(b"", b"0.5 w 0 G 60 405 440 40 re S\n"),
+        &spec,
+        Clean,
+    );
+    check(
+        "a frame round the row, drawn as lines and closed",
+        &page(b"", b"0.5 w 0 G 60 405 m 500 405 l 500 445 l 60 445 l s\n"),
+        &spec,
+        Clean,
+    );
+    check(
+        "a frame with a side through the region",
+        &page(b"", b"0.5 w 0 G 150 300 200 150 re S\n"),
+        &spec,
+        Leak(&[PAINTED_MESSAGE, "stroke of a path"], &[]),
+    );
+    check(
+        "a frame that is filled as well",
+        &page(b"", b"0.5 w 0 G 60 405 440 40 re B\n"),
+        &spec,
+        Leak(&[PAINTED_MESSAGE, "fill and stroke of a path"], &[]),
     );
     check(
         "a background that a shape clips",

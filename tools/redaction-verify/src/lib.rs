@@ -35,7 +35,7 @@
 //!    where a whole block, and the blocks that its colour spreads from, lie inside the region; the
 //!    rest of it is left out of the render check too, because the codec changed those pixels. A
 //!    JPEG with no such block under the region, or with quantisation tables so coarse that a flat
-//!    block may be off by more than 16 levels of 255, is "could not check".
+//!    block may be off by more than 12 levels of 255, is "could not check".
 //! 3. The geometry. One interpreter walks the content of the page with a complete graphics state
 //!    (the stack of `q` and `Q`, the matrix, the clip, the colours, the text state, the text and
 //!    line matrices), through forms, soft mask groups, every state of every annotation appearance
@@ -104,6 +104,7 @@ pub mod pdfobj;
 mod regions;
 pub mod roles;
 pub mod search;
+mod stdfonts;
 pub mod strings;
 mod structure;
 pub mod textdec;

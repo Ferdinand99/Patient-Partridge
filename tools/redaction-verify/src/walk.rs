@@ -276,8 +276,99 @@ struct PathState {
     moves: usize,
     lines: usize,
     curves: usize,
-    /// Every `re` was made under a matrix that keeps rectangles rectangles.
-    turned: bool,
+    /// The straight segments of the path on the page (the sides of rectangles and the closing
+    /// segments too), as `[x0, y0, x1, y1]`. Curves have none: their bounds are those of their
+    /// control points.
+    segs: Vec<[f64; 4]>,
+    cur: Option<(f64, f64)>,
+    start: Option<(f64, f64)>,
+}
+
+impl PathState {
+    fn line_to(&mut self, p: (f64, f64)) {
+        if let Some(c) = self.cur {
+            self.segs.push([c.0, c.1, p.0, p.1]);
+        }
+        self.cur = Some(p);
+    }
+}
+
+impl PathState {
+    /// The rectangle that the path is, if it is one: one `re`, or one `m` with three or four `l`
+    /// that go round a rectangle, and no curve.
+    fn as_rect(&self) -> Option<[f64; 4]> {
+        if self.curves != 0 {
+            return None;
+        }
+        let one_re = self.rects == 1 && self.moves == 0 && self.lines == 0;
+        let polyline = self.rects == 0 && self.moves == 1 && (self.lines == 3 || self.lines == 4);
+        if one_re || polyline {
+            rect_of(&self.pts)
+        } else {
+            None
+        }
+    }
+}
+
+/// `h`: a segment back to where the subpath started.
+fn close_path(p: &mut PathState) {
+    if let (Some(c), Some(s)) = (p.cur, p.start) {
+        if c != s {
+            p.segs.push([c.0, c.1, s.0, s.1]);
+        }
+        p.cur = Some(s);
+    }
+}
+
+/// The rectangle that these points are the corners of, if they are: every point at a corner of
+/// their bounds, and (unless the rectangle is flat) every corner there.
+fn rect_of(pts: &[(f64, f64)]) -> Option<[f64; 4]> {
+    let b = bounds(pts);
+    if b.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let eps = 1e-6 * (1.0 + (b[2] - b[0]).abs() + (b[3] - b[1]).abs());
+    let at = |v: f64, lo: f64, hi: f64| (v - lo).abs() <= eps || (v - hi).abs() <= eps;
+    if !pts
+        .iter()
+        .all(|p| at(p.0, b[0], b[2]) && at(p.1, b[1], b[3]))
+    {
+        return None;
+    }
+    let has = |x: f64, y: f64| {
+        pts.iter()
+            .any(|p| (p.0 - x).abs() <= eps && (p.1 - y).abs() <= eps)
+    };
+    (has(b[0], b[1]) && has(b[2], b[1]) && has(b[0], b[3]) && has(b[2], b[3])).then_some(b)
+}
+
+/// Whether the segment meets the rectangle (touching counts).
+fn segment_meets(s: &[f64; 4], r: &[f64; 4]) -> bool {
+    let (dx, dy) = (s[2] - s[0], s[3] - s[1]);
+    let (mut t0, mut t1) = (0.0f64, 1.0f64);
+    for (p, q) in [
+        (-dx, s[0] - r[0]),
+        (dx, r[2] - s[0]),
+        (-dy, s[1] - r[1]),
+        (dy, r[3] - s[1]),
+    ] {
+        if p == 0.0 {
+            if q < 0.0 {
+                return false;
+            }
+        } else {
+            let t = q / p;
+            if p < 0.0 {
+                t0 = t0.max(t);
+            } else {
+                t1 = t1.min(t);
+            }
+            if t0 > t1 {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// The text object: the text matrix and the line matrix, and how far the position has moved
@@ -339,6 +430,10 @@ pub struct Font {
     /// predefined ones); another encoding is read byte by byte, with widths that are not known.
     two_byte: bool,
     vertical: bool,
+    /// A standard font that the file does not describe: its widths are the ones of the tables.
+    std: Option<crate::stdfonts::Std>,
+    /// The font program is in the file. A font that is not draws a space as nothing.
+    embedded: bool,
 }
 
 /// The box of a glyph when the font has none that is plausible: the em square with room for
@@ -363,6 +458,8 @@ impl Font {
             max_w: ADVANCE_RANGE[1],
             two_byte: false,
             vertical: false,
+            std: None,
+            embedded: false,
         }
     }
 
@@ -382,12 +479,22 @@ impl Font {
             }
             _ => {
                 if !self.have_widths {
-                    return None;
+                    return self.std.and_then(|s| s.width(code));
                 }
                 let i = i64::from(code) - self.first;
                 let w = usize::try_from(i).ok().and_then(|i| self.widths.get(i));
                 Some(w.copied().or(self.missing).unwrap_or(0.0))
             }
+        }
+    }
+
+    /// How far a width of this font may be from the one that a viewer uses, as a fraction: the
+    /// tables of the standard fonts are not the file's own numbers.
+    fn slack(&self) -> f64 {
+        if self.kind == FontKind::Simple && !self.have_widths && self.std.is_some() {
+            crate::stdfonts::SLACK
+        } else {
+            0.0
         }
     }
 
@@ -566,6 +673,12 @@ impl<'a, 'd> Walker<'a, 'd> {
 
     /// One painting event: tested against the targets now, so that nothing is dropped.
     fn emit(&mut self, e: Event) {
+        self.emit_segs(e, &[], 0.0);
+    }
+
+    /// The same for the stroke of straight segments: a segment that is not within `reach` of a
+    /// target leaves it alone, whatever the bounds of the whole path say.
+    fn emit_segs(&mut self, e: Event, segs: &[[f64; 4]], reach: f64) {
         if e.bbox.iter().any(|v| !v.is_finite()) {
             let what = match e.class {
                 Class::Glyph { .. } => "text",
@@ -579,7 +692,21 @@ impl<'a, 'd> Walker<'a, 'd> {
         }
         for i in 0..self.targets.len() {
             let t = self.targets[i].clone();
-            if !overlaps(&e.bbox, &t.rect) || self.is_free(&e, &t) {
+            if !overlaps(&e.bbox, &t.rect) {
+                continue;
+            }
+            if !segs.is_empty() {
+                let wide = [
+                    t.rect[0] - reach,
+                    t.rect[1] - reach,
+                    t.rect[2] + reach,
+                    t.rect[3] + reach,
+                ];
+                if !segs.iter().any(|s| segment_meets(s, &wide)) {
+                    continue;
+                }
+            }
+            if self.is_free(&e, &t) {
                 continue;
             }
             let first = if self.found[i].first.is_none() {
@@ -612,12 +739,14 @@ impl<'a, 'd> Walker<'a, 'd> {
         let mut bbox = bounds(&path.pts);
         let scale = gs.ctm[0].hypot(gs.ctm[1]).max(gs.ctm[2].hypot(gs.ctm[3]));
         let width = gs.line_width.abs() * scale;
+        // How far the ink of a stroke reaches from the path.
+        let mut reach = 0.0;
         if stroke {
             // The widest line a viewer draws: a hairline is one device pixel, a join may reach
             // the miter limit (at most 10 times the half width).
             let half = width.max(0.5) / 2.0;
             let joins = path.pts.len() > 2;
-            let reach = half
+            reach = half
                 * if joins {
                     gs.miter.clamp(1.5, 10.0)
                 } else {
@@ -631,13 +760,7 @@ impl<'a, 'd> Walker<'a, 'd> {
             ];
         }
         let plain = path.curves == 0;
-        let shape = if class == Class::Fill
-            && path.rects == 1
-            && path.moves == 0
-            && path.lines == 0
-            && plain
-            && !path.turned
-        {
+        let shape = if class == Class::Fill && path.as_rect().is_some() {
             Shape::Rect(bounds(&path.pts))
         } else if class == Class::Stroke
             && path.rects == 0
@@ -656,17 +779,27 @@ impl<'a, 'd> Walker<'a, 'd> {
             Class::Fill => "fill of a path",
             _ => "stroke of a path",
         };
-        self.emit(Event {
-            class,
-            bbox,
-            shape,
-            kind,
-            fill: gs.fill,
-            stroke: gs.stroke,
-            width,
-            clip: (gs.clip_box, gs.clip_exact),
-            smask: gs.smask,
-        });
+        // The ink of a stroke of straight segments is near the segments, not all over the bounds.
+        let segs: &[[f64; 4]] = if class == Class::Stroke && plain {
+            &path.segs
+        } else {
+            &[]
+        };
+        self.emit_segs(
+            Event {
+                class,
+                bbox,
+                shape,
+                kind,
+                fill: gs.fill,
+                stroke: gs.stroke,
+                width,
+                clip: (gs.clip_box, gs.clip_exact),
+                smask: gs.smask,
+            },
+            segs,
+            reach,
+        );
     }
 
     /// The path that was built is a clip: the clip path is geometry, and the clip is narrowed.
@@ -676,8 +809,7 @@ impl<'a, 'd> Walker<'a, 'd> {
             return;
         }
         let bbox = bounds(&f.path.pts);
-        let one_rect =
-            f.path.rects == 1 && f.path.moves == 0 && f.path.curves == 0 && !f.path.turned;
+        let one_rect = f.path.as_rect().is_some();
         let gs = &f.gs;
         self.emit(Event {
             class: Class::Clip,
@@ -849,11 +981,15 @@ impl<'a, 'd> Walker<'a, 'd> {
             }
             b"m" | b"l" => {
                 if n.len() == 2 {
-                    f.path.pts.push(apply(&f.gs.ctm, n[0], n[1]));
+                    let p = apply(&f.gs.ctm, n[0], n[1]);
+                    f.path.pts.push(p);
                     if op.name == b"m" {
                         f.path.moves += 1;
+                        f.path.cur = Some(p);
+                        f.path.start = Some(p);
                     } else {
                         f.path.lines += 1;
+                        f.path.line_to(p);
                     }
                 } else {
                     self.malformed("a path operator");
@@ -865,6 +1001,7 @@ impl<'a, 'd> Walker<'a, 'd> {
                         f.path.pts.push(apply(&f.gs.ctm, n[2 * i], n[2 * i + 1]));
                     }
                     f.path.curves += 1;
+                    f.path.cur = f.path.pts.last().copied();
                 } else {
                     self.malformed("a path operator");
                 }
@@ -875,6 +1012,7 @@ impl<'a, 'd> Walker<'a, 'd> {
                         f.path.pts.push(apply(&f.gs.ctm, n[2 * i], n[2 * i + 1]));
                     }
                     f.path.curves += 1;
+                    f.path.cur = f.path.pts.last().copied();
                 } else {
                     self.malformed("a path operator");
                 }
@@ -882,20 +1020,38 @@ impl<'a, 'd> Walker<'a, 'd> {
             b"re" => {
                 if n.len() == 4 {
                     let (x, y, w, h) = (n[0], n[1], n[2], n[3]);
-                    for (px, py) in [(x, y), (x + w, y), (x, y + h), (x + w, y + h)] {
-                        f.path.pts.push(apply(&f.gs.ctm, px, py));
+                    // The sides, in the order the path runs: a rectangle is closed.
+                    let c = [
+                        apply(&f.gs.ctm, x, y),
+                        apply(&f.gs.ctm, x + w, y),
+                        apply(&f.gs.ctm, x + w, y + h),
+                        apply(&f.gs.ctm, x, y + h),
+                    ];
+                    f.path.pts.extend_from_slice(&c);
+                    for i in 0..4 {
+                        let (a, b) = (c[i], c[(i + 1) % 4]);
+                        f.path.segs.push([a.0, a.1, b.0, b.1]);
                     }
                     f.path.rects += 1;
-                    f.path.turned |= !axis_aligned(&f.gs.ctm);
+                    f.path.cur = Some(c[0]);
+                    f.path.start = Some(c[0]);
                 } else {
                     self.malformed("a path operator");
                 }
             }
-            b"h" => {}
+            b"h" => close_path(&mut f.path),
             b"W" | b"W*" => f.pending_clip = true,
             b"f" | b"F" | b"f*" => self.painted(f, Class::Fill),
-            b"S" | b"s" => self.painted(f, Class::Stroke),
-            b"B" | b"B*" | b"b" | b"b*" => self.painted(f, Class::FillStroke),
+            b"S" => self.painted(f, Class::Stroke),
+            b"s" => {
+                close_path(&mut f.path);
+                self.painted(f, Class::Stroke);
+            }
+            b"B" | b"B*" => self.painted(f, Class::FillStroke),
+            b"b" | b"b*" => {
+                close_path(&mut f.path);
+                self.painted(f, Class::FillStroke);
+            }
             b"n" => {
                 if f.pending_clip {
                     self.apply_clip(f);
@@ -1027,11 +1183,15 @@ impl<'a, 'd> Walker<'a, 'd> {
                 }
             }
             Some(mask) => {
-                f.gs.smask = true;
+                // The group is drawn in the space of this moment, and what it paints is not itself
+                // masked.
                 if let Some(Obj::Ref(n)) = mask.get("G") {
                     let n = *n;
-                    self.xobject(n, f.res, &f.gs, f.depth);
+                    let mut inner = f.gs.clone();
+                    inner.smask = false;
+                    self.xobject(n, f.res, &inner, f.depth);
                 }
+                f.gs.smask = true;
             }
         }
     }
@@ -1101,25 +1261,33 @@ impl<'a, 'd> Walker<'a, 'd> {
                             apply(&m, x[0], y[1]),
                             apply(&m, x[1], y[1]),
                         ];
-                        self.emit(Event {
-                            class: Class::Glyph { paints },
-                            bbox: bounds(&pts),
-                            shape: Shape::Other,
-                            kind: if paints {
-                                "glyphs of a Type 3 font"
-                            } else {
-                                "glyph of text"
-                            },
-                            fill: gs.fill,
-                            stroke: gs.stroke,
-                            width: 0.0,
-                            clip: (gs.clip_box, gs.clip_exact),
-                            smask: gs.smask,
-                        });
+                        // The space of a font that is not in the file is drawn as nothing.
+                        let blank = font.kind == FontKind::Simple && !font.embedded && code == 32;
+                        if !blank {
+                            self.emit(Event {
+                                class: Class::Glyph { paints },
+                                bbox: bounds(&pts),
+                                shape: Shape::Other,
+                                kind: if paints {
+                                    "glyphs of a Type 3 font"
+                                } else {
+                                    "glyph of text"
+                                },
+                                fill: gs.fill,
+                                stroke: gs.stroke,
+                                width: 0.0,
+                                clip: (gs.clip_box, gs.clip_exact),
+                                smask: gs.smask,
+                            });
+                        }
                         // The advance.
                         let adv = |wv: f64| (wv * size + gs.char_space + space) * h;
+                        let slack = font.slack();
                         let (lo, hi) = match w {
-                            Some(w) => (adv(w), adv(w)),
+                            Some(w) => {
+                                let (a, b) = (adv(w * (1.0 - slack)), adv(w * (1.0 + slack)));
+                                (a.min(b), a.max(b))
+                            }
                             None => {
                                 let top = font.max_w.max(ADVANCE_RANGE[1]);
                                 let (a, b) = (adv(ADVANCE_RANGE[0]), adv(top));
@@ -1193,6 +1361,14 @@ impl<'a, 'd> Walker<'a, 'd> {
         (bbox, missing)
     }
 
+    /// Whether the font program is in the file.
+    fn has_font_file(&self, font: &Obj) -> bool {
+        let d = self.doc.dget(font, "FontDescriptor");
+        ["FontFile", "FontFile2", "FontFile3"]
+            .iter()
+            .any(|k| d.get(k).is_some())
+    }
+
     fn load_font(&mut self, font: &Obj, label: &str, res: &Obj) -> Font {
         let doc = self.doc;
         let subtype = doc.dget(font, "Subtype").name().unwrap_or("");
@@ -1212,6 +1388,7 @@ impl<'a, 'd> Walker<'a, 'd> {
                     .map(|d| doc.resolve(d))
                     .unwrap_or(&Obj::Null);
                 let (bbox, _) = self.descriptor_box(desc);
+                let embedded = self.has_font_file(desc);
                 let dw = doc.dget(desc, "DW").num().unwrap_or(1000.0) / 1000.0;
                 let mut w_map: HashMap<u32, f64> = HashMap::new();
                 let mut max_w = dw;
@@ -1256,6 +1433,7 @@ impl<'a, 'd> Walker<'a, 'd> {
                     max_w,
                     two_byte,
                     vertical,
+                    embedded,
                     ..Font::plain()
                 }
             }
@@ -1273,6 +1451,12 @@ impl<'a, 'd> Walker<'a, 'd> {
                         .fold(ADVANCE_RANGE[1], f64::max),
                     widths: widths.iter().map(|w| w / 1000.0).collect(),
                     missing,
+                    std: if widths.is_empty() {
+                        crate::stdfonts::for_name(doc.dget(font, "BaseFont").name().unwrap_or(""))
+                    } else {
+                        None
+                    },
+                    embedded: self.has_font_file(font),
                     ..Font::plain()
                 }
             }

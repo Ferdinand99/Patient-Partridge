@@ -123,11 +123,13 @@ struct Pixels {
 
 /// The most that the check lets a JPEG be off in a flat block, in levels of 255. A flat block is
 /// off by at most half a quantisation step of its DC coefficient divided by 8, widened for the
-/// colour conversion and the rounding (see [`jpeg_lossy`]); 16 stands for a DC step of 80, about
-/// quality 10 of libjpeg, below which a scan is too coarse for any check to separate what was
-/// there from what the codec made of it. The light gray of a faint stamp is 40 levels from white,
-/// so 16 still tells it from a blank block. A JPEG that needs more is "could not check".
-const JPEG_TOLERANCE_CAP: u8 = 16;
+/// colour conversion and the rounding (see [`jpeg_lossy`]). 12 stands for a DC step of 57, about
+/// quality 15 of libjpeg: a scan coarser than that is too coarse for any check to separate what
+/// was there from what the codec made of it. Faint text, 8 levels below white, in a scan of
+/// quality 10 decodes to within 16 levels, so a cap of 16 let it pass. The JPEG images of the
+/// corpus that the tests draw on (1962 of them) need at most 5, so the cap leaves them alone. A
+/// JPEG that needs more is "could not check".
+const JPEG_TOLERANCE_CAP: u8 = 12;
 
 /// The tolerance and the blocks of a JPEG, from the first value of the quantisation tables that
 /// its components use and the largest sampling factors in the markers of the file. A table that no
@@ -1571,7 +1573,7 @@ mod tests {
         assert_eq!((l.mcu, l.spread), ((8, 8), (0, 0)));
         assert_eq!(l.tolerance, 3);
         // A coarser table allows more.
-        assert!(jpeg_lossy(&jpeg_head(80, 0x22)).unwrap().tolerance > 10);
+        assert!(jpeg_lossy(&jpeg_head(50, 0x22)).unwrap().tolerance > 10);
         assert!(jpeg_lossy(b"not a jpeg").is_err());
     }
 
@@ -1628,9 +1630,9 @@ mod tests {
             v.extend(&jpeg_head(0, 0x11)[2 + 69..]);
             jpeg_lossy(&v)
         };
-        // 80 / 16 * 2.8 + 2 = 16: the most that is accepted.
-        assert_eq!(at(80).unwrap().tolerance, JPEG_TOLERANCE_CAP);
-        assert!(at(81).unwrap_err().contains("so coarse"));
+        // 57 / 16 * 2.8 + 2 = 12: the most that is accepted.
+        assert_eq!(at(57).unwrap().tolerance, JPEG_TOLERANCE_CAP);
+        assert!(at(58).unwrap_err().contains("so coarse"));
         assert!(at(255).is_err());
     }
 

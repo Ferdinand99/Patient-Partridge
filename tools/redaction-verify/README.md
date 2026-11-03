@@ -56,7 +56,7 @@ A region (`{"page": 1, "rect": [x0, y0, x1, y1], "fill": "#000000"}`) must pass 
    device pixels is left out). With no fill named, it is one colour.
 2. The images under the region, also turned ones, with their masks, are one value. A JPEG is
    compared only where whole blocks lie inside the region and the tolerance comes from the
-   quantisation tables that its components use, capped at 16 levels. A JPEG that cannot be judged
+   quantisation tables that its components use, capped at 12 levels (about libjpeg quality 15). A JPEG that cannot be judged
    (no whole block under the region, or tables too coarse) is "could not check".
 3. The geometry. One interpreter walks the content of the page with a complete graphics state (the
    stack of `q` and `Q`, the matrix, the clip, the colours, the text state with spacing, scale,

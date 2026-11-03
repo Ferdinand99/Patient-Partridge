@@ -1,0 +1,150 @@
+//! The widths of the standard fonts that a file may use without describing them: Helvetica and
+//! Arial, Times, and Courier, in their four styles. A simple font that has no `/Widths` is one of
+//! the 14 standard fonts, and a viewer places its glyphs with these widths. They are in thousandths
+//! of an em, for the codes 32 to 126 (the same in every Latin encoding). The region check uses them
+//! to place text, with a small tolerance (see [`SLACK`]); a code outside the table, and the fonts
+//! that are not in it (Symbol, ZapfDingbats), have no width here and are placed by an interval.
+
+/// How far a width of the tables may be from the one a viewer uses, as a fraction.
+pub const SLACK: f64 = 0.015;
+
+const HELVETICA: [u16; 95] = [
+    278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278, 556, 556, 556,
+    556, 556, 556, 556, 556, 556, 556, 278, 278, 584, 584, 584, 556, 1015, 667, 667, 722, 722, 667,
+    611, 778, 722, 278, 500, 667, 556, 833, 722, 778, 667, 778, 722, 667, 611, 722, 667, 944, 667,
+    667, 611, 278, 278, 278, 469, 556, 333, 556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500,
+    222, 833, 556, 556, 556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334, 260, 334, 584,
+];
+
+const HELVETICA_BOLD: [u16; 95] = [
+    278, 333, 474, 556, 556, 889, 722, 238, 333, 333, 389, 584, 278, 333, 278, 278, 556, 556, 556,
+    556, 556, 556, 556, 556, 556, 556, 333, 333, 584, 584, 584, 611, 975, 722, 722, 722, 722, 667,
+    611, 778, 722, 278, 556, 722, 611, 833, 722, 778, 667, 778, 722, 667, 611, 722, 667, 944, 667,
+    667, 611, 333, 278, 333, 584, 556, 333, 556, 611, 556, 611, 556, 333, 611, 611, 278, 278, 556,
+    278, 889, 611, 611, 611, 611, 389, 556, 333, 611, 556, 778, 556, 556, 500, 389, 280, 389, 584,
+];
+
+const TIMES: [u16; 95] = [
+    250, 333, 408, 500, 500, 833, 778, 180, 333, 333, 500, 564, 250, 333, 250, 278, 500, 500, 500,
+    500, 500, 500, 500, 500, 500, 500, 278, 278, 564, 564, 564, 444, 921, 722, 667, 667, 722, 611,
+    556, 722, 722, 333, 389, 722, 611, 889, 722, 722, 556, 722, 667, 556, 611, 722, 722, 944, 722,
+    722, 611, 333, 278, 333, 469, 500, 333, 444, 500, 444, 500, 444, 333, 500, 500, 278, 278, 500,
+    278, 778, 500, 500, 500, 500, 333, 389, 278, 500, 500, 722, 500, 500, 444, 480, 200, 480, 541,
+];
+
+const TIMES_BOLD: [u16; 95] = [
+    250, 333, 555, 500, 500, 1000, 833, 278, 333, 333, 500, 570, 250, 333, 250, 278, 500, 500, 500,
+    500, 500, 500, 500, 500, 500, 500, 333, 333, 570, 570, 570, 500, 930, 722, 667, 722, 722, 667,
+    611, 778, 778, 389, 500, 778, 667, 944, 722, 778, 611, 778, 722, 556, 667, 722, 722, 1000, 722,
+    722, 667, 333, 278, 333, 581, 500, 333, 500, 556, 444, 556, 444, 333, 500, 556, 278, 333, 556,
+    278, 833, 556, 500, 556, 556, 444, 389, 333, 556, 500, 722, 500, 500, 444, 394, 220, 394, 520,
+];
+
+const TIMES_ITALIC: [u16; 95] = [
+    250, 333, 420, 500, 500, 833, 778, 214, 333, 333, 500, 675, 250, 333, 250, 278, 500, 500, 500,
+    500, 500, 500, 500, 500, 500, 500, 333, 333, 675, 675, 675, 500, 920, 611, 611, 667, 722, 611,
+    611, 722, 722, 333, 444, 667, 556, 833, 667, 722, 611, 722, 611, 500, 556, 722, 611, 833, 611,
+    556, 556, 389, 278, 389, 422, 500, 333, 500, 500, 444, 500, 444, 278, 500, 500, 278, 278, 444,
+    278, 722, 500, 500, 500, 500, 389, 389, 278, 500, 444, 667, 444, 444, 389, 400, 275, 400, 541,
+];
+
+const TIMES_BOLD_ITALIC: [u16; 95] = [
+    250, 389, 555, 500, 500, 833, 778, 278, 333, 333, 500, 570, 250, 333, 250, 278, 500, 500, 500,
+    500, 500, 500, 500, 500, 500, 500, 333, 333, 570, 570, 570, 500, 832, 667, 667, 667, 722, 667,
+    667, 722, 778, 389, 500, 667, 611, 889, 722, 722, 611, 722, 667, 556, 611, 722, 667, 889, 667,
+    611, 611, 333, 278, 333, 570, 500, 333, 500, 500, 444, 500, 444, 333, 500, 556, 278, 278, 500,
+    278, 778, 556, 500, 500, 500, 389, 389, 278, 556, 444, 667, 500, 444, 389, 348, 220, 348, 570,
+];
+
+/// The widths of a standard font.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Std {
+    /// Courier in any style: every glyph is 600 wide.
+    Courier,
+    Table(&'static [u16; 95]),
+}
+
+impl Std {
+    /// The width of the glyph for a code, in em, if the table has it.
+    pub fn width(self, code: u32) -> Option<f64> {
+        match self {
+            Std::Courier => (32..=255).contains(&code).then_some(0.6),
+            Std::Table(t) => {
+                let i = usize::try_from(code.checked_sub(32)?).ok()?;
+                t.get(i).map(|w| f64::from(*w) / 1000.0)
+            }
+        }
+    }
+}
+
+/// The standard font that a `/BaseFont` name stands for (a subset tag is ignored, and so are
+/// spaces, commas and hyphens: `Arial,Bold`, `TimesNewRomanPS-BoldItalicMT`).
+pub fn for_name(base_font: &str) -> Option<Std> {
+    let name = match base_font.split_once('+') {
+        Some((tag, rest)) if tag.len() == 6 && tag.bytes().all(|b| b.is_ascii_uppercase()) => rest,
+        _ => base_font,
+    };
+    let n: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let bold = n.contains("bold") || n.contains("black") || n.contains("heavy");
+    let italic = n.contains("italic") || n.contains("oblique");
+    if n.contains("courier") {
+        Some(Std::Courier)
+    } else if n.contains("helvetica") || n.starts_with("arial") {
+        Some(Std::Table(if bold { &HELVETICA_BOLD } else { &HELVETICA }))
+    } else if n.contains("times") {
+        Some(Std::Table(match (bold, italic) {
+            (false, false) => &TIMES,
+            (true, false) => &TIMES_BOLD,
+            (false, true) => &TIMES_ITALIC,
+            (true, true) => &TIMES_BOLD_ITALIC,
+        }))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_stand_for_their_tables() {
+        assert_eq!(for_name("Helvetica").unwrap().width(65), Some(0.667));
+        assert_eq!(
+            for_name("ABCDEF+Arial-BoldMT").unwrap().width(65),
+            Some(0.722)
+        );
+        assert_eq!(for_name("Times-Roman").unwrap().width(109), Some(0.778));
+        assert_eq!(
+            for_name("TimesNewRomanPS-ItalicMT").unwrap().width(65),
+            Some(0.611)
+        );
+        assert_eq!(for_name("Courier-Oblique").unwrap().width(200), Some(0.6));
+        assert_eq!(for_name("Symbol"), None);
+        assert_eq!(for_name("ZapfDingbats"), None);
+        // Outside the table.
+        assert_eq!(for_name("Helvetica").unwrap().width(200), None);
+    }
+
+    #[test]
+    fn the_tables_have_a_width_for_the_space_and_the_letters() {
+        for t in [
+            &HELVETICA,
+            &HELVETICA_BOLD,
+            &TIMES,
+            &TIMES_BOLD,
+            &TIMES_ITALIC,
+            &TIMES_BOLD_ITALIC,
+        ] {
+            assert_eq!(t.len(), 95);
+            assert!(t[0] == 250 || t[0] == 278, "space");
+            // Every width is a plausible width of a glyph, and the digits are all one width.
+            assert!(t.iter().all(|w| (180..=1100).contains(w)));
+            assert!(t[16..26].iter().all(|w| *w == t[16]));
+        }
+    }
+}
