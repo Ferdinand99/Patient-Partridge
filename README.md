@@ -173,6 +173,10 @@ Version 0.2.0 is out. There are no dates for what comes next; each step is done 
 - **Planned:** text recognition (OCR) for scanned documents, on your own computer.
 - **Planned, for later:** an optional, on-device feature for summaries and questions on a Mac, using Apple's on-device model.
 
+## Support
+
+Hedgerow is built in spare time and is free to use. If you find it useful, you can support it through [GitHub Sponsors](https://github.com/sponsors/Ferdinand99) or [Ko-fi](https://ko-fi.com/ferdinand99). Thank you.
+
 ## Licence
 
 Patient Partridge is free software under the [GNU Affero General Public License, version 3](LICENSE). PDFium is under a BSD-style licence; its licence files are shipped with the app.
