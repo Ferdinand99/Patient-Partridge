@@ -9,18 +9,21 @@
 //! pictures: they are pictures, and prove nothing about who placed them.
 //!
 //! An earlier version kept the file in the app's data folder (Roaming AppData on Windows). At every
-//! start the old file is moved to the new place, or removed when the new place has one already; a
-//! move that does not work is tried again at the next start, and until then the pictures of the old
-//! file are used (and written to the new place with the first change). "Forget" deletes the old
-//! file too.
+//! start the old file is moved to the new place; when the new place has a file already, the
+//! pictures of the old file that the new one lacks are added to it, and the old file is removed
+//! only when all of its pictures are in the new one. An old file that cannot be read, or whose
+//! pictures do not all fit, stays where it is and is tried again at the next start; while the new
+//! place cannot be used, the pictures of the old file are the list for the run (and are written to
+//! the new place with the first change). "Forget" deletes the old file too.
 //!
 //! Another program may change the file while the app runs. Before every change the app looks at
 //! the file again: when its size or its time has changed since the app last read or wrote it, the
 //! list is read from the file first, so a change made elsewhere is built on and not overwritten.
 //! A file that cannot be read as a list (damaged, cut short, too big, from another version) is
 //! never written over: the list starts empty, or stays as it was when the file went bad while the
-//! app ran, and the first change moves the bad file aside as `signatures.json.bad` before it
-//! writes the new one. "Forget" deletes that file too.
+//! app ran, and the first change moves the bad file aside as `signatures.json.bad` (or the next
+//! free `.bad.1` to `.bad.9`, never over one that is there; when all are taken nothing is written)
+//! before it writes the new one. "Forget" deletes those files too.
 //!
 //! The file is user data on a disk that other programs can write, so everything in it is checked
 //! again when it is read, with the same caps as a picture that is sent to the engine. An imported
@@ -285,15 +288,48 @@ impl SignatureMarks {
             move_earlier_file(from, to);
         }
         let mut store = SignatureMarks::load(file);
-        if let (Some(to), Some(from)) = (&store.file, &earlier) {
-            if fs::symlink_metadata(to).is_err() {
-                if let Loaded::List(list) = read_marks(from) {
-                    store.marks = list;
-                }
+        store.earlier = earlier;
+        store.take_in_earlier();
+        store
+    }
+
+    /// Brings in the pictures of the earlier file, when there is one that can be read. Where the new
+    /// file cannot be used (it is not there because the move did not work, or it cannot be read as
+    /// a list) they are the list for this run. Otherwise those the new file lacks are added to it,
+    /// and the earlier file is removed once all of its pictures are in the new one. A file that
+    /// cannot be read, or whose pictures do not all fit, is left where it is for the next start.
+    fn take_in_earlier(&mut self) {
+        let (Some(to), Some(from)) = (self.file.clone(), self.earlier.clone()) else {
+            return;
+        };
+        if fs::symlink_metadata(&from).is_err() {
+            return;
+        }
+        let Loaded::List(old) = read_marks(&from) else {
+            return;
+        };
+        if self.unreadable || fs::symlink_metadata(&to).is_err() {
+            self.marks = old;
+            return;
+        }
+        let missing: Vec<StoredMark> = old
+            .into_iter()
+            .filter(|m| self.marks.iter().all(|k| k.id != m.id))
+            .collect();
+        if !missing.is_empty() {
+            if self.marks.len() + missing.len() > MAX_MARKS {
+                return;
+            }
+            let before = self.marks.clone();
+            let mut merged = missing;
+            merged.append(&mut self.marks);
+            self.marks = merged;
+            if self.save().is_err() {
+                self.marks = before;
+                return;
             }
         }
-        store.earlier = earlier;
-        store
+        let _ = fs::remove_file(&from);
     }
 
     /// Reads the list again when the file is not the one the app last saw. A file that is gone
@@ -399,7 +435,9 @@ impl SignatureMarks {
         let Some(file) = &self.file else {
             return Ok(());
         };
-        let mut gone = vec![aside_of(file)];
+        let mut gone: Vec<PathBuf> = (0..ASIDE_SLOTS)
+            .map(|slot| aside_name(file, slot))
+            .collect();
         gone.extend(self.earlier.clone());
         for old in gone {
             match fs::remove_file(&old) {
@@ -437,7 +475,11 @@ impl SignatureMarks {
         // A file that could not be read as a list is not written over: it is moved aside first, and
         // when that cannot be done nothing is written.
         if self.unreadable && fs::symlink_metadata(file).is_ok_and(|m| m.is_file()) {
-            fs::rename(file, aside_of(file))?;
+            let aside = (0..ASIDE_SLOTS)
+                .map(|slot| aside_name(file, slot))
+                .find(|name| fs::symlink_metadata(name).is_err())
+                .ok_or_else(|| io::Error::other("too many unreadable files are set aside"))?;
+            fs::rename(file, aside)?;
         }
         write_replacing(file, &json)?;
         self.unreadable = false;
@@ -446,9 +488,22 @@ impl SignatureMarks {
     }
 }
 
-/// Where a file that could not be read is kept when the list is written anew.
+/// How many files that could not be read are kept at most (see [`aside_name`]).
+const ASIDE_SLOTS: u32 = 10;
+
+/// Where a file that could not be read is kept when the list is written anew: `.bad`, then
+/// `.bad.1` and so on. An earlier one is never written over.
+fn aside_name(file: &Path, slot: u32) -> PathBuf {
+    if slot == 0 {
+        file.with_extension("json.bad")
+    } else {
+        file.with_extension(format!("json.bad.{slot}"))
+    }
+}
+
+#[cfg(test)]
 fn aside_of(file: &Path) -> PathBuf {
-    file.with_extension("json.bad")
+    aside_name(file, 0)
 }
 
 /// Writes `bytes` to `file` so that a crash or a failure leaves either the old file or the new
@@ -496,18 +551,11 @@ fn write_flushed(file: &Path, bytes: &[u8]) -> io::Result<()> {
 /// Moves the file of an earlier version to its place in the local data folder. Before, the file
 /// lived in the app's data folder, which on Windows is Roaming AppData and can be copied to a
 /// server with the profile. It is tried at every start, so a move that did not work is made later.
-/// Nothing happens when `from` and `to` are the same file or when there is no earlier file. When
-/// the new place has a file already, that is the list, and the old file is removed (a crash after
-/// the move, or a move that was never finished, leaves both). The old file is removed only after
-/// the new one is written and flushed.
+/// Nothing happens when `from` and `to` are the same file, when there is no earlier file, or when
+/// the new place has something already (see [`SignatureMarks::load_moving`] for that case). The
+/// old file is removed only after the new one is written and flushed.
 pub fn move_earlier_file(from: &Path, to: &Path) {
-    if from == to {
-        return;
-    }
-    if fs::symlink_metadata(to).is_ok() {
-        if fs::symlink_metadata(from).is_ok() {
-            let _ = fs::remove_file(from);
-        }
+    if from == to || fs::symlink_metadata(to).is_ok() {
         return;
     }
     let Some(bytes) = read_plain_file(from, MAX_FILE_BYTES) else {
@@ -1340,12 +1388,11 @@ mod tests {
         assert!(!from.exists(), "the old file is gone");
         let marks = SignatureMarks::load(Some(to.clone()));
         assert_eq!(marks.len(), 1);
-        // A new place that has a file already is the list and is not touched; the old file, which
-        // is what a move that was never finished leaves, is removed.
+        // A new place that has a file already is not touched by the move, and the old file stays.
         let mut again = SignatureMarks::load(Some(from.clone()));
         again.add("Second", typed(), 2).unwrap();
         move_earlier_file(&from, &to);
-        assert!(!from.exists());
+        assert!(from.exists());
         assert_eq!(SignatureMarks::load(Some(to.clone())).len(), 1);
         // The same place, or no earlier file, is nothing to do.
         move_earlier_file(&to, &to);
@@ -1400,7 +1447,8 @@ mod tests {
     }
 
     #[test]
-    fn an_old_file_that_is_still_there_next_to_the_new_one_is_removed_at_the_start() {
+    fn an_old_file_that_is_still_there_next_to_the_new_one_is_merged_and_then_removed_at_the_start()
+    {
         let dir = TempDir::new();
         let from = dir.0.join("roaming").join("signatures.json");
         let to = dir.0.join("local").join("signatures.json");
@@ -1410,9 +1458,82 @@ mod tests {
         SignatureMarks::load(Some(to.clone()))
             .add("New", typed(), 2)
             .unwrap();
-        let marks = SignatureMarks::load_moving(Some(to.clone()), Some(from.clone()));
+        let mut marks = SignatureMarks::load_moving(Some(to.clone()), Some(from.clone()));
         assert!(!from.exists());
-        assert_eq!(marks.len(), 1);
+        let names: Vec<String> = marks.list().into_iter().map(|m| m.name).collect();
+        assert_eq!(names, vec!["Old", "New"]);
+        // It is in the new file, not only in memory.
+        assert_eq!(SignatureMarks::load(Some(to)).len(), 2);
+    }
+
+    #[test]
+    fn an_old_file_that_could_not_be_read_at_the_first_start_is_not_removed_by_the_next() {
+        let dir = TempDir::new();
+        let from = dir.0.join("roaming").join("signatures.json");
+        let to = dir.0.join("local").join("signatures.json");
+        SignatureMarks::load(Some(from.clone()))
+            .add("Old", draw(), 1)
+            .unwrap();
+        let good = fs::read(&from).unwrap();
+        // At the first start the old file cannot be read (here it is too big; a file held by
+        // another program is the same to the app).
+        fs::write(&from, vec![b' '; MAX_FILE_BYTES as usize + 1]).unwrap();
+        let mut first = SignatureMarks::load_moving(Some(to.clone()), Some(from.clone()));
+        assert!(first.list().is_empty());
+        assert!(from.exists());
+        // One picture is saved, which makes the new file.
+        first.add("New", typed(), 2).unwrap();
+        // The next start finds the old file unreadable still, and leaves it.
+        let second = SignatureMarks::load_moving(Some(to.clone()), Some(from.clone()));
+        assert!(from.exists());
+        assert_eq!(second.len(), 1);
+        // Once it can be read, its picture is brought in and it is removed.
+        fs::write(&from, good).unwrap();
+        let mut third = SignatureMarks::load_moving(Some(to.clone()), Some(from.clone()));
+        assert!(!from.exists());
+        let names: Vec<String> = third.list().into_iter().map(|m| m.name).collect();
+        assert_eq!(names, vec!["Old", "New"]);
+    }
+
+    #[test]
+    fn the_old_file_stays_while_the_new_place_cannot_be_used_and_its_pictures_are_the_list() {
+        let dir = TempDir::new();
+        let from = dir.0.join("roaming").join("signatures.json");
+        let to = dir.0.join("local").join("signatures.json");
+        SignatureMarks::load(Some(from.clone()))
+            .add("Old", draw(), 1)
+            .unwrap();
+        // The new place holds a file from a later version.
+        fs::create_dir_all(to.parent().unwrap()).unwrap();
+        fs::write(&to, b"{\"version\":2,\"marks\":[]}").unwrap();
+        let mut marks = SignatureMarks::load_moving(Some(to.clone()), Some(from.clone()));
+        assert!(from.exists());
+        assert_eq!(marks.list().len(), 1);
+        // The new place is a folder.
+        fs::remove_file(&to).unwrap();
+        fs::create_dir(&to).unwrap();
+        let mut marks = SignatureMarks::load_moving(Some(to.clone()), Some(from.clone()));
+        assert!(from.exists());
+        assert_eq!(marks.list().len(), 1);
+    }
+
+    #[test]
+    fn an_old_file_whose_pictures_do_not_all_fit_is_left_for_later() {
+        let dir = TempDir::new();
+        let from = dir.0.join("roaming").join("signatures.json");
+        let to = dir.0.join("local").join("signatures.json");
+        SignatureMarks::load(Some(from.clone()))
+            .add("Old", draw(), 1)
+            .unwrap();
+        let mut full = SignatureMarks::load(Some(to.clone()));
+        for n in 0..MAX_MARKS as u64 {
+            full.add(&format!("New {n}"), typed(), 100 + n).unwrap();
+        }
+        let before = fs::read(&to).unwrap();
+        let marks = SignatureMarks::load_moving(Some(to.clone()), Some(from.clone()));
+        assert!(from.exists());
+        assert_eq!(marks.len(), MAX_MARKS);
+        assert_eq!(fs::read(&to).unwrap(), before);
     }
 
     #[test]
@@ -1434,13 +1555,13 @@ mod tests {
 
     #[test]
     fn a_file_that_cannot_be_read_is_kept_aside_and_not_written_over() {
-        let dir = TempDir::new();
         for content in [
             &b"not json at all"[..],
             &b"{\"version\":2,\"marks\":[]}"[..],
             &[0xff, 0xfe, 0x00][..],
             &b""[..],
         ] {
+            let dir = TempDir::new();
             fs::write(dir.file(), content).unwrap();
             let mut marks = SignatureMarks::load(Some(dir.file()));
             assert!(marks.is_empty());
@@ -1481,12 +1602,45 @@ mod tests {
     }
 
     #[test]
+    fn a_bad_file_never_replaces_one_that_was_set_aside_before() {
+        let dir = TempDir::new();
+        let mut marks = SignatureMarks::load(Some(dir.file()));
+        for (n, content) in [
+            b"first bad".to_vec(),
+            b"second bad".to_vec(),
+            b"third bad".to_vec(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            fs::write(dir.file(), content).unwrap();
+            // The change is made from a list that was read before the file went bad.
+            marks.list();
+            marks
+                .add(&format!("Picture {n}"), draw(), n as u64)
+                .unwrap();
+        }
+        assert_eq!(fs::read(aside_name(&dir.file(), 0)).unwrap(), b"first bad");
+        assert_eq!(fs::read(aside_name(&dir.file(), 1)).unwrap(), b"second bad");
+        assert_eq!(fs::read(aside_name(&dir.file(), 2)).unwrap(), b"third bad");
+        assert_eq!(SignatureMarks::load(Some(dir.file())).len(), 3);
+        // Forgetting deletes every one of them.
+        marks.clear().unwrap();
+        for slot in 0..ASIDE_SLOTS {
+            assert!(!aside_name(&dir.file(), slot).exists());
+        }
+    }
+
+    #[test]
     fn nothing_is_written_when_the_bad_file_cannot_be_set_aside() {
         let dir = TempDir::new();
         fs::write(dir.file(), b"not a list").unwrap();
-        // The place for it is taken by a folder that has something in it.
-        fs::create_dir(aside_of(&dir.file())).unwrap();
-        fs::write(aside_of(&dir.file()).join("inside"), b"x").unwrap();
+        // Every place for it is taken (one by a folder that has something in it).
+        fs::create_dir(aside_name(&dir.file(), 0)).unwrap();
+        fs::write(aside_name(&dir.file(), 0).join("inside"), b"x").unwrap();
+        for slot in 1..ASIDE_SLOTS {
+            fs::write(aside_name(&dir.file(), slot), b"earlier").unwrap();
+        }
         let mut marks = SignatureMarks::load(Some(dir.file()));
         assert!(matches!(
             marks.add("One", draw(), 1),
