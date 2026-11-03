@@ -589,8 +589,9 @@ pub fn restrict_files() -> Result<(), String> {
 /// Locks the process in and checks that it worked. Returns the layers that are in force.
 pub fn lock_down() -> Result<Vec<&'static str>, String> {
     let mut layers = Vec::new();
-    // Landlock is normally in force already (see `restrict_files`). Where nobody asked for it yet
-    // it is applied now, and then it cannot be in force for every thread.
+    // The engine has asked for Landlock already, before it started any thread (start-up calls
+    // `restrict_files` first). This is only for a caller that did not: Landlock is applied now,
+    // and then it is not in force for every thread, so it is not reported.
     if !LANDLOCK_TRIED.load(std::sync::atomic::Ordering::SeqCst) {
         let _ = restrict_files();
     }
