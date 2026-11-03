@@ -120,7 +120,7 @@ impl MarkBody {
 fn is_base64(text: &str) -> bool {
     let body = text.trim_end_matches('=');
     text.len() - body.len() <= 2
-        && text.len() % 4 == 0
+        && text.len().is_multiple_of(4)
         && body
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
@@ -193,10 +193,12 @@ impl SignatureMarks {
         self.marks.clone()
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.marks.len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.marks.is_empty()
     }

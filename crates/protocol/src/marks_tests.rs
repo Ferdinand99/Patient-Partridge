@@ -100,14 +100,28 @@ fn a_drawn_picture_is_held_to_its_caps() {
     let one_over = vec![vec![[1.0, 1.0]; MAX_MARK_POINTS + 1]];
     assert!(!strokes_mark(one_over).within_caps());
     // The wire says the same: a hand-made frame with 65 strokes, or 4097 points, is refused.
-    let mut bytes = encoded(strokes_mark(vec![vec![[1.0, 1.0]]]));
+    // The frames hold every point they name, so only the cap can be the reason.
     let count_at = 1 + 4 + 4 + 4 + 16 + 4 + 1 + 12;
-    bytes[count_at..count_at + 4].copy_from_slice(&(MAX_MARK_STROKES as u32 + 1).to_le_bytes());
-    assert!(Request::decode(&bytes).is_err());
-    let mut bytes = encoded(strokes_mark(vec![vec![[1.0, 1.0]]]));
+    let head = encoded(strokes_mark(vec![vec![[1.0, 1.0]]]))[..count_at].to_vec();
+    let frame = |lengths: &[usize]| {
+        let mut bytes = head.clone();
+        bytes.extend((lengths.len() as u32).to_le_bytes());
+        for n in lengths {
+            bytes.extend((*n as u32).to_le_bytes());
+            for _ in 0..*n {
+                bytes.extend(1.0f32.to_le_bytes());
+                bytes.extend(1.0f32.to_le_bytes());
+            }
+        }
+        bytes
+    };
+    assert!(Request::decode(&frame(&vec![1; MAX_MARK_STROKES])).is_ok());
+    assert!(Request::decode(&frame(&vec![1; MAX_MARK_STROKES + 1])).is_err());
+    assert!(Request::decode(&frame(&[MAX_MARK_POINTS])).is_ok());
+    assert!(Request::decode(&frame(&[MAX_MARK_POINTS + 1])).is_err());
+    assert!(Request::decode(&frame(&[MAX_MARK_POINTS - 1, 1])).is_ok());
+    assert!(Request::decode(&frame(&[MAX_MARK_POINTS - 1, 2])).is_err());
     let points_at = count_at + 4;
-    bytes[points_at..points_at + 4].copy_from_slice(&(MAX_MARK_POINTS as u32 + 1).to_le_bytes());
-    assert!(Request::decode(&bytes).is_err());
     // No strokes, an empty stroke.
     let mut bytes = encoded(strokes_mark(vec![vec![[1.0, 1.0]]]));
     bytes[count_at..count_at + 4].copy_from_slice(&0u32.to_le_bytes());

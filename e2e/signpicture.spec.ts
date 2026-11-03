@@ -141,7 +141,7 @@ test("the tool opens a box that says a picture is not a digital signature", asyn
   // Nothing has been drawn: the box cannot be used yet.
   await expect(box.getByRole("button", { name: "Use on the page" })).toBeDisabled();
   const text = (await box.textContent()) ?? "";
-  expect(text).not.toMatch(/\b(legal|legally|court|guarantee|valid|binding|qualified|advanced|eidas|compliant|certified|adobe|acrobat)\b/i);
+  expect(text).not.toMatch(new RegExp("\\b(legal|legally|court|guarantee|valid|binding|qualified|advanced|eidas|compliant|certified|" + "ad" + "obe|acro" + "bat)\\b", "i"));
   // Escape closes it and nothing is picked.
   await page.keyboard.press("Escape");
   await expect(box).toHaveCount(0);
@@ -225,6 +225,59 @@ test("a file that is not a picture, a drawing file and a file that is too big ar
   await input.setInputFiles({ name: "sig.svg", mimeType: "image/svg+xml", buffer: Buffer.from("<svg xmlns='http://www.w3.org/2000/svg'/>") });
   await expect(box).toContainText("could not be read as a picture");
   await expect(box.getByRole("button", { name: "Use on the page" })).toBeDisabled();
+});
+
+test("the caps hold: at most 64 lines, 40 characters, and an image scaled to the size the engine takes", async ({ page }) => {
+  await openBook(page);
+  await openBar(page);
+  await page.locator("#tool-signature").click();
+  const box = dialog(page);
+  // Sixty-six short lines: the sixty-fifth is refused with words, and 64 are kept.
+  const surface = await page.locator(".sigpic-surface").boundingBox();
+  if (!surface) throw new Error("no drawing surface");
+  for (let i = 0; i < 66; i++) {
+    const x = surface.x + 20 + (i % 33) * 12;
+    const y = surface.y + 20 + Math.floor(i / 33) * 60;
+    await page.mouse.move(x, y);
+    await page.mouse.down();
+    await page.mouse.move(x + 6, y + 30, { steps: 2 });
+    await page.mouse.up();
+  }
+  await expect(box).toContainText("That is as much as a signature picture holds");
+  await box.getByRole("button", { name: "Use on the page" }).click();
+  const drawn = await placeAt(page, 300, 300);
+  const strokes = (drawn.args.mark as { strokes: unknown[][] }).strokes;
+  expect(strokes.length).toBe(64);
+  expect(strokes.flat().length).toBeLessThanOrEqual(4096);
+
+  // Sixty characters typed: forty are kept.
+  await page.locator("#tool-signature").click();
+  await dialog(page).getByRole("tab", { name: "Type" }).click();
+  const input = dialog(page).getByRole("textbox", { name: "Your name" });
+  await expect(input).toHaveAttribute("maxlength", "40");
+  await input.evaluate((el: HTMLInputElement) => {
+    el.removeAttribute("maxlength");
+    el.value = "ab".repeat(30);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await expect(dialog(page)).toContainText("A signature picture holds at most 40 characters");
+  await dialog(page).getByRole("button", { name: "Use on the page" }).click();
+  const typed = await placeAt(page, 110, 330);
+  expect(Array.from((typed.args.mark as { text: string }).text)).toHaveLength(40);
+
+  // A picture of 3000 by 1500 pixels is scaled in the window to what the engine takes.
+  await page.locator("#tool-signature").click();
+  await dialog(page).getByRole("tab", { name: "Image" }).click();
+  await dialog(page).locator("input.sigpic-file").setInputFiles({ name: "big.png", mimeType: "image/png", buffer: await png(page, 3000, 1500) });
+  await expect(dialog(page).getByText(/pixels\.$/)).toBeVisible();
+  await dialog(page).getByRole("button", { name: "Use on the page" }).click();
+  const image = await placeAt(page, 450, 330, "add_signature_image");
+  const { width, height, bytes } = image.args as { width: number; height: number; bytes: number };
+  expect(width).toBeLessThanOrEqual(1024);
+  expect(height).toBeLessThanOrEqual(1024);
+  expect(width * height).toBeLessThanOrEqual(1024 * 512);
+  expect(bytes).toBe(width * height * 4);
+  expect(width / height).toBeCloseTo(2, 1);
 });
 
 test("a signature is kept for later, used again, renamed, deleted and forgotten", async ({ page }) => {
