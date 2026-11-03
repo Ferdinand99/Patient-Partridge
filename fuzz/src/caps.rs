@@ -43,10 +43,18 @@ pub fn check_request_caps(request: &Request) {
         }
         RequestBody::Pages(request) => crate::pages::check_pages_request_caps(request),
         RequestBody::SetFormField { name, value, .. } => {
-            assert!(name.len() <= MAX_FORM_NAME, "field name of {} bytes", name.len());
+            assert!(
+                name.len() <= MAX_FORM_NAME,
+                "field name of {} bytes",
+                name.len()
+            );
             match value {
                 FormValue::Text(text) => {
-                    assert!(text.len() <= MAX_FORM_VALUE, "value of {} bytes", text.len())
+                    assert!(
+                        text.len() <= MAX_FORM_VALUE,
+                        "value of {} bytes",
+                        text.len()
+                    )
                 }
                 FormValue::Choice(picked) => {
                     assert!(picked.len() <= MAX_FORM_OPTIONS, "{} choices", picked.len())
@@ -67,7 +75,10 @@ pub fn check_request_caps(request: &Request) {
             assert!(x.abs() <= MAX_COORDINATE && y.abs() <= MAX_COORDINATE);
         }
         RequestBody::AddInk { width, strokes, .. } => {
-            assert!((MIN_INK_WIDTH..=MAX_INK_WIDTH).contains(width), "width {width}");
+            assert!(
+                (MIN_INK_WIDTH..=MAX_INK_WIDTH).contains(width),
+                "width {width}"
+            );
             assert!(!strokes.is_empty() && strokes.len() <= MAX_INK_STROKES);
             assert!(strokes.iter().all(|s| !s.is_empty()));
             assert!(strokes.iter().map(Vec::len).sum::<usize>() <= MAX_INK_POINTS);
@@ -78,6 +89,13 @@ pub fn check_request_caps(request: &Request) {
         }
         RequestBody::AddStamp { x, y, .. } => {
             assert!(x.abs() <= MAX_COORDINATE && y.abs() <= MAX_COORDINATE);
+        }
+        RequestBody::AddSignature { rect, mark, .. } => {
+            assert!(rect.iter().all(|v| v.abs() <= MAX_COORDINATE));
+            crate::marks::check_mark_caps(mark);
+        }
+        RequestBody::PlaceSignature { rect, .. } => {
+            assert!(rect.iter().all(|v| v.abs() <= MAX_COORDINATE));
         }
         RequestBody::UpdateAnnot { text, dx, dy, .. } => {
             if let Some(text) = text {
@@ -219,13 +237,22 @@ pub fn check_response_caps(response: &Response) {
 }
 
 fn check_annot(item: &partridge_protocol::AnnotInfo) {
-    assert!(item.text.len() <= MAX_ANNOT_TEXT, "text of {} bytes", item.text.len());
+    assert!(
+        item.text.len() <= MAX_ANNOT_TEXT,
+        "text of {} bytes",
+        item.text.len()
+    );
     assert!(
         item.author.len() <= MAX_ANNOT_AUTHOR,
         "author of {} bytes",
         item.author.len()
     );
-    assert_eq!(item.abilities & !ability::ALL, 0, "abilities {}", item.abilities);
+    assert_eq!(
+        item.abilities & !ability::ALL,
+        0,
+        "abilities {}",
+        item.abilities
+    );
     assert!(item.rect.iter().all(|v| v.is_finite()));
 }
 
@@ -289,13 +316,17 @@ fn form_answer(id: u32, name: usize, value: usize, options: usize, label: usize)
 }
 
 /// How many cases `over_cap_request_case` has.
-pub const OVER_CAP_REQUESTS: usize = 15 + crate::pages::PAGES_OVER_REQUESTS;
+pub const OVER_CAP_REQUESTS: usize =
+    15 + crate::marks::MARK_OVER_REQUESTS + crate::pages::PAGES_OVER_REQUESTS;
 
 /// A request that is valid except that one string is one byte over its cap. Returns a name and
 /// the payload; the decoder must return an error.
 pub fn over_cap_request_case(case: usize, id: u32) -> (&'static str, Vec<u8>) {
     match case % OVER_CAP_REQUESTS {
-        n if n >= 15 => crate::pages::pages_over_cap_request_case(n - 15, id),
+        n if n >= 15 + crate::marks::MARK_OVER_REQUESTS => {
+            crate::pages::pages_over_cap_request_case(n - 15 - crate::marks::MARK_OVER_REQUESTS, id)
+        }
+        n if n >= 15 => crate::marks::mark_over_cap_request_case(n - 15, id),
         0 => {
             let mut p = header(2, id);
             p.push(1);
@@ -688,10 +719,26 @@ pub fn over_cap_response_case(case: usize, id: u32) -> (&'static str, Vec<u8>, b
             push_annot(&mut p, MAX_ANNOT_TEXT, MAX_ANNOT_AUTHOR);
             ("annotation with the longest text and author", p, true)
         }
-        26 => ("form field name over the cap", form_answer(id, MAX_FORM_NAME + 1, 1, 0, 0), false),
-        27 => ("form field value over the cap", form_answer(id, 1, MAX_FORM_VALUE + 1, 0, 0), false),
-        28 => ("form field with one choice too many", form_answer(id, 1, 1, MAX_FORM_OPTIONS + 1, 0), false),
-        29 => ("form field at every cap", form_answer(id, MAX_FORM_NAME, MAX_FORM_VALUE, MAX_FORM_OPTIONS, 4), true),
+        26 => (
+            "form field name over the cap",
+            form_answer(id, MAX_FORM_NAME + 1, 1, 0, 0),
+            false,
+        ),
+        27 => (
+            "form field value over the cap",
+            form_answer(id, 1, MAX_FORM_VALUE + 1, 0, 0),
+            false,
+        ),
+        28 => (
+            "form field with one choice too many",
+            form_answer(id, 1, 1, MAX_FORM_OPTIONS + 1, 0),
+            false,
+        ),
+        29 => (
+            "form field at every cap",
+            form_answer(id, MAX_FORM_NAME, MAX_FORM_VALUE, MAX_FORM_OPTIONS, 4),
+            true,
+        ),
         30 => {
             let mut p = header(171, id);
             push_u32(&mut p, MAX_FORM_FIELDS_PER_PAGE as u32 + 1);

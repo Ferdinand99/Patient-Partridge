@@ -46,7 +46,8 @@ pub use spawn::{spawn_engine, EngineProcess, SandboxPolicy, SpawnRequest, Spawne
 pub use partridge_protocol::{
     ability, field_flag, AnnotInfo, AnnotKind, CertificateTime, FontScript, FormField,
     FormFieldKind, FormKind, FormOption, FormValue, LinkTarget, OutlineItem, PageLink,
-    SignatureInfo, SignatureReason, SignatureReport, SignatureState, StampKind, TextMatch,
+    SignatureFont, SignatureInfo, SignatureMark, SignatureReason, SignatureReport, SignatureState,
+    StampKind, TextMatch,
 };
 
 mod pages;
@@ -794,6 +795,59 @@ impl EngineClient {
                 stamp,
             },
             |item| item.kind == AnnotKind::Stamp,
+        )
+    }
+
+    /// The picture of a signature, fitted into `rect` (`[left, top, right, bottom]` in points on
+    /// the page as it is drawn). The picture is held to the limits of the protocol here, because
+    /// the protocol would leave out what is over them without saying so.
+    pub fn add_signature(
+        &self,
+        doc: u64,
+        page: u32,
+        rect: [f32; 4],
+        color: [u8; 4],
+        mark: SignatureMark,
+    ) -> Result<AnnotInfo, ClientError> {
+        check_place(rect[0], rect[1])?;
+        check_place(rect[2], rect[3])?;
+        if !mark.within_caps() {
+            return Err(refused_request("that picture is outside the limits"));
+        }
+        self.annot_call(
+            doc,
+            "signature picture",
+            |doc| RequestBody::AddSignature {
+                doc,
+                page,
+                rect,
+                color,
+                mark,
+            },
+            |item| item.kind == AnnotKind::Signature,
+        )
+    }
+
+    /// Moves and resizes a signature picture: it takes the top left corner and the width of `rect`.
+    pub fn place_signature(
+        &self,
+        doc: u64,
+        page: u32,
+        id: u32,
+        rect: [f32; 4],
+    ) -> Result<AnnotInfo, ClientError> {
+        check_place(rect[0], rect[1])?;
+        check_place(rect[2], rect[3])?;
+        self.annot_call(
+            doc,
+            "signature picture change",
+            |doc| RequestBody::PlaceSignature {
+                doc,
+                page,
+                id,
+                rect,
+            },
+            |item| item.id == id && item.kind == AnnotKind::Signature,
         )
     }
 

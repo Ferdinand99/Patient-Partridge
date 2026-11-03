@@ -17,8 +17,8 @@ use partridge_fuzz::{
 use partridge_protocol::{
     ability, field_flag, AnnotInfo, AnnotKind, ErrorCode, FontScript, FormField, FormFieldKind,
     FormKind, FormOption, FormValue, LinkTarget, OutlineItem, PageLink, PageSize, PagesRequest,
-    PagesResponse, Request, RequestBody, Response, ResponseBody, StampKind, TextMatch, MAX_FRAME_LEN,
-    MAX_LINKS_PER_PAGE, MAX_MATCHES_PER_PAGE,
+    PagesResponse, Request, RequestBody, Response, ResponseBody, SignatureFont, SignatureMark,
+    StampKind, TextMatch, MAX_FRAME_LEN, MAX_LINKS_PER_PAGE, MAX_MATCHES_PER_PAGE,
     MAX_OUTLINE_DEPTH, MAX_OUTLINE_ITEMS, MAX_OUTLINE_TITLE, MAX_QUERY_LEN, MAX_SAVE_BYTES,
     MAX_SAVE_CHUNK, MAX_URI_LEN, PROTOCOL_VERSION,
 };
@@ -102,7 +102,10 @@ fn requests() -> Vec<(&'static str, Request)> {
         ),
         ("save_end", b(13, RequestBody::SaveEnd { doc: 1 })),
         ("fingerprint", b(14, RequestBody::Fingerprint { doc: 1 })),
-        ("list_annots", b(15, RequestBody::ListAnnots { doc: 1, page: 0 })),
+        (
+            "list_annots",
+            b(15, RequestBody::ListAnnots { doc: 1, page: 0 }),
+        ),
         (
             "add_markup",
             b(
@@ -174,11 +177,91 @@ fn requests() -> Vec<(&'static str, Request)> {
         ),
         (
             "remove_annot",
-            b(21, RequestBody::RemoveAnnot { doc: 1, page: 0, id: 3 }),
+            b(
+                21,
+                RequestBody::RemoveAnnot {
+                    doc: 1,
+                    page: 0,
+                    id: 3,
+                },
+            ),
         ),
         (
             "restore_annot",
-            b(22, RequestBody::RestoreAnnot { doc: 1, page: 0, id: 3 }),
+            b(
+                22,
+                RequestBody::RestoreAnnot {
+                    doc: 1,
+                    page: 0,
+                    id: 3,
+                },
+            ),
+        ),
+        (
+            "add_signature_drawn",
+            b(
+                26,
+                RequestBody::AddSignature {
+                    doc: 1,
+                    page: 0,
+                    rect: [100.0, 100.0, 300.0, 180.0],
+                    color: [10, 40, 120, 255],
+                    mark: SignatureMark::Strokes {
+                        width: 240.0,
+                        height: 100.0,
+                        line: 4.0,
+                        strokes: vec![
+                            vec![[10.0, 50.0], [60.0, 20.0], [120.0, 80.0]],
+                            vec![[200.0, 60.0]],
+                        ],
+                    },
+                },
+            ),
+        ),
+        (
+            "add_signature_typed",
+            b(
+                27,
+                RequestBody::AddSignature {
+                    doc: 1,
+                    page: 0,
+                    rect: [100.0, 100.0, 300.0, 180.0],
+                    color: [0, 0, 0, 255],
+                    mark: SignatureMark::Typed {
+                        font: SignatureFont::GreatVibes,
+                        text: "Anna Alvorlig".into(),
+                    },
+                },
+            ),
+        ),
+        (
+            "add_signature_image",
+            b(
+                28,
+                RequestBody::AddSignature {
+                    doc: 1,
+                    page: 0,
+                    rect: [100.0, 100.0, 300.0, 180.0],
+                    color: [0, 0, 0, 255],
+                    mark: SignatureMark::Image {
+                        width: 4,
+                        height: 2,
+                        rgba: (0..32).map(|i| i as u8 * 8).collect(),
+                    },
+                },
+            ),
+        ),
+        (
+            "place_signature",
+            b(
+                29,
+                RequestBody::PlaceSignature {
+                    doc: 1,
+                    page: 0,
+                    id: 3,
+                    rect: [50.0, 60.0, 250.0, 60.0],
+                },
+            ),
         ),
         ("form_info", b(23, RequestBody::FormInfo { doc: 1 })),
         (
@@ -194,8 +277,11 @@ fn requests() -> Vec<(&'static str, Request)> {
                     page: 0,
                     index: 2,
                     name: "fullname".into(),
-                    value: FormValue::Text("Ada
-Lovelace".into()),
+                    value: FormValue::Text(
+                        "Ada
+Lovelace"
+                            .into(),
+                    ),
                 },
             ),
         ),
@@ -304,10 +390,7 @@ Lovelace".into()),
             "import_begin",
             b(
                 22,
-                RequestBody::Pages(PagesRequest::ImportBegin {
-                    doc: 1,
-                    size: 5000,
-                }),
+                RequestBody::Pages(PagesRequest::ImportBegin { doc: 1, size: 5000 }),
             ),
         ),
         (
@@ -593,7 +676,15 @@ fn responses() -> Vec<(&'static str, Response)> {
                 },
             ),
         ),
-        ("annot", b(18, ResponseBody::Annot { item: a_note(3, "") })),
+        (
+            "annot",
+            b(
+                18,
+                ResponseBody::Annot {
+                    item: a_note(3, ""),
+                },
+            ),
+        ),
         ("annot_removed", b(19, ResponseBody::AnnotRemoved)),
         (
             "error_no_such_annotation",
@@ -631,7 +722,8 @@ fn responses() -> Vec<(&'static str, Response)> {
                             name: "person.first".into(),
                             tooltip: "First name".into(),
                             value: "Ada
-Lovelace".into(),
+Lovelace"
+                                .into(),
                             max_len: 40,
                             options: vec![],
                         },
@@ -703,10 +795,16 @@ Lovelace".into(),
                 }),
             ),
         ),
-        ("import_ready", b(32, ResponseBody::Pages(PagesResponse::ImportReady))),
+        (
+            "import_ready",
+            b(32, ResponseBody::Pages(PagesResponse::ImportReady)),
+        ),
         (
             "import_ack",
-            b(33, ResponseBody::Pages(PagesResponse::ImportAck { received: 8 })),
+            b(
+                33,
+                ResponseBody::Pages(PagesResponse::ImportAck { received: 8 }),
+            ),
         ),
         (
             "exported",
@@ -721,7 +819,10 @@ Lovelace".into(),
                 }),
             ),
         ),
-        ("pages_done", b(35, ResponseBody::Pages(PagesResponse::Done))),
+        (
+            "pages_done",
+            b(35, ResponseBody::Pages(PagesResponse::Done)),
+        ),
         (
             "error_too_many_pages",
             b(
@@ -906,7 +1007,7 @@ fn main() {
     );
 
     // Round trips: one input per kind of message.
-    for kind in 0..27u8 {
+    for kind in 0..29u8 {
         write(
             &dir,
             "protocol_roundtrip_request",
@@ -927,6 +1028,10 @@ fn main() {
     // on one. The page text cases are 1.7 MB and are left to the round-trip target.
     for case in 0..OVER_CAP_REQUESTS {
         let (name, payload) = over_cap_request_case(case, 1);
+        // Not the picture with a row too many (2 MB): the unit tests of the fuzz crate decode it.
+        if payload.len() > 100_000 {
+            continue;
+        }
         write(
             &dir,
             "protocol_request_decode",
@@ -1110,7 +1215,10 @@ fn main() {
             "dangling_resources",
             kit::dangling_resources_pdf("/Resources 900 0 R"),
         ),
-        ("null_resources", kit::dangling_resources_pdf("/Resources null")),
+        (
+            "null_resources",
+            kit::dangling_resources_pdf("/Resources null"),
+        ),
         ("outside_parent", kit::outside_parent_pdf(true, true)),
         ("turned_root", kit::turned_root_pdf()),
         ("listed_many_times", kit::listed_many_times_pdf(200, 300, 0)),

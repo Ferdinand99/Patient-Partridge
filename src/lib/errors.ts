@@ -194,6 +194,13 @@ export function describeError(error: AppErrorLike, fileName?: string): Described
         action: "none",
       };
     case "save_too_large":
+      if (/not enough memory/i.test(error.message)) {
+        return {
+          title: "Not enough memory to finish saving",
+          detail: `There was not enough memory to finish saving ${file}. Nothing was saved, and the file on the disk was not changed. Closing other documents or programs may help.`,
+          action: "none",
+        };
+      }
       return {
         title: "The document is too big to save",
         detail: `${file} would be larger than 512 MiB, which is more than Patient Partridge saves. Nothing was saved, and the file on the disk was not changed.`,

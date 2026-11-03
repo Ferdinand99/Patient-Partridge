@@ -245,6 +245,7 @@
     note: { editText: true, recolour: false, move: true, remove: true, restore: true, locked: false },
     ink: { editText: true, recolour: false, move: false, remove: true, restore: false, locked: false },
     stamp: { editText: false, recolour: false, move: false, remove: true, restore: false, locked: false },
+    signature: { editText: false, recolour: false, move: true, remove: true, restore: true, locked: false, resize: true },
     other: { editText: false, recolour: false, move: false, remove: true, restore: false, locked: false },
   };
   const YELLOW = [255, 235, 59, 255];
@@ -315,6 +316,71 @@
   const STAMP_LABELS = { approved: "APPROVED", rejected: "REJECTED", draft: "DRAFT", final: "FINAL", confidential: "CONFIDENTIAL", reviewed: "REVIEWED" };
   const stampSize = (name) => [STAMP_LABELS[name].length * 26 * 0.72 + 18, 44];
 
+  // Where the engine puts a new picture of a signature, and where it puts one that is resized
+  // (crates/engine/src/sigmark.rs, fit_box and place_box).
+  const MIN_SIDE = 8;
+  function fitBox(aspect, want, size) {
+    const rw = want[2] - want[0];
+    const rh = want[3] - want[1];
+    if (!(rw > 0 && rh > 0 && aspect > 0)) return null;
+    let [w, h] = rw / rh > aspect ? [rh * aspect, rh] : [rw, rw / aspect];
+    if (w > size.w) [w, h] = [size.w, size.w / aspect];
+    if (h > size.h) [w, h] = [size.h * aspect, size.h];
+    if (w < MIN_SIDE || h < MIN_SIDE) return null;
+    const x = Math.min(Math.max(want[0] + (rw - w) / 2, 0), Math.max(size.w - w, 0));
+    const y = Math.min(Math.max(want[1] + (rh - h) / 2, 0), Math.max(size.h - h, 0));
+    return [x, y, x + w, y + h];
+  }
+  function placeBox(aspect, want, size) {
+    const widest = Math.min(size.w, size.h * aspect);
+    const narrowest = Math.max(MIN_SIDE, MIN_SIDE * aspect);
+    if (narrowest > widest) return null;
+    const w = Math.min(Math.max(Math.abs(want[2] - want[0]), narrowest), widest);
+    const h = w / aspect;
+    const x = Math.min(Math.max(want[0], 0), Math.max(size.w - w, 0));
+    const y = Math.min(Math.max(want[1], 0), Math.max(size.h - h, 0));
+    return [x, y, x + w, y + h];
+  }
+
+  // The signatures kept for later, the way the app process keeps them: twenty at the most.
+  const marks = [];
+  let nextMark = 1;
+  state.marks = marks;
+  function mark(cmd, args) {
+    switch (cmd) {
+      case "list_signature_marks":
+        return JSON.parse(JSON.stringify(marks));
+      case "add_signature_mark": {
+        if (state.marksFailure) {
+          const f = state.marksFailure;
+          state.marksFailure = null;
+          throw f;
+        }
+        if (marks.length >= 20) throw { code: "signature_store_full", message: "full" };
+        const name = String(args.name).trim();
+        if (!name || name.length > 60) throw { code: "invalid_request", message: "a name has one to sixty characters" };
+        const kept = { id: `m${nextMark++}`, name, created: 1, ...JSON.parse(JSON.stringify(args.mark)) };
+        marks.push(kept);
+        return JSON.parse(JSON.stringify(kept));
+      }
+      case "rename_signature_mark": {
+        const found = marks.find((m) => m.id === args.id);
+        if (!found) throw { code: "invalid_request", message: "gone" };
+        found.name = String(args.name).trim();
+        return JSON.parse(JSON.stringify(found));
+      }
+      case "delete_signature_mark": {
+        const at = marks.findIndex((m) => m.id === args.id);
+        if (at < 0) throw { code: "invalid_request", message: "gone" };
+        marks.splice(at, 1);
+        return null;
+      }
+      default:
+        marks.length = 0;
+        return null;
+    }
+  }
+
   function failIfScripted(cmd) {
     const f = state.annotFailure;
     if (f && f.cmd === cmd) {
@@ -351,7 +417,17 @@
       else if (a.kind === "strikeout") for (const b of a.boxes ?? [a.rect]) fill([b[0], (b[1] + b[3]) / 2 - 0.75, b[2], (b[1] + b[3]) / 2 + 0.75], a.color, false);
       else if (a.kind === "note") fill(a.rect, [255, 235, 59], false);
       else if (a.kind === "stamp") fill(a.rect, a.color, false);
-      else if (a.kind === "ink") {
+      else if (a.kind === "signature") {
+        // A picture of a signature is drawn as a line from corner to corner, so that its place and
+        // its size can be seen on the canvas.
+        const [l, t, r, b] = a.rect;
+        const steps = Math.max(2, Math.ceil(Math.hypot(r - l, b - t) * 2));
+        for (let s = 0; s <= steps; s++) {
+          const x = l + ((r - l) * s) / steps;
+          const y = t + ((b - t) * s) / steps;
+          fill([x - 1, y - 1, x + 1, y + 1], a.color, false);
+        }
+      } else if (a.kind === "ink") {
         const r = Math.max(1, (a.width ?? 3) / 2);
         for (const stroke of a.strokes) {
           for (let i = 0; i < stroke.length; i++) {
@@ -413,6 +489,27 @@
         const [sw, sh] = stampSize(args.stamp);
         const item = made("stamp", { rect: [args.x, args.y, args.x + sw, args.y + sh], text: STAMP_LABELS[args.stamp], color: [26, 127, 55, 255] });
         listFor(args.doc, args.page).push(item);
+        return view(item);
+      }
+      case "add_signature":
+      case "add_signature_image": {
+        failIfScripted(cmd);
+        const size = dims(docs.get(args.doc).path);
+        const mark = cmd === "add_signature" ? args.mark : { kind: "image", width: args.width, height: args.height };
+        const aspect = mark.kind === "draw" ? mark.width / mark.height : mark.kind === "image" ? mark.width / mark.height : Math.max(1, Array.from(mark.text).length * 0.42);
+        const rect = fitBox(aspect, args.rect, size);
+        if (!rect) throw { code: "invalid_request", message: "the picture does not fit in that box" };
+        const item = made("signature", { rect, color: args.color, text: "Signature picture", aspect, mark });
+        listFor(args.doc, args.page).push(item);
+        return view(item);
+      }
+      case "place_signature": {
+        failIfScripted(cmd);
+        const { item } = findAnnot(args.doc, args.page, args.id);
+        if (!item.can.resize) throw { code: "annotation_refused", message: "not allowed" };
+        const placed = placeBox(item.aspect, args.rect, dims(docs.get(args.doc).path));
+        if (!placed) throw { code: "annotation_refused", message: "does not fit" };
+        item.rect = placed;
         return view(item);
       }
       case "update_annotation": {
@@ -497,7 +594,13 @@
     for (const { id, handler } of handlers.get(name) ?? []) callbacks.get(handler)?.({ event: name, id, payload });
   };
 
-  async function invoke(cmd, args = {}) {
+  async function invoke(cmd, args = {}, options = {}) {
+    // The pixels of an imported picture come as the body of the request, and what they are for in a
+    // header: the call is kept as the window meant it, with the size of the pixels instead of them.
+    if (cmd === "add_signature_image") {
+      const bytes = args;
+      args = { ...JSON.parse(options.headers?.["x-signature-image"] ?? "{}"), bytes: bytes.length, first: Array.from(bytes.slice(0, 4)) };
+    }
     state.calls.push({ cmd, args });
     switch (cmd) {
       case "plugin:event|listen": {
@@ -516,7 +619,16 @@
       case "update_annotation":
       case "remove_annotation":
       case "restore_annotation":
+      case "add_signature":
+      case "add_signature_image":
+      case "place_signature":
         return annotate(cmd, args);
+      case "list_signature_marks":
+      case "add_signature_mark":
+      case "rename_signature_mark":
+      case "delete_signature_mark":
+      case "clear_signature_marks":
+        return mark(cmd, args);
       case "set_dirty":
         state.dirty[args.doc] = args.dirty;
         return null;

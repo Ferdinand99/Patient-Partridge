@@ -16,6 +16,7 @@ mod locate;
 mod pages;
 mod positions;
 mod session;
+mod sigmarks;
 mod signatures;
 mod unsaved;
 mod updates;
@@ -31,6 +32,7 @@ use partridge_engine_client::{
 use positions::{Position, Positions};
 use serde::Serialize;
 use session::SessionStore;
+use sigmarks::{SignatureMarkStore, SignatureMarks};
 use tauri::webview::PageLoadEvent;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
@@ -885,6 +887,25 @@ pub fn run() {
                 .map(|dir| dir.join("positions.json"));
             app.manage(LinkMemory(Mutex::new(KnownLinks::default())));
             app.manage(PositionStore(Mutex::new(Positions::load(positions_file))));
+            // The saved signatures are in the local data folder, which does not roam with a Windows
+            // profile (the app data folder does), so "kept on this computer only" holds. A file that
+            // an earlier version left in the app data folder is moved here at the start (again at the
+            // next start if that did not work, and removed once the new file is there). On macOS and
+            // Linux both folders are the same one and nothing moves.
+            let signatures_file = app
+                .path()
+                .app_local_data_dir()
+                .ok()
+                .map(|dir| dir.join("signatures.json"));
+            let earlier_signatures = app
+                .path()
+                .app_data_dir()
+                .ok()
+                .map(|dir| dir.join("signatures.json"));
+            app.manage(SignatureMarkStore(Mutex::new(SignatureMarks::load_moving(
+                signatures_file,
+                earlier_signatures,
+            ))));
             app.manage(Engine(Arc::new(EnginePool::new(
                 engine_config(app),
                 MAX_DOCUMENTS,
@@ -964,6 +985,14 @@ pub fn run() {
             annotations::update_annotation,
             annotations::remove_annotation,
             annotations::restore_annotation,
+            sigmarks::list_signature_marks,
+            sigmarks::add_signature_mark,
+            sigmarks::rename_signature_mark,
+            sigmarks::delete_signature_mark,
+            sigmarks::clear_signature_marks,
+            sigmarks::add_signature,
+            sigmarks::add_signature_image,
+            sigmarks::place_signature,
             take_pending_paths,
             measure_mode,
             frontend_error,

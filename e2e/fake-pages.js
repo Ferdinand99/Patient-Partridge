@@ -199,10 +199,10 @@
     return { changed: changed(m, snapshot, source.pages), inserted: source.pages };
   }
 
-  async function invoke(cmd, args = {}) {
+  async function invoke(cmd, args = {}, options) {
     if (cmd === "open_pdf" && SPECS[args.path]) return open(args.path);
     const isMine = cmd.startsWith("pages_") || (typeof args.doc === "number" && models.has(args.doc));
-    if (!isMine) return baseInvoke(cmd, args);
+    if (!isMine) return baseInvoke(cmd, args, options);
     pg.calls.push({ cmd, args });
     if (pg.failNext && pg.failNext.cmd === cmd) {
       const { error } = pg.failNext;
@@ -238,16 +238,16 @@
         models.delete(args.doc);
         return null;
       case "form_info":
-        if (!model(args.doc).fields) return baseInvoke(cmd, args);
+        if (!model(args.doc).fields) return baseInvoke(cmd, args, options);
         return { kind: "acro", actions: false };
       case "get_form_fields": {
         const { fields } = model(args.doc);
-        if (!fields) return baseInvoke(cmd, args);
+        if (!fields) return baseInvoke(cmd, args, options);
         return structuredClone(fields);
       }
       case "set_form_field": {
         const { fields } = model(args.doc);
-        if (!fields) return baseInvoke(cmd, args);
+        if (!fields) return baseInvoke(cmd, args, options);
         const f = fields.find((x) => x.index === args.index && x.name === args.name);
         if (!f) throw { code: "form_field_refused", message: "not the field" };
         if (args.value.kind === "text") f.value = args.value.text;
@@ -373,7 +373,7 @@
         pg.cancelled = true;
         return "handover";
       default:
-        return baseInvoke(cmd, args);
+        return baseInvoke(cmd, args, options);
     }
   }
 

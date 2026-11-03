@@ -24,6 +24,8 @@ pub struct Abilities {
     restore: bool,
     /// The file or the document forbids changing it.
     locked: bool,
+    /// A picture of a signature can be made bigger or smaller.
+    resize: bool,
 }
 
 /// An annotation of a page as the window sees it. `rect` is `[left, top, right, bottom]` in points
@@ -52,6 +54,7 @@ impl From<AnnotInfo> for AnnotationInfo {
                 remove: item.abilities & ability::REMOVE != 0,
                 restore: item.abilities & ability::RESTORE != 0,
                 locked: item.abilities & ability::LOCKED != 0,
+                resize: item.abilities & ability::RESIZE != 0,
             },
             rect: item.rect.map(round2),
             color: item.color,
@@ -294,7 +297,8 @@ mod tests {
                     "move": true,
                     "remove": true,
                     "restore": false,
-                    "locked": false
+                    "locked": false,
+                    "resize": false
                 },
                 "rect": [10.5, 20.0, 30.25, 41.0],
                 "color": [1, 2, 3, 255],

@@ -66,8 +66,8 @@ use partridge_engine::Engine;
 use partridge_fuzz::check_response_caps;
 use partridge_protocol::{
     AnnotKind, ErrorCode, FormFieldKind, FormKind, FormValue, LinkTarget, PageSize, PagesRequest,
-    PagesResponse, Request, RequestBody, Response, ResponseBody, StampKind, MAX_ANNOTS_PER_PAGE,
-    MAX_SAVE_BYTES, MAX_SAVE_CHUNK, PROTOCOL_VERSION,
+    PagesResponse, Request, RequestBody, Response, ResponseBody, SignatureFont, SignatureMark,
+    StampKind, MAX_ANNOTS_PER_PAGE, MAX_SAVE_BYTES, MAX_SAVE_CHUNK, PROTOCOL_VERSION,
 };
 
 /// Longest side of the bitmaps the target draws. Small, so that an iteration is fast.
@@ -344,7 +344,11 @@ impl State {
                 ..
             }) => {
                 if let Some(expected) = expected {
-                    assert_eq!(sizes.len() as u32, expected, "the number of pages after a change");
+                    assert_eq!(
+                        sizes.len() as u32,
+                        expected,
+                        "the number of pages after a change"
+                    );
                 }
                 for s in &sizes {
                     assert!(s.width.is_finite() && s.width > 0.0 && s.width <= 14_400.0);
@@ -368,9 +372,9 @@ impl State {
     /// each tool: a document whose copies PDFium cannot read again (a damaged one) may refuse to go
     /// back, and the tools must still report what the document has.
     fn tools(&mut self, doc: u32, count: u32, data: &[u8]) -> u32 {
-        let seed = data
-            .iter()
-            .fold(0x9E37_79B9u32, |a, b| a.wrapping_mul(31).wrapping_add(u32::from(*b)));
+        let seed = data.iter().fold(0x9E37_79B9u32, |a, b| {
+            a.wrapping_mul(31).wrapping_add(u32::from(*b))
+        });
         let pick = |n: u32, salt: u32| {
             if n == 0 {
                 0
@@ -485,14 +489,22 @@ impl State {
             std::fs::write(&copy, &bytes).expect("write the copy");
             self.engine
                 .set_document(std::fs::File::open(&copy).expect("open the copy"));
-            if let ResponseBody::Opened { doc: other, pages: n } =
-                self.ask(RequestBody::Open { password: None })
+            if let ResponseBody::Opened {
+                doc: other,
+                pages: n,
+            } = self.ask(RequestBody::Open { password: None })
             {
                 assert_eq!(n.len(), 1, "the copy of one page has other pages");
-                if let ResponseBody::Fingerprint { failed: 0, digest: d, .. } =
-                    self.ask(RequestBody::Fingerprint { doc: other })
+                if let ResponseBody::Fingerprint {
+                    failed: 0,
+                    digest: d,
+                    ..
+                } = self.ask(RequestBody::Fingerprint { doc: other })
                 {
-                    assert_eq!(d, digest, "the copy is not the document the engine described");
+                    assert_eq!(
+                        d, digest,
+                        "the copy is not the document the engine described"
+                    );
                 }
                 self.ask(RequestBody::Close { doc: other });
             }
@@ -654,12 +666,60 @@ impl State {
                         stamp: StampKind::Draft,
                     },
                 ),
+                (
+                    AnnotKind::Signature,
+                    RequestBody::AddSignature {
+                        doc,
+                        page,
+                        rect: [20.0, 20.0, size.width / 2.0, size.height / 3.0],
+                        color: [10, 40, 120, 255],
+                        mark: SignatureMark::Strokes {
+                            width: 200.0,
+                            height: 80.0,
+                            line: 4.0,
+                            strokes: vec![
+                                vec![[10.0, 10.0], [100.0, 70.0], [190.0, 20.0]],
+                                vec![[100.0, 40.0]],
+                            ],
+                        },
+                    },
+                ),
+                (
+                    AnnotKind::Signature,
+                    RequestBody::AddSignature {
+                        doc,
+                        page,
+                        rect: [20.0, 20.0, size.width / 2.0, size.height / 3.0],
+                        color: [0, 0, 0, 255],
+                        mark: SignatureMark::Typed {
+                            font: SignatureFont::Allura,
+                            text: "Anna Alvorlig".into(),
+                        },
+                    },
+                ),
+                (
+                    AnnotKind::Signature,
+                    RequestBody::AddSignature {
+                        doc,
+                        page,
+                        rect: [20.0, 20.0, size.width / 2.0, size.height / 3.0],
+                        color: [0, 0, 0, 255],
+                        mark: SignatureMark::Image {
+                            width: 3,
+                            height: 2,
+                            rgba: vec![200; 24],
+                        },
+                    },
+                ),
             ];
             for (kind, body) in requests {
                 match self.ask(body) {
                     ResponseBody::Annot { item } => {
                         assert_eq!(item.kind, kind);
-                        assert!(!ids.contains(&item.id), "a new annotation took an id in use");
+                        assert!(
+                            !ids.contains(&item.id),
+                            "a new annotation took an id in use"
+                        );
                         ids.push(item.id);
                         check_response_caps(&Response {
                             id: 0,
@@ -692,10 +752,17 @@ impl State {
             };
             if after.len() < MAX_ANNOTS_PER_PAGE {
                 for (_, id) in &made {
-                    assert!(after.iter().any(|i| i.id == *id), "annotation {id} is not listed");
+                    assert!(
+                        after.iter().any(|i| i.id == *id),
+                        "annotation {id} is not listed"
+                    );
                 }
                 for item in &listed {
-                    assert!(after.iter().any(|i| i.id == item.id), "annotation {} was lost", item.id);
+                    assert!(
+                        after.iter().any(|i| i.id == item.id),
+                        "annotation {} was lost",
+                        item.id
+                    );
                 }
             }
             if let Some((_, id)) = made.iter().find(|(k, _)| *k == AnnotKind::Note) {
@@ -710,6 +777,27 @@ impl State {
                 }) {
                     ResponseBody::Annot { item } => assert_eq!(item.id, *id),
                     other => panic!("unexpected answer to a change: {other:?}"),
+                }
+            }
+            // A picture of a signature is moved and resized, and its box stays on the page.
+            if let Some((_, id)) = made.iter().find(|(k, _)| *k == AnnotKind::Signature) {
+                match self.ask(RequestBody::PlaceSignature {
+                    doc,
+                    page,
+                    id: *id,
+                    rect: [30.0, 30.0, 130.0, 30.0],
+                }) {
+                    ResponseBody::Annot { item } => {
+                        assert_eq!(item.id, *id);
+                        assert!(
+                            item.rect[2] <= size.width + 0.1 && item.rect[3] <= size.height + 0.1
+                        );
+                    }
+                    ResponseBody::Error {
+                        code: ErrorCode::AnnotationRefused,
+                        ..
+                    } => {}
+                    other => panic!("unexpected answer to a resize: {other:?}"),
                 }
             }
             // Remove each one made, then put each back: the same ids come back.
@@ -924,8 +1012,14 @@ impl State {
                         if was_text != here_text || was.0 != here.0 {
                             continue;
                         }
-                        assert_eq!(was_text, now_text, "page {page} of the saved file reads another text");
-                        assert_eq!(was.0, now.0, "page {page} of the saved file has another size");
+                        assert_eq!(
+                            was_text, now_text,
+                            "page {page} of the saved file reads another text"
+                        );
+                        assert_eq!(
+                            was.0, now.0,
+                            "page {page} of the saved file has another size"
+                        );
                     }
                 }
                 if level == 0 {
@@ -1101,7 +1195,9 @@ impl State {
                     code: ErrorCode::FormUnsupported,
                     ..
                 } => return,
-                other => panic!("fields of a document that has no form the reader fills in: {other:?}"),
+                other => {
+                    panic!("fields of a document that has no form the reader fills in: {other:?}")
+                }
             }
         }
         let fields = match listed {
@@ -1115,7 +1211,11 @@ impl State {
         };
         for field in &fields {
             let [l, t, r, b] = field.rect;
-            assert!(r - l >= 1.0 && b - t >= 1.0, "a field without a place: {:?}", field.rect);
+            assert!(
+                r - l >= 1.0 && b - t >= 1.0,
+                "a field without a place: {:?}",
+                field.rect
+            );
             assert!(field.options.len() <= partridge_protocol::MAX_FORM_OPTIONS);
         }
         for field in fields.iter().take(3) {

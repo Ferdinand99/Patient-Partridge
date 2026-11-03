@@ -6,10 +6,12 @@
 //! that go past a limit on purpose are in `caps`.
 
 mod caps;
+mod marks;
 mod pages;
 mod signatures;
 
 pub use caps::*;
+pub use marks::*;
 pub use pages::*;
 pub use signatures::*;
 
@@ -134,7 +136,7 @@ fn arb_strokes(u: &mut Unstructured) -> Result<Vec<Vec<[f32; 2]>>> {
 /// A request that the encoder writes without cutting anything.
 pub fn arb_request(u: &mut Unstructured) -> Result<Request> {
     let id: u32 = u.arbitrary()?;
-    let body = match u.int_in_range(0..=26u8)? {
+    let body = match u.int_in_range(0..=28u8)? {
         0 => RequestBody::Hello {
             protocol_version: u.arbitrary()?,
         },
@@ -289,6 +291,29 @@ pub fn arb_request(u: &mut Unstructured) -> Result<Request> {
             } else {
                 u.int_in_range(0..=MAX_UNIX_TIME)?
             },
+        },
+        27 => RequestBody::AddSignature {
+            doc: u.arbitrary()?,
+            page: u.arbitrary()?,
+            rect: [
+                coordinate(u)?,
+                coordinate(u)?,
+                coordinate(u)?,
+                coordinate(u)?,
+            ],
+            color: u.arbitrary()?,
+            mark: arb_mark(u)?,
+        },
+        28 => RequestBody::PlaceSignature {
+            doc: u.arbitrary()?,
+            page: u.arbitrary()?,
+            id: u.arbitrary()?,
+            rect: [
+                coordinate(u)?,
+                coordinate(u)?,
+                coordinate(u)?,
+                coordinate(u)?,
+            ],
         },
         _ => RequestBody::Pages(arb_pages_request(u)?),
     };
@@ -542,7 +567,10 @@ pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
         }
         16 => {
             let (s, e) = arb_annot(u)?;
-            (ResponseBody::Annot { item: s }, ResponseBody::Annot { item: e })
+            (
+                ResponseBody::Annot { item: s },
+                ResponseBody::Annot { item: e },
+            )
         }
         17 => (ResponseBody::AnnotRemoved, ResponseBody::AnnotRemoved),
         18 => {
@@ -704,7 +732,11 @@ fn arb_form_field(u: &mut Unstructured, index: u32, heavy: bool) -> Result<(Form
         Vec::new()
     };
     let rect = any_rect(u)?;
-    let font_size: f32 = if chance(u, 8)? { f32::NAN } else { finite(u)?.abs() };
+    let font_size: f32 = if chance(u, 8)? {
+        f32::NAN
+    } else {
+        finite(u)?.abs()
+    };
     let field = FormField {
         index,
         kind,
@@ -720,6 +752,10 @@ fn arb_form_field(u: &mut Unstructured, index: u32, heavy: bool) -> Result<(Form
     };
     let mut expected = field.clone();
     expected.rect = sanitized(rect);
-    expected.font_size = if font_size.is_finite() { font_size } else { 0.0 };
+    expected.font_size = if font_size.is_finite() {
+        font_size
+    } else {
+        0.0
+    };
     Ok((field, expected))
 }

@@ -4,7 +4,7 @@
 
 export type Rgba = [number, number, number, number];
 
-export type AnnotKind = "highlight" | "underline" | "strikeout" | "note" | "ink" | "stamp" | "other";
+export type AnnotKind = "highlight" | "underline" | "strikeout" | "note" | "ink" | "stamp" | "signature" | "other";
 
 export type StampName = "approved" | "rejected" | "draft" | "final" | "confidential" | "reviewed";
 
@@ -17,6 +17,8 @@ export interface AnnotAbilities {
   restore: boolean;
   /** The file or the document forbids changing it (read-only, locked, or no permission). */
   locked: boolean;
+  /** The annotation can be made bigger or smaller (a picture of a signature). Absent means no. */
+  resize?: boolean;
 }
 
 /** An annotation of a page as the engine reports it. */
@@ -33,7 +35,7 @@ export interface Annotation {
   author: string;
 }
 
-export type Tool = "select" | "highlight" | "underline" | "strikeout" | "note" | "pen" | "stamp";
+export type Tool = "select" | "highlight" | "underline" | "strikeout" | "note" | "pen" | "stamp" | "signature";
 
 export interface ToolInfo {
   id: Tool;
@@ -51,6 +53,7 @@ export const TOOLS: readonly ToolInfo[] = [
   { id: "note", label: "Note", key: "n" },
   { id: "pen", label: "Pen", key: "p" },
   { id: "stamp", label: "Stamp", key: "m" },
+  { id: "signature", label: "Signature picture", key: "g" },
 ];
 
 export function toolForKey(key: string): Tool | null {
@@ -144,6 +147,7 @@ const KIND_NAMES: Record<AnnotKind, string> = {
   note: "Note",
   ink: "Drawing",
   stamp: "Stamp",
+  signature: "Signature picture",
   other: "Annotation",
 };
 

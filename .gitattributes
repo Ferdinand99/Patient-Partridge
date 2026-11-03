@@ -6,3 +6,5 @@ crates/engine/src/warm-up.pdf binary
 THIRD-PARTY-NOTICES text eol=lf
 legal/* text eol=lf
 notices-extra.json text eol=lf
+*.ttf binary
+assets/fonts/signature/*.txt text eol=lf
