@@ -283,7 +283,7 @@ fn signs_of_life_do_not_keep_a_save_open_for_ever() {
 
 #[test]
 fn the_overall_limit_grows_with_the_size_of_the_file() {
-    // A file of 4 MiB at 1 MiB a second, four passes: 16 s more than the floor. A save that takes
+    // A file of 4 MiB at 1 MiB a second, six passes: 24 s more than the floor. A save that takes
     // 1.8 s with signs of life every 0.3 s is far inside it, and a floor of 0 does not matter.
     let mut config = EngineConfig::new(fake_engine());
     config.args = vec!["save-progress".into()];

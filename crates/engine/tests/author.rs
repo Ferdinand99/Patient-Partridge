@@ -1293,3 +1293,50 @@ fn a_field_that_was_taken_away_is_not_in_the_saved_file() {
         );
     }
 }
+
+// ---- metadata that a save refuses ----------------------------------------------------------------
+
+#[test]
+fn a_document_with_xmp_metadata_gets_fields_and_is_saved_with_them() {
+    // The document is written out to put the fields after its bytes; those bytes stay in the engine,
+    // and the metadata check is made on the bytes of a save only.
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let (doc, _file) = open(e, &kit::xmp_pdf(true, false));
+    apply_ok(e, doc, vec![add(text("added", [72.0, 72.0, 272.0, 94.0]))]);
+    assert_eq!(one(&fields(e, doc, 0), "added").name, "added");
+    let saved = save_all(e, doc);
+    assert!(common::contains(&saved, kit::XMP_CATALOG_TITLE.as_bytes()));
+    assert!(common::contains(&saved, b"added"));
+}
+
+#[test]
+fn a_protected_document_with_xmp_is_refused_by_the_designer_and_by_a_save_with_their_own_codes() {
+    // The designer does not work on a protected document at all, so it never reaches the metadata
+    // check (which is for bytes that leave the engine); the save is refused with its own code.
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let file = kit::TempFile::new("enc-xmp.pdf", &kit::encrypted_xmp_pdf("secret", false));
+    e.set_document(File::open(file.path()).unwrap());
+    let ResponseBody::Opened { doc, .. } = ask(
+        e,
+        RequestBody::Open {
+            password: Some("secret".into()),
+        },
+    ) else {
+        panic!("not opened");
+    };
+    let (code, message) = failed(ask(e, RequestBody::Author(AuthorRequest::Check { doc })));
+    assert_eq!(code, ErrorCode::AuthorUnsupported, "{message}");
+    assert!(message.contains("encrypted"), "{message}");
+    let (code, message) =
+        apply(e, doc, vec![add(text("t", [72.0, 72.0, 272.0, 94.0]))]).unwrap_err();
+    assert_eq!(code, ErrorCode::AuthorUnsupported, "{message}");
+    let (code, message) = failed(ask(e, RequestBody::SaveBegin { doc }));
+    assert_eq!(code, ErrorCode::SaveMetadataNotEncrypted, "{message}");
+    // The document is as it was.
+    assert!(matches!(
+        ask(e, RequestBody::DocInfo { doc }),
+        ResponseBody::DocInfo { pages: 1, .. }
+    ));
+}

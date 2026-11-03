@@ -31,6 +31,7 @@ pub mod fonts;
 pub mod form_actions;
 pub mod forms;
 pub mod limits;
+pub mod metadata;
 pub mod pages;
 pub mod pagetree;
 pub mod sandbox;
@@ -144,6 +145,17 @@ fn fail<T>(code: ErrorCode, message: impl Into<String>) -> Result<T, Failure> {
     Err((code, message.into()))
 }
 
+/// Overwrites a string with zeros, so that what it held does not stay in memory.
+fn wipe(text: &mut str) {
+    // SAFETY: the bytes are overwritten in place with zeros, which are valid text, and the writes
+    // are volatile so that they are not removed.
+    unsafe {
+        for byte in text.as_bytes_mut() {
+            std::ptr::write_volatile(byte, 0);
+        }
+    }
+}
+
 /// True for a request that can change an open document (or hands out a copy of it), so that what the
 /// form designer kept of its written-out form is out of date after it. The designer's own requests
 /// look after their cache themselves.
@@ -183,7 +195,8 @@ pub struct Engine {
     /// What the page tools keep for each document (copies for taking a change back, a document
     /// being handed over to be inserted).
     tools: HashMap<u32, pages::PageTools>,
-    /// The passwords the documents were opened with, to load copies of them.
+    /// The passwords the documents were opened with, to load copies of them (also when a document
+    /// is saved).
     passwords: HashMap<u32, pages::Secret>,
     /// What the engine knows of the annotations of each document (their ids, and how to put back
     /// what it removed).
@@ -373,7 +386,13 @@ impl Engine {
                     sandbox: self.sandbox.clone(),
                 })
             }
-            RequestBody::Open { password } => self.open(pdfium, password.as_deref()),
+            RequestBody::Open { mut password } => {
+                let opened = self.open(pdfium, password.as_deref());
+                if let Some(password) = password.as_mut() {
+                    wipe(password);
+                }
+                opened
+            }
             RequestBody::Render {
                 doc,
                 page,

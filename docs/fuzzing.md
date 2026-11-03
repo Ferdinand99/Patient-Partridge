@@ -13,6 +13,7 @@ PDF files are untrusted input, and the app and its PDF engine talk over a binary
 | `protocol_roundtrip_response` | The same for all twenty-four kinds of response (the page tool answers are one kind with six forms, the form designer's one with two). Boxes that are not finite must come back as zeros. Lists sometimes have the most entries the protocol allows, and a piece of a saved file sometimes has the longest length. One run in eight builds a response that is one over a cap (outline entries, outline depth, title, links, address, matches, page text, strings, bitmap width and height, the size of a saved file, a piece of it that is too long or reaches past the biggest file or is shorter than it says), which the decoder must refuse; several cases sit exactly on a cap and must be accepted. |
 | `form_author` | The writer of form fields (`partridge_engine::author`), the second writer of PDF structure in the engine. The fuzzer's bytes are a script: a document of the test kit (a plain page, forms of every shape the kit makes, a nested form, one with scripts, a turned page, a page whose annotations are written in place with strings that are not text) or bytes of its own, spoiled (a byte changed, the end cut, a window overwritten), the geometry of four pages, and a batch of changes built from the same bytes (fields of every kind with names that meet each other, boxes outside the page, properties that do not fit their kind). The writer must not panic or hang, every field it makes has a name the rules allow, and what it appends is a well formed update: the bytes it was given are untouched, the last line names a table, the table lists objects that are where it says, and the trailer names the table before. What the writer lists (the names, and the widgets of each page) is encoded as the engine would send it and decoded again, because the app takes an answer it cannot decode for a broken engine and ends it. |
 | `signature_check` | The check of one digital signature against the bytes of a file (`partridge_engine::signatures::check`): the CMS parser, the signed attributes, the key arithmetic, the chain against a trust list, the byte range and the hash of the file. The fuzzer's bytes are a script that starts from a signed file made by the test kit (a real P-256 signature, made when the target starts) and spoils it: a bit flipped, bytes cut out or put in, the signature data cut or filled, the byte range moved, the sub-filter changed, the file given another size. Half of the runs keep the file and the signature data in step, so that the work goes past the first comparison. No panic or hang. A signature may be called intact only when the byte range, worked out again by a separate and simpler routine in the target, starts at the beginning of the file, stays inside it, leaves out exactly one hexadecimal string in `<` and `>` and that string is the signature data; an intact signature reaches the end of the file, or else it is called changed; nothing is called trusted when the trust list is empty; the report is inside every cap of the protocol and survives encode and decode. |
+| `metadata_check` | Arbitrary bytes as the file PDFium wrote for a save, through the check that refuses a protected file whose XMP metadata would be written without encryption (`partridge_engine::metadata`). No panic, the same answer and progress for the same bytes, and a low `-timeout` (5 seconds) so that a check that is not one pass over the file fails. The seeds are files in the form PDFium writes: a protected file with an XMP stream, one that says `/EncryptMetadata false`, one whose stream is not XML, and the shapes a search for words is fooled by (a name that looks like `stream`, the key in a string, in a nested dictionary, in an array of the trailer). |
 | `engine_open_render` | Arbitrary bytes as a PDF file, through the engine's request handler with the real, pinned PDFium: open (also with a password), outline, then for the first pages and the last page the text, the links, searches and a small render, then a save (`DocInfo`, `SaveBegin`, all the pieces, `SaveEnd`: the file starts like a PDF, the pieces are refused past the end, and the saved file opens again with the same number of pages and the same kind of protection and the same fingerprint as the document had just before the save (where both can be read in full), and each page that is looked at and that the saved file, a fresh open of the original and the document in the session can all read, and on which the last two agree, has the same size and the same text in the saved file), then close. The page tools run on the document as it was saved and opened again and on the document with its annotations and form changes still in it (see below). The answers are checked as the engine builds them, before the encoder cuts any list; see below. |
 
 What `engine_open_render` checks:
@@ -41,7 +42,7 @@ PDFium is the prebuilt library from `pdfium.lock.json` (checked against its SHA-
 - Memory errors inside PDFium are found only when they crash the process (a signal, or an abort from an out-of-memory). AddressSanitizer does not check the library's own reads and writes.
 - A PDF that makes PDFium use huge amounts of memory, or hang, ends the fuzz run too. In the app that only ends the engine process of one tab. Such inputs are still worth a look; see "A crash was found" below.
 
-The target checks that the engine code around PDFium (page sizes, text, links, outline, search, bitmap sizes, the limits of the answers) behaves on hostile files, and it is a cheap crash search of PDFium. It does not replace PDFium's own fuzzing. It is also no substitute for a sandbox: the engine is not sandboxed by the operating system yet (see the README), so a bug in PDFium that is not a crash is not found here and is not contained.
+The target checks that the engine code around PDFium (page sizes, text, links, outline, search, bitmap sizes, the limits of the answers) behaves on hostile files, and it is a cheap crash search of PDFium. It does not replace PDFium's own fuzzing. It is also no substitute for a sandbox: the engine is not sandboxed by the operating system yet (see [security.md](security.md)), so a bug in PDFium that is not a crash is not found here and is not contained.
 
 ## Requirements
 
@@ -73,20 +74,35 @@ cargo fuzz run protocol_response_decode corpus/protocol_response_decode seeds/pr
 
 ## The seed corpus
 
-`fuzz/seeds/` is made by `make-seeds`, from the protocol crate (a valid message of every kind, a message one over each cap, a message exactly on a cap, frame streams) and the PDF generator in `crates/testkit` (plain documents, mixed page sizes, outlines with loops and depth, many links, destinations past the end of the document, an encrypted file, a JavaScript action, a damaged file and a cut-off file). Nothing is downloaded, and no file from outside the repository is used.
+`fuzz/seeds/` is made by `make-seeds`, from the protocol crate (a valid message of every kind, a message one over each cap, a message exactly on a cap, frame streams) and the PDF generator in `crates/testkit` (plain documents, protected documents with an XMP stream, mixed page sizes, outlines with loops and depth, many links, destinations past the end of the document, an encrypted file, a JavaScript action, a damaged file and a cut-off file). Nothing is downloaded, and no file from outside the repository is used.
 
 ```sh
 cd fuzz
 cargo run --release --bin make-seeds -- seeds
 ```
 
-Run it again after the protocol or the generator changes, and commit what changed. The binary files are marked `binary` in `fuzz/seeds/.gitattributes`, which `make-seeds` writes too.
+Run it again after the protocol or the generator changes, and commit what changed. The three `saved_*` files in `seeds/metadata_check/` are what the engine wrote for a save (a protected file whose metadata stays clear, a protected file without metadata, an unprotected one with metadata); `make-seeds` does not write them and does not remove them. The binary files are marked `binary` in `fuzz/seeds/.gitattributes`, which `make-seeds` writes too.
 
 ## CI
 
 `.github/workflows/fuzz.yml` builds every target with the pinned toolchain and runs each for 60 seconds from the seed corpus, one job per target. It runs once a week, on request (with the seconds, 1 to 800, as input), and on pull requests that touch `crates/protocol`, `crates/engine`, `crates/testkit`, `pdfium.lock.json`, `fuzz/` or the workflow. It does not run on other pushes. The job has read-only permissions. It fails when `fuzz/Cargo.lock` does not cover the manifests (`cargo metadata --locked`; cargo-fuzz has no `--locked` of its own). When a target crashes, the input that did it is kept as the artifact `crash-<target>`.
 
 A 60 second run finds shallow bugs only. Run the targets for much longer by hand (hours, in the background) before a release.
+
+### Long runs of the engine target
+
+The engine target keeps one engine in one process for the whole run, and PDFium (or its Rust wrapper) keeps some memory after a document with annotations is closed: about 15 to 20 KiB for each stamp, about 3 KiB for each highlight or note, nothing for a document that is only opened and closed. Under AddressSanitizer, with a corpus that adds annotations to every file, the process grows by roughly 60 KiB per execution, and a run of several hours ends with `out-of-memory` at `-rss_limit_mb` even though no single input needs much. The app does not behave this way: it starts a new engine process for each document, so this memory goes away when the document is closed.
+
+For runs longer than about an hour, stop and start the process again every 20 to 30 minutes, with the same corpus folder, so that the memory starts from zero each time:
+
+```sh
+cd fuzz
+for i in $(seq 1 12); do
+  cargo fuzz run engine_open_render corpus/engine_open_render seeds/engine_open_render --     -dict=dictionaries/pdf.dict -max_len=100000 -timeout=30 -rss_limit_mb=3072     -malloc_limit_mb=3072 -max_total_time=1800 || break
+done
+```
+
+The loop stops at the first run that ends with a finding.
 
 ## A crash was found
 
@@ -97,6 +113,8 @@ A 60 second run finds shallow bugs only. Run the targets for much longer by hand
    - Engine bugs: a test in `crates/engine/tests/` that writes the minimized PDF to a temporary file and runs it through the engine as the target does. A small input can be put in the test as a byte string; a larger one in a new `crates/engine/tests/data/` folder (keep it small).
 4. Also add the minimized input to the matching `fuzz/seeds/<target>/` folder, so that the CI run replays it. The seed generator removes nothing from that folder, but it must be able to write it again: add the file to `make-seeds` if it should survive a full regeneration.
 5. A crash that is only memory use or time from a hostile PDF in PDFium itself (an abort from out-of-memory, `timeout` or `out-of-memory` reports) cannot be fixed here. The engine runs in its own process, with a memory limit (enforced by the system on Linux and Windows, and by a watch of the app on macOS), so the app survives it. Report it to the PDFium build's upstream and note it in the pull request.
+
+   Before that, replay the file alone (`cargo fuzz run <target> <file> -- -runs=1 -print_final_stats=1`) and read `peak_rss_mb`. If it is small, the input is not what ran out of memory: the process grew over the run (see "Long runs of the engine target"), and the file is only the one that happened to be running when the limit was crossed. Such a report needs no fix and no seed.
 
 ## Adding a target
 

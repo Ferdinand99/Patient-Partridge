@@ -59,6 +59,8 @@ fn geometry_of(document: &PdfDocument<'_>, page: usize) -> Result<PageGeo, Failu
 /// a new one. It is written the way a save writes it (see [`save::serialise_clean`]): what nothing
 /// refers to any more (the picture of a signature that Undo took off, a field that was taken away)
 /// is not in the bytes the fields are written after, nor in the copy a step back loads.
+/// The bytes stay in the engine, so they are not looked at for metadata that a save would refuse
+/// (see [`save::serialise_clean_in_engine`]).
 fn bytes_for(
     engine: &mut Engine,
     pdfium: &'static Pdfium,
@@ -71,7 +73,7 @@ fn bytes_for(
     engine.check_source(progress)?;
     let password = engine.passwords.get(&doc).map(|p| p.0.clone());
     let document = engine.document(doc)?;
-    let bytes = save::serialise_clean(pdfium, document, password.as_deref(), progress)?;
+    let bytes = save::serialise_clean_in_engine(pdfium, document, password.as_deref(), progress)?;
     engine.check_source(progress)?;
     Ok(bytes)
 }
