@@ -24,6 +24,10 @@ pub use author::*;
 mod annots_tests;
 mod forms;
 pub use forms::*;
+mod marks;
+pub use marks::*;
+#[cfg(test)]
+mod marks_tests;
 mod pages;
 pub use pages::*;
 mod signatures;
@@ -32,7 +36,7 @@ pub use signatures::*;
 mod signatures_tests;
 
 /// Version of this protocol. Both sides check it in the `Hello` exchange.
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// Largest frame (payload) either side accepts: 128 MiB, enough for the biggest allowed bitmap.
 pub const MAX_FRAME_LEN: usize = 128 * 1024 * 1024;
@@ -112,6 +116,8 @@ const TAG_REQ_ADD_STAMP: u8 = 19;
 const TAG_REQ_UPDATE_ANNOT: u8 = 20;
 const TAG_REQ_REMOVE_ANNOT: u8 = 21;
 const TAG_REQ_RESTORE_ANNOT: u8 = 22;
+const TAG_REQ_ADD_SIGNATURE: u8 = 23;
+const TAG_REQ_PLACE_SIGNATURE: u8 = 24;
 
 const TAG_RES_HELLO: u8 = 129;
 const TAG_RES_OPENED: u8 = 130;
@@ -459,6 +465,25 @@ pub enum RequestBody {
         x: f32,
         y: f32,
         stamp: StampKind,
+    },
+    /// A picture of a signature on a page, as a stamp that prints. `rect` is a box in points from
+    /// the top left of the page as it is drawn: the picture is fitted into it, whole, with its own
+    /// proportions, and the answer says the box it took. `color` is the colour of a drawn or typed
+    /// picture. The picture proves nothing about who placed it.
+    AddSignature {
+        doc: u32,
+        page: u32,
+        rect: [f32; 4],
+        color: [u8; 4],
+        mark: SignatureMark,
+    },
+    /// Moves and resizes a signature picture that was placed in this session: it takes the top left
+    /// corner and the width of `rect` and keeps its proportions. The answer says the box it has.
+    PlaceSignature {
+        doc: u32,
+        page: u32,
+        id: u32,
+        rect: [f32; 4],
     },
     /// Changes an annotation: its text, its colour and its place (`dx` and `dy` in points on the
     /// drawn page). What the annotation does not allow is refused.
@@ -880,6 +905,38 @@ impl Request {
                 put_f32(&mut out, *y);
                 out.push(*stamp as u8);
             }
+            RequestBody::AddSignature {
+                doc,
+                page,
+                rect,
+                color,
+                mark,
+            } => {
+                out.push(TAG_REQ_ADD_SIGNATURE);
+                put_u32(&mut out, self.id);
+                put_u32(&mut out, *doc);
+                put_u32(&mut out, *page);
+                for v in rect {
+                    put_f32(&mut out, *v);
+                }
+                out.extend_from_slice(color);
+                put_mark(&mut out, mark);
+            }
+            RequestBody::PlaceSignature {
+                doc,
+                page,
+                id,
+                rect,
+            } => {
+                out.push(TAG_REQ_PLACE_SIGNATURE);
+                put_u32(&mut out, self.id);
+                put_u32(&mut out, *doc);
+                put_u32(&mut out, *page);
+                put_u32(&mut out, *id);
+                for v in rect {
+                    put_f32(&mut out, *v);
+                }
+            }
             RequestBody::UpdateAnnot {
                 doc,
                 page,
@@ -1040,6 +1097,29 @@ impl Request {
                 x: r.coordinate()?,
                 y: r.coordinate()?,
                 stamp: StampKind::from_u8(r.u8()?)?,
+            },
+            TAG_REQ_ADD_SIGNATURE => RequestBody::AddSignature {
+                doc: r.u32()?,
+                page: r.u32()?,
+                rect: [
+                    r.coordinate()?,
+                    r.coordinate()?,
+                    r.coordinate()?,
+                    r.coordinate()?,
+                ],
+                color: r.color()?,
+                mark: read_mark(&mut r)?,
+            },
+            TAG_REQ_PLACE_SIGNATURE => RequestBody::PlaceSignature {
+                doc: r.u32()?,
+                page: r.u32()?,
+                id: r.u32()?,
+                rect: [
+                    r.coordinate()?,
+                    r.coordinate()?,
+                    r.coordinate()?,
+                    r.coordinate()?,
+                ],
             },
             TAG_REQ_UPDATE_ANNOT => {
                 let doc = r.u32()?;
@@ -3053,6 +3133,8 @@ mod tags {
             TAG_REQ_UPDATE_ANNOT,
             TAG_REQ_REMOVE_ANNOT,
             TAG_REQ_RESTORE_ANNOT,
+            TAG_REQ_ADD_SIGNATURE,
+            TAG_REQ_PLACE_SIGNATURE,
         ];
         let responses: Vec<u8> = vec![
             TAG_RES_HELLO,
@@ -3121,6 +3203,6 @@ mod tags {
                 "error code {raw} is missing"
             );
         }
-        assert_eq!(PROTOCOL_VERSION, 10);
+        assert_eq!(PROTOCOL_VERSION, 11);
     }
 }

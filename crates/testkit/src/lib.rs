@@ -808,6 +808,46 @@ pub fn free_text_without_appearance_pdf() -> Vec<u8> {
     build(&specs, "", "", extras)
 }
 
+/// The content of every stream of a file that inflates (an empty or a damaged one is left out),
+/// in the order of the file, at most 64 MiB each. A stream that is not compressed is not here: look
+/// for it in the file itself.
+pub fn inflated_streams(file: &[u8]) -> Vec<Vec<u8>> {
+    use std::io::Read as _;
+    let mut found = Vec::new();
+    let mut at = 0;
+    while let Some(start) = file[at..]
+        .windows(6)
+        .position(|w| w == b"stream")
+        .map(|p| p + at)
+    {
+        let mut body = start + 6;
+        if file.get(body) == Some(&b'\r') {
+            body += 1;
+        }
+        if file.get(body) == Some(&b'\n') {
+            body += 1;
+        }
+        let Some(end) = file[body..]
+            .windows(9)
+            .position(|w| w == b"endstream")
+            .map(|p| p + body)
+        else {
+            break;
+        };
+        let mut out = Vec::new();
+        if flate2::read::ZlibDecoder::new(&file[body..end])
+            .take(64 << 20)
+            .read_to_end(&mut out)
+            .is_ok()
+            && !out.is_empty()
+        {
+            found.push(out);
+        }
+        at = end + 9;
+    }
+    found
+}
+
 /// The forms in which a text can be in a saved file: as it is, as UTF-16 and as the hex strings
 /// of both. A text is there when any form is in the file or in a stream that has been inflated.
 pub fn text_in_file(file: &[u8], text: &str) -> bool {
@@ -839,40 +879,7 @@ pub fn text_in_file(file: &[u8], text: &str) -> bool {
     ];
     let mut haystacks: Vec<Vec<u8>> = vec![file.to_vec()];
     // Every stream, inflated when it can be.
-    let mut at = 0;
-    while let Some(start) = file[at..]
-        .windows(6)
-        .position(|w| w == b"stream")
-        .map(|p| p + at)
-    {
-        let mut body = start + 6;
-        if file.get(body) == Some(&b'\r') {
-            body += 1;
-        }
-        if file.get(body) == Some(&b'\n') {
-            body += 1;
-        }
-        let Some(end) = file[body..]
-            .windows(9)
-            .position(|w| w == b"endstream")
-            .map(|p| p + body)
-        else {
-            break;
-        };
-        {
-            use std::io::Read as _;
-            let mut out = Vec::new();
-            if flate2::read::ZlibDecoder::new(&file[body..end])
-                .take(64 << 20)
-                .read_to_end(&mut out)
-                .is_ok()
-                && !out.is_empty()
-            {
-                haystacks.push(out);
-            }
-        }
-        at = end + 9;
-    }
+    haystacks.extend(inflated_streams(file));
     haystacks.iter().any(|h| needles.iter().any(|n| find(h, n)))
 }
 

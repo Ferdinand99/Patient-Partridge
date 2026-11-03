@@ -14,13 +14,16 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::raw::c_int;
+use std::sync::Arc;
 
 use partridge_protocol::{
-    ability, AnnotInfo, AnnotKind, ErrorCode, StampKind, MAX_ANNOTS_PER_PAGE, MAX_ANNOT_AUTHOR,
-    MAX_ANNOT_TEXT, MAX_INK_POINTS, MAX_INK_STROKES, MAX_INK_WIDTH, MIN_INK_WIDTH,
+    ability, AnnotInfo, AnnotKind, ErrorCode, SignatureMark, StampKind, MAX_ANNOTS_PER_PAGE,
+    MAX_ANNOT_AUTHOR, MAX_ANNOT_TEXT, MAX_INK_POINTS, MAX_INK_STROKES, MAX_INK_WIDTH,
+    MIN_INK_WIDTH,
 };
 use pdfium_render::prelude::*;
 
+use crate::sigmark::{self, Seg};
 use crate::text::{self, Mapper, TextChar};
 use crate::{fail, Failure};
 
@@ -35,6 +38,28 @@ pub const MAX_MARKUP_BOXES: usize = 512;
 
 /// Side of a sticky note's icon, in points.
 const NOTE_SIDE: f32 = 20.0;
+
+/// The print flag of an annotation (`/F`). PDFium writes no flags for a stamp, and a stamp without
+/// this one is left out when another reader prints the page, so a signature picture sets it.
+const FLAG_PRINT: i32 = 1 << 2;
+
+/// The words a signature picture carries as its text.
+pub const SIGNATURE_TEXT: &str = "Signature picture";
+
+/// Most bytes of pictures of signatures the engine keeps to put them back after an undo, for one
+/// document. A bigger sum is refused when a picture is added.
+const MAX_MARK_BYTES: usize = 32 * 1024 * 1024;
+
+/// Most bytes of pictures of signatures that may be made in PDFium over the life of one open
+/// document, counting every time one is put on a page or put back after an undo. PDFium keeps what
+/// it made for a picture until the document is closed, even after the picture is taken off, so
+/// this is the bound on that memory (the bound above is on what is remembered). Past it the
+/// document has to be saved and opened again.
+const MAX_MARK_MADE_BYTES: usize = 256 * 1024 * 1024;
+
+/// What making a picture is counted at, at least: a drawn or a typed one takes more of PDFium
+/// than the bytes of its recipe.
+const MARK_MADE_MIN: usize = 32 * 1024;
 
 /// The flags of an annotation (`/F`) that lock it: read-only and locked. A third keeps its text.
 const FLAG_READ_ONLY: i32 = 1 << 6;
@@ -77,6 +102,16 @@ enum Recipe {
         /// The top left corner on the page as it is drawn.
         x: f32,
         y: f32,
+    },
+    /// The picture of a signature.
+    Signature {
+        mark: Arc<SignatureMark>,
+        /// The colour of a drawn or typed picture.
+        color: [u8; 4],
+        /// The box on the page as it is drawn: `[left, top, right, bottom]`.
+        rect: [f32; 4],
+        /// Width over height of the picture, which a move or a resize keeps.
+        aspect: f32,
     },
 }
 
@@ -121,6 +156,9 @@ pub struct DocAnnots {
     reach: HashMap<u32, [f32; 4]>,
     /// Annotations that were removed, oldest first: `(page, id, what it was)`.
     removed: VecDeque<(u32, u32, Snapshot)>,
+    /// Bytes of pictures of signatures made in PDFium since the document was opened (see
+    /// [`MAX_MARK_MADE_BYTES`]).
+    made_bytes: usize,
 }
 
 fn refused(_: PdfiumError) -> Failure {
@@ -353,6 +391,16 @@ impl DocAnnots {
         self.settled.clear();
     }
 
+    /// The bytes of signature pictures made in PDFium so far (see [`MAX_MARK_MADE_BYTES`]).
+    pub fn made_bytes(&self) -> usize {
+        self.made_bytes
+    }
+
+    /// Sets that count, for a record that is made again after a change to the pages.
+    pub fn set_made_bytes(&mut self, bytes: usize) {
+        self.made_bytes = bytes;
+    }
+
     /// The ids of the annotations of a page, brought in step with the page's list.
     fn ids(&mut self, page: u32, count: usize) -> &mut Vec<u32> {
         let next = &mut self.next_id;
@@ -388,6 +436,12 @@ impl DocAnnots {
         allowed: bool,
     ) -> Option<AnnotInfo> {
         let kind = kind_of(annotation)?;
+        // A picture of a signature that was placed in this session is a stamp to the file, and a
+        // signature to the window: it can be moved and resized.
+        let kind = match (kind, self.made.get(&id)) {
+            (AnnotKind::Stamp, Some(Recipe::Signature { .. })) => AnnotKind::Signature,
+            (kind, _) => kind,
+        };
         if annotation.is_hidden() {
             return None;
         }
@@ -411,6 +465,7 @@ impl DocAnnots {
             AnnotKind::Note => ability::EDIT_TEXT | ability::MOVE | ability::REMOVE | restore,
             AnnotKind::Ink => ability::EDIT_TEXT | ability::REMOVE | restore,
             AnnotKind::Stamp => ability::REMOVE | restore,
+            AnnotKind::Signature => ability::MOVE | ability::RESIZE | ability::REMOVE | restore,
             AnnotKind::Other => ability::REMOVE,
         };
         // What the file or the document forbids comes first. Only an annotation the engine made
@@ -716,6 +771,120 @@ impl DocAnnots {
         self.create_from(&mut page, document, page_index, &snapshot, None, true)
     }
 
+    // ---- pictures of signatures --------------------------------------------------
+
+    /// The bytes of the pictures of signatures that are kept for an undo: those on the pages and
+    /// those taken off.
+    fn mark_bytes(&self) -> usize {
+        let weight = |r: &Recipe| match r {
+            Recipe::Signature { mark, .. } => mark.weight(),
+            _ => 0,
+        };
+        self.made.values().map(weight).sum::<usize>()
+            + self
+                .removed
+                .iter()
+                .filter(|(_, id, _)| !self.made.contains_key(id))
+                .map(|(_, _, s)| weight(&s.recipe))
+                .sum::<usize>()
+    }
+
+    /// Puts the picture of a signature on a page as a stamp. The picture is fitted whole into
+    /// `rect` (`[left, top, right, bottom]` in points on the page as it is drawn). The stamp has
+    /// the print flag, so that other readers print it too. It is a picture and nothing else: no
+    /// signature field, no certificate, nothing that says who placed it.
+    pub fn add_signature(
+        &mut self,
+        document: &mut PdfDocument<'static>,
+        page_index: u32,
+        rect: [f32; 4],
+        color: [u8; 4],
+        mark: SignatureMark,
+    ) -> Result<AnnotInfo, Failure> {
+        ensure_allowed(document)?;
+        if !mark.within_caps() {
+            return fail(
+                ErrorCode::InvalidRequest,
+                "that picture is outside the limits",
+            );
+        }
+        let aspect = sigmark::aspect_of(&mark).map_err(|m| (ErrorCode::InvalidRequest, m))?;
+        if self.mark_bytes() + mark.weight() > MAX_MARK_BYTES {
+            return fail(
+                ErrorCode::AnnotationRefused,
+                "this document holds too many pictures of signatures",
+            );
+        }
+        let mut page = load(document, page_index)?;
+        let size = (page.width().value, page.height().value);
+        let Some(placed) = sigmark::fit_box(aspect, rect, size) else {
+            return fail(
+                ErrorCode::InvalidRequest,
+                "the picture does not fit in that box",
+            );
+        };
+        let snapshot = Snapshot {
+            recipe: Recipe::Signature {
+                mark: Arc::new(mark),
+                color,
+                rect: placed,
+                aspect,
+            },
+            text: SIGNATURE_TEXT.to_string(),
+            author: String::new(),
+        };
+        self.create_from(&mut page, document, page_index, &snapshot, None, true)
+    }
+
+    /// Moves and resizes a picture of a signature that was placed in this session: it takes the
+    /// top left corner and the width of `rect` and keeps its proportions.
+    pub fn place_signature(
+        &mut self,
+        document: &mut PdfDocument<'static>,
+        page_index: u32,
+        id: u32,
+        rect: [f32; 4],
+    ) -> Result<AnnotInfo, Failure> {
+        ensure_allowed(document)?;
+        let page = load(document, page_index)?;
+        let (position, info) = self.find(document, &page, page_index, id)?;
+        let aspect = match self.made.get(&id) {
+            Some(Recipe::Signature { aspect, .. }) if info.abilities & ability::RESIZE != 0 => {
+                *aspect
+            }
+            _ => {
+                return fail(
+                    ErrorCode::AnnotationRefused,
+                    "this annotation does not allow that change",
+                )
+            }
+        };
+        let size = (page.width().value, page.height().value);
+        let Some(placed) = sigmark::place_box(aspect, rect, size) else {
+            return fail(
+                ErrorCode::AnnotationRefused,
+                "the picture does not fit in that box",
+            );
+        };
+        let mapper = Mapper::new(&page);
+        let bounds = page_bounds(&page, &mapper, placed).ok_or_else(|| {
+            (
+                ErrorCode::AnnotationRefused,
+                "that place is not on the page".to_string(),
+            )
+        })?;
+        {
+            let mut annotation = page.annotations().get(position).map_err(|_| no_such())?;
+            annotation.set_bounds(rect_of(bounds)).map_err(refused)?;
+        }
+        settle(&page);
+        let (_, info) = self.find(document, &page, page_index, id)?;
+        if let Some(Recipe::Signature { rect, .. }) = self.made.get_mut(&id) {
+            *rect = info.rect;
+        }
+        Ok(info)
+    }
+
     /// Makes the annotation a snapshot describes, as the newest of the page. `id` is the id it
     /// is to have (when it is put back); without one it gets a new id. `remember` keeps its recipe
     /// for a later removal and restoring.
@@ -729,6 +898,19 @@ impl DocAnnots {
         remember: bool,
     ) -> Result<AnnotInfo, Failure> {
         let before = page.annotations().len();
+        if let Recipe::Signature { mark, .. } = &snapshot.recipe {
+            // Each picture that is made stays in PDFium's memory until the document is closed, also
+            // when it is taken off again, so a document that is put through undo and redo of a big
+            // picture many times is stopped before the engine runs out of memory.
+            let cost = mark.weight().max(MARK_MADE_MIN);
+            if self.made_bytes.saturating_add(cost) > MAX_MARK_MADE_BYTES {
+                return fail(
+                    ErrorCode::AnnotationRefused,
+                    "pictures of signatures were put on and taken off too often in this document; save it and open it again to go on",
+                );
+            }
+            self.made_bytes += cost;
+        }
         // Brings the list of ids in step before something is added to it.
         self.ids(page_index, before);
         let new_id = match id {
@@ -869,6 +1051,12 @@ impl DocAnnots {
         }
         settle(&page);
         let (_, info) = self.find(document, &page, page_index, id)?;
+        // A picture of a signature that is put back after a removal is put where it was moved to.
+        if wants_move {
+            if let Some(Recipe::Signature { rect, .. }) = self.made.get_mut(&id) {
+                *rect = info.rect;
+            }
+        }
         Ok(info)
     }
 
@@ -901,7 +1089,9 @@ impl DocAnnots {
                 color: info.color,
                 bounds,
             }),
-            AnnotKind::Ink | AnnotKind::Stamp => self.made.get(&info.id).cloned(),
+            AnnotKind::Ink | AnnotKind::Stamp | AnnotKind::Signature => {
+                self.made.get(&info.id).cloned()
+            }
             AnnotKind::Other => None,
         };
         Ok((
@@ -992,6 +1182,7 @@ impl DocAnnots {
         self.settled.clear();
         self.originals.clear();
         self.reach.clear();
+        self.made_bytes = 0;
     }
 }
 
@@ -1512,8 +1703,10 @@ unsafe fn finish_group(
 /// Takes the annotation at `position` off the page, with the popup it owns, after overwriting
 /// what the person wrote and detaching the appearance. Returns the places that were taken off,
 /// lowest first. A save writes the dictionaries of annotations made in the session (and any
-/// appearance stream PDFium made, which no call can overwrite) as objects that nothing refers
-/// to; those of a loaded file are left out.
+/// appearance stream PDFium made, which no call can overwrite, and the pictures of a signature)
+/// as objects that nothing refers to; those of a loaded file are left out. The save therefore
+/// writes the document twice (see `save::serialise_clean`), and the text is overwritten here as
+/// well, so that it is not left behind even where a document is written only once.
 fn remove_raw(
     document: &PdfDocument<'static>,
     page_index: u32,
@@ -1630,6 +1823,9 @@ fn write_annotation(
             page, document, page_index, snapshot, *color, *width, strokes,
         ),
         Recipe::Stamp { stamp, x, y } => write_stamp(page, document, snapshot, *stamp, *x, *y),
+        Recipe::Signature {
+            mark, color, rect, ..
+        } => write_signature(page, document, page_index, mark, *color, *rect),
     }
 }
 
@@ -1887,6 +2083,215 @@ fn write_stamp(
     annotation.set_contents(stamp.label()).map_err(refused)?;
     let _ = snapshot;
     Ok(())
+}
+
+/// A box on the page as it is drawn (`[left, top, right, bottom]`) as the box that holds it in
+/// page space (`[left, bottom, right, top]`).
+fn page_bounds(page: &PdfPage, mapper: &Mapper, r: [f32; 4]) -> Option<[f32; 4]> {
+    let corners = [
+        mapper.to_page(page, r[0], r[1])?,
+        mapper.to_page(page, r[2], r[1])?,
+        mapper.to_page(page, r[0], r[3])?,
+        mapper.to_page(page, r[2], r[3])?,
+    ];
+    let fold = |pick: fn(&(f32, f32)) -> f32, f: fn(f32, f32) -> f32, from: f32| {
+        corners.iter().map(pick).fold(from, f)
+    };
+    Some([
+        fold(|c| c.0, f32::min, f32::MAX),
+        fold(|c| c.1, f32::min, f32::MAX),
+        fold(|c| c.0, f32::max, f32::MIN),
+        fold(|c| c.1, f32::max, f32::MIN),
+    ])
+}
+
+/// A picture of a signature: a stamp annotation with an appearance made of the paths (or the
+/// image) of the picture, and the print flag. The appearance is drawn upright on the page as it is
+/// seen, in a frame with the origin at the bottom left of the box, and goes to page space through
+/// three points, as the fixed stamps do.
+fn write_signature(
+    page: &mut PdfPage<'static>,
+    document: &mut PdfDocument<'static>,
+    page_index: u32,
+    mark: &SignatureMark,
+    color: [u8; 4],
+    rect: [f32; 4],
+) -> Result<(), Failure> {
+    let mapper = Mapper::new(page);
+    let (x, y) = (rect[0], rect[1]);
+    let (width, height) = (rect[2] - rect[0], rect[3] - rect[1]);
+    let corner = |dx: f32, dy: f32| mapper.to_page(page, x + dx, y + height - dy);
+    let (Some(o), Some(u), Some(v)) = (corner(0.0, 0.0), corner(width, 0.0), corner(0.0, height))
+    else {
+        return fail(
+            ErrorCode::AnnotationRefused,
+            "that place is not on the page",
+        );
+    };
+    let matrix = PdfMatrix::new(
+        (u.0 - o.0) / width,
+        (u.1 - o.1) / width,
+        (v.0 - o.0) / height,
+        (v.1 - o.1) / height,
+        o.0,
+        o.1,
+    );
+    let Some(bounds) = page_bounds(page, &mapper, rect) else {
+        return fail(
+            ErrorCode::AnnotationRefused,
+            "that place is not on the page",
+        );
+    };
+    let color = pdf_color(color);
+    let before = page.annotations().len();
+    let mut annotation = page
+        .annotations_mut()
+        .create_stamp_annotation()
+        .map_err(refused)?;
+    annotation.set_bounds(rect_of(bounds)).map_err(refused)?;
+
+    match mark {
+        SignatureMark::Strokes {
+            width: box_w,
+            height: box_h,
+            line,
+            strokes,
+        } => {
+            let (sx, sy) = (width / box_w, height / box_h);
+            let thickness = (line * (sx + sy) / 2.0).max(0.05);
+            for stroke in strokes {
+                let mut points: Vec<(f32, f32)> = stroke
+                    .iter()
+                    .map(|p| {
+                        (
+                            p[0].clamp(0.0, *box_w) * sx,
+                            height - p[1].clamp(0.0, *box_h) * sy,
+                        )
+                    })
+                    .collect();
+                if points.len() == 1 {
+                    // A dot: a line so short that its round ends are all there is.
+                    points.push((points[0].0 + 0.01, points[0].1));
+                }
+                let Some(first) = points.first().copied() else {
+                    continue;
+                };
+                let mut path = PdfPagePathObject::new(
+                    document,
+                    PdfPoints::new(first.0),
+                    PdfPoints::new(first.1),
+                    Some(color),
+                    Some(PdfPoints::new(thickness)),
+                    None,
+                )
+                .map_err(refused)?;
+                for p in &points[1..] {
+                    path.line_to(PdfPoints::new(p.0), PdfPoints::new(p.1))
+                        .map_err(refused)?;
+                }
+                path.set_line_cap(PdfPageObjectLineCap::Round)
+                    .map_err(refused)?;
+                path.set_line_join(PdfPageObjectLineJoin::Round)
+                    .map_err(refused)?;
+                path.apply_matrix(matrix).map_err(refused)?;
+                annotation
+                    .objects_mut()
+                    .add_object(PdfPageObject::from(path))
+                    .map_err(refused)?;
+            }
+        }
+        SignatureMark::Typed { font, text } => {
+            let outline = sigmark::typed_outline(*font, text).map_err(|_| {
+                (
+                    ErrorCode::InvalidRequest,
+                    "that text cannot be set in this font".to_string(),
+                )
+            })?;
+            let b = outline.bounds;
+            let (sx, sy) = (width / (b[2] - b[0]), height / (b[3] - b[1]));
+            let at = |gx: f32, gy: f32| {
+                (
+                    PdfPoints::new((gx - b[0]) * sx),
+                    PdfPoints::new((gy - b[1]) * sy),
+                )
+            };
+            for segs in &outline.paths {
+                let Some(Seg::Move(mx, my)) = segs.first().copied() else {
+                    continue;
+                };
+                let (px, py) = at(mx, my);
+                let mut path = PdfPagePathObject::new(document, px, py, None, None, Some(color))
+                    .map_err(refused)?;
+                for seg in &segs[1..] {
+                    match *seg {
+                        Seg::Move(gx, gy) => {
+                            let (px, py) = at(gx, gy);
+                            path.move_to(px, py).map_err(refused)?;
+                        }
+                        Seg::Line(gx, gy) => {
+                            let (px, py) = at(gx, gy);
+                            path.line_to(px, py).map_err(refused)?;
+                        }
+                        Seg::Cubic(c1x, c1y, c2x, c2y, gx, gy) => {
+                            let (px, py) = at(gx, gy);
+                            let (a, b) = at(c1x, c1y);
+                            let (c, d) = at(c2x, c2y);
+                            path.bezier_to(px, py, a, b, c, d).map_err(refused)?;
+                        }
+                        Seg::Close => path.close_path().map_err(refused)?,
+                    }
+                }
+                path.apply_matrix(matrix).map_err(refused)?;
+                annotation
+                    .objects_mut()
+                    .add_object(PdfPageObject::from(path))
+                    .map_err(refused)?;
+            }
+        }
+        SignatureMark::Image {
+            width: px_w,
+            height: px_h,
+            rgba,
+        } => {
+            // PDFium takes blue, green, red, alpha.
+            let mut bgra = Vec::with_capacity(rgba.len());
+            for px in rgba.as_chunks::<4>().0 {
+                bgra.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+            }
+            let bitmap =
+                PdfBitmap::from_bytes(*px_w as i32, *px_h as i32, PdfBitmapFormat::BGRA, &mut bgra)
+                    .map_err(refused)?;
+            let mut image = PdfPageImageObject::new(document).map_err(refused)?;
+            image.set_bitmap(&bitmap).map_err(refused)?;
+            image
+                .apply_matrix(PdfMatrix::new(width, 0.0, 0.0, height, 0.0, 0.0))
+                .map_err(refused)?;
+            image.apply_matrix(matrix).map_err(refused)?;
+            annotation
+                .objects_mut()
+                .add_object(PdfPageObject::from(image))
+                .map_err(refused)?;
+        }
+    }
+    annotation.set_contents(SIGNATURE_TEXT).map_err(refused)?;
+
+    // The print flag, so that the picture is on the paper when another reader prints the page.
+    let flagged = with_raw_page(document, page_index, |bindings, raw| {
+        // SAFETY: `raw` is live, and so is the annotation inside the closure.
+        unsafe {
+            with_annot(bindings, raw, before, |a| {
+                bindings.FPDFAnnot_SetFlags(a, FLAG_PRINT) != 0
+            })
+        }
+    })?;
+    if flagged == Some(true) {
+        Ok(())
+    } else {
+        fail(
+            ErrorCode::AnnotationRefused,
+            "the picture could not be written",
+        )
+    }
 }
 
 // ---- boxes of text -------------------------------------------------------------

@@ -679,14 +679,15 @@ fn the_owner_password_allows_what_the_user_password_does_not() {
     annot(ask(e, note(as_owner)));
 }
 
-// ---- a limit that is known -------------------------------------------------------------------------------
+// ---- what was made while the page was drawn -------------------------------------------------------
 
 #[test]
-fn a_free_text_box_without_an_appearance_keeps_its_words_in_the_saved_file_after_a_delete() {
-    // PDFium makes the appearance of such a box, with its words, when the page is drawn, and a
-    // save writes what it made even when nothing refers to it any more. No call overwrites it.
-    // The README says so. If this test fails because the words are gone, PDFium changed: take the
-    // exception out of the README and out of the question that is asked before a delete.
+fn a_free_text_box_without_an_appearance_leaves_its_words_out_of_the_saved_file_after_a_delete() {
+    // PDFium makes the appearance of such a box, with its words, when the page is drawn, and a save
+    // writes what it made in the session even when nothing refers to it any more. No call
+    // overwrites it, so the words would stay in the file. A save therefore writes the bytes, reads
+    // them in again and writes them a second time (`save::serialise_clean`), which leaves out what
+    // nothing refers to.
     let mut guard = engine();
     let e = &mut guard.0;
     let doc = open(e, &kit::free_text_without_appearance_pdf(), None).unwrap();
@@ -698,7 +699,7 @@ fn a_free_text_box_without_an_appearance_keeps_its_words_in_the_saved_file_after
     assert_eq!(annotation_count(e, doc), 0);
     let saved = save_all(e, doc);
     assert!(
-        kit::text_in_file(&saved, "BAREFREEWORDS"),
-        "the words are gone from the saved file: the README no longer needs its exception"
+        !kit::text_in_file(&saved, "BAREFREEWORDS"),
+        "the words of the deleted text box are in the saved file"
     );
 }

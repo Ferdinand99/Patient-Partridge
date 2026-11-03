@@ -33,6 +33,10 @@ struct Capped {
     bytes: Vec<u8>,
     limit: usize,
     overflowed: bool,
+    /// The buffer could not grow although the document is within the limit.
+    no_memory: bool,
+    /// Makes room for `more` bytes in the buffer; false when there is none. A test replaces it.
+    reserve: fn(&mut Vec<u8>, usize) -> bool,
     since_progress: usize,
     /// Called with the number of bytes written, about every MiB. The pointer lives only as long
     /// as the call to `serialise_up_to` that made it (see there).
@@ -52,8 +56,8 @@ impl Write for Capped {
         }
         // A buffer that cannot grow is a failed save, not an engine that aborts and takes the
         // changes of the document with it.
-        if self.bytes.try_reserve(data.len()).is_err() {
-            self.overflowed = true;
+        if !(self.reserve)(&mut self.bytes, data.len()) {
+            self.no_memory = true;
             return Err(io::Error::other("no memory for the saved document"));
         }
         self.bytes.extend_from_slice(data);
@@ -70,6 +74,26 @@ impl Write for Capped {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+fn reserve_bytes(bytes: &mut Vec<u8>, more: usize) -> bool {
+    bytes.try_reserve(more).is_ok()
+}
+
+/// The failure to give when the writer stopped the write, or nothing when it did not.
+fn unfinished(out: &Capped) -> Option<Failure> {
+    (out.overflowed || out.no_memory).then(|| too_large(out.overflowed))
+}
+
+/// The failure for a document that could not be written out whole: it passed the limit, or the
+/// buffer for it could not grow (the same code, and words that say which it was).
+fn too_large(passed_limit: bool) -> Failure {
+    let words = if passed_limit {
+        "the document is too big to be saved"
+    } else {
+        "there was not enough memory to finish saving the document"
+    };
+    (ErrorCode::SaveTooLarge, words.to_string())
 }
 
 /// Writes the document out as PDFium would write a copy of it, with every change made so far.
@@ -96,15 +120,14 @@ pub fn serialise_up_to(
         bytes: Vec::new(),
         limit,
         overflowed: false,
+        no_memory: false,
+        reserve: reserve_bytes,
         since_progress: 0,
         progress,
     };
     let result = document.save_to_writer(&mut out);
-    if out.overflowed {
-        return Err((
-            ErrorCode::SaveTooLarge,
-            "the document is too big to be saved".to_string(),
-        ));
+    if let Some(failure) = unfinished(&out) {
+        return Err(failure);
     }
     if result.is_err() {
         return Err((
@@ -120,6 +143,40 @@ pub fn serialise_up_to(
         ));
     }
     Ok(out.bytes)
+}
+
+/// Writes the document for a save, without anything that nothing refers to.
+///
+/// PDFium writes every object that was made in this session, whether or not anything still refers
+/// to it: the picture of a signature that Undo took off, the drawing that was deleted, the
+/// appearance of a note that is gone. Those would stay in the saved file, whole, with the pixels or
+/// the lines in them. The objects of a file that was loaded are written only when something refers
+/// to them. So the bytes are written once, read in again as a document of their own, and written a
+/// second time; the second writing is the file. The cost is one more load and one more write of the
+/// same bytes, and the memory for a second copy of them.
+pub fn serialise_clean(
+    pdfium: &Pdfium,
+    document: &PdfDocument<'_>,
+    password: Option<&str>,
+    progress: &mut dyn FnMut(u32),
+) -> Result<Vec<u8>, Failure> {
+    let first = serialise_up_to(document, MAX_SAVE_BYTES, progress)?;
+    let pages = document.pages().len();
+    let reread = pdfium
+        .load_pdf_from_byte_vec(first, password)
+        .map_err(|_| {
+            (
+                ErrorCode::SaveFailed,
+                "the written document could not be read again".to_string(),
+            )
+        })?;
+    if reread.pages().len() != pages {
+        return Err((
+            ErrorCode::SaveFailed,
+            "the written document has another number of pages when it is read again".to_string(),
+        ));
+    }
+    serialise_up_to(&reread, MAX_SAVE_BYTES, progress)
 }
 
 /// The failure to give when the file the document is read from is not to be trusted.
@@ -260,5 +317,55 @@ pub fn fingerprint(document: &PdfDocument<'_>, progress: &mut dyn FnMut(u32)) ->
         pages: pages.len() as u32,
         failed,
         digest,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_save_that_ran_out_of_memory_does_not_say_the_document_is_too_big() {
+        let (code, words) = too_large(false);
+        assert_eq!(code, ErrorCode::SaveTooLarge);
+        assert!(words.contains("not enough memory"), "{words}");
+        assert!(!words.contains("too big"), "{words}");
+        let (code, words) = too_large(true);
+        assert_eq!(code, ErrorCode::SaveTooLarge);
+        assert!(words.contains("too big"), "{words}");
+    }
+
+    fn writer(limit: usize, reserve: fn(&mut Vec<u8>, usize) -> bool) -> Capped {
+        // No progress is reported in these tests (that needs a megabyte).
+        let noop: &'static mut (dyn FnMut(u32) + 'static) = Box::leak(Box::new(|_: u32| {}));
+        let progress: *mut (dyn FnMut(u32) + 'static) = noop;
+        Capped {
+            bytes: Vec::new(),
+            limit,
+            overflowed: false,
+            no_memory: false,
+            reserve,
+            since_progress: 0,
+            progress,
+        }
+    }
+
+    #[test]
+    fn the_writer_tells_a_buffer_that_cannot_grow_from_a_document_over_the_limit() {
+        // Room for nothing, within the limit: the words are those of the memory.
+        let mut out = writer(1_000, |_, _| false);
+        assert!(out.write(b"abc").is_err());
+        let (_, words) = unfinished(&out).expect("the write was stopped");
+        assert!(words.contains("not enough memory"), "{words}");
+        assert!(!words.contains("too big"), "{words}");
+        // Over the limit, with room: the words are those of the size.
+        let mut out = writer(2, reserve_bytes);
+        assert!(out.write(b"abc").is_err());
+        let (_, words) = unfinished(&out).expect("the write was stopped");
+        assert!(words.contains("too big"), "{words}");
+        // A write that fits is not a failure.
+        let mut out = writer(10, reserve_bytes);
+        assert_eq!(out.write(b"abc").unwrap(), 3);
+        assert!(unfinished(&out).is_none());
     }
 }

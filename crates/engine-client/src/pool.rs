@@ -20,7 +20,7 @@ use crate::save::{save_document, verify_written, FileStamp};
 use crate::{
     AnnotInfo, AnnotKind, Bitmap, ClientError, EngineClient, EngineConfig, EngineInfo, FontScript,
     FormField, FormKind, FormValue, OutlineItem, PageLink, PageText, SaveError, SaveOptions,
-    SaveOutcome, StampKind, TextMatch,
+    SaveOutcome, SignatureMark, StampKind, TextMatch,
 };
 
 /// The file a document belongs to, and how it looked when the document was opened (or last saved).
@@ -516,6 +516,29 @@ impl EnginePool {
     ) -> Result<AnnotInfo, ClientError> {
         let (client, doc) = self.entry(handle)?;
         client.add_stamp(doc, page, x, y, stamp)
+    }
+
+    pub fn add_signature(
+        &self,
+        handle: u64,
+        page: u32,
+        rect: [f32; 4],
+        color: [u8; 4],
+        mark: SignatureMark,
+    ) -> Result<AnnotInfo, ClientError> {
+        let (client, doc) = self.entry(handle)?;
+        client.add_signature(doc, page, rect, color, mark)
+    }
+
+    pub fn place_signature(
+        &self,
+        handle: u64,
+        page: u32,
+        id: u32,
+        rect: [f32; 4],
+    ) -> Result<AnnotInfo, ClientError> {
+        let (client, doc) = self.entry(handle)?;
+        client.place_signature(doc, page, id, rect)
     }
 
     #[allow(clippy::too_many_arguments)]

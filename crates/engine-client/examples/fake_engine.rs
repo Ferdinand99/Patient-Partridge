@@ -375,6 +375,34 @@ fn main() {
                     },
                 );
             }
+            RequestBody::AddSignature { .. } => {
+                let kind = if mode == "annot-wrong-kind" {
+                    AnnotKind::Note
+                } else {
+                    AnnotKind::Signature
+                };
+                reply(
+                    &mut output,
+                    id,
+                    ResponseBody::Annot {
+                        item: made_up(6, kind, ""),
+                    },
+                );
+            }
+            RequestBody::PlaceSignature { id: annot, .. } => {
+                let annot = if mode == "annot-wrong-id" {
+                    annot + 1
+                } else {
+                    annot
+                };
+                reply(
+                    &mut output,
+                    id,
+                    ResponseBody::Annot {
+                        item: made_up(annot, AnnotKind::Signature, ""),
+                    },
+                );
+            }
             RequestBody::UpdateAnnot {
                 id: annot, text, ..
             } => {

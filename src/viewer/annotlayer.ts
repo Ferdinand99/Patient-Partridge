@@ -20,6 +20,7 @@ import {
   simplifyStroke,
   snippet,
 } from "../lib/annotations";
+import { widenedRect, type Rect } from "../lib/signpicture";
 import type { PageSizePt } from "./layout";
 
 export interface AnnotLayerEvents {
@@ -33,6 +34,8 @@ export interface AnnotLayerEvents {
   onMove(page: number, id: number, dx: number, dy: number): void;
   /** A box was double clicked. */
   onEdit(page: number, id: number): void;
+  /** The corner of a box that can be resized was dragged: the box it now has, in points. */
+  onResize?(page: number, id: number, rect: Rect): void;
   /** The list of a page could not be had. */
   onLoadFailed?(page: number, error: unknown): void;
 }
@@ -65,6 +68,8 @@ export class AnnotationLayer {
   private destroyed = false;
   /** A change to the pages is under way: nothing is asked for and nothing is picked or drawn. */
   private held = false;
+  /** Puts a box that is being resized back and ends the drag, while one is going on. */
+  private resizing: (() => void) | null = null;
 
   constructor(
     private readonly pages: PageSizePt[],
@@ -198,6 +203,7 @@ export class AnnotationLayer {
     }
     if (held) {
       if (this.stroke) this.cancelStroke();
+      this.resizing?.();
       this.placing = null;
     } else {
       for (const page of this.layers.keys()) this.pageDrawn(page);
@@ -266,7 +272,65 @@ export class AnnotationLayer {
     el.addEventListener("focus", () => this.events.onSelect(page, a.id));
     el.addEventListener("pointerdown", (e) => this.onBoxDown(e, page, a, el));
     el.addEventListener("dblclick", () => this.events.onEdit(page, a.id));
+    // A picture of a signature can be made bigger or smaller by its corner.
+    if (a.can.resize) {
+      const handle = document.createElement("span");
+      handle.className = "annot-handle";
+      handle.dataset.handle = "se";
+      handle.setAttribute("aria-hidden", "true");
+      handle.addEventListener("pointerdown", (e) => this.onHandleDown(e, page, a, el, [l, t, r, b]));
+      el.append(handle);
+    }
     return el;
+  }
+
+  // ---- making a box bigger or smaller ---------------------------------------------------------
+
+  /**
+   * The bottom right corner of a picked box is dragged: the box grows or shrinks with its
+   * proportions and its top left corner kept, and shows it while the pointer moves. When the
+   * pointer is let go the new box is handed on; Escape or a cancelled pointer puts it back.
+   */
+  private onHandleDown(e: PointerEvent, page: number, a: Annotation, el: HTMLElement, rect: Rect): void {
+    if (e.button !== 0 || this.tool !== "select") return;
+    e.stopPropagation();
+    e.preventDefault();
+    this.events.onSelect(page, a.id);
+    const layer = this.layers.get(page);
+    if (!layer) return;
+    const size = this.pages[page];
+    const start = { x: e.clientX, y: e.clientY };
+    let latest: Rect = rect;
+    const show = (r: Rect) => {
+      el.style.left = percentOf(r[0], size.width);
+      el.style.top = percentOf(r[1], size.height);
+      el.style.width = percentOf(r[2] - r[0], size.width);
+      el.style.height = percentOf(r[3] - r[1], size.height);
+    };
+    const move = (m: PointerEvent) => {
+      const box = layer.el.getBoundingClientRect();
+      const [x0] = clientToPage(box, size, start.x, start.y);
+      const [x1] = clientToPage(box, size, m.clientX, m.clientY);
+      latest = widenedRect(rect, x1 - x0, size);
+      show(latest);
+    };
+    const finish = (cancelled: boolean) => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", cancel);
+      this.resizing = null;
+      if (cancelled || Math.abs(latest[2] - rect[2]) < 0.5) {
+        show(rect);
+        return;
+      }
+      this.events.onResize?.(page, a.id, latest);
+    };
+    const up = () => finish(false);
+    const cancel = () => finish(true);
+    this.resizing = () => finish(true);
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", cancel);
   }
 
   // ---- picking and moving a box ------------------------------------------------
@@ -332,7 +396,7 @@ export class AnnotationLayer {
       layer.line.setAttribute("stroke", rgbaCss(this.ink.color));
       layer.line.setAttribute("stroke-width", String(this.ink.width));
       this.showStroke(layer);
-    } else if (this.tool === "note" || this.tool === "stamp") {
+    } else if (this.tool === "note" || this.tool === "stamp" || this.tool === "signature") {
       this.placing = { page, pointerId: e.pointerId, x: e.clientX, y: e.clientY };
     }
   }
@@ -393,6 +457,10 @@ export class AnnotationLayer {
 
   /** The user pressed Escape in the middle of a stroke. */
   abort(): boolean {
+    if (this.resizing) {
+      this.resizing();
+      return true;
+    }
     if (!this.stroke && !this.placing) return false;
     this.placing = null;
     this.cancelStroke();

@@ -104,6 +104,9 @@
         <symbol id="i-stamp" viewBox="0 0 24 24">
           <path d="M9.25 14V9.25a2.75 2.75 0 1 1 5.5 0V14" /><path d="M5.5 14h13v3.25h-13z" /><path d="M4.5 20.25h15" />
         </symbol>
+        <symbol id="i-signature" viewBox="0 0 24 24">
+          <path d="M4 16.5c2.2-4.4 3.6-7.6 5-7.6 1.6 0 .2 5.6 1.8 5.6 1.4 0 1.9-3.4 3.2-3.4 1 0 .6 2.6 1.9 2.6.9 0 1.5-.7 2.1-1.7" /><path d="M4.5 20h15" />
+        </symbol>
         <symbol id="i-undo" viewBox="0 0 24 24"><path d="M8.5 5.5L4.5 9.5l4 4" /><path d="M4.5 9.5h9a5 5 0 0 1 0 10H9.5" /></symbol>
         <symbol id="i-redo" viewBox="0 0 24 24"><path d="M15.5 5.5l4 4-4 4" /><path d="M19.5 9.5h-9a5 5 0 0 0 0 10h4" /></symbol>
         <symbol id="i-save" viewBox="0 0 24 24">
@@ -206,6 +209,9 @@
             </button>
             <button type="button" id="tool-stamp" aria-pressed="false" aria-label="Stamp" title="Stamp (M)">
               <svg class="icon" aria-hidden="true"><use href="#i-stamp"></use></svg>
+            </button>
+            <button type="button" id="tool-signature" aria-pressed="false" aria-label="Signature picture" title="Signature picture (G)">
+              <svg class="icon" aria-hidden="true"><use href="#i-signature"></use></svg>
             </button>
           </div>
           <span class="toolbar-sep" aria-hidden="true"></span>
@@ -370,6 +376,10 @@
         <button class="menu-item" id="forget-positions" type="button" role="menuitem">
           <svg class="icon" aria-hidden="true"><use href="#i-trash"></use></svg>
           <span>Forget remembered positions</span>
+        </button>
+        <button class="menu-item" id="forget-signatures" type="button" role="menuitem">
+          <svg class="icon" aria-hidden="true"><use href="#i-trash"></use></svg>
+          <span>Forget saved signatures</span>
         </button>
       </div>
 

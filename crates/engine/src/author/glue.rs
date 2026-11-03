@@ -56,9 +56,12 @@ fn geometry_of(document: &PdfDocument<'_>, page: usize) -> Result<PageGeo, Failu
 }
 
 /// The document written out: the copy from the last read when nothing has changed it since, else
-/// a new one.
+/// a new one. It is written the way a save writes it (see [`save::serialise_clean`]): what nothing
+/// refers to any more (the picture of a signature that Undo took off, a field that was taken away)
+/// is not in the bytes the fields are written after, nor in the copy a step back loads.
 fn bytes_for(
     engine: &mut Engine,
+    pdfium: &'static Pdfium,
     doc: u32,
     progress: &mut dyn FnMut(u32),
 ) -> Result<Vec<u8>, Failure> {
@@ -66,8 +69,9 @@ fn bytes_for(
         return Ok(bytes);
     }
     engine.check_source(progress)?;
+    let password = engine.passwords.get(&doc).map(|p| p.0.clone());
     let document = engine.document(doc)?;
-    let bytes = save::serialise_up_to(document, MAX_SAVE_BYTES, progress)?;
+    let bytes = save::serialise_clean(pdfium, document, password.as_deref(), progress)?;
     engine.check_source(progress)?;
     Ok(bytes)
 }
@@ -106,7 +110,7 @@ fn check(
         check_document(pdfium, document)?;
         document.pages().len() as usize
     };
-    let bytes = bytes_for(engine, doc, progress)?;
+    let bytes = bytes_for(engine, pdfium, doc, progress)?;
     // The pages are the ones PDFium counts: a page tree that lists another number is refused.
     let mut author = Author::with_count(bytes, HashMap::new(), count).map_err(failure)?;
     let mut names = author.names().map_err(failure)?;
@@ -140,7 +144,7 @@ fn list(
         }
         (count, geometry_of(document, page as usize)?)
     };
-    let bytes = bytes_for(engine, doc, progress)?;
+    let bytes = bytes_for(engine, pdfium, doc, progress)?;
     let mut author =
         Author::with_count(bytes, HashMap::from([(page as usize, geo)]), count).map_err(failure)?;
     let mut items = author.list_page(page as usize).map_err(failure)?;
@@ -213,7 +217,7 @@ fn apply(
             form_fields: 0,
         }));
     }
-    let bytes = bytes_for(engine, doc, progress)?;
+    let bytes = bytes_for(engine, pdfium, doc, progress)?;
     let original_len = bytes.len();
     let mut author = Author::with_count(bytes, geo, count).map_err(failure)?;
     author.apply(&ops).map_err(failure)?;

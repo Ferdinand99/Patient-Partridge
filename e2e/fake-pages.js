@@ -343,12 +343,12 @@
 
   pg.designWidgets = (doc) => structuredClone(models.get(doc)?.design ?? []);
 
-  async function invoke(cmd, args = {}) {
+  async function invoke(cmd, args = {}, options) {
     if (cmd === "open_pdf" && SPECS[args.path]) return open(args.path);
     const isMine = cmd.startsWith("pages_") || (typeof args.doc === "number" && models.has(args.doc));
     // The form designer works on the documents of this file only.
-    if (cmd.startsWith("author_") && !models.has(args.doc)) return baseInvoke(cmd, args);
-    if (!isMine) return baseInvoke(cmd, args);
+    if (cmd.startsWith("author_") && !models.has(args.doc)) return baseInvoke(cmd, args, options);
+    if (!isMine) return baseInvoke(cmd, args, options);
     pg.calls.push({ cmd, args });
     if (pg.failNext && pg.failNext.cmd === cmd) {
       const { error } = pg.failNext;
@@ -386,7 +386,7 @@
       case "form_info":
         // A document the designer made fields in has a form: the fields are what a reader fills in.
         if (model(args.doc).design?.length) return { kind: "acro", actions: false };
-        if (!model(args.doc).fields) return baseInvoke(cmd, args);
+        if (!model(args.doc).fields) return baseInvoke(cmd, args, options);
         return { kind: "acro", actions: false };
       case "get_form_fields": {
         const { fields, design } = model(args.doc);
@@ -395,12 +395,12 @@
             .filter((w) => w.page === args.page && w.kind === "text")
             .map((w, i) => ({ ...textField(), index: i, name: w.name, tooltip: w.props.tooltip ?? "", rect: w.rect, value: "" }));
         }
-        if (!fields) return baseInvoke(cmd, args);
+        if (!fields) return baseInvoke(cmd, args, options);
         return structuredClone(fields);
       }
       case "set_form_field": {
         const { fields } = model(args.doc);
-        if (!fields) return baseInvoke(cmd, args);
+        if (!fields) return baseInvoke(cmd, args, options);
         const f = fields.find((x) => x.index === args.index && x.name === args.name);
         if (!f) throw { code: "form_field_refused", message: "not the field" };
         if (args.value.kind === "text") f.value = args.value.text;
@@ -549,7 +549,7 @@
         pg.cancelled = true;
         return "handover";
       default:
-        return baseInvoke(cmd, args);
+        return baseInvoke(cmd, args, options);
     }
   }
 

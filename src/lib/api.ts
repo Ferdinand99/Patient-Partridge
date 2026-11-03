@@ -6,6 +6,8 @@ import type { FormFieldInfo, FormInfo, FormValueIn } from "../viewer/forms";
 import type { PageLinkInfo } from "../viewer/overlays";
 import type { SignaturesInfo } from "./signatures";
 import type { Annotation, AnnotKind, Rgba, StampName } from "./annotations";
+import type { DrawnPicture, Rect, SavedBody, SavedPicture, TypedPicture } from "./signpicture";
+import { bodyOf } from "./signpicture";
 
 /** Where the reader was in a file, as remembered on this computer. */
 export interface SavedPosition {
@@ -236,6 +238,58 @@ export const api = {
   /** Puts back an annotation that was removed. It keeps its id. */
   restoreAnnotation(doc: number, page: number, id: number): Promise<Annotation> {
     return invoke<Annotation>("restore_annotation", { doc, page, id });
+  },
+
+  /**
+   * A drawn or a typed picture of a signature, fitted into `rect` (`[left, top, right, bottom]` in
+   * points from the top left of the page as it is drawn). It is a picture and nothing more.
+   */
+  addSignature(doc: number, page: number, rect: Rect, color: Rgba, picture: DrawnPicture | TypedPicture): Promise<Annotation> {
+    return invoke<Annotation>("add_signature", { doc, page, rect, color, mark: bodyOf(picture) });
+  },
+
+  /** An imported picture of a signature as raw pixels (red, green, blue, alpha), fitted into `rect`. */
+  addSignatureImage(
+    doc: number,
+    page: number,
+    rect: Rect,
+    color: Rgba,
+    width: number,
+    height: number,
+    rgba: Uint8ClampedArray,
+  ): Promise<Annotation> {
+    // The pixels are the body of the request, as bytes; what they are for is in a header.
+    const bytes = new Uint8Array(rgba.buffer, rgba.byteOffset, rgba.byteLength);
+    return invoke<Annotation>("add_signature_image", bytes, {
+      headers: { "x-signature-image": JSON.stringify({ doc, page, rect, color, width, height }) },
+    });
+  },
+
+  /** Moves and resizes a picture of a signature: it takes the corner and the width of `rect`. */
+  placeSignature(doc: number, page: number, id: number, rect: Rect): Promise<Annotation> {
+    return invoke<Annotation>("place_signature", { doc, page, id, rect });
+  },
+
+  /** The signatures kept on this computer for later, oldest first. */
+  listSignatureMarks(): Promise<SavedPicture[]> {
+    return invoke<SavedPicture[]>("list_signature_marks");
+  },
+
+  addSignatureMark(name: string, mark: SavedBody): Promise<SavedPicture> {
+    return invoke<SavedPicture>("add_signature_mark", { name, mark });
+  },
+
+  renameSignatureMark(id: string, name: string): Promise<SavedPicture> {
+    return invoke<SavedPicture>("rename_signature_mark", { id, name });
+  },
+
+  async deleteSignatureMark(id: string): Promise<void> {
+    await invoke<void>("delete_signature_mark", { id });
+  },
+
+  /** Forgets every kept signature. */
+  async clearSignatureMarks(): Promise<void> {
+    await invoke<void>("clear_signature_marks");
   },
 
   /**

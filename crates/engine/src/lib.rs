@@ -36,6 +36,7 @@ pub mod pagetree;
 pub mod sandbox;
 pub mod save;
 pub mod sigcheck;
+pub mod sigmark;
 pub mod signatures;
 pub mod source;
 pub mod startup;
@@ -491,8 +492,9 @@ impl Engine {
                 // The file must be what it was when the parts that are in memory were read: the
                 // parts that are not are read now, and a mix of two versions is not a document.
                 self.check_source(progress)?;
-                let bytes =
-                    save::serialise_up_to(document, partridge_protocol::MAX_SAVE_BYTES, progress)?;
+                // Written twice, so that what nothing refers to is not in the file (see there).
+                let password = self.passwords.get(&doc).map(|s| s.0.as_str());
+                let bytes = save::serialise_clean(pdfium, document, password, progress)?;
                 self.check_source(progress)?;
                 let size = bytes.len() as u32;
                 self.saves.insert(doc, bytes);
@@ -613,6 +615,27 @@ impl Engine {
             } => {
                 let (document, state) = self.annotating(doc)?;
                 let item = state.add_stamp(document, page, x, y, stamp)?;
+                Ok(ResponseBody::Annot { item })
+            }
+            RequestBody::AddSignature {
+                doc,
+                page,
+                rect,
+                color,
+                mark,
+            } => {
+                let (document, state) = self.annotating(doc)?;
+                let item = state.add_signature(document, page, rect, color, mark)?;
+                Ok(ResponseBody::Annot { item })
+            }
+            RequestBody::PlaceSignature {
+                doc,
+                page,
+                id,
+                rect,
+            } => {
+                let (document, state) = self.annotating(doc)?;
+                let item = state.place_signature(document, page, id, rect)?;
                 Ok(ResponseBody::Annot { item })
             }
             RequestBody::UpdateAnnot {

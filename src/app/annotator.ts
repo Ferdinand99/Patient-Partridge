@@ -27,6 +27,16 @@ import {
   stampSize,
 } from "../lib/annotations";
 import { describeError, isEngineLost, toAppError, type AppErrorLike } from "../lib/errors";
+import {
+  PICTURE_WORDS,
+  sameRect,
+  scaledRect,
+  startingRect,
+  type Chosen,
+  type DrawnPicture,
+  type Rect,
+  type TypedPicture,
+} from "../lib/signpicture";
 import type { AnnotLayerEvents } from "../viewer/annotlayer";
 import { MAX_SELECTION_RANGES } from "../viewer/overlays";
 import type { DocumentView } from "../viewer/viewer";
@@ -54,6 +64,20 @@ export interface AnnotatorApi {
   ): Promise<Annotation>;
   removeAnnotation(doc: number, page: number, id: number): Promise<void>;
   restoreAnnotation(doc: number, page: number, id: number): Promise<Annotation>;
+  /** A drawn or a typed picture of a signature, fitted into a box of the page. */
+  addSignature?(doc: number, page: number, rect: Rect, color: Rgba, picture: DrawnPicture | TypedPicture): Promise<Annotation>;
+  /** An imported picture of a signature as raw pixels. */
+  addSignatureImage?(
+    doc: number,
+    page: number,
+    rect: Rect,
+    color: Rgba,
+    width: number,
+    height: number,
+    rgba: Uint8ClampedArray,
+  ): Promise<Annotation>;
+  /** Moves and resizes a picture of a signature: it takes the corner and the width of the box. */
+  placeSignature?(doc: number, page: number, id: number, rect: Rect): Promise<Annotation>;
 }
 
 export interface AnnotatorHost {
@@ -142,6 +166,8 @@ export class Annotator implements AnnotLayerEvents {
   color: Rgba = PALETTE[0].rgba;
   penWidth: number = PEN_WIDTHS[1].width;
   stamp: StampName = "approved";
+  /** The picture of a signature the next click on a page places, if one was made or picked. */
+  signature: Chosen | null = null;
   selected: { page: number; id: number } | null = null;
 
   private chain: Promise<unknown> = Promise.resolve();
@@ -273,7 +299,7 @@ export class Annotator implements AnnotLayerEvents {
     const a = this.current;
     if (!a) return null;
     if (a.can.locked) return "This annotation is locked in the file, so it cannot be changed.";
-    if (!a.can.editText && a.text !== "" && a.can.remove && a.kind !== "stamp") {
+    if (!a.can.editText && a.text !== "" && a.can.remove && a.kind !== "stamp" && a.kind !== "signature") {
       return "The text of this annotation is too long or is locked in the file, so it cannot be edited here.";
     }
     if (this.recolourRefused(a)) return RECOLOUR_REASON;
@@ -419,6 +445,21 @@ export class Annotator implements AnnotLayerEvents {
     else if (tool === "pen") this.host.announce("Pen: draw on the page with the pointer.");
     else if (tool === "note") this.host.announce("Note: click on the page to place a note.");
     else if (tool === "stamp") this.host.announce("Stamp: click on the page to place the stamp.");
+    else if (tool === "signature") this.host.announce(PICTURE_WORDS.placing);
+  }
+
+  /**
+   * The picture the person made or picked for the signature tool. The tool is switched on, so that
+   * the next click on a page places it; while the pages are being changed nothing is begun.
+   */
+  setSignature(picture: Chosen): void {
+    this.signature = picture;
+    if (this.tool === "signature") {
+      this.host.announce(PICTURE_WORDS.placing);
+      this.host.changed();
+      return;
+    }
+    this.setTool("signature");
   }
 
   setColor(color: Rgba): void {
@@ -465,6 +506,7 @@ export class Annotator implements AnnotLayerEvents {
   onPlace(page: number, x: number, y: number, client: { x: number; y: number }): void {
     if (this.tool === "note") void this.placeNote(page, x, y, client);
     else if (this.tool === "stamp") void this.placeStamp(page, x, y);
+    else if (this.tool === "signature") void this.placePicture(page, x, y);
   }
 
   onStroke(page: number, points: [number, number][]): void {
@@ -473,6 +515,10 @@ export class Annotator implements AnnotLayerEvents {
 
   onMove(page: number, id: number, dx: number, dy: number): void {
     void this.moveBy(page, id, dx, dy);
+  }
+
+  onResize(page: number, id: number, rect: Rect): void {
+    void this.resizeTo(page, id, rect);
   }
 
   onEdit(page: number, id: number): void {
@@ -645,6 +691,29 @@ export class Annotator implements AnnotLayerEvents {
     });
   }
 
+  /** Puts the picture of a signature on the page, its middle at the point, and records it. */
+  private placePicture(page: number, x: number, y: number): Promise<void> {
+    if (this.refuseWhileHeld()) return Promise.resolve();
+    const picture = this.signature;
+    if (!picture) return Promise.resolve();
+    if (!this.api.addSignature || !this.api.addSignatureImage) {
+      this.host.announce("Signature pictures are not available.");
+      return Promise.resolve();
+    }
+    const rect = startingRect(picture.aspect, [x, y], this.view.pageSizeOf(page));
+    return this.queued(async () => {
+      const a =
+        picture.kind === "image"
+          ? await this.api.addSignatureImage!(this.doc, page, rect, picture.color, picture.width, picture.height, picture.rgba)
+          : await this.api.addSignature!(this.doc, page, rect, picture.color, picture);
+      this.boxes.set(`${page}:${a.id}`, a.rect);
+      this.refresh(page);
+      this.record("Signature picture", [{ page, id: a.id }], "remove");
+      this.host.announce(`${PICTURE_WORDS.placed} ${PICTURE_WORDS.resizeHint}`);
+      this.finishPlacing(page, a.id);
+    });
+  }
+
   /** A note or a stamp is placed: the pointer goes back to picking, with the new one picked. */
   private finishPlacing(page: number, id: number): void {
     this.tool = "select";
@@ -665,6 +734,8 @@ export class Annotator implements AnnotLayerEvents {
       void this.placeNote(centre.page, centre.x, centre.y, { x: window.innerWidth / 2 - 144, y: window.innerHeight / 3 });
     } else if (this.tool === "stamp") {
       void this.placeStamp(centre.page, centre.x, centre.y);
+    } else if (this.tool === "signature") {
+      void this.placePicture(centre.page, centre.x, centre.y);
     }
   }
 
@@ -711,6 +782,37 @@ export class Annotator implements AnnotLayerEvents {
         redo: () => this.replay(page, id, { dx: mx, dy: my }),
       });
     });
+  }
+
+  /**
+   * Makes a picture of a signature bigger or smaller: it keeps its corner and its proportions, and
+   * `rect` says the width. The engine says the box it really has, which is what an undo goes back to.
+   */
+  resizeTo(page: number, id: number, rect: Rect): Promise<void> {
+    if (this.refuseWhileHeld()) return Promise.resolve();
+    const a = this.view.annotationLayer.find(page, id);
+    if (!a?.can.resize || !this.api.placeSignature) return Promise.resolve();
+    return this.queued(async () => {
+      const key = `${page}:${id}`;
+      const from = this.boxes.get(key) ?? a.rect;
+      const placed = await this.api.placeSignature!(this.doc, page, id, rect);
+      this.boxes.set(key, placed.rect);
+      this.refresh(page);
+      if (sameRect(from, placed.rect)) return;
+      this.push({
+        label: "Resize signature picture",
+        undo: () => this.replayPlace(page, id, from),
+        redo: () => this.replayPlace(page, id, placed.rect),
+      });
+    });
+  }
+
+  /** Undo or redo of a resize: skipped for an annotation that has been deleted for good. */
+  private async replayPlace(page: number, id: number, rect: Rect): Promise<void> {
+    if (this.gone.has(`${page}:${id}`) || !this.api.placeSignature) return;
+    const placed = await this.api.placeSignature(this.doc, page, id, rect);
+    this.boxes.set(`${page}:${id}`, placed.rect);
+    this.refresh(page);
   }
 
   /** Opens the box for the text of an annotation and saves what the person writes. */
@@ -786,7 +888,7 @@ export class Annotator implements AnnotLayerEvents {
     if (!a.can.restore) {
       const answer = await this.host.ask({
         title: "Delete this annotation?",
-        detail: deleteWarning(a.kind),
+        detail: deleteWarning(),
         buttons: [
           { id: "cancel", label: "Cancel", safe: true },
           { id: "delete", label: "Delete", primary: true },
@@ -838,7 +940,7 @@ export class Annotator implements AnnotLayerEvents {
       }
       return false;
     }
-    if ((this.tool === "note" || this.tool === "stamp") && e.key === "Enter") {
+    if ((this.tool === "note" || this.tool === "stamp" || this.tool === "signature") && e.key === "Enter") {
       this.placeAtCentre();
       return true;
     }
@@ -864,6 +966,16 @@ export class Annotator implements AnnotLayerEvents {
         void this.moveBy(page, id, dx, dy);
         return true;
       }
+      case "+":
+      case "=":
+      case "-":
+      case "_": {
+        if (!a.can.resize) return false;
+        const grow = e.key === "+" || e.key === "=";
+        const from = this.boxes.get(`${page}:${id}`) ?? a.rect;
+        void this.resizeTo(page, id, scaledRect(from, grow ? 1.1 : 1 / 1.1, this.view.pageSizeOf(page)));
+        return true;
+      }
       default:
         return false;
     }
@@ -878,15 +990,15 @@ export class Annotator implements AnnotLayerEvents {
 /**
  * What is said before an annotation that came with the file is deleted. Saving writes a new file in
  * which the comment, the author, the rich text and the subject are not kept; it is not redaction,
- * and copies and backups made before the save keep everything. A free text box may keep its words.
+ * and copies and backups made before the save keep everything.
  */
-function deleteWarning(kind: Annotation["kind"]): string {
-  const base =
+function deleteWarning(): string {
+  return (
     "This annotation came with the file, and Undo cannot bring it back. Deleting it also clears Redo. " +
     "Taking back a delete, a move or added pages that you made before it loads the document as it was then, with the annotation in it; taking back a turn or a crop never does. " +
     "If you delete it and save, the new file does not hold its comment or author. " +
-    "This is not redaction: copies and backups made before the save still hold the text.";
-  return kind === "other" ? `${base} The words of a text box can stay in the saved file.` : base;
+    "This is not redaction: copies and backups made before the save still hold the text."
+  );
 }
 
 function pagesText(pages: number[]): string {
