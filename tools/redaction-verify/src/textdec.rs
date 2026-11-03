@@ -8,7 +8,9 @@
 //! has the resource name is tried, and if there is none, every font of the file.
 
 use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use crate::content::{for_each_op, shown, Op, ShownItem, WORD_SPACE};
@@ -267,7 +269,28 @@ pub fn decode(doc: &Doc, res: &Resolver, entry: Option<&Entry>, pieces: &[Piece]
                 }
             }
         }
-        usable.push((name, ms.iter().filter(|m| m.unknown().is_none()).collect()));
+        // Two candidates that read every string of this font alike are one candidate (the
+        // Latin encodings agree on all the letters, so most fonts have one).
+        let strings: Vec<&[u8]> = pieces
+            .iter()
+            .filter_map(|p| match p {
+                Piece::Show { font, bytes } if font == name => Some(bytes.as_slice()),
+                _ => None,
+            })
+            .collect();
+        let mut seen: Vec<u64> = Vec::new();
+        let mut distinct: Vec<&Mapper> = Vec::new();
+        for m in ms.iter().filter(|m| m.unknown().is_none()) {
+            let mut h = DefaultHasher::new();
+            for s in &strings {
+                m.decode(s).hash(&mut h);
+            }
+            if !seen.contains(&h.finish()) {
+                seen.push(h.finish());
+                distinct.push(m);
+            }
+        }
+        usable.push((name, distinct));
     }
     // Every combination of the candidates of the fonts: with shared resource names in an object
     // that nothing refers to, any font of that name may be the one in use.

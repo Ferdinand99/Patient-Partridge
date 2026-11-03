@@ -660,3 +660,27 @@ fn the_soft_mask_of_a_jpeg_is_checked() {
         Clean,
     );
 }
+
+#[test]
+fn an_image_drawn_by_the_glyphs_of_a_type3_font_is_said() {
+    let names = vec!["a".to_owned()];
+    let page = |glyph: &[u8]| {
+        let mut fx = Fx::new(&[BENIGN, b"BT /F2 12 Tf 72 600 Td (A) Tj ET\n".as_slice()].concat());
+        fx.extra.insert(6, fonts::type3_font(65, &names, 20, None));
+        fx.extra.insert(20, stream_obj("", glyph, false));
+        fx.build()
+    };
+    let with_image =
+        page(b"1000 0 d0 q 500 0 0 500 0 0 cm BI /W 2 /H 2 /BPC 8 /CS /G ID abcd EI Q");
+    let r = cli(&with_image, Some(REGION), &[], &[]);
+    assert_eq!(r.code, 2, "{}", r.out);
+    assert!(
+        r.problems().iter().any(|p| p.contains("Type 3 font /F2")),
+        "{}",
+        r.out
+    );
+    // Glyphs that draw only a shape need no saying.
+    let shape = page(b"500 0 d0 0 0 400 400 re f");
+    let r = cli(&shape, Some(REGION), &[], &[]);
+    assert_eq!(r.code, 0, "{}", r.out);
+}

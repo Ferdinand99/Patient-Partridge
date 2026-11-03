@@ -244,3 +244,41 @@ fn a_stream_that_is_neither_image_font_nor_content_is_listed_and_checked_by_the_
     assert_eq!(r.code, 1, "{}", r.out);
     assert!(r.layers().contains("carve"), "{}", r.out);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Many fonts that read alike are one way to read the page.
+
+#[test]
+fn fonts_without_an_encoding_that_read_alike_do_not_multiply() {
+    // Nine simple fonts without an encoding are each read as StandardEncoding and as WinAnsi: two
+    // ways each, 512 together. For ASCII text the two agree, so there is one way to read the page.
+    let mut o = Objs::new();
+    o.insert(1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec());
+    o.insert(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec());
+    let fonts: String = (0..9).map(|i| format!("/F{i} {} 0 R ", 20 + i)).collect();
+    o.insert(
+        3,
+        format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R \
+             /Resources << /Font << {fonts}>> >> >>"
+        )
+        .into_bytes(),
+    );
+    let content: String = (0..9)
+        .map(|i| {
+            format!(
+                "BT /F{i} 12 Tf 72 {} Td (Quarterly report {i}) Tj ET\n",
+                700 - 20 * i
+            )
+        })
+        .collect();
+    o.insert(4, stream_obj("", content.as_bytes(), true));
+    for i in 0..9 {
+        o.insert(
+            20 + i,
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        );
+    }
+    let r = cli(&file(&o), Some(&spec()), &[], &[]);
+    assert_eq!(r.code, 0, "{}", r.out);
+}

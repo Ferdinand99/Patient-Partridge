@@ -150,6 +150,12 @@ impl Walker<'_, '_> {
                     self.pattern(name, res);
                 }
             }
+            // A Type 3 font draws its glyphs with content streams, which may draw images.
+            b"Tf" => {
+                if let Some(name) = op.name_arg() {
+                    self.type3(name, res);
+                }
+            }
             // A soft mask is a form that is drawn in the space of the moment it is set.
             b"gs" => {
                 if let Some(name) = op.name_arg() {
@@ -175,9 +181,40 @@ impl Walker<'_, '_> {
             return;
         };
         let Some(e) = self.doc.latest(*n) else { return };
-        if e.stream.is_some() && draws_image(self.doc, e, 0) {
+        if e.stream.is_some() && draws_image(self.doc, e, res, 0) {
             let msg = format!(
                 "an image is drawn through the tiling pattern /{name}: where the pattern is painted is not followed, so the pixels of that image were checked only in the render"
+            );
+            if !self.problems.contains(&msg) {
+                self.problems.push(msg);
+            }
+        }
+    }
+
+    /// A Type 3 font whose glyph procedures draw an image: said, like a pattern, because where
+    /// the glyphs are shown is not followed.
+    fn type3(&mut self, name: &[u8], res: &Obj) {
+        let name: String = name.iter().map(|b| char::from(*b)).collect();
+        let fonts = self.doc.dget(res, "Font");
+        let font = self.doc.dget(fonts, &name);
+        if self.doc.dget(font, "Subtype").name() != Some("Type3") {
+            return;
+        }
+        let own = font.get("Resources").map(|r| self.doc.resolve(r).clone());
+        let font_res = own.unwrap_or_else(|| res.clone());
+        let found = self
+            .doc
+            .dget(font, "CharProcs")
+            .entries()
+            .iter()
+            .filter_map(|(_, v)| match v {
+                Obj::Ref(n) => self.doc.latest(*n),
+                _ => None,
+            })
+            .any(|e| e.stream.is_some() && draws_image(self.doc, e, &font_res, 0));
+        if found {
+            let msg = format!(
+                "an image is drawn by the glyphs of the Type 3 font /{name}: where the glyphs are shown is not followed, so the pixels of that image were checked only in the render"
             );
             if !self.problems.contains(&msg) {
                 self.problems.push(msg);
@@ -215,15 +252,16 @@ impl Walker<'_, '_> {
     }
 }
 
-/// Whether the content of a form or pattern draws an image (also through a form it draws).
-fn draws_image(doc: &Doc, e: &Entry, depth: usize) -> bool {
+/// Whether the content of a form, pattern or glyph procedure draws an image (also through a form
+/// it draws). It uses its own resources, or `fallback` where it has none.
+fn draws_image(doc: &Doc, e: &Entry, fallback: &Obj, depth: usize) -> bool {
     let Some(d) = doc.stream_data(e) else {
         return false;
     };
     let res = e
         .value
         .get("Resources")
-        .map_or(Obj::Null, |r| doc.resolve(r).clone());
+        .map_or_else(|| fallback.clone(), |r| doc.resolve(r).clone());
     let mut found = false;
     for_each_op(&d.data, &mut |op: &Op| match op.name {
         b"BI" => found = true,
@@ -237,7 +275,7 @@ fn draws_image(doc: &Doc, e: &Entry, depth: usize) -> bool {
             let Some(x) = doc.latest(*n) else { return };
             match doc.dget(&x.value, "Subtype").name() {
                 Some("Image") => found = true,
-                Some("Form") if depth < 4 => found |= draws_image(doc, x, depth + 1),
+                Some("Form") if depth < 4 => found |= draws_image(doc, x, &res, depth + 1),
                 _ => {}
             }
         }
