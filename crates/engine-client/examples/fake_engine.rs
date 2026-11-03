@@ -519,6 +519,14 @@ fn main() {
                     message: "this stand-in has no page tools".into(),
                 },
             ),
+            RequestBody::Author(_) => reply(
+                &mut output,
+                id,
+                ResponseBody::Error {
+                    code: ErrorCode::InvalidRequest,
+                    message: "this stand-in has no form designer".into(),
+                },
+            ),
         }
     }
 }

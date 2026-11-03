@@ -31,12 +31,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use partridge_protocol::{
-    read_frame_limited, write_request, ErrorCode, PageSize, Request, RequestBody, Response,
-    ResponseBody, ANNOT_INFO_MIN, MAX_ANNOTS_PER_PAGE, MAX_ANNOT_AUTHOR, MAX_ANNOT_TEXT,
-    MAX_COORDINATE, MAX_FORM_ANSWER_BYTES, MAX_FORM_NAME, MAX_FORM_OPTIONS, MAX_FORM_VALUE,
-    MAX_INK_POINTS, MAX_INK_STROKES, MAX_INK_WIDTH, MAX_MARKUP_CHARS, MAX_QUERY_LEN,
-    MAX_SAVE_BYTES, MAX_SAVE_CHUNK, MAX_SIGNATURE_REPORT, MAX_STRING_LEN, MIN_INK_WIDTH,
-    PROTOCOL_VERSION, SAVE_DATA_HEADER_LEN,
+    read_frame_limited, write_request, AuthorRequest, ErrorCode, PageSize, Request, RequestBody,
+    Response, ResponseBody, ANNOT_INFO_MIN, MAX_ANNOTS_PER_PAGE, MAX_ANNOT_AUTHOR, MAX_ANNOT_TEXT,
+    MAX_AUTHOR_ANSWER_BYTES, MAX_COORDINATE, MAX_FORM_ANSWER_BYTES, MAX_FORM_NAME,
+    MAX_FORM_OPTIONS, MAX_FORM_VALUE, MAX_INK_POINTS, MAX_INK_STROKES, MAX_INK_WIDTH,
+    MAX_MARKUP_CHARS, MAX_QUERY_LEN, MAX_SAVE_BYTES, MAX_SAVE_CHUNK, MAX_SIGNATURE_REPORT,
+    MAX_STRING_LEN, MIN_INK_WIDTH, PROTOCOL_VERSION, SAVE_DATA_HEADER_LEN,
 };
 
 #[cfg(all(windows, debug_assertions))]
@@ -50,6 +50,7 @@ pub use partridge_protocol::{
     StampKind, TextMatch,
 };
 
+mod author;
 mod pages;
 pub use pages::{ExportError, Exported, PagesChanged, PagesCropped};
 mod pool;
@@ -1030,7 +1031,11 @@ impl EngineClient {
                 (SAVE_DATA_HEADER_LEN + (*len as usize).min(MAX_SAVE_CHUNK)).max(IDLE_LIMIT)
             }
             // The size of every page, for up to MAX_PAGES pages, and a list of boxes.
-            RequestBody::Pages(_) => PAGES_ANSWER_LIMIT,
+            RequestBody::Pages(_) | RequestBody::Author(AuthorRequest::Apply { .. }) => {
+                PAGES_ANSWER_LIMIT
+            }
+            // The names of the fields, or the widgets of a page.
+            RequestBody::Author(_) => MAX_AUTHOR_ANSWER_BYTES + 64,
             // A search answer holds at most 2 000 matches of 8 bytes: it fits the idle limit.
             _ => IDLE_LIMIT,
         }
@@ -1062,7 +1067,8 @@ impl EngineClient {
             | RequestBody::Fingerprint { .. }
             | RequestBody::Signatures { .. }
             | RequestBody::SaveBegin { .. }
-            | RequestBody::Pages(_) => self.config.save_stall,
+            | RequestBody::Pages(_)
+            | RequestBody::Author(_) => self.config.save_stall,
             _ => self.config.timeout,
         };
         let result = self.wait_for_answer(running, id, body, patience);
@@ -1083,7 +1089,10 @@ impl EngineClient {
         } else {
             SAVE_PASSES
         };
-        let is_change = matches!(body, RequestBody::Pages(_));
+        let is_change = matches!(
+            body,
+            RequestBody::Pages(_) | RequestBody::Author(AuthorRequest::Apply { .. })
+        );
         write_request(&mut running.stdin, &Request { id, body }).map_err(|e| {
             format!(
                 "the request could not be sent ({e}); {}",

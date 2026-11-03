@@ -706,6 +706,13 @@ mod tests {
         busy(pool.pages_insert_blank(handle, 0, 100.0, 100.0).map(|_| ()));
         busy(pool.pages_restore(handle, 1).map(|_| ()));
         busy(
+            pool.author_apply(
+                handle,
+                &[partridge_protocol::AuthorOp::Remove { name: "a".into() }],
+            )
+            .map(|_| ()),
+        );
+        busy(
             pool.insert_pdf(handle, 0, "x.pdf", None, Default::default(), &|_, _| {})
                 .map(|_| ()),
         );

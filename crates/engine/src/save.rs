@@ -231,16 +231,36 @@ fn signature_widgets(document: &PdfDocument<'_>, progress: &mut dyn FnMut(u32)) 
     count
 }
 
+/// How many signatures a document holds, as far as its fields tell. PDFium lists a signature
+/// field whether or not anybody has signed it, so a form with a place to sign would count as
+/// signed. Only a field with contents counts here; a field whose contents cannot be asked for
+/// counts as well, because a warning that was not needed is cheap.
+///
+/// PDFium's list follows the entries of `/AcroForm /Fields`. The widgets on the pages also find a
+/// field below a grouping field, but cannot say whether it holds a signature, so the widgets
+/// beyond the fields PDFium listed are counted as signed. The result is never more than the
+/// larger of the two counts, and an unsigned field is the only thing that makes it smaller.
+fn signatures_held(listed: &PdfSignatures<'_>, widgets: u32) -> u32 {
+    let total = listed.len();
+    let signed = (0..total)
+        .filter(|&index| match listed.get(index) {
+            Ok(signature) => !signature.bytes().is_empty(),
+            Err(_) => true,
+        })
+        .count() as u32;
+    signed + widgets.saturating_sub(u32::from(total))
+}
+
 /// What the app needs to know before it saves.
 pub fn doc_info(
     document: &PdfDocument<'_>,
     source: Option<&Mutex<SourceGuard>>,
     progress: &mut dyn FnMut(u32),
 ) -> ResponseBody {
-    let found = document.signatures().len() as u32;
     // PDFium reads the file through the guard while it looks at the pages, so the guard must not
     // be held here.
     let widgets = signature_widgets(document, progress);
+    let held = signatures_held(document.signatures(), widgets);
     // When the file cannot be scanned, the document is treated as possibly signed.
     let maybe_signed = match source {
         Some(guard) => crate::source::lock(guard)
@@ -252,7 +272,7 @@ pub fn doc_info(
     ResponseBody::DocInfo {
         pages: document.pages().len() as u32,
         security: security_revision(document),
-        signatures: found.max(widgets),
+        signatures: held,
         maybe_signed,
         touched,
     }

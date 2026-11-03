@@ -24,6 +24,7 @@ use pdfium_render::prelude::*;
 use source::{GuardedReader, SourceFile, SourceGuard};
 
 pub mod annots;
+pub mod author;
 #[cfg(unix)]
 pub mod fds;
 pub mod fonts;
@@ -143,6 +144,32 @@ fn fail<T>(code: ErrorCode, message: impl Into<String>) -> Result<T, Failure> {
     Err((code, message.into()))
 }
 
+/// True for a request that can change an open document (or hands out a copy of it), so that what the
+/// form designer kept of its written-out form is out of date after it. The designer's own requests
+/// look after their cache themselves.
+fn changes_the_document(body: &RequestBody) -> bool {
+    !matches!(
+        body,
+        RequestBody::Hello { .. }
+            | RequestBody::Render { .. }
+            | RequestBody::Outline { .. }
+            | RequestBody::PageText { .. }
+            | RequestBody::PageLinks { .. }
+            | RequestBody::Search { .. }
+            | RequestBody::FontReport
+            | RequestBody::DocInfo { .. }
+            | RequestBody::Fingerprint { .. }
+            | RequestBody::Signatures { .. }
+            | RequestBody::SaveBegin { .. }
+            | RequestBody::SaveChunk { .. }
+            | RequestBody::SaveEnd { .. }
+            | RequestBody::FormInfo { .. }
+            | RequestBody::ListFormFields { .. }
+            | RequestBody::ListAnnots { .. }
+            | RequestBody::Author(_)
+    )
+}
+
 /// The engine state: the loaded PDFium library and the documents that are open.
 pub struct Engine {
     pdfium: Result<&'static Pdfium, String>,
@@ -161,6 +188,9 @@ pub struct Engine {
     /// What the engine knows of the annotations of each document (their ids, and how to put back
     /// what it removed).
     annots: HashMap<u32, annots::DocAnnots>,
+    /// The document as PDFium last wrote it out, for the form designer to read: writing out is the
+    /// slow part. Gone as soon as anything but the designer's reads could have changed the document.
+    author_bytes: HashMap<u32, Vec<u8>>,
     next_doc: u32,
     /// The one document the app handed over. `Open` takes it.
     document: Option<Box<dyn SourceFile>>,
@@ -224,6 +254,7 @@ impl Engine {
             tools: HashMap::new(),
             passwords: HashMap::new(),
             annots: HashMap::new(),
+            author_bytes: HashMap::new(),
             next_doc: 1,
             document: None,
             source: None,
@@ -297,6 +328,9 @@ impl Engine {
                 | RequestBody::PageLinks { .. }
                 | RequestBody::Search { .. }
         );
+        if changes_the_document(&request.body) {
+            self.author_bytes.clear();
+        }
         let body = match self.dispatch(request.body, &mut rising) {
             Ok(body) => body,
             Err(failure) => {
@@ -354,9 +388,11 @@ impl Engine {
                 self.tools.remove(&doc);
                 self.passwords.remove(&doc);
                 self.annots.remove(&doc);
+                self.author_bytes.remove(&doc);
                 Ok(ResponseBody::Closed)
             }
             RequestBody::Pages(request) => pages::handle(self, pdfium, request, progress),
+            RequestBody::Author(request) => author::glue::handle(self, pdfium, request, progress),
             RequestBody::Outline { doc } => {
                 let document = self.document(doc)?;
                 let items = text::outline(document);

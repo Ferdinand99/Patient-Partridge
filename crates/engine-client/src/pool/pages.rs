@@ -191,6 +191,32 @@ impl EnginePool {
         self.page_op(handle, |c, d| c.pages_restore(d, snapshot))
     }
 
+    /// Asks whether the form designer can work on the document, and for the names of its fields.
+    pub fn author_check(&self, handle: u64) -> Result<Vec<String>, ClientError> {
+        let h = self.handles(handle)?;
+        h.client.author_check(h.doc)
+    }
+
+    /// The widgets of a page that the form designer lists.
+    pub fn author_list(
+        &self,
+        handle: u64,
+        page: u32,
+    ) -> Result<Vec<partridge_protocol::DesignedWidget>, ClientError> {
+        let h = self.handles(handle)?;
+        h.client.author_list(h.doc, page)
+    }
+
+    /// Makes form fields, changes the ones the designer made and takes them away. One reload of the
+    /// document for the whole batch. The answer has the number of the copy to go back to.
+    pub fn author_apply(
+        &self,
+        handle: u64,
+        ops: &[partridge_protocol::AuthorOp],
+    ) -> Result<PagesChanged, ClientError> {
+        self.page_op(handle, |c, d| c.author_apply(d, ops))
+    }
+
     /// Inserts all the pages of another file so that the first becomes page `at` (counted from
     /// 0). The file is opened by an engine of its own, with a read-only handle like any document;
     /// the pages travel from that engine to the one of this document through the app, in pieces,

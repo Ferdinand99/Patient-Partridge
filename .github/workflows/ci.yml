@@ -217,9 +217,9 @@ jobs:
       - name: THIRD-PARTY-NOTICES is up to date
         run: scripts/notices.sh --check
 
-  # A form that was filled in and saved by the engine is handed to tools that are not PDFium: qpdf
-  # checks the structure, pdftk reads the field values, poppler draws the page. See
-  # scripts/check-forms.sh.
+  # A form that was filled in and saved by the engine, and a form that the designer made, are handed
+  # to tools that are not PDFium: qpdf checks the structure, pdftk reads the field values, poppler
+  # draws the page. See scripts/check-forms.sh and crates/engine/tests/author_readers.rs.
   forms-tools:
     name: Filled forms read by other tools (qpdf, pdftk, poppler)
     runs-on: ubuntu-24.04
@@ -252,6 +252,15 @@ jobs:
         run: cargo test -p partridge-engine --locked --test forms --test forms_process --test forms_actions
       - name: Read them with other tools
         run: scripts/check-forms.sh "$RUNNER_TEMP/forms"
+      # Forms that the designer made (fields of every kind, on a plain page and on turned pages) are
+      # read by qpdf (the structure), Poppler (opens and draws every field and what was filled in)
+      # and pdftk (kinds, flags, tooltips, states and defaults; fills them in, and the engine reads
+      # what it wrote). Each of the tools must be there.
+      - name: Forms made by the designer, read with other tools
+        env:
+          PARTRIDGE_REQUIRE_READERS: "1"
+          PARTRIDGE_REQUIRE_PDFTK: "1"
+        run: cargo test -p partridge-engine --locked --test author_readers
 
   # Documents that the page tools changed and saved (a delete, a move, a turn, a crop, an insert and a
   # copy of some pages) are handed to tools that are not PDFium: qpdf checks the structure, poppler

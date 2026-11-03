@@ -59,6 +59,9 @@ jobs:
           - target: protocol_roundtrip_response
             dict: protocol
             args: "-max_len=4096 -timeout=10 -malloc_limit_mb=8"
+          - target: form_author
+            dict: pdf
+            args: "-max_len=4096 -timeout=10 -malloc_limit_mb=256"
           - target: signature_check
             dict: protocol
             args: "-max_len=2048 -timeout=10 -malloc_limit_mb=64"

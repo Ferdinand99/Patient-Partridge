@@ -15,7 +15,8 @@ use partridge_fuzz::{
     over_cap_request_case, over_cap_response_case, OVER_CAP_REQUESTS, OVER_CAP_RESPONSES,
 };
 use partridge_protocol::{
-    ability, field_flag, AnnotInfo, AnnotKind, ErrorCode, FontScript, FormField, FormFieldKind,
+    ability, field_flag, AuthorOp, AuthorRequest, AuthorResponse, DesignField, DesignKind,
+    DesignProps, DesignWidget, DesignedWidget, WidgetRef, AnnotInfo, AnnotKind, ErrorCode, FontScript, FormField, FormFieldKind,
     FormKind, FormOption, FormValue, LinkTarget, OutlineItem, PageLink, PageSize, PagesRequest,
     PagesResponse, Request, RequestBody, Response, ResponseBody, SignatureFont, SignatureMark,
     StampKind, TextMatch, MAX_FRAME_LEN, MAX_LINKS_PER_PAGE, MAX_MATCHES_PER_PAGE,
@@ -480,6 +481,103 @@ fn a_note(id: u32, text: &str) -> AnnotInfo {
     }
 }
 
+fn author_field() -> DesignField {
+    DesignField {
+        name: "name".into(),
+        kind: DesignKind::Text,
+        props: DesignProps {
+            tooltip: "Your name".into(),
+            required: true,
+            max_len: 20,
+            default_value: "Ola".into(),
+            ..DesignProps::default()
+        },
+        widgets: vec![DesignWidget {
+            page: 0,
+            rect: [72.0, 100.0, 232.0, 122.0],
+            export: String::new(),
+        }],
+    }
+}
+
+fn author_requests() -> Vec<(&'static str, Request)> {
+    let b = |id, body| Request { id, body };
+    vec![
+        ("author_check", b(60, RequestBody::Author(AuthorRequest::Check { doc: 1 }))),
+        ("author_list", b(61, RequestBody::Author(AuthorRequest::List { doc: 1, page: 0 }))),
+        (
+            "author_apply",
+            b(
+                62,
+                RequestBody::Author(AuthorRequest::Apply {
+                    doc: 1,
+                    ops: vec![
+                        AuthorOp::Add(author_field()),
+                        AuthorOp::Move {
+                            name: "name".into(),
+                            widget: 0,
+                            page: 0,
+                            rect: [80.0, 110.0, 240.0, 132.0],
+                        },
+                        AuthorOp::Update {
+                            name: "name".into(),
+                            new_name: "full_name".into(),
+                            props: DesignProps::default(),
+                            exports: vec![],
+                        },
+                        AuthorOp::Reorder {
+                            page: 0,
+                            order: vec![WidgetRef {
+                                name: "full_name".into(),
+                                widget: 0,
+                            }],
+                        },
+                        AuthorOp::Remove {
+                            name: "full_name".into(),
+                        },
+                    ],
+                }),
+            ),
+        ),
+    ]
+}
+
+fn author_responses() -> Vec<(&'static str, Response)> {
+    let b = |id, body| Response { id, body };
+    vec![
+        (
+            "author_ready",
+            b(
+                60,
+                ResponseBody::Author(AuthorResponse::Ready {
+                    names: vec!["a".into(), "person.first".into()],
+                }),
+            ),
+        ),
+        (
+            "author_widgets",
+            b(
+                61,
+                ResponseBody::Author(AuthorResponse::Widgets {
+                    items: vec![DesignedWidget {
+                        name: "size".into(),
+                        kind: DesignKind::Radio,
+                        widget: 1,
+                        widgets: 3,
+                        rect: [10.0, 20.0, 24.0, 34.0],
+                        export: "M".into(),
+                        editable: true,
+                        props: DesignProps {
+                            default_value: "M".into(),
+                            ..DesignProps::default()
+                        },
+                    }],
+                }),
+            ),
+        ),
+    ]
+}
+
 fn responses() -> Vec<(&'static str, Response)> {
     let b = |id, body| Response { id, body };
     vec![
@@ -913,10 +1011,10 @@ fn main() {
     );
 
     // Decoders: one valid message of every kind.
-    for (name, request) in requests() {
+    for (name, request) in requests().into_iter().chain(author_requests()) {
         write(&dir, "protocol_request_decode", name, &request.encode());
     }
-    for (name, response) in responses() {
+    for (name, response) in responses().into_iter().chain(author_responses()) {
         write(&dir, "protocol_response_decode", name, &response.encode());
     }
 
@@ -1257,5 +1355,16 @@ fn main() {
     }
     // Git must not change the line endings of binary files.
     fs::write(dir.join(".gitattributes"), "* binary\n").expect("write .gitattributes");
+
+    // The writer of form fields: the first bytes pick the document, the rest is the script.
+    let mut state = 0x2545_f491u32;
+    for fixture in 0..8u8 {
+        let mut script = vec![fixture];
+        for _ in 0..160 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            script.push((state >> 24) as u8);
+        }
+        write(&dir, "form_author", &format!("script_{fixture}"), &script);
+    }
     println!("seeds written to {}", dir.display());
 }

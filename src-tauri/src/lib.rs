@@ -10,6 +10,7 @@
 //! starts again (a reload, whatever the cause), every engine is ended and the window starts clean.
 
 mod annotations;
+mod author;
 mod forms;
 mod links;
 mod locate;
@@ -955,6 +956,9 @@ pub fn run() {
             pages::pages_set_boxes,
             pages::pages_insert_blank,
             pages::pages_restore,
+            author::author_check,
+            author::author_list,
+            author::author_apply,
             pages::pages_insert_pdf,
             pages::pages_extract,
             pages::pages_cancel,

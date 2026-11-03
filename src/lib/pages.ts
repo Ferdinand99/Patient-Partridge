@@ -297,4 +297,6 @@ export const TOOL_NOTES = {
     "This step cannot be stopped any more. Wait until it is done.",
   working:
     "A change to the pages cannot be stopped half way, so there is no Stop button. Wait until it is done.",
+  workingForm:
+    "A change to the form cannot be stopped half way, so there is no Stop button. Wait until it is done.",
 } as const;

@@ -25,6 +25,7 @@ import {
 } from "./layout";
 import { FormLayer, type FormEdit, type FormsApi } from "./forms";
 import { AnnotationLayer, type AnnotLayerEvents } from "./annotlayer";
+import type { DesignLayer, DesignTool } from "./designlayer";
 import { PageOverlays, type CopyResult, type OverlayApi, type OverlayLimits, type PageLinkInfo } from "./overlays";
 import { RenderScheduler, type RenderJob } from "./scheduler";
 import type { SearchMatch } from "./search";
@@ -88,6 +89,16 @@ export interface ViewerOptions {
   };
 }
 
+/**
+ * What the form designer lets the view know: whether it holds changes it has not sent to the engine,
+ * and how to send them. They count as form input that is not sent yet, so that a save, a print, a
+ * page tool and a step back send them first, like the text typed in a field.
+ */
+export interface DesignHooks {
+  pending(): boolean;
+  flush(): Promise<void>;
+}
+
 export interface DocumentInfo {
   doc: number;
   pages: PageSizePt[];
@@ -125,6 +136,12 @@ export class DocumentView {
   private editsHeld = false;
   private forms: FormLayer | null;
   private annots: AnnotationLayer;
+  /** The layer of the form designer, while the designer is on. */
+  private design: DesignLayer | null = null;
+  /** Makes the layer of the designer for a list of pages; asked again when the pages change. */
+  private designMaker: ((pages: PageSizePt[]) => DesignLayer) | null = null;
+  /** What the designer has not sent yet, and how to send it (see `setDesign`). */
+  private designHooks: DesignHooks | null = null;
   /** How many times the picture of a page was asked to be drawn afresh (see `invalidatePage`). */
   private versions = new Map<number, number>();
   /** Those waiting for a page to be drawn (see `whenRedrawn`). */
@@ -230,6 +247,45 @@ export class DocumentView {
     if (this.destroyed) return;
     this.forms?.hold(held);
     this.annots.setHeld(held);
+    this.design?.setHeld(held);
+  }
+
+  /**
+   * Turns the form designer on or off. `make` builds its layer for a list of pages, and is called
+   * again when the pages change (the new layer takes over the pick and the tool of the old one). While
+   * the designer is on the fields of the form are not filled in: their controls are out of the way.
+   */
+  setDesign(make: ((pages: PageSizePt[]) => DesignLayer) | null, hooks: DesignHooks | null = null): void {
+    if (this.destroyed) return;
+    this.design?.destroy();
+    this.designMaker = make;
+    this.designHooks = make ? hooks : null;
+    this.design = make ? make(this.info.pages) : null;
+    this.element.classList.toggle("viewer-designing", make !== null);
+    this.overlays.setSuspended(this.suspendsText());
+    if (this.design) {
+      this.design.setHeld(this.editsHeld);
+      for (const [index, m] of this.mounted) this.design.mount(index, m.el);
+    }
+  }
+
+  /** The layer of the designer, while it is on. */
+  get designLayer(): DesignLayer | null {
+    return this.design;
+  }
+
+  /**
+   * The tool of the designer. A tool that places a field takes the pointer, so the selection of
+   * text, which also takes it, steps aside while it is picked.
+   */
+  setDesignTool(tool: DesignTool): void {
+    this.design?.setTool(tool);
+    this.overlays.setSuspended(this.suspendsText());
+  }
+
+  /** True while a tool of the annotation bar or of the designer has the pointer. */
+  private suspendsText(): boolean {
+    return this.pointerTool || (this.design !== null && this.design.currentTool !== "select");
   }
 
   /** The layer of the annotations for the pages now in the view. */
@@ -281,7 +337,6 @@ export class DocumentView {
     for (const done of waiting) done();
     this.info = { doc: this.info.doc, pages };
     this.overlays = this.makeOverlays();
-    this.overlays.setSuspended(this.pointerTool);
     this.forms = this.makeForms();
     this.forms?.start();
     replacedForms?.retire(this.forms);
@@ -289,6 +344,12 @@ export class DocumentView {
     this.annots.inherit(replaced);
     this.forms?.hold(this.editsHeld);
     this.annots.setHeld(this.editsHeld);
+    const replacedDesign = this.design;
+    replacedDesign?.destroy();
+    this.design = this.designMaker ? this.designMaker(pages) : null;
+    if (replacedDesign && this.design) this.design.inherit(replacedDesign);
+    this.design?.setHeld(this.editsHeld);
+    this.overlays.setSuspended(this.suspendsText());
     this.lastPage = -1;
     const page = pages.length === 0 ? 0 : Math.min(Math.max(0, show ?? had), pages.length - 1);
     this.hiddenAnchor = { page, fraction: 0 };
@@ -399,6 +460,7 @@ export class DocumentView {
     cancelAnimationFrame(this.frame);
     this.resizeObserver?.disconnect();
     window.removeEventListener("resize", this.onWindowResize);
+    this.design?.destroy();
     this.forms?.destroy();
     for (const index of [...this.mounted.keys()]) this.unmount(index);
     this.overlays.destroy();
@@ -495,7 +557,7 @@ export class DocumentView {
   setAnnotationTool(tool: Tool): void {
     this.annots.setTool(tool);
     this.pointerTool = tool === "pen" || tool === "note" || tool === "stamp";
-    this.overlays.setSuspended(this.pointerTool);
+    this.overlays.setSuspended(this.suspendsText());
   }
 
   /** The selected stretches of text, page by page: characters `start..end` of the page text. */
@@ -772,6 +834,7 @@ export class DocumentView {
     this.overlays.mount(index, el);
     this.forms?.mount(index, el);
     this.annots.mount(index, el);
+    this.design?.mount(index, el);
     return m;
   }
 
@@ -784,6 +847,7 @@ export class DocumentView {
     this.forms?.unmount(index);
     this.overlays.unmount(index);
     this.annots.unmount(index);
+    this.design?.unmount(index);
     m.el.remove();
     this.mounted.delete(index);
   }
@@ -792,13 +856,14 @@ export class DocumentView {
    * Sends what was typed in a field of the form that was not left, and waits until every change of
    * the form is made. Call it before anything that looks at the document.
    */
-  flushForms(): Promise<void> {
-    return this.forms?.flush() ?? Promise.resolve();
+  async flushForms(): Promise<void> {
+    await (this.forms?.flush() ?? Promise.resolve());
+    await this.designHooks?.flush();
   }
 
   /** True while a field of the form holds text that is not in the document yet. */
   get hasPendingFormInput(): boolean {
-    return this.forms?.hasPendingInput ?? false;
+    return (this.forms?.hasPendingInput ?? false) || (this.designHooks?.pending() ?? false);
   }
 
   /** The fields that hold text the document did not accept: where they are and what they are called. */
