@@ -105,9 +105,22 @@ pub fn serialise(document: &PdfDocument<'_>) -> Result<Vec<u8>, Failure> {
 
 /// As [`serialise_up_to`], and the bytes are looked at before they are handed over: a protected
 /// document whose file would hold an XMP metadata stream that PDFium writes without encryption is
-/// refused (see the module `metadata`). Every write whose bytes leave the engine is made with this,
+/// refused (see the module `metadata`), and a compressed XMP stream that PDFium wrote without its
+/// filter is mended (see [`mended`]). Every write whose bytes leave the engine is made with this,
 /// and nothing that stays in the engine needs to be.
 pub fn serialise_checked(
+    document: &PdfDocument<'_>,
+    limit: usize,
+    progress: &mut dyn FnMut(u32),
+) -> Result<Vec<u8>, Failure> {
+    let bytes = serialise_unmended(document, limit, progress)?;
+    mended(bytes, limit, progress)
+}
+
+/// As [`serialise_checked`] but a damaged XMP stream is left as PDFium wrote it. It is for the
+/// first of the two writings of a save, whose bytes are read in again and written a second time:
+/// the second writing damages the stream again, so only its bytes are mended.
+fn serialise_unmended(
     document: &PdfDocument<'_>,
     limit: usize,
     progress: &mut dyn FnMut(u32),
@@ -121,6 +134,24 @@ pub fn serialise_checked(
         ));
     }
     Ok(bytes)
+}
+
+/// Mends the bytes PDFium wrote: an XMP metadata stream that was Flate compressed in the document
+/// is written by PDFium as compressed bytes without `/Filter`, which no reader can read. The stream
+/// is written again with its filter in an update that is added to the end (see
+/// [`metadata::repair`]). A stream that would inflate to more than the limit makes the save fail,
+/// rather than hand over metadata that is damaged. Every write whose bytes leave the engine ends
+/// with this.
+pub fn mended(
+    bytes: Vec<u8>,
+    limit: usize,
+    progress: &mut dyn FnMut(u32),
+) -> Result<Vec<u8>, Failure> {
+    use metadata::repair::{mend, Refusal};
+    mend(bytes, limit.min(MAX_SAVE_BYTES), progress).map_err(|refusal| match refusal {
+        Refusal::FileTooBig => too_large(true),
+        Refusal::StreamTooBig => (ErrorCode::SaveFailed, refusal.message().to_string()),
+    })
 }
 
 /// Writes the document out as PDFium would write a copy of it, with a limit of `limit` bytes (a
@@ -179,15 +210,23 @@ pub fn serialise_up_to(
 /// second time; the second writing is the file. The cost is one more load and one more write of the
 /// same bytes, and the memory for a second copy of them.
 ///
-/// The bytes leave the engine, so both writings are made with [`serialise_checked`]. What stays in
-/// the engine is written with [`serialise_clean_in_engine`].
+/// The bytes leave the engine, so both writings are looked at (see [`serialise_checked`]) and the
+/// second, which is the file, is mended. What stays in the engine is written with
+/// [`serialise_clean_in_engine`].
 pub fn serialise_clean(
     pdfium: &Pdfium,
     document: &PdfDocument<'_>,
     password: Option<&str>,
     progress: &mut dyn FnMut(u32),
 ) -> Result<Vec<u8>, Failure> {
-    write_twice(pdfium, document, password, progress, serialise_checked)
+    write_twice(
+        pdfium,
+        document,
+        password,
+        progress,
+        serialise_unmended,
+        serialise_checked,
+    )
 }
 
 /// As [`serialise_clean`], for bytes that never leave the engine (the form designer writes the
@@ -201,7 +240,14 @@ pub fn serialise_clean_in_engine(
     password: Option<&str>,
     progress: &mut dyn FnMut(u32),
 ) -> Result<Vec<u8>, Failure> {
-    write_twice(pdfium, document, password, progress, serialise_up_to)
+    write_twice(
+        pdfium,
+        document,
+        password,
+        progress,
+        serialise_up_to,
+        serialise_up_to,
+    )
 }
 
 /// A function that writes a document out within a limit and reports its progress.
@@ -212,9 +258,10 @@ fn write_twice(
     document: &PdfDocument<'_>,
     password: Option<&str>,
     progress: &mut dyn FnMut(u32),
-    write: Writer,
+    write_first: Writer,
+    write_last: Writer,
 ) -> Result<Vec<u8>, Failure> {
-    let mut first = write(document, MAX_SAVE_BYTES, progress)?;
+    let mut first = write_first(document, MAX_SAVE_BYTES, progress)?;
     // The buffer grew by doubling; the reload needs the room.
     first.shrink_to_fit();
     let pages = document.pages().len();
@@ -232,7 +279,7 @@ fn write_twice(
             "the written document has another number of pages when it is read again".to_string(),
         ));
     }
-    write(&reread, MAX_SAVE_BYTES, progress)
+    write_last(&reread, MAX_SAVE_BYTES, progress)
 }
 
 /// The failure to give when the file the document is read from is not to be trusted.
