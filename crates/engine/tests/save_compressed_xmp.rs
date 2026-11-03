@@ -166,6 +166,13 @@ fn add_text(engine: &mut partridge_engine::Engine, doc: u32) {
         .expect("the document is open");
 }
 
+/// How many tables the file has (and so how many ends): 1 for a file as PDFium wrote it, 2 when an
+/// update was added to it.
+fn assert_sections(file: &[u8], sections: usize, what: &str) {
+    assert_eq!(count(file, b"startxref"), sections, "{what}: startxref");
+    assert_eq!(count(file, b"%%EOF"), sections, "{what}: %%EOF");
+}
+
 fn titles(catalog: bool, page: bool) -> Vec<&'static str> {
     let mut titles = Vec::new();
     if catalog {
@@ -215,6 +222,8 @@ fn a_compressed_xmp_stream_is_saved_so_that_other_programs_read_it() {
             assert_good(&dir, &saved, catalog, page, edit, &what);
             // The mended stream is the compressed one with its filter back.
             assert!(contains(&saved, b"/Filter/FlateDecode "), "{what}");
+            // One update, not one more for each save: the file has two tables and two ends.
+            assert_sections(&saved, 2, &what);
 
             // The same document saved again gives a good file as well.
             let again = save(e, doc);
@@ -226,6 +235,7 @@ fn a_compressed_xmp_stream_is_saved_so_that_other_programs_read_it() {
                 edit,
                 &format!("{what}, saved twice"),
             );
+            assert_sections(&again, 2, &format!("{what}, saved twice"));
 
             // The saved file, opened and saved once more, and once more after an edit.
             let reopened = open(e, &saved, None).unwrap();
@@ -238,6 +248,7 @@ fn a_compressed_xmp_stream_is_saved_so_that_other_programs_read_it() {
                 edit,
                 &format!("{what}, reopened"),
             );
+            assert_sections(&third, 2, &format!("{what}, reopened"));
             add_text(e, reopened);
             let fourth = save(e, reopened);
             assert_good(
@@ -248,6 +259,7 @@ fn a_compressed_xmp_stream_is_saved_so_that_other_programs_read_it() {
                 true,
                 &format!("{what}, reopened and edited"),
             );
+            assert_sections(&fourth, 2, &format!("{what}, reopened and edited"));
             ask(e, RequestBody::Close { doc: reopened });
             ask(e, RequestBody::Close { doc });
         }

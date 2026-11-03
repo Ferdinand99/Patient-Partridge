@@ -6,14 +6,15 @@
 //! untrusted bytes. It checks that:
 //! - the function never panics and does not take long, whatever the bytes (run it with a low
 //!   `-timeout`; a stream that swells is stopped at the limit for inflating);
-//! - what it gives back is the bytes it was given, or the same bytes with an update added to the
-//!   end, and the update is not longer than the stream data it carries plus a small amount for
-//!   each stream;
+//! - what it gives back is the bytes it was given, or the same bytes with one update added to the
+//!   end (`check_update`): a table of its own, a trailer with the keys of the old one and `/Prev`
+//!   that names the old table, objects that are objects of the input with the same data and
+//!   length and a `/Filter` added, and not more bytes than the budget allows;
 //! - it gives the same answer, and the same number of reports of progress, for the same bytes;
 //! - a second mend of its own result changes nothing.
 
 use libfuzzer_sys::fuzz_target;
-use partridge_engine::metadata::repair::mend;
+use partridge_engine::metadata::repair::{check_update, mend};
 
 /// A limit like the one of a save, so that the refusal for a file that grows too much is reached.
 const LIMIT: usize = 64 * 1024 * 1024;
@@ -26,11 +27,9 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(first, second, "the answer is not the same for the same bytes");
     assert_eq!(calls, again, "the progress is not the same for the same bytes");
     if let Ok(out) = first {
-        assert!(out.starts_with(data), "the bytes of the file were changed");
-        assert!(
-            out.len() <= data.len() * 4 + 1024,
-            "the update is longer than the streams in it can explain"
-        );
+        if let Err(why) = check_update(data, &out) {
+            panic!("the update is not well formed: {why}");
+        }
         let twice = mend(out.clone(), LIMIT, &mut |_| {}).expect("a mended file is mended");
         assert_eq!(twice, out, "a second mend changed the bytes");
     }

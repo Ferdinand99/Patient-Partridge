@@ -66,7 +66,7 @@ describe("describeError: saving", () => {
     expect(protectedFile.detail).toContain("Nothing was saved");
   });
 
-  it("explains a compressed block of document details that is too big, and any other failed write generally", () => {
+  it("explains a block of document details that is too big, and any other failed write generally", () => {
     const big = describeError(
       {
         code: "save_failed",
@@ -77,6 +77,8 @@ describe("describeError: saving", () => {
     expect(big.title).toContain("document details");
     expect(big.detail).toContain('"tax.pdf"');
     expect(big.detail).toContain("Nothing was saved");
+    expect(big.detail).toContain("compressed");
+    expect(big.detail).toContain("saving a copy does not help");
     expect(big.action).toBe("none");
     const other = describeError({ code: "save_failed", message: "the document could not be written" }, "tax.pdf");
     expect(other.title).toBe("The document could not be written");
