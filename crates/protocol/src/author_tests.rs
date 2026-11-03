@@ -285,3 +285,90 @@ fn the_decoder_refuses_what_is_over_a_cap_or_not_known() {
     bytes[at..].copy_from_slice(&(MAX_LISTED_WIDGETS as u32 + 1).to_le_bytes());
     assert!(Response::decode(bytes).is_err());
 }
+
+/// What the engine lists comes from a file, so every part of an answer can hold a value no one
+/// meant. Whatever the encoder writes, the decoder has to accept (the app takes an answer it cannot
+/// decode for a broken engine and ends it).
+#[test]
+fn an_answer_the_encoder_writes_is_one_the_decoder_accepts() {
+    let odd_boxes: [[f32; 4]; 6] = [
+        [0.0, 0.0, 1.0e9, 20.0],
+        [-1.0e9, -1.0e30, 5.0, 5.0],
+        [f32::NAN, 0.0, 1.0, 1.0],
+        [f32::INFINITY, f32::NEG_INFINITY, 1.0, 1.0],
+        [f32::MAX, f32::MIN, 0.0, 0.0],
+        [MAX_BOX_VALUE, -MAX_BOX_VALUE, 0.0, 0.0],
+    ];
+    let mut items = Vec::new();
+    for (i, rect) in odd_boxes.iter().enumerate() {
+        let mut w = designed(i as u32);
+        w.rect = *rect;
+        // A size of the text and strings that are longer than the caps.
+        w.props.font_size = [-3.0, f32::NAN, f32::INFINITY, -0.0, 1.0e30, 12.0][i];
+        w.props.tooltip = "t\u{e6}".repeat(MAX_FORM_TOOLTIP);
+        w.props.default_value = "d\u{f8}".repeat(MAX_FORM_VALUE);
+        w.props.choices = (0..MAX_FORM_OPTIONS + 40)
+            .map(|n| format!("{n}\u{e5}").repeat(MAX_FORM_OPTION_LABEL))
+            .collect();
+        w.export = "e\u{e5}".repeat(MAX_EXPORT_VALUE);
+        w.name = "n\u{e6}".repeat(MAX_FORM_NAME);
+        items.push(w);
+    }
+    let bytes = Response {
+        id: 7,
+        body: ResponseBody::Author(AuthorResponse::Widgets { items }),
+    }
+    .encode();
+    let back = Response::decode(bytes).expect("what was encoded decodes");
+    match back.body {
+        ResponseBody::Author(AuthorResponse::Widgets { items }) => {
+            assert_eq!(items.len(), odd_boxes.len());
+            for w in &items {
+                assert!(w
+                    .rect
+                    .iter()
+                    .all(|v| v.is_finite() && v.abs() <= MAX_BOX_VALUE));
+                assert!(w.props.font_size.is_finite() && w.props.font_size >= 0.0);
+                assert!(w.props.choices.len() <= MAX_FORM_OPTIONS);
+            }
+            // A box in range is not changed.
+            assert_eq!(items[5].rect, [MAX_BOX_VALUE, -MAX_BOX_VALUE, 0.0, 0.0]);
+            assert_eq!(items[0].rect, [0.0, 0.0, MAX_BOX_VALUE, 20.0]);
+        }
+        other => panic!("{other:?}"),
+    }
+    // The names a document has: more than the cap, and names longer than the cap.
+    let names: Vec<String> = (0..MAX_AUTHOR_NAMES + 10)
+        .map(|n| format!("{n}\u{e6}").repeat(MAX_FORM_NAME))
+        .collect();
+    let bytes = Response {
+        id: 8,
+        body: ResponseBody::Author(AuthorResponse::Ready { names }),
+    }
+    .encode();
+    match Response::decode(bytes)
+        .expect("what was encoded decodes")
+        .body
+    {
+        ResponseBody::Author(AuthorResponse::Ready { names }) => {
+            assert_eq!(names.len(), MAX_AUTHOR_NAMES);
+            assert!(names.iter().all(|n| n.len() <= MAX_FORM_NAME));
+        }
+        other => panic!("{other:?}"),
+    }
+    // A request that was made with a place nobody can use is cut too.
+    let request = Request {
+        id: 1,
+        body: RequestBody::Author(AuthorRequest::Apply {
+            doc: 1,
+            ops: vec![AuthorOp::Move {
+                name: "a".into(),
+                widget: 0,
+                page: 0,
+                rect: [f32::NAN, 1.0e12, -1.0e12, 3.0],
+            }],
+        }),
+    }
+    .encode();
+    assert!(Request::decode(&request).is_ok());
+}

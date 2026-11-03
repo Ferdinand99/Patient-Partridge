@@ -262,9 +262,18 @@ fn get_flag(r: &mut Reader<'_>) -> Result<bool, ProtocolError> {
     }
 }
 
+/// A box is written inside the range that the reader of it accepts, so that nothing that is
+/// encoded is refused when it is decoded: a place no one can use is cut to the edge of the range.
 fn put_box(out: &mut Vec<u8>, b: &[f32; 4]) {
     for v in b {
-        put_f32(out, if v.is_finite() { *v } else { 0.0 });
+        put_f32(
+            out,
+            if v.is_finite() {
+                v.clamp(-MAX_BOX_VALUE, MAX_BOX_VALUE)
+            } else {
+                0.0
+            },
+        );
     }
 }
 

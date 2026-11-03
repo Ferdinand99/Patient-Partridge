@@ -25,7 +25,7 @@ use arbitrary::Unstructured;
 use libfuzzer_sys::fuzz_target;
 use partridge_engine::author::{rules, Author, PageGeo};
 use partridge_fuzz::arb_ops;
-use partridge_protocol::AuthorOp;
+use partridge_protocol::{AuthorOp, AuthorResponse, Response, ResponseBody};
 use partridge_testkit as kit;
 
 fn fixtures() -> &'static [Vec<u8>] {
@@ -39,8 +39,33 @@ fn fixtures() -> &'static [Vec<u8>] {
             kit::forms_rotated_pdf(90),
             kit::forms_many_pdf(25),
             kit::turned_pdf(),
+            kit::direct_annots_pdf(),
         ]
     })
+}
+
+/// What the engine would answer to a request for the names and for the widgets of a page is encoded and
+/// decoded again: an answer that the app cannot decode is taken for a broken engine, and the engine
+/// is ended. Whatever a document holds, what the writer lists has to be an answer that decodes.
+fn look(author: &mut Author) {
+    if let Ok(names) = author.names() {
+        let bytes = Response {
+            id: 1,
+            body: ResponseBody::Author(AuthorResponse::Ready { names }),
+        }
+        .encode();
+        Response::decode(bytes).expect("the names of a form are an answer that decodes");
+    }
+    for page in 0..4 {
+        if let Ok(items) = author.list_page(page) {
+            let bytes = Response {
+                id: 1,
+                body: ResponseBody::Author(AuthorResponse::Widgets { items }),
+            }
+            .encode();
+            Response::decode(bytes).expect("the widgets of a page are an answer that decodes");
+        }
+    }
 }
 
 fn spoil(u: &mut Unstructured, bytes: &mut Vec<u8>) {
@@ -186,10 +211,7 @@ fuzz_target!(|data: &[u8]| {
     let Ok(mut author) = Author::new(bytes, geo) else {
         return;
     };
-    let _ = author.names();
-    for page in 0..4 {
-        let _ = author.list_page(page);
-    }
+    look(&mut author);
     let ops = arb_ops(&mut u, 12).unwrap_or_default();
     if author.apply(&ops).is_err() {
         // Nothing is kept of a batch that did not work.
@@ -204,10 +226,7 @@ fuzz_target!(|data: &[u8]| {
             );
         }
     }
-    let _ = author.names();
-    for page in 0..4 {
-        let _ = author.list_page(page);
-    }
+    look(&mut author);
     if let Ok(outcome) = author.finish() {
         check_update(&original, &outcome.bytes);
     }
