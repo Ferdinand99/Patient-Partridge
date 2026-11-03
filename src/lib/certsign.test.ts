@@ -106,6 +106,7 @@ describe("the answers to what can go wrong", () => {
     "sign_unsaved",
     "sign_same_file",
     "sign_encrypted",
+    "save_metadata_not_encrypted",
     "sign_xfa",
     "sign_already_signed",
     "sign_structure",

@@ -193,6 +193,12 @@ export function describeError(error: AppErrorLike, fileName?: string): Described
         detail: `The PDF engine could not write ${file} out. Nothing was saved, and the file on the disk was not changed. Your changes are still in the open document.`,
         action: "none",
       };
+    case "save_metadata_not_encrypted":
+      return {
+        title: "This protected file cannot be saved yet",
+        detail: `${file} is protected, and it holds a block of document details (XMP metadata) that Patient Partridge cannot yet save in protected form. It will not save it without protection, and saving a copy does not help either. Nothing was saved, and the file on the disk was not changed. Your changes are still in the open document.`,
+        action: "none",
+      };
     case "save_too_large":
       if (/not enough memory/i.test(error.message)) {
         return {

@@ -31,6 +31,14 @@ updates:
     groups:
       npm-minor-patch:
         update-types: [minor, patch]
+    ignore:
+      # `typescript` is the copy that typescript-eslint uses (its peer range stops below 6.1), so
+      # it stays on 6.0.x. TypeScript 7 has no JavaScript compiler API; it is installed under the
+      # name `typescript-native` and runs the type check only. Dependabot does not read npm
+      # aliases, so that version is raised by hand. Remove this ignore (and the alias, see
+      # package.json) once typescript-eslint supports TypeScript 7.1.
+      - dependency-name: typescript
+        versions: [">=6.1.0"]
     commit-message:
       prefix: "chore(deps)"
   - package-ecosystem: github-actions

@@ -46,18 +46,15 @@ use crate::annots::DocAnnots;
 use crate::{fail, pagetree, sane_size, save, Engine, Failure};
 
 /// A password kept in memory while its document is open (the engine has to load copies of the
-/// document with it). It is overwritten with zeros when it is let go of.
+/// document with it). It is overwritten with zeros when it is let go of, and so is the copy in the
+/// request once the document is open (the engine's `wipe`). This is best effort: the buffer the frame
+/// was read into, the C string that `pdfium-render` makes for each load and the copy in PDFium's
+/// parser are not in the engine's hands.
 pub struct Secret(pub(crate) String);
 
 impl Drop for Secret {
     fn drop(&mut self) {
-        // SAFETY: the bytes are overwritten in place and the string is dropped right after, so no
-        // one reads it as text again. The writes are volatile so that they are not removed.
-        unsafe {
-            for byte in self.0.as_bytes_mut() {
-                std::ptr::write_volatile(byte, 0);
-            }
-        }
+        crate::wipe(&mut self.0);
     }
 }
 

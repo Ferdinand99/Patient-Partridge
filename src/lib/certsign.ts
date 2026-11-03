@@ -267,6 +267,7 @@ export function describeSignError(error: AppErrorLike, fileName = "this file"): 
         detail: "The signed copy cannot replace the file that is open. Give the copy a name of its own.",
       };
     case "sign_encrypted":
+    case "save_metadata_not_encrypted":
       return {
         title: "This document is protected with a password",
         detail: "A document that is protected with a password cannot be signed here.",

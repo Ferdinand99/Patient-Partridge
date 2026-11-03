@@ -680,3 +680,46 @@ fn the_check_sees_a_file_with_the_same_pages_but_other_content() {
     // Without the fingerprint the old check cannot tell them apart.
     verify_written(&config(), &b, None, info, None).unwrap();
 }
+
+#[test]
+fn a_protected_file_with_metadata_is_refused_by_the_whole_save_path_and_leaves_nothing_behind() {
+    let dir = Dir::new("xmp");
+    let original = kit::encrypted_xmp_pdf("secret", false);
+    let path = dir.write("a.pdf", &original);
+    let pool = pool();
+    let (handle, _) = pool.open(&text(&path), Some("secret")).unwrap();
+
+    // The code reaches the app as the engine names it, for a save in place and for Save As, and
+    // neither the file nor the folder changes (no temporary file stays).
+    let refusal = |result: Result<_, ClientError>| match result {
+        Err(ClientError::Engine { code, message }) => {
+            assert_eq!(code.name(), "save_metadata_not_encrypted");
+            assert!(message.contains("XMP"), "{message}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+    refusal(pool.save(handle, SaveOptions::default()).map(|_| ()));
+    refusal(
+        pool.save_as(handle, &dir.0.join("copy.pdf"), SaveOptions::default())
+            .map(|_| ()),
+    );
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert_eq!(dir.names(), vec!["a.pdf".to_string()]);
+    assert_eq!(pool.source_path(handle), Some(path.clone()));
+    // The document is still open.
+    assert!(pool.render(handle, 0, 100, 130).is_ok());
+}
+
+#[test]
+fn a_protected_file_that_keeps_its_metadata_clear_is_saved_by_the_whole_save_path() {
+    let dir = Dir::new("xmp-clear");
+    let path = dir.write("a.pdf", &kit::encrypted_xmp_pdf("secret", true));
+    let pool = pool();
+    let (handle, _) = pool.open(&text(&path), Some("secret")).unwrap();
+    pool.save(handle, SaveOptions::default()).unwrap();
+    let saved = fs::read(&path).unwrap();
+    assert!(saved
+        .windows(kit::XMP_CATALOG_TITLE.len())
+        .any(|w| w == kit::XMP_CATALOG_TITLE.as_bytes()));
+    assert_eq!(describe(&path, Some("secret")).security, 2);
+}
