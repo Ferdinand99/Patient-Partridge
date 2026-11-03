@@ -31,6 +31,12 @@ const-oid = "=0.9.6"
 spki = "=0.7.3"
 ring = { version = "=0.17.14", default-features = false, features = ["alloc"] }
 
+# Inflating a compressed XMP stream to see what is in it (see src/metadata/repair.rs). Pure Rust,
+# no network code, the same version as the test kit. The engine is built on its own for the app
+# (`cargo build -p partridge-engine`), which gives it the miniz_oxide backend named here; a build of
+# the whole workspace may also get flate2's zlib-rs, which reads the same data.
+flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"] }
+
 # The outlines of the letters of a typed signature picture (see src/sigmark.rs), read from the
 # bundled fonts only. `ttf-parser` is not used: it is unmaintained (RUSTSEC-2026-0192).
 skrifa = { version = "=0.40.0", default-features = false, features = ["std"] }

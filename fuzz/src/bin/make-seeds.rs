@@ -1370,6 +1370,109 @@ fn main() {
         write(&dir, "metadata_check", &format!("{name}.pdf"), bytes);
     }
 
+    // The mend of a compressed XMP stream that PDFium wrote without its filter: the same shapes
+    // with data that is not text.
+    let shaped_data = |streams: &[Vec<u8>], trailer: &str| -> Vec<u8> {
+        let mut objects: Vec<Vec<u8>> = vec![
+            b"<</Metadata 3 0 R /Pages 2 0 R /Type/Catalog>>".to_vec(),
+            b"<</Type/Pages>>".to_vec(),
+        ];
+        objects.extend_from_slice(streams);
+        let mut out = b"%PDF-1.7\r\n%\xA1\xB3\xC5\xD7\r\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, body) in objects.iter().enumerate() {
+            out.extend_from_slice(b"\r\n");
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\r\n", i + 1).as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"\r\nendobj\r\n");
+        }
+        let xref = out.len();
+        out.extend_from_slice(
+            format!(
+                "xref\r\n0 {}\r\n0000000000 65535 f\r\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        for offset in offsets {
+            out.extend_from_slice(format!("{offset:010} 00000 n\r\n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!("trailer\r\n<<{trailer}>>\r\nstartxref\r\n{xref}\r\n%%EOF\r\n").as_bytes(),
+        );
+        out
+    };
+    let stream_of = |data: &[u8]| -> Vec<u8> {
+        let mut out = format!(
+            "<</Length {}/Subtype/XML/Type/Metadata>>stream\r\n",
+            data.len()
+        )
+        .into_bytes();
+        out.extend_from_slice(data);
+        out.extend_from_slice(b"\r\nendstream");
+        out
+    };
+    let packet = kit::xmp_packet(kit::XMP_CATALOG_TITLE);
+    let packed = kit::flate(packet.as_bytes());
+    let mut swells = String::from("<x><!--");
+    swells.push_str(&" ".repeat(5 * 1024 * 1024));
+    swells.push_str("--></x>");
+    let plain_trailer = "/Root 1 0 R /Size 4";
+    let damaged = shaped_data(&[stream_of(&packed)], plain_trailer);
+    let mended = partridge_engine::metadata::repair::mend(damaged.clone(), usize::MAX, &mut |_| {})
+        .expect("the seed is mended");
+    let repair_seeds: Vec<(&str, Vec<u8>)> = vec![
+        ("damaged_xmp", damaged),
+        ("mended_xmp", mended),
+        (
+            "two_damaged",
+            shaped_data(
+                &[stream_of(&packed), stream_of(&packed)],
+                "/Root 1 0 R /Size 5",
+            ),
+        ),
+        (
+            "hex_xmp",
+            shaped_data(&[stream_of(&kit::ascii_hex(packet.as_bytes()))], plain_trailer),
+        ),
+        (
+            "base85_flate_xmp",
+            shaped_data(&[stream_of(&kit::ascii_85(&packed))], plain_trailer),
+        ),
+        (
+            "xml_xmp",
+            shaped_data(&[stream_of(packet.as_bytes())], plain_trailer),
+        ),
+        (
+            "not_flate",
+            shaped_data(&[stream_of(b"x\x9c not data")], plain_trailer),
+        ),
+        (
+            "flate_not_xml",
+            shaped_data(&[stream_of(&kit::flate(b"plain words"))], plain_trailer),
+        ),
+        (
+            "swells",
+            shaped_data(&[stream_of(&kit::flate(swells.as_bytes()))], plain_trailer),
+        ),
+        (
+            "cut_short",
+            shaped_data(&[stream_of(&packed[..packed.len() - 4])], plain_trailer),
+        ),
+        (
+            "protected",
+            shaped_data(&[stream_of(&packed)], "/Root 1 0 R /Encrypt 2 0 R /Size 4"),
+        ),
+        (
+            "earlier_part",
+            shaped_data(&[stream_of(&packed)], "/Root 1 0 R /Prev 9 /Size 4"),
+        ),
+    ];
+    for (name, bytes) in &repair_seeds {
+        write(&dir, "metadata_repair", &format!("{name}.pdf"), bytes);
+    }
+
     // Engine: PDF files from the test kit. Small ones, so the fuzzer can change them quickly.
     let target = "engine_open_render";
     // Documents whose destinations are page numbers that do not exist: a link and outline
@@ -1447,6 +1550,8 @@ fn main() {
         // and clear as `/EncryptMetadata false` says (a save keeps it).
         ("encrypted_xmp", kit::encrypted_xmp_pdf("secret", false)),
         ("encrypted_xmp_clear", kit::encrypted_xmp_pdf("secret", true)),
+        // A compressed XMP stream on the catalog and on the page: the save mends it (see the mend).
+        ("compressed_xmp", kit::xmp_pdf_with(true, true, true)),
         ("truncated", kit::truncated_pdf()),
         // Forms: every kind of field, a turned page, XFA, scripts and actions, a signature, fields
         // that sit under a parent, and a page with many fields.

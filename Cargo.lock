@@ -3032,6 +3032,7 @@ dependencies = [
  "cms 0.2.3",
  "const-oid 0.9.6",
  "der 0.7.10",
+ "flate2",
  "libc",
  "partridge-engine-client",
  "partridge-protocol",
