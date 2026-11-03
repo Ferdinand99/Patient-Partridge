@@ -13,24 +13,15 @@ use super::build::{
 use super::model::{font_size_of, Node, View};
 use super::rules::{self, refused};
 use super::syntax::{
-    array_items, encode_name, encode_text, get, num, num_box, parse_name, parse_ref, remove, set,
+    array_bytes, array_items, encode_name, encode_text, get, num, num_box, parse_name, parse_ref,
+    remove, set,
 };
-use super::{odd, Author, AuthorError, Place};
+use super::{odd, Author, AuthorError, Place, Role};
 
 fn taken(name: &str) -> AuthorError {
     refused(format!(
         "There is already a field called \u{201c}{name}\u{201d}. Every field needs a name of its own."
     ))
-}
-
-fn array_text(items: &[Vec<u8>]) -> String {
-    let mut s = String::from("[");
-    for item in items {
-        s.push_str(&String::from_utf8_lossy(item));
-        s.push(' ');
-    }
-    s.push(']');
-    s
 }
 
 fn ref_number(item: &[u8]) -> Option<u32> {
@@ -89,6 +80,13 @@ impl Author {
         obj: u32,
         f: impl FnOnce(Vec<u8>) -> Option<Vec<u8>>,
     ) -> Result<(), AuthorError> {
+        // A field or a widget that is also a page, the catalog or a list the writer keeps a copy
+        // of would be written over when the copy is written back.
+        if self.is_structure(obj) {
+            return Err(odd(
+                "a field that is also a part of the document's structure",
+            ));
+        }
         let d = self.revisable(obj)?;
         let nd = f(d).ok_or_else(|| odd("a damaged field"))?;
         self.put(obj, nd);
@@ -242,7 +240,10 @@ impl Author {
             )));
         }
         if view.widgets.len() >= partridge_protocol::MAX_AUTHOR_WIDGETS {
-            return Err(refused("A group can have at most 64 buttons."));
+            return Err(refused(format!(
+                "A group can have at most {} buttons.",
+                partridge_protocol::MAX_AUTHOR_WIDGETS
+            )));
         }
         let placed = vec![self.place(w)?];
         self.check_room(&placed)?;
@@ -254,7 +255,7 @@ impl Author {
             let mut items: Vec<Vec<u8>> =
                 array_items(kids)?.into_iter().map(<[u8]>::to_vec).collect();
             items.push(format!("{kid} 0 R").into_bytes());
-            set(&d, "Kids", array_text(&items).as_bytes())
+            set(&d, "Kids", &array_bytes(&items))
         })?;
         self.push_widget(kid, placed[0].page)?;
         Ok(())
@@ -293,7 +294,7 @@ impl Author {
                 .filter(|i| ref_number(i) != Some(w))
                 .map(<[u8]>::to_vec)
                 .collect();
-            let mut d = set(&d, "Kids", array_text(&items).as_bytes())?;
+            let mut d = set(&d, "Kids", &array_bytes(&items))?;
             if was_on {
                 d = set(&d, "V", b"/Off")?;
                 d = remove(&d, "DV")?;
@@ -316,7 +317,7 @@ impl Author {
             .widgets
             .get(widget as usize)
             .ok_or_else(|| refused("That place is not there."))?;
-        let mut placed = self.place(&DesignWidget {
+        let placed = self.place(&DesignWidget {
             page: page as u32,
             rect,
             export: String::new(),
@@ -330,15 +331,17 @@ impl Author {
             self.check_room(std::slice::from_ref(&placed))?;
         }
         self.ensure_resources()?;
-        let state = self
+        // The picture is made for the state the button has, as the bytes that name it: they are not
+        // read as text, so a name another program wrote keeps its spelling.
+        let state: Vec<u8> = self
             .button_states(w)
-            .first()
-            .map(|s| String::from_utf8_lossy(s).into_owned());
-        placed.export = state.clone().unwrap_or_else(|| "Yes".to_string());
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| b"Yes".to_vec());
         let page_ref = self.file.reference(placed.page_obj);
         let ap = match view.kind {
             DesignKind::Checkbox | DesignKind::Radio => {
-                Some(self.button_ap(view.kind, &placed, &placed.export)?)
+                Some(self.button_ap(view.kind, &placed, &state)?)
             }
             DesignKind::Signature => Some(self.signature_ap(&placed)?),
             _ => None,
@@ -389,8 +392,19 @@ impl Author {
                 return Err(taken(target));
             }
         }
-        rules::check_props(view.kind, props)?;
         let old = self.read_props(&view);
+        // A field made by another program may hold a size or a limit that the designer would not
+        // write. What the reader did not change is not asked about again, and is not rewritten.
+        let size_changed = props.font_size != old.font_size;
+        let length_changed = props.max_len != old.max_len;
+        let mut checked = props.clone();
+        if !size_changed {
+            checked.font_size = 0.0;
+        }
+        if !length_changed && checked.max_len > partridge_protocol::MAX_FIELD_LENGTH {
+            checked.max_len = 0;
+        }
+        rules::check_props(view.kind, &checked)?;
         let current_states: Vec<Vec<u8>> = view
             .widgets
             .iter()
@@ -412,7 +426,20 @@ impl Author {
             } else {
                 return Err(refused("Give every radio button of the group a value."));
             };
-            rules::check_exports(&list, &props.default_value)?;
+            // The button that is on keeps being on when it is renamed: its new word is the default.
+            let default = if props.default_value == old.default_value {
+                current_states
+                    .iter()
+                    .position(|s| {
+                        !old.default_value.is_empty()
+                            && s.as_slice() == old.default_value.as_bytes()
+                    })
+                    .and_then(|at| list.get(at).cloned())
+                    .unwrap_or_else(|| props.default_value.clone())
+            } else {
+                props.default_value.clone()
+            };
+            rules::check_exports(&list, &default)?;
             list
         } else {
             Vec::new()
@@ -425,7 +452,25 @@ impl Author {
         let tooltip = (!props.tooltip.is_empty()).then(|| encode_text(&props.tooltip));
         let renamed = target != name;
         let kind = view.kind;
-        let on = self.checkbox_on(&view);
+        // A check box: whether its word changed, the word, and whether it is on now and by default.
+        let export_changed = props.export_value != old.export_value;
+        let box_state: Vec<u8> = if props.export_value.is_empty() {
+            b"Yes".to_vec()
+        } else {
+            props.export_value.as_bytes().to_vec()
+        };
+        let was_on = view.widgets.first().is_some_and(|w| self.widget_is_on(*w));
+        let box_on = if changed_default {
+            props.default_value == "on"
+        } else {
+            was_on
+        };
+        let box_default_on = if changed_default {
+            props.default_value == "on"
+        } else {
+            old.default_value == "on"
+        };
+        let box_touched = kind == DesignKind::Checkbox && (changed_default || export_changed);
         // The field itself.
         self.edit(view.obj, |d| {
             let mut d = set(&d, "Ff", ff.to_string().as_bytes())?;
@@ -435,11 +480,13 @@ impl Author {
             d = set_or_remove(&d, "TU", tooltip.as_deref())?;
             match kind {
                 DesignKind::Text => {
-                    d = if props.max_len > 0 {
-                        set(&d, "MaxLen", props.max_len.to_string().as_bytes())?
-                    } else {
-                        remove(&d, "MaxLen")?
-                    };
+                    if length_changed {
+                        d = if props.max_len > 0 {
+                            set(&d, "MaxLen", props.max_len.to_string().as_bytes())?
+                        } else {
+                            remove(&d, "MaxLen")?
+                        };
+                    }
                     if changed_default {
                         d = if props.default_value.is_empty() {
                             remove(&remove(&d, "V")?, "DV")?
@@ -489,7 +536,29 @@ impl Author {
                         };
                     }
                 }
-                DesignKind::Checkbox | DesignKind::Signature => {}
+                DesignKind::Checkbox => {
+                    if box_touched {
+                        // The value of a field is on the field, not on its widgets: a check box
+                        // that shows in two places has one value. The word is the first widget's.
+                        let word = if export_changed {
+                            box_state.clone()
+                        } else {
+                            current_states
+                                .first()
+                                .filter(|s| !s.is_empty())
+                                .cloned()
+                                .unwrap_or_else(|| box_state.clone())
+                        };
+                        let on = format!("/{}", encode_name(&word));
+                        d = set(&d, "V", if box_on { on.as_bytes() } else { b"/Off" })?;
+                        d = if box_default_on {
+                            set(&d, "DV", on.as_bytes())?
+                        } else {
+                            remove(&d, "DV")?
+                        };
+                    }
+                }
+                DesignKind::Signature => {}
             }
             Some(d)
         })?;
@@ -523,51 +592,69 @@ impl Author {
             };
             match kind {
                 DesignKind::Text | DesignKind::Combo | DesignKind::List => {
-                    let existing_da = self
-                        .dict(w)
-                        .and_then(|d| get(d, "DA"))
-                        .and_then(super::syntax::decode_text);
-                    let da = existing_da
-                        .and_then(|s| with_font_size(&s, props.font_size))
-                        .map(|s| encode_text(&s))
-                        .unwrap_or_else(|| default_appearance(kind, props.font_size));
-                    self.edit(w, |d| remove(&set(&d, "DA", da.as_bytes())?, "AP"))?;
+                    let da = if size_changed {
+                        let existing_da = self
+                            .dict(w)
+                            .and_then(|d| get(d, "DA"))
+                            .and_then(super::syntax::decode_text);
+                        Some(
+                            existing_da
+                                .and_then(|s| with_font_size(&s, props.font_size))
+                                .map(|s| encode_text(&s))
+                                .unwrap_or_else(|| default_appearance(kind, props.font_size)),
+                        )
+                    } else {
+                        None
+                    };
+                    self.edit(w, |d| {
+                        let d = match &da {
+                            Some(da) => set(&d, "DA", da.as_bytes())?,
+                            None => d,
+                        };
+                        remove(&d, "AP")
+                    })?;
                 }
                 DesignKind::Checkbox => {
-                    let export = if props.export_value.is_empty() {
-                        "Yes".to_string()
-                    } else {
-                        props.export_value.clone()
-                    };
-                    placed.export = export.clone();
-                    let is_on = if changed_default {
-                        props.default_value == "on"
-                    } else {
-                        on
-                    };
-                    let ap = self.button_ap(kind, &placed, &export)?;
-                    let e = encode_name(export.as_bytes());
-                    self.edit(w, |d| {
-                        let d = set(&d, "AP", ap.strip_prefix("/AP ")?.as_bytes())?;
-                        let state = if is_on {
-                            format!("/{e}")
+                    if box_touched {
+                        // Each widget keeps its own word and picture unless the word changed.
+                        let own: Vec<u8> = if export_changed {
+                            box_state.clone()
                         } else {
-                            "/Off".to_string()
+                            current_states
+                                .get(i)
+                                .filter(|s| !s.is_empty())
+                                .cloned()
+                                .unwrap_or_else(|| box_state.clone())
                         };
-                        let d = set(&d, "AS", state.as_bytes())?;
-                        let d = set(&d, "V", state.as_bytes())?;
-                        if is_on {
-                            set(&d, "DV", state.as_bytes())
+                        let widget_on = if changed_default {
+                            box_on
                         } else {
-                            remove(&d, "DV")
-                        }
-                    })?;
+                            self.widget_is_on(w)
+                        };
+                        let ap = if export_changed {
+                            Some(self.button_ap(kind, &placed, &own)?)
+                        } else {
+                            None
+                        };
+                        self.edit(w, |d| {
+                            let d = match &ap {
+                                Some(ap) => set(&d, "AP", ap.strip_prefix("/AP ")?.as_bytes())?,
+                                None => d,
+                            };
+                            let state = if widget_on {
+                                format!("/{}", encode_name(&own))
+                            } else {
+                                "/Off".to_string()
+                            };
+                            set(&d, "AS", state.as_bytes())
+                        })?;
+                    }
                 }
                 DesignKind::Radio => {
                     let export = new_exports[i].clone();
                     placed.export = export.clone();
                     let value = self.radio_value_now(&view, &new_exports);
-                    let ap = self.button_ap(kind, &placed, &export)?;
+                    let ap = self.button_ap(kind, &placed, export.as_bytes())?;
                     let state = if value.as_deref() == Some(export.as_str()) {
                         format!("/{}", encode_name(export.as_bytes()))
                     } else {
@@ -587,16 +674,12 @@ impl Author {
         Ok(())
     }
 
-    /// Whether a check box is on now.
-    fn checkbox_on(&self, view: &View) -> bool {
-        view.kind == DesignKind::Checkbox
-            && view
-                .widgets
-                .first()
-                .and_then(|w| self.dict(*w))
-                .and_then(|d| get(d, "AS"))
-                .and_then(parse_name)
-                .is_some_and(|n| n != b"Off")
+    /// Whether the picture a widget shows is not the off picture.
+    fn widget_is_on(&self, widget: u32) -> bool {
+        self.dict(widget)
+            .and_then(|d| get(d, "AS"))
+            .and_then(parse_name)
+            .is_some_and(|n| n != b"Off")
     }
 
     /// The value a radio group has after its field was written: the word of the button that is on.
@@ -671,15 +754,15 @@ impl Author {
         for page in dirty {
             let (arr, place) = {
                 let pa = &self.pages[&page];
-                (array_text(&pa.items), pa.place)
+                (array_bytes(&pa.items), pa.place)
             };
             match place {
                 Place::Object(n) => self.put(n, arr),
                 Place::Direct | Place::Missing => {
                     let page_obj = self.page_objs[page];
+                    self.claim(page_obj, Role::Page(page))?;
                     let d = self.revisable(page_obj)?;
-                    let nd =
-                        set(&d, "Annots", arr.as_bytes()).ok_or_else(|| odd("a damaged page"))?;
+                    let nd = set(&d, "Annots", &arr).ok_or_else(|| odd("a damaged page"))?;
                     self.put(page_obj, nd);
                 }
             }
@@ -696,12 +779,11 @@ impl Author {
         }
         let mut dict = acro.dict;
         if let Some(list) = acro.fields {
-            let arr = array_text(&list.items);
+            let arr = array_bytes(&list.items);
             match list.place {
                 Place::Object(n) => self.put(n, arr),
                 Place::Direct | Place::Missing => {
-                    dict = set(&dict, "Fields", arr.as_bytes())
-                        .ok_or_else(|| odd("a damaged form"))?;
+                    dict = set(&dict, "Fields", &arr).ok_or_else(|| odd("a damaged form"))?;
                 }
             }
         }

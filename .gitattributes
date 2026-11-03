@@ -6,3 +6,4 @@ crates/engine/src/warm-up.pdf binary
 THIRD-PARTY-NOTICES text eol=lf
 legal/* text eol=lf
 notices-extra.json text eol=lf
+src/lib/formrules.cases.txt text eol=lf

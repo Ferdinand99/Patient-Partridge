@@ -23,6 +23,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use partridge_protocol::{AuthorOp, DesignedWidget, ErrorCode, MAX_PAGES};
 
+use crate::pagetree;
+
 pub mod appearance;
 pub mod file;
 pub mod geometry;
@@ -70,10 +72,26 @@ impl From<Unsupported> for AuthorError {
     }
 }
 
+/// The document is built in a way the designer does not work with. `why` is for the one who reads
+/// the code and the tests; the reader of the document is told it in plain words.
 pub(crate) fn odd(why: &str) -> AuthorError {
-    AuthorError::Unsupported(format!(
-        "the structure of this document is not one the form designer can write into ({why})"
-    ))
+    let _ = why;
+    AuthorError::Unsupported(
+        "this document is built in a way the form designer cannot work with yet".to_string(),
+    )
+}
+
+/// Which part of the document an object is, for the objects the writer keeps a copy of and writes
+/// back at the end. Two parts that are one object would write over each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Role {
+    Catalog,
+    Form,
+    Fields,
+    Resources,
+    Fonts,
+    Page(usize),
+    Annots(usize),
 }
 
 /// Where a part of the form lives in the file.
@@ -140,16 +158,59 @@ pub struct Author {
     pub(crate) zadb: Option<u32>,
     pub(crate) fonts_in_dr: bool,
     pub(crate) redraw: BTreeSet<usize>,
+    /// The parts of the document the writer keeps a copy of, by object number.
+    pub(crate) claims: HashMap<u32, Role>,
+    /// The page objects, for a look at whether an object is a page.
+    pub(crate) page_set: HashSet<u32>,
+    /// The lists of annotations that more than one page names, found once.
+    pub(crate) shared_annots: Option<HashSet<u32>>,
 }
-
-/// Most objects of the page tree the reader follows.
-const MAX_TREE_NODES: usize = 1_000_000;
 
 impl Author {
     /// Reads the bytes PDFium saved. `geo` holds the geometry of the pages the caller expects to
-    /// be named (a page that is named and not there is refused).
+    /// be named (a page that is named and not there is refused). The pages are the ones the file's
+    /// own count says it has.
     pub fn new(bytes: Vec<u8>, geo: HashMap<usize, PageGeo>) -> Result<Author, AuthorError> {
         let file = file::parse(bytes)?;
+        let count = Self::declared_count(&file)?;
+        Self::open(file, geo, count)
+    }
+
+    /// As [`Author::new`], with the number of pages that PDFium says the document has: the page
+    /// tree has to list exactly that many.
+    pub fn with_count(
+        bytes: Vec<u8>,
+        geo: HashMap<usize, PageGeo>,
+        count: usize,
+    ) -> Result<Author, AuthorError> {
+        let file = file::parse(bytes)?;
+        Self::open(file, geo, count)
+    }
+
+    /// The number of pages at the top of the page tree, as the file writes it.
+    fn declared_count(file: &Parsed) -> Result<usize, AuthorError> {
+        let root = get(&file.trailer, "Root")
+            .and_then(parse_ref)
+            .map(|r| r.0)
+            .ok_or_else(|| odd("no catalog"))?;
+        let catalog = file.obj(root).ok_or_else(|| odd("no catalog"))?;
+        let top = get(catalog, "Pages")
+            .and_then(parse_ref)
+            .map(|r| r.0)
+            .ok_or_else(|| odd("no pages"))?;
+        let tree = file.obj(top).ok_or_else(|| odd("no page tree"))?;
+        get(tree, "Count")
+            .and_then(syntax::parse_int)
+            .and_then(|c| usize::try_from(c).ok())
+            .filter(|c| *c <= MAX_PAGES)
+            .ok_or_else(|| odd("no usable count of pages"))
+    }
+
+    fn open(
+        file: Parsed,
+        geo: HashMap<usize, PageGeo>,
+        count: usize,
+    ) -> Result<Author, AuthorError> {
         let root = get(&file.trailer, "Root")
             .and_then(parse_ref)
             .map(|r| r.0)
@@ -158,11 +219,21 @@ impl Author {
         if get(catalog, "Pages").is_none() {
             return Err(odd("no pages"));
         }
+        // The pages are found the way the page tools find them, by the reader that checks the
+        // counts of the nodes: a node whose count is wrong makes PDFium number the pages other
+        // than the file's lists do, and a field would be put on the wrong page.
+        let tree = pagetree::read(&file.bytes, count, false).map_err(|e| odd(&e.reason()))?;
+        let page_set: HashSet<u32> = tree.pages.iter().copied().collect();
+        if page_set.len() != tree.pages.len() {
+            // One page object at two places of the order: a change to one page is a change to both.
+            return Err(odd("a page that the page tree lists twice"));
+        }
         let next = file.size;
         let mut author = Author {
             file,
             geo,
-            page_objs: Vec::new(),
+            page_set,
+            page_objs: tree.pages,
             root,
             out: BTreeMap::new(),
             next,
@@ -175,46 +246,49 @@ impl Author {
             zadb: None,
             fonts_in_dr: false,
             redraw: BTreeSet::new(),
+            claims: HashMap::new(),
+            shared_annots: None,
         };
-        author.page_objs = author.leaf_pages()?;
         author.load_acro()?;
         Ok(author)
     }
 
-    /// The page objects in reading order.
-    fn leaf_pages(&self) -> Result<Vec<u32>, AuthorError> {
-        let catalog = self.file.obj(self.root).ok_or_else(|| odd("no catalog"))?;
-        let top = get(catalog, "Pages")
-            .and_then(parse_ref)
-            .map(|r| r.0)
-            .ok_or_else(|| odd("no page tree"))?;
-        let mut out = Vec::new();
-        let mut seen = HashSet::new();
-        // Depth first, in order: the stack holds the nodes still to visit, the next one on top.
-        let mut stack = vec![(top, 0usize)];
-        while let Some((node, depth)) = stack.pop() {
-            if depth > 64 || !seen.insert(node) || seen.len() > MAX_TREE_NODES {
-                return Err(odd("a page tree that loops or is too big"));
-            }
-            let dict = self.file.obj(node).ok_or_else(|| odd("a missing page"))?;
-            match get(dict, "Kids") {
-                Some(kids) => {
-                    let items = syntax::array_items(kids).ok_or_else(|| odd("damaged kids"))?;
-                    for item in items.iter().rev() {
-                        let kid =
-                            parse_ref(item).ok_or_else(|| odd("a page that is not an object"))?;
-                        stack.push((kid.0, depth + 1));
-                    }
-                }
-                None => {
-                    out.push(node);
-                    if out.len() > MAX_PAGES {
-                        return Err(odd("too many pages"));
-                    }
-                }
-            }
+    /// Notes that object `n` is the part `role` of the document. Refuses when it is another part
+    /// as well: the revisions of the two would write over each other.
+    pub(crate) fn claim(&mut self, n: u32, role: Role) -> Result<(), AuthorError> {
+        match self.claims.insert(n, role) {
+            Some(other) if other != role => Err(odd("two parts of the document are one object")),
+            _ => Ok(()),
         }
-        Ok(out)
+    }
+
+    /// True for an object the writer keeps a copy of, or that is a page or the catalog: a field or
+    /// a widget must not be one of them.
+    pub(crate) fn is_structure(&self, n: u32) -> bool {
+        n == self.root || self.page_set.contains(&n) || self.claims.contains_key(&n)
+    }
+
+    /// The lists of annotations (objects of their own) that more than one page names.
+    pub(crate) fn shared(&mut self) -> &HashSet<u32> {
+        if self.shared_annots.is_none() {
+            let mut seen = HashSet::new();
+            let mut shared = HashSet::new();
+            for page in &self.page_objs {
+                let list = self
+                    .file
+                    .obj(*page)
+                    .and_then(|d| get(d, "Annots"))
+                    .and_then(parse_ref)
+                    .map(|r| r.0);
+                if let Some(n) = list {
+                    if !seen.insert(n) {
+                        shared.insert(n);
+                    }
+                }
+            }
+            self.shared_annots = Some(shared);
+        }
+        self.shared_annots.get_or_insert_with(HashSet::new)
     }
 
     /// The bytes the author was given, when nothing was changed.
@@ -323,13 +397,23 @@ impl Author {
         let xref_pos = file.xref_pos;
         let generations: BTreeMap<u32, u16> =
             out.keys().map(|n| (*n, file.generation(*n))).collect();
-        let kept: Vec<(&str, String)> = ["Info", "ID"]
+        // The values the trailer keeps are copied as the bytes they are: the identifier of a file
+        // is binary, and none of it goes through text.
+        let kept: Vec<(&str, Vec<u8>)> = ["Info", "ID"]
             .into_iter()
-            .filter_map(|key| {
-                get(&file.trailer, key).map(|v| (key, String::from_utf8_lossy(v).into_owned()))
-            })
+            .filter_map(|key| get(&file.trailer, key).map(|v| (key, v.to_vec())))
             .collect();
+        // What is added is counted first, so that the document's own bytes are not copied into a
+        // bigger buffer, and the buffer is not left with room the document will never use.
+        let added: usize = out.values().map(|body| body.len() + 48).sum::<usize>()
+            + out.len() * (20 + 24)
+            + kept
+                .iter()
+                .map(|(k, v)| k.len() + v.len() + 4)
+                .sum::<usize>()
+            + 160;
         let mut bytes = file.bytes;
+        bytes.reserve_exact(added);
         if !bytes.ends_with(b"\n") {
             bytes.push(b'\n');
         }
@@ -362,12 +446,14 @@ impl Author {
             next.max(size),
             root_ref,
             xref_pos
-        );
+        )
+        .into_bytes();
         for (key, value) in kept {
-            trailer.push_str(&format!(" /{key} {value}"));
+            trailer.extend_from_slice(format!(" /{key} ").as_bytes());
+            trailer.extend_from_slice(&value);
         }
-        trailer.push_str(" >>\n");
-        bytes.extend_from_slice(trailer.as_bytes());
+        trailer.extend_from_slice(b" >>\n");
+        bytes.extend_from_slice(&trailer);
         bytes.extend_from_slice(format!("startxref\n{xref_at}\n%%EOF\n").as_bytes());
         Ok(Outcome {
             bytes,

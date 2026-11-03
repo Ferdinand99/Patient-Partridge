@@ -235,6 +235,19 @@ pub fn array_items(v: &[u8]) -> Option<Vec<&[u8]>> {
     }
 }
 
+/// An array made of items as they stand in the file. The items are bytes and stay bytes: a string
+/// in a dictionary that is written in place may hold any byte, and none of it may be read as text.
+pub fn array_bytes(items: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + items.iter().map(|i| i.len() + 1).sum::<usize>());
+    out.push(b'[');
+    for item in items {
+        out.extend_from_slice(item);
+        out.push(b' ');
+    }
+    out.push(b']');
+    out
+}
+
 /// `n g R` as `(n, g)`.
 pub fn parse_ref(v: &[u8]) -> Option<(u32, u16)> {
     let t = std::str::from_utf8(v).ok()?;
@@ -498,6 +511,37 @@ mod tests {
             "Navn_\u{e6}\u{f8}\u{e5}_\u{65e5}\u{672c}",
         ] {
             assert_eq!(decode_text(encode_text(s).as_bytes()).unwrap(), s);
+        }
+    }
+
+    #[test]
+    fn an_array_of_items_keeps_every_byte_of_them() {
+        // Items that no text holds: single bytes above 127, UTF-16 with its byte order mark,
+        // a zero byte, and a dictionary written in place with such strings in it.
+        let items: Vec<Vec<u8>> = vec![
+            b"12 0 R".to_vec(),
+            b"(Bl\xE5b\xE6r)".to_vec(),
+            b"(\xFE\xFF\x00\xC6\x03\xA9)".to_vec(),
+            b"<< /T (\x80\xFF\x00\xC3) /C [1 0 0] >>".to_vec(),
+            b"<FEFF00C6>".to_vec(),
+        ];
+        let written = array_bytes(&items);
+        let back: Vec<Vec<u8>> = array_items(&written)
+            .unwrap()
+            .into_iter()
+            .map(<[u8]>::to_vec)
+            .collect();
+        assert_eq!(back, items);
+        assert_eq!(array_bytes(&[]), b"[]");
+        // Arbitrary bytes, as long as they are strings, come back the same.
+        for byte in 0..=255u8 {
+            if matches!(byte, b'(' | b')' | b'\\') {
+                continue;
+            }
+            let item = vec![b'(', byte, byte, b')'];
+            let written = array_bytes(std::slice::from_ref(&item));
+            let back = array_items(&written).unwrap();
+            assert_eq!(back, vec![item.as_slice()], "byte {byte}");
         }
     }
 

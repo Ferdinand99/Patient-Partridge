@@ -26,9 +26,10 @@ impl Unsupported {
             Unsupported::Encrypted => {
                 "this document is encrypted, so fields cannot be added to it".to_string()
             }
-            Unsupported::Structure(why) => format!(
-                "the structure of this document is not one the form designer can write into ({why})"
-            ),
+            // `why` is for the code and the tests: the reader of the document gets plain words.
+            Unsupported::Structure(_) => {
+                "this document is built in a way the form designer cannot work with yet".to_string()
+            }
         }
     }
 }

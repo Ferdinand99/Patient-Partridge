@@ -1,0 +1,87 @@
+# Cases for the rules of the form designer, held by both sides: the window (src/lib/formdesign.ts,
+# tried in src/lib/formdesign.test.ts) and the engine (crates/engine/src/author/rules.rs, tried in the
+# tests of that file). A line is: kind, a tab, ok or no, a tab, the text. In the text, \uXXXX is a
+# character that is not typed and \n is a line break. A rule that one side changes and the other does
+# not makes one of the two tests fail.
+#
+# kinds: name, tooltip, export (the word of a button), drawn (text a field draws, one line),
+# multiline (the same where a line break is allowed), fontsize and maxlen (numbers).
+
+name	ok	first_name
+name	ok	Text 1
+name	ok	Navn \u00e6\u00f8\u00e5
+name	ok	\u65e5\u672c
+name	ok	a b
+name	ok	a\u200cb
+name	ok	a\u200db
+name	no
+name	no	a.b
+name	no	.
+name	no	 a
+name	no	a\u0000b
+name	no	a\u0007b
+name	no	a\u007fb
+name	no	a\u0085b
+name	no	a\u202eb
+name	no	a\u200eb
+name	no	a\u200fb
+name	no	a\u061cb
+name	no	a\u200bb
+name	no	a\ufeffb
+name	no	a\u2028b
+name	no	a\u2029b
+name	no	a\u2066b
+
+tooltip	ok
+tooltip	ok	Your full name
+tooltip	ok	Line one\nLine two
+tooltip	ok	\u00e6\u00f8\u00e5 \u65e5\u672c
+tooltip	ok	a\u200cb
+tooltip	no	a\u0007b
+tooltip	no	a\u202eb
+tooltip	no	a\u061cb
+tooltip	no	a\u200bb
+
+export	ok	Yes
+export	ok	Choice1
+export	ok	a b
+export	ok	M-2_x.y
+export	no
+export	no	Off
+export	no	Ja \u00f8
+export	no	\u65e5
+export	no	a\u0009b
+export	no	a\u0000b
+export	no	a\u200cb
+
+drawn	ok
+drawn	ok	plain text (with) signs
+drawn	ok	Bl\u00e5b\u00e6r
+drawn	ok	\u00c6\u00d8\u00c5 caf\u00e9
+drawn	ok
+drawn	no	\u20ac
+drawn	no	\u65e5\u672c
+drawn	no	\u0141\u00f3d\u017a
+drawn	no	a\nb
+drawn	no	\u201cq\u201d
+
+multiline	ok	a\nb
+multiline	ok	Bl\u00e5b\u00e6r
+multiline	no	\u20ac
+multiline	no	a\u0009b
+
+fontsize	ok	0
+fontsize	ok	1
+fontsize	ok	12
+fontsize	ok	11.5
+fontsize	ok	96
+fontsize	no	0.5
+fontsize	no	97
+fontsize	no	-1
+fontsize	no	1000
+
+maxlen	ok	0
+maxlen	ok	1
+maxlen	ok	32767
+maxlen	no	32768
+maxlen	no	100000

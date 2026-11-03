@@ -706,3 +706,590 @@ fn what_is_appended_is_a_well_formed_update_for_every_kind_of_change() {
         assert_well_formed(&bytes, &out.bytes, &previous.to_string());
     }
 }
+
+// ---- bytes stay bytes ---------------------------------------------------------------------------
+
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+fn has(hay: &[u8], needle: &[u8]) -> bool {
+    find(hay, needle).is_some()
+}
+
+/// The text of object `n` in the update appended after the first `from` bytes.
+fn revision(out: &[u8], from: usize, n: u32) -> Option<Vec<u8>> {
+    // The bytes before an update end in a line break, so the first object has one before it too.
+    let hay = &out[from - 1..];
+    let head = format!("\n{n} 0 obj\n");
+    let start = find(hay, head.as_bytes())? + head.len();
+    let end = find(&hay[start..], b"\nendobj\n")? + start;
+    Some(hay[start..end].to_vec())
+}
+
+fn revised(out: &[u8], from: usize, n: u32) -> bool {
+    revision(out, from, n).is_some()
+}
+
+#[test]
+fn what_an_annotation_holds_is_not_read_as_text_when_its_page_is_written_again() {
+    let bytes = kit::direct_annots_pdf();
+    // None of what the page holds is text: the writer may not change a byte of it.
+    for item in kit::DIRECT_ANNOTS {
+        assert!(std::str::from_utf8(item).is_err());
+    }
+    let new = |name: &str, x: f32| {
+        let mut f = field(name, DesignKind::Text);
+        f.widgets[0].rect = [x, 20.0, x + 100.0, 40.0];
+        f
+    };
+    let scenarios: Vec<(&str, Vec<AuthorOp>)> = vec![
+        ("add", vec![AuthorOp::Add(new("a", 10.0))]),
+        (
+            "add and move",
+            vec![
+                AuthorOp::Add(new("a", 10.0)),
+                AuthorOp::Move {
+                    name: "a".into(),
+                    widget: 0,
+                    page: 0,
+                    rect: [200.0, 200.0, 300.0, 220.0],
+                },
+            ],
+        ),
+        (
+            "add and remove",
+            vec![
+                AuthorOp::Add(new("a", 10.0)),
+                AuthorOp::Remove { name: "a".into() },
+            ],
+        ),
+        (
+            "add two and reorder",
+            vec![
+                AuthorOp::Add(new("a", 10.0)),
+                AuthorOp::Add(new("b", 130.0)),
+                AuthorOp::Reorder {
+                    page: 0,
+                    order: ["b", "a"]
+                        .map(|n| WidgetRef {
+                            name: n.into(),
+                            widget: 0,
+                        })
+                        .to_vec(),
+                },
+            ],
+        ),
+    ];
+    for (what, ops) in scenarios {
+        let mut a = Author::new(bytes.clone(), geo(0)).unwrap();
+        a.apply(&ops).unwrap();
+        let out = a.finish().unwrap();
+        let page = revision(&out.bytes, bytes.len(), 4)
+            .unwrap_or_else(|| panic!("{what}: the page was not written again"));
+        for item in kit::DIRECT_ANNOTS {
+            assert!(
+                has(&page, item),
+                "{what}: an annotation of the page was changed in the new revision"
+            );
+        }
+        // Nothing was replaced by the character that stands for a byte that is not text.
+        assert!(!has(&out.bytes[bytes.len()..], b"\xEF\xBF\xBD"), "{what}");
+        // The identifier of the file is the one it had, byte for byte.
+        let tail = &out.bytes[bytes.len()..];
+        let trailer = find(tail, b"trailer\n").expect("a trailer");
+        assert!(
+            has(&tail[trailer..], &kit::DIRECT_ID[1..]),
+            "{what}: the identifier of the file was changed"
+        );
+    }
+}
+
+// ---- documents made by hand ---------------------------------------------------------------------
+
+/// Objects 1.. (`objects[i]` is object `i + 1`) in a file with a plain table of their places.
+fn assemble(objects: &[Vec<u8>], trailer_extra: &str) -> Vec<u8> {
+    let mut out = b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, body) in objects.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let table = out.len();
+    out.extend_from_slice(
+        format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+    );
+    for off in offsets {
+        out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R {trailer_extra} >>\nstartxref\n{table}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+fn pdf(objects: &[&str]) -> Vec<u8> {
+    let bodies: Vec<Vec<u8>> = objects.iter().map(|s| s.as_bytes().to_vec()).collect();
+    assemble(&bodies, "")
+}
+
+const PAGE: &str = "/Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]";
+
+/// A one-page document with a form of one text field, whose widget has the box `rect`.
+fn one_widget_pdf(rect: &str) -> Vec<u8> {
+    pdf(&[
+        "<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        &format!("<< {PAGE} /Annots [4 0 R] >>"),
+        &format!(
+            "<< /Type /Annot /Subtype /Widget /FT /Tx /T (wide) /Rect {rect} /P 3 0 R /F 4 >>"
+        ),
+        "<< /Fields [4 0 R] /DA (/Helv 0 Tf 0 g) >>",
+    ])
+}
+
+#[test]
+fn a_box_the_answer_cannot_carry_is_not_listed() {
+    let mut a = Author::new(one_widget_pdf("[0 0 1000000000 20]"), geo(0)).unwrap();
+    assert!(listed(&mut a, 0).is_empty(), "a box of a billion points");
+    let mut a = Author::new(one_widget_pdf("[-30000000 0 10000000 20]"), geo(0)).unwrap();
+    assert!(listed(&mut a, 0).is_empty());
+    // A box on the page is listed, and so are the widgets of a document with several.
+    let mut a = Author::new(one_widget_pdf("[0 0 612 20]"), geo(0)).unwrap();
+    assert_eq!(listed(&mut a, 0).len(), 1);
+    let mut a = Author::new(kit::forms_pdf(), geo(0)).unwrap();
+    assert!(listed(&mut a, 0).len() >= 3);
+}
+
+// ---- the pages the writer finds are the pages PDFium finds ----------------------------------------
+
+#[test]
+fn a_page_tree_with_a_wrong_count_is_refused() {
+    // A node that says it has 3 pages and lists one: PDFium goes by the counts, and its page 1 is
+    // not the first page the lists name.
+    let wrong = pdf(&[
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [5 0 R 4 0 R] /Count 2 >>",
+        "<< /Type /Page /Parent 5 0 R /MediaBox [0 0 612 792] >>",
+        &format!("<< {PAGE} >>"),
+        "<< /Type /Pages /Parent 2 0 R /Kids [3 0 R] /Count 3 >>",
+    ]);
+    match Author::new(wrong.clone(), geo(0)) {
+        Err(AuthorError::Unsupported(m)) => {
+            assert!(!m.contains("kids") && !m.contains("Count"), "{m}");
+        }
+        other => panic!("{:?}", other.err()),
+    }
+    assert!(Author::with_count(wrong, geo(0), 2).is_err());
+    // The same tree with the right count is read, in the order the lists give.
+    let right = pdf(&[
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [5 0 R 4 0 R] /Count 2 >>",
+        "<< /Type /Page /Parent 5 0 R /MediaBox [0 0 612 792] >>",
+        &format!("<< {PAGE} >>"),
+        "<< /Type /Pages /Parent 2 0 R /Kids [3 0 R] /Count 1 >>",
+    ]);
+    let a = Author::new(right.clone(), geo(0)).unwrap();
+    assert_eq!(a.page_objs, vec![3, 4]);
+    // PDFium says another number of pages: the tree is not the one it numbers.
+    assert!(Author::with_count(right, geo(0), 3).is_err());
+}
+
+#[test]
+fn a_page_that_the_tree_lists_twice_is_refused() {
+    let twice = pdf(&[
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R 3 0 R] /Count 2 >>",
+        &format!("<< {PAGE} >>"),
+    ]);
+    assert!(Author::new(twice, geo(0)).is_err());
+}
+
+// ---- objects that are one and the same ----------------------------------------------------------
+
+fn two_pages(annots_one: &str, annots_two: &str, catalog_extra: &str, more: &[&str]) -> Vec<u8> {
+    let mut objects = vec![
+        format!("<< /Type /Catalog /Pages 2 0 R {catalog_extra} >>"),
+        "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_string(),
+        format!("<< {PAGE} {annots_one} >>"),
+        format!("<< {PAGE} {annots_two} >>"),
+    ];
+    objects.extend(more.iter().map(|s| (*s).to_string()));
+    let refs: Vec<&str> = objects.iter().map(String::as_str).collect();
+    pdf(&refs)
+}
+
+fn one_field(a: &mut Author, name: &str, page: u32) -> Result<(), AuthorError> {
+    let mut f = field(name, DesignKind::Text);
+    f.widgets[0].page = page;
+    a.apply(&[AuthorOp::Add(f)])
+}
+
+#[test]
+fn two_pages_that_share_a_list_of_annotations_are_not_written() {
+    let bytes = two_pages("/Annots 5 0 R", "/Annots 5 0 R", "", &["[ ]"]);
+    let mut a = Author::new(bytes.clone(), geo(0)).unwrap();
+    // Reading is fine.
+    assert!(listed(&mut a, 0).is_empty());
+    // A field on either page would be on both.
+    assert!(matches!(
+        one_field(&mut a, "x", 0),
+        Err(AuthorError::Unsupported(_))
+    ));
+    let mut b = Author::new(bytes, geo(0)).unwrap();
+    assert!(matches!(
+        one_field(&mut b, "x", 1),
+        Err(AuthorError::Unsupported(_))
+    ));
+    // A list that only one page names is not shared.
+    let mut c = Author::new(two_pages("/Annots 5 0 R", "", "", &["[ ]"]), geo(0)).unwrap();
+    one_field(&mut c, "x", 0).unwrap();
+    one_field(&mut c, "y", 1).unwrap();
+    assert!(c.finish().is_ok());
+}
+
+#[test]
+fn a_part_of_the_form_that_is_also_something_else_is_not_written() {
+    // The list of fields is a page list of annotations.
+    let bytes = two_pages(
+        "/Annots 6 0 R",
+        "",
+        "/AcroForm 5 0 R",
+        &["<< /Fields 6 0 R >>", "[ ]"],
+    );
+    let mut a = Author::new(bytes, geo(0)).unwrap();
+    assert!(matches!(
+        one_field(&mut a, "x", 0),
+        Err(AuthorError::Unsupported(_))
+    ));
+    // The form is a page list of annotations.
+    let bytes = two_pages("/Annots 5 0 R", "", "/AcroForm 5 0 R", &["[ ]"]);
+    if let Ok(mut a) = Author::new(bytes, geo(0)) {
+        assert!(one_field(&mut a, "x", 0).is_err());
+    }
+    // The catalog is a page list of annotations.
+    let bytes = two_pages("/Annots 1 0 R", "", "", &[]);
+    if let Ok(mut a) = Author::new(bytes, geo(0)) {
+        assert!(one_field(&mut a, "x", 0).is_err());
+    }
+    // The form is the catalog.
+    let bytes = two_pages("", "", "/AcroForm 1 0 R", &[]);
+    assert!(Author::new(bytes, geo(0)).is_err());
+    // The list of fields is a page.
+    let bytes = two_pages("", "", "/AcroForm 5 0 R", &["<< /Fields 3 0 R >>"]);
+    if let Ok(mut a) = Author::new(bytes, geo(0)) {
+        assert!(one_field(&mut a, "x", 0).is_err());
+    }
+    // The resources of the form are the list of fields.
+    let bytes = two_pages(
+        "",
+        "",
+        "/AcroForm 5 0 R",
+        &["<< /Fields 6 0 R /DR 6 0 R >>", "[ ]"],
+    );
+    if let Ok(mut a) = Author::new(bytes, geo(0)) {
+        assert!(one_field(&mut a, "x", 0).is_err());
+    }
+    // A form that is its own is written.
+    let bytes = two_pages("", "", "/AcroForm 5 0 R", &["<< /Fields [ ] >>"]);
+    let mut a = Author::new(bytes, geo(0)).unwrap();
+    one_field(&mut a, "x", 0).unwrap();
+    a.finish().unwrap();
+}
+
+// ---- a check box that is in two places ----------------------------------------------------------
+
+/// A check box with two widgets, one on each page, that have a word of their own (`A` and `B`). The
+/// value of the field is on the field.
+fn checkbox_in_two_places() -> Vec<u8> {
+    let widget = |page: u32, word: &str, x: u32| {
+        format!(
+            "<< /Type /Annot /Subtype /Widget /Rect [{x} 10 {} 24] /P {page} 0 R /Parent 5 0 R /AS /Off /F 4 /AP << /N << /{word} 11 0 R /Off 12 0 R >> >> >>",
+            x + 14
+        )
+    };
+    two_pages(
+        "/Annots [6 0 R]",
+        "/Annots [7 0 R]",
+        "/AcroForm 8 0 R",
+        &[
+            "<< /FT /Btn /T (agree) /V /Off /Kids [6 0 R 7 0 R] >>",
+            &widget(3, "A", 10),
+            &widget(4, "B", 40),
+            "<< /Fields [5 0 R] /DA (/Helv 0 Tf 0 g) /DR << /Font << /Helv 9 0 R /ZaDb 10 0 R >> >> >>",
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            "<< /Type /Font /Subtype /Type1 /BaseFont /ZapfDingbats >>",
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 14 14] >>",
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 14 14] >>",
+        ],
+    )
+}
+
+fn update(a: &mut Author, name: &str, props: DesignProps) {
+    a.apply(&[AuthorOp::Update {
+        name: name.into(),
+        new_name: String::new(),
+        props,
+        exports: vec![],
+    }])
+    .unwrap();
+}
+
+#[test]
+fn the_value_of_a_check_box_in_two_places_is_on_the_field() {
+    let bytes = checkbox_in_two_places();
+    let mut a = Author::new(bytes.clone(), geo(0)).unwrap();
+    let shown = listed(&mut a, 0);
+    assert_eq!(shown.len(), 1);
+    assert!(shown[0].editable);
+    assert_eq!(shown[0].props.export_value, "A");
+    // Starting checked: the field is on, and so is each widget, with its own word.
+    let mut props = shown[0].props.clone();
+    props.default_value = "on".into();
+    update(&mut a, "agree", props.clone());
+    let out = a.finish().unwrap();
+    let field = revision(&out.bytes, bytes.len(), 5).expect("the field was written");
+    assert_eq!(get(&field, "V"), Some(&b"/A"[..]));
+    assert_eq!(get(&field, "DV"), Some(&b"/A"[..]));
+    let first = revision(&out.bytes, bytes.len(), 6).expect("a widget was written");
+    let second = revision(&out.bytes, bytes.len(), 7).expect("a widget was written");
+    assert_eq!(get(&first, "AS"), Some(&b"/A"[..]));
+    assert_eq!(get(&second, "AS"), Some(&b"/B"[..]));
+    for widget in [&first, &second] {
+        assert_eq!(get(widget, "V"), None);
+        assert_eq!(get(widget, "DV"), None);
+    }
+    // The words and the pictures of the widgets are the ones they had.
+    assert!(has(&second, b"/B 11 0 R"));
+    assert!(!has(&out.bytes[bytes.len()..], b"/Subtype /Form"));
+
+    // A change that is not about the word or the start leaves the widgets alone.
+    let mut a = Author::new(bytes.clone(), geo(0)).unwrap();
+    let mut props = listed(&mut a, 0)[0].props.clone();
+    props.tooltip = "Tick it".into();
+    update(&mut a, "agree", props);
+    let out = a.finish().unwrap();
+    let field = revision(&out.bytes, bytes.len(), 5).unwrap();
+    assert!(has(&field, b"/TU (Tick it)"));
+    assert!(!revised(&out.bytes, bytes.len(), 6));
+    assert!(!revised(&out.bytes, bytes.len(), 7));
+
+    // A new word is on every widget, and on the field when it is on.
+    let mut a = Author::new(bytes.clone(), geo(0)).unwrap();
+    let mut props = listed(&mut a, 0)[0].props.clone();
+    props.default_value = "on".into();
+    update(&mut a, "agree", props.clone());
+    props.export_value = "Z".into();
+    update(&mut a, "agree", props);
+    let out = a.finish().unwrap();
+    let field = revision(&out.bytes, bytes.len(), 5).unwrap();
+    assert_eq!(get(&field, "V"), Some(&b"/Z"[..]));
+    for n in [6, 7] {
+        let widget = revision(&out.bytes, bytes.len(), n).unwrap();
+        assert_eq!(get(&widget, "AS"), Some(&b"/Z"[..]), "widget {n}");
+        assert!(has(&widget, b"/Z "), "widget {n}");
+    }
+
+    // Turning it off again: the field is off, and the widgets are.
+    let mut a = Author::new(bytes.clone(), geo(0)).unwrap();
+    let mut props = listed(&mut a, 0)[0].props.clone();
+    props.default_value = "on".into();
+    update(&mut a, "agree", props.clone());
+    props.default_value = String::new();
+    update(&mut a, "agree", props);
+    let out = a.finish().unwrap();
+    let field = revision(&out.bytes, bytes.len(), 5).unwrap();
+    assert_eq!(get(&field, "V"), Some(&b"/Off"[..]));
+    assert_eq!(get(&field, "DV"), None);
+}
+
+#[test]
+fn a_move_keeps_the_spelling_of_a_state_that_is_not_text() {
+    // The state of the button is the bytes `Ja` and 0xF8, as a name.
+    let bytes = pdf(&[
+        "<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        &format!("<< {PAGE} /Annots [4 0 R] >>"),
+        "<< /Type /Annot /Subtype /Widget /FT /Btn /T (c) /Rect [10 10 24 24] /P 3 0 R /AS /Off /F 4 /V /Off /AP << /N << /Ja#F8 6 0 R /Off 7 0 R >> >> >>",
+        "<< /Fields [4 0 R] /DA (/Helv 0 Tf 0 g) /DR << /Font << /Helv 8 0 R /ZaDb 8 0 R >> >> >>",
+        "<< /Type /XObject /Subtype /Form /BBox [0 0 14 14] >>",
+        "<< /Type /XObject /Subtype /Form /BBox [0 0 14 14] >>",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]);
+    let mut a = Author::new(bytes.clone(), geo(0)).unwrap();
+    a.apply(&[AuthorOp::Move {
+        name: "c".into(),
+        widget: 0,
+        page: 0,
+        rect: [100.0, 100.0, 120.0, 120.0],
+    }])
+    .unwrap();
+    let out = a.finish().unwrap();
+    let widget = revision(&out.bytes, bytes.len(), 4).unwrap();
+    assert!(
+        has(&widget, b"/Ja#F8 "),
+        "{}",
+        String::from_utf8_lossy(&widget)
+    );
+    assert!(!has(&widget, b"#EF#BF#BD"));
+}
+
+// ---- what is not ours stays as it is ------------------------------------------------------------
+
+/// A form that another program made: its resources and its list of fonts are objects of their own,
+/// its `Helv` is not the standard one, and it asks to have its pictures made again.
+fn foreign_form() -> Vec<u8> {
+    pdf(&[
+        "<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        &format!("<< {PAGE} >>"),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Symbol >>",
+        "<< /Fields [ ] /DA (/Helv 10 Tf 0 g) /DR 6 0 R /NeedAppearances true >>",
+        "<< /Font 7 0 R /Encoding << >> >>",
+        "<< /Helv 4 0 R >>",
+    ])
+}
+
+#[test]
+fn the_resources_of_a_form_that_is_not_ours_are_kept_as_they_are() {
+    let bytes = foreign_form();
+    let mut a = Author::new(bytes.clone(), geo(0)).unwrap();
+    one_field(&mut a, "x", 0).unwrap();
+    let mut sign = field("sign", DesignKind::Signature);
+    sign.widgets[0].rect = [10.0, 100.0, 210.0, 150.0];
+    a.apply(&[AuthorOp::Add(sign)]).unwrap();
+    let out = a.finish().unwrap();
+    let update = &out.bytes[bytes.len()..];
+    // The font the form has is not touched, and none is made in its place.
+    assert!(!revised(&out.bytes, bytes.len(), 4));
+    assert!(!has(update, b"/BaseFont /Helvetica"));
+    // The list of fonts gets the one it lacks and keeps the one it has.
+    let fonts = revision(&out.bytes, bytes.len(), 7).expect("the list of fonts");
+    assert!(has(&fonts, b"/Helv 4 0 R"));
+    assert!(has(&fonts, b"/ZaDb "));
+    // The resources are not written again, and the form keeps its own words.
+    assert!(!revised(&out.bytes, bytes.len(), 6));
+    let form = revision(&out.bytes, bytes.len(), 5).expect("the form");
+    assert_eq!(get(&form, "NeedAppearances"), Some(&b"true"[..]));
+    assert_eq!(get(&form, "DA"), Some(&b"(/Helv 10 Tf 0 g)"[..]));
+    // The picture of a place to sign uses the font of the form.
+    assert!(has(update, b"/Font << /Helv 4 0 R >>"));
+}
+
+#[test]
+fn a_form_with_both_fonts_is_not_given_new_ones() {
+    let bytes = pdf(&[
+        "<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        &format!("<< {PAGE} >>"),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        "<< /Fields [ ] /DA (/Helv 0 Tf 0 g) /DR << /Font << /Helv 4 0 R /ZaDb 4 0 R >> >> >>",
+    ]);
+    let mut a = Author::new(bytes.clone(), geo(0)).unwrap();
+    one_field(&mut a, "x", 0).unwrap();
+    let out = a.finish().unwrap();
+    let update = &out.bytes[bytes.len()..];
+    assert!(!has(update, b"/BaseFont"), "a font was made again");
+}
+
+#[test]
+fn a_size_and_a_limit_that_were_not_changed_are_kept() {
+    let bytes = pdf(&[
+        "<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        &format!("<< {PAGE} /Annots [4 0 R] >>"),
+        "<< /Type /Annot /Subtype /Widget /FT /Tx /T (big) /Rect [10 10 200 30] /P 3 0 R /F 4 /DA (/Helv 200 Tf 0 g) /MaxLen 40000 >>",
+        "<< /Fields [4 0 R] /DA (/Helv 0 Tf 0 g) /DR << /Font << /Helv 6 0 R /ZaDb 6 0 R >> >> >>",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]);
+    let mut a = Author::new(bytes.clone(), geo(0)).unwrap();
+    let shown = listed(&mut a, 0);
+    assert!(shown[0].editable);
+    assert_eq!(shown[0].props.font_size, 200.0);
+    assert_eq!(shown[0].props.max_len, 40000);
+    let mut props = shown[0].props.clone();
+    props.tooltip = "A tooltip".into();
+    update(&mut a, "big", props.clone());
+    let out = a.finish().unwrap();
+    let field = revision(&out.bytes, bytes.len(), 4).unwrap();
+    assert!(has(&field, b"/Helv 200 Tf"));
+    assert_eq!(get(&field, "MaxLen"), Some(&b"40000"[..]));
+    // A size the designer does not write is refused when it is asked for.
+    let mut a = Author::new(bytes.clone(), geo(0)).unwrap();
+    props.font_size = 300.0;
+    assert!(refusal(a.apply(&[AuthorOp::Update {
+        name: "big".into(),
+        new_name: String::new(),
+        props: props.clone(),
+        exports: vec![],
+    }]))
+    .contains("size"));
+    props.font_size = 12.0;
+    props.max_len = 100;
+    update(&mut a, "big", props);
+    let out = a.finish().unwrap();
+    let field = revision(&out.bytes, bytes.len(), 4).unwrap();
+    assert!(has(&field, b"/Helv 12 Tf"));
+    assert_eq!(get(&field, "MaxLen"), Some(&b"100"[..]));
+}
+
+#[test]
+fn a_radio_group_can_be_renamed_without_saying_which_button_is_on_again() {
+    let mut a = Author::new(kit::simple_pdf(1), geo(0)).unwrap();
+    let radio = DesignField {
+        name: "size".into(),
+        kind: DesignKind::Radio,
+        props: DesignProps {
+            default_value: "M".into(),
+            ..DesignProps::default()
+        },
+        widgets: ["S", "M"]
+            .iter()
+            .enumerate()
+            .map(|(i, e)| DesignWidget {
+                page: 0,
+                rect: [10.0 + 30.0 * i as f32, 10.0, 24.0 + 30.0 * i as f32, 24.0],
+                export: (*e).into(),
+            })
+            .collect(),
+    };
+    a.apply(&[AuthorOp::Add(radio)]).unwrap();
+    let props = listed(&mut a, 0)[0].props.clone();
+    assert_eq!(props.default_value, "M");
+    // The default is the word it had; the words are new. The button that was on stays on.
+    a.apply(&[AuthorOp::Update {
+        name: "size".into(),
+        new_name: String::new(),
+        props,
+        exports: vec!["Small".into(), "Medium".into()],
+    }])
+    .unwrap();
+    let items = listed(&mut a, 0);
+    assert_eq!(items[0].export, "Small");
+    assert_eq!(items[1].export, "Medium");
+    assert_eq!(items[0].props.default_value, "Medium");
+}
+
+// ---- the bytes that come out ----------------------------------------------------------------------
+
+#[test]
+fn the_buffer_that_comes_out_has_no_room_the_document_will_not_use() {
+    // A document of a few megabytes, with exactly the room for its own bytes.
+    let big = kit::padded_pdf(3 << 20).to_vec();
+    assert_eq!(big.capacity(), big.len());
+    let mut a = Author::new(big.clone(), geo(0)).unwrap();
+    add(&mut a, "t", DesignKind::Text);
+    let out = a.finish().unwrap();
+    assert!(out.bytes.len() > big.len());
+    let spare = out.bytes.capacity() - out.bytes.len();
+    assert!(spare < 16 * 1024, "{spare} bytes of room");
+}

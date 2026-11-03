@@ -82,13 +82,6 @@ fn failure(error: AuthorError) -> Failure {
     error.into_failure()
 }
 
-fn tree_differs() -> Failure {
-    (
-        ErrorCode::AuthorUnsupported,
-        "the pages of this document are not laid out the way the form designer needs".to_string(),
-    )
-}
-
 pub(crate) fn handle(
     engine: &mut Engine,
     pdfium: &'static Pdfium,
@@ -114,10 +107,8 @@ fn check(
         document.pages().len() as usize
     };
     let bytes = bytes_for(engine, doc, progress)?;
-    let mut author = Author::new(bytes, HashMap::new()).map_err(failure)?;
-    if author.page_count() != count {
-        return Err(tree_differs());
-    }
+    // The pages are the ones PDFium counts: a page tree that lists another number is refused.
+    let mut author = Author::with_count(bytes, HashMap::new(), count).map_err(failure)?;
     let mut names = author.names().map_err(failure)?;
     names.truncate(MAX_AUTHOR_NAMES);
     keep(engine, doc, author.into_bytes());
@@ -150,10 +141,8 @@ fn list(
         (count, geometry_of(document, page as usize)?)
     };
     let bytes = bytes_for(engine, doc, progress)?;
-    let mut author = Author::new(bytes, HashMap::from([(page as usize, geo)])).map_err(failure)?;
-    if author.page_count() != count {
-        return Err(tree_differs());
-    }
+    let mut author =
+        Author::with_count(bytes, HashMap::from([(page as usize, geo)]), count).map_err(failure)?;
     let mut items = author.list_page(page as usize).map_err(failure)?;
     keep(engine, doc, author.into_bytes());
     let mut used = 64;
@@ -226,10 +215,7 @@ fn apply(
     }
     let bytes = bytes_for(engine, doc, progress)?;
     let original_len = bytes.len();
-    let mut author = Author::new(bytes, geo).map_err(failure)?;
-    if author.page_count() != count {
-        return Err(tree_differs());
-    }
+    let mut author = Author::with_count(bytes, geo, count).map_err(failure)?;
     author.apply(&ops).map_err(failure)?;
     let outcome = author.finish().map_err(failure)?;
     if outcome.bytes.len() > MAX_SAVE_BYTES {

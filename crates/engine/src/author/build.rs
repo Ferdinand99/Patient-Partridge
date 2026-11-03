@@ -8,7 +8,7 @@ use super::model::{
     FF_RADIO, FF_READ_ONLY, FF_REQUIRED,
 };
 use super::syntax::{encode_name, encode_text, get, num, num_box, parse_ref, set};
-use super::{odd, Author, AuthorError, Place};
+use super::{odd, Author, AuthorError, Place, Role};
 
 /// A widget on its page: the page, the box in the page's own coordinates and the turn.
 #[derive(Debug, Clone)]
@@ -171,66 +171,94 @@ impl Author {
 
     /// Makes sure the form has the fonts the new fields name in their default appearance (Helvetica
     /// with WinAnsi, which has the Nordic letters, and ZapfDingbats for the marks of buttons), and
-    /// a default appearance of its own.
+    /// a default appearance of its own. A font the form already has under the name is the form's
+    /// own and is left as it is; a font object is only made for a name that is not there.
     pub(crate) fn ensure_resources(&mut self) -> Result<(), AuthorError> {
         if self.fonts_in_dr {
             return Ok(());
         }
-        let helv = self.helv_font()?;
-        let zadb = self.zadb_font()?;
-        let fonts = |h: bool, z: bool| {
-            let mut s = String::from("<< ");
-            if h {
-                s.push_str(&format!("/Helv {helv} 0 R "));
-            }
-            if z {
-                s.push_str(&format!("/ZaDb {zadb} 0 R "));
-            }
-            s.push_str(">>");
-            s
-        };
         let mut dict = self.acro_mut()?.dict.clone();
         if get(&dict, "DA").is_none() {
             dict = set(&dict, "DA", b"(/Helv 0 Tf 0 g)").ok_or_else(|| odd("a damaged form"))?;
         }
         match get(&dict, "DR").map(<[u8]>::to_vec) {
             None => {
-                let dr = format!("<< /Font {} >>", fonts(true, true));
+                let helv = self.helv_font()?;
+                let zadb = self.zadb_font()?;
+                let dr = format!("<< /Font << /Helv {helv} 0 R /ZaDb {zadb} 0 R >> >>");
                 dict = set(&dict, "DR", dr.as_bytes()).ok_or_else(|| odd("a damaged form"))?;
             }
             Some(dr) => {
                 let (dr_obj, dr_text) = match parse_ref(&dr) {
-                    Some((n, _)) => (Some(n), self.revisable(n)?),
+                    Some((n, _)) => {
+                        self.claim(n, Role::Resources)?;
+                        (Some(n), self.revisable(n)?)
+                    }
                     None => (None, dr),
                 };
-                let new_dr = match get(&dr_text, "Font").map(<[u8]>::to_vec) {
-                    None => set(&dr_text, "Font", fonts(true, true).as_bytes()),
+                // The new text of the resources, when they change.
+                let new_dr: Option<Vec<u8>> = match get(&dr_text, "Font").map(<[u8]>::to_vec) {
+                    None => {
+                        let helv = self.helv_font()?;
+                        let zadb = self.zadb_font()?;
+                        let fonts = format!("<< /Helv {helv} 0 R /ZaDb {zadb} 0 R >>");
+                        Some(
+                            set(&dr_text, "Font", fonts.as_bytes())
+                                .ok_or_else(|| odd("damaged resources"))?,
+                        )
+                    }
                     Some(font) => {
                         let (font_obj, font_text) = match parse_ref(&font) {
-                            Some((n, _)) => (Some(n), self.revisable(n)?),
+                            Some((n, _)) => {
+                                self.claim(n, Role::Fonts)?;
+                                (Some(n), self.revisable(n)?)
+                            }
                             None => (None, font),
                         };
                         let mut new_font = font_text.clone();
-                        for (key, obj) in [("Helv", helv), ("ZaDb", zadb)] {
-                            if get(&new_font, key).is_none() {
-                                new_font = set(&new_font, key, format!("{obj} 0 R").as_bytes())
-                                    .ok_or_else(|| odd("a damaged list of fonts"))?;
+                        for key in ["Helv", "ZaDb"] {
+                            match get(&new_font, key).map(<[u8]>::to_vec) {
+                                None => {
+                                    let obj = if key == "Helv" {
+                                        self.helv_font()?
+                                    } else {
+                                        self.zadb_font()?
+                                    };
+                                    new_font = set(&new_font, key, format!("{obj} 0 R").as_bytes())
+                                        .ok_or_else(|| odd("a damaged list of fonts"))?;
+                                }
+                                // The picture of a place to sign uses the form's own font.
+                                Some(have) if key == "Helv" => {
+                                    if let Some((n, _)) = parse_ref(&have) {
+                                        self.helv = Some(n);
+                                    }
+                                }
+                                Some(_) => {}
                             }
                         }
-                        match font_obj {
-                            Some(n) => {
-                                self.put(n, new_font);
-                                Some(dr_text.clone())
+                        if new_font == font_text {
+                            None
+                        } else {
+                            match font_obj {
+                                Some(n) => {
+                                    self.put(n, new_font);
+                                    None
+                                }
+                                None => Some(
+                                    set(&dr_text, "Font", &new_font)
+                                        .ok_or_else(|| odd("damaged resources"))?,
+                                ),
                             }
-                            None => set(&dr_text, "Font", &new_font),
                         }
                     }
-                }
-                .ok_or_else(|| odd("damaged resources"))?;
-                match dr_obj {
-                    Some(n) => self.put(n, new_dr),
-                    None => {
-                        dict = set(&dict, "DR", &new_dr).ok_or_else(|| odd("a damaged form"))?;
+                };
+                if let Some(new_dr) = new_dr {
+                    match dr_obj {
+                        Some(n) => self.put(n, new_dr),
+                        None => {
+                            dict =
+                                set(&dict, "DR", &new_dr).ok_or_else(|| odd("a damaged form"))?;
+                        }
                     }
                 }
             }
@@ -274,7 +302,7 @@ impl Author {
         &mut self,
         kind: DesignKind,
         w: &Placed,
-        state: &str,
+        state: &[u8],
     ) -> Result<String, AuthorError> {
         let (dw, dh) = w.drawn();
         let (on, off) = if kind == DesignKind::Radio {
@@ -288,7 +316,7 @@ impl Author {
         self.put(b, appearance::form_object(dw, dh, w.turns, "", &off));
         Ok(format!(
             "/AP << /N << /{} {a} 0 R /Off {b} 0 R >> >>",
-            encode_name(state.as_bytes())
+            encode_name(state)
         ))
     }
 
@@ -390,7 +418,7 @@ impl Author {
                         } else {
                             p.export_value.as_str()
                         };
-                        let ap = self.button_ap(f.kind, w, export)?;
+                        let ap = self.button_ap(f.kind, w, export.as_bytes())?;
                         let e = encode_name(export.as_bytes());
                         let on = p.default_value == "on";
                         if on {
@@ -424,7 +452,7 @@ impl Author {
         on: &str,
     ) -> Result<u32, AuthorError> {
         let n = self.alloc()?;
-        let ap = self.button_ap(DesignKind::Radio, w, &w.export)?;
+        let ap = self.button_ap(DesignKind::Radio, w, w.export.as_bytes())?;
         let state = if w.export == on {
             encode_name(w.export.as_bytes())
         } else {

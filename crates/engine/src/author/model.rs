@@ -14,7 +14,7 @@ use super::syntax::{
     array_items, decode_text, entries, get, parse_box, parse_f32, parse_int, parse_name, parse_ref,
     skip_ws,
 };
-use super::{odd, rules, Acro, Author, AuthorError, FieldList, PageAnnots, Place};
+use super::{odd, rules, Acro, Author, AuthorError, FieldList, PageAnnots, Place, Role};
 
 // Bits of the field flags (`/Ff`).
 pub(crate) const FF_READ_ONLY: u32 = 1;
@@ -90,6 +90,7 @@ impl Author {
                 let n = parse_ref(v)
                     .map(|r| r.0)
                     .ok_or_else(|| odd("a form that is neither a dictionary nor an object"))?;
+                self.claim(n, Role::Form)?;
                 (Place::Object(n), self.revisable(n)?)
             }
         };
@@ -115,6 +116,7 @@ impl Author {
                 let n = parse_ref(v)
                     .map(|r| r.0)
                     .ok_or_else(|| odd("a list of fields that is not an array"))?;
+                self.claim(n, Role::Fields)?;
                 let text = self.revisable(n)?;
                 FieldList {
                     items: array_items(&text)
@@ -139,6 +141,7 @@ impl Author {
         if let Some(c) = &self.catalog {
             return Ok(c.clone());
         }
+        self.claim(self.root, Role::Catalog)?;
         let text = self.revisable(self.root)?;
         if !text[skip_ws(&text, 0)..].starts_with(b"<<") {
             return Err(odd("a catalog that is not a dictionary"));
@@ -183,6 +186,7 @@ impl Author {
             top: Vec::new(),
             taken: HashSet::new(),
         };
+        let mut is_field: HashMap<u32, bool> = HashMap::new();
         let mut stack: Vec<(u32, Option<String>, usize, bool)> =
             roots.iter().rev().map(|r| (*r, None, 0, true)).collect();
         while let Some((obj, prefix, depth, top)) = stack.pop() {
@@ -206,8 +210,11 @@ impl Author {
                 .into_iter()
                 .filter_map(|k| parse_ref(k).map(|r| r.0))
                 .filter(|k| {
-                    self.dict(*k)
-                        .is_some_and(|kd| get(kd, "T").is_some() || get(kd, "Kids").is_some())
+                    // A list of kids may name one object many times: each is looked at once.
+                    *is_field.entry(*k).or_insert_with(|| {
+                        self.dict(*k)
+                            .is_some_and(|kd| get(kd, "T").is_some() || get(kd, "Kids").is_some())
+                    })
                 })
                 .collect();
             if top {
@@ -534,6 +541,15 @@ impl Author {
         if !self.pages.contains_key(&page) {
             let (items, place) = self.read_annots(page)?;
             if let Place::Object(n) = place {
+                // A list of annotations that two pages name is one list: a field put on one page
+                // is on the other, and the places of the annotations of the other would shift. A
+                // list that is a page, the catalog or a part of the form would be written over.
+                if self.shared().contains(&n) || self.is_structure(n) {
+                    return Err(odd(
+                        "a list of annotations that is shared with something else",
+                    ));
+                }
+                self.claim(n, Role::Annots(page))?;
                 self.revisable(n)?;
             }
             let map = (0..items.len()).map(Some).collect();
@@ -581,6 +597,7 @@ impl Author {
             None => self.read_annots(page)?.0,
         };
         let mut out = Vec::new();
+        let mut fields: HashMap<u32, Option<(DesignProps, View)>> = HashMap::new();
         for item in items {
             if out.len() >= partridge_protocol::MAX_LISTED_WIDGETS {
                 break;
@@ -598,7 +615,11 @@ impl Author {
             let Some(field) = self.field_of(w) else {
                 continue;
             };
-            let Some(view) = self.view(field) else {
+            // A field is read once, however many widgets of it the page has.
+            let known = fields
+                .entry(field)
+                .or_insert_with(|| self.view(field).map(|v| (self.read_props(&v), v)));
+            let Some((props, view)) = known.as_ref() else {
                 continue;
             };
             let Some(index) = view.widgets.iter().position(|x| *x == w) else {
@@ -618,15 +639,25 @@ impl Author {
             } else {
                 String::new()
             };
+            // A box the answer cannot carry (the decoder refuses it, and the app would take the
+            // refusal for a broken engine) is not listed: the widget is not on the page as far as
+            // anyone can place it.
+            let drawn = geo.to_drawn(user);
+            if drawn
+                .iter()
+                .any(|v| !v.is_finite() || v.abs() > partridge_protocol::MAX_BOX_VALUE)
+            {
+                continue;
+            }
             out.push(DesignedWidget {
                 name: view.name.clone(),
                 kind: view.kind,
                 widget: index as u32,
                 widgets: view.widgets.len() as u32,
-                rect: geo.to_drawn(user),
+                rect: drawn,
                 export,
                 editable: view.editable,
-                props: self.read_props(&view),
+                props: props.clone(),
             });
         }
         Ok(out)

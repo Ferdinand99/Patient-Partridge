@@ -482,6 +482,48 @@ BT /F1 12 Tf 72 400 Td 16 TL (A needle in a haystack.) Tj T* (Another NEEDLE her
     build(&specs, "", "", extras)
 }
 
+/// A document whose first page lists its annotations in place (as dictionaries inside `/Annots`,
+/// the way a program that makes them with PDFium's calls writes them), with text and authors in
+/// PDFDocEncoding (single bytes above 127) and in UTF-16, and a trailer `/ID` of binary bytes. None
+/// of the strings is valid UTF-8.
+pub fn direct_annots_pdf() -> Vec<u8> {
+    let specs = [PageSpec {
+        width: 612,
+        height: 792,
+        content: Some(demo_content(1, 612, 792)),
+        extra: String::new(),
+    }];
+    let mut objects = build_objects(&specs, "", Vec::new());
+    let mut annots: Vec<u8> = b"/Annots [".to_vec();
+    for item in DIRECT_ANNOTS {
+        annots.extend_from_slice(item);
+        annots.push(b' ');
+    }
+    annots.extend_from_slice(b"] ");
+    let page = &mut objects[3];
+    page.truncate(page.len() - 2);
+    page.extend_from_slice(&annots);
+    page.extend_from_slice(b">>");
+    let mut out = assemble(&objects, "");
+    let marker = b" >>\nstartxref\n";
+    let at = out
+        .windows(marker.len())
+        .rposition(|w| w == marker)
+        .expect("the trailer ends where the table is pointed at");
+    out.splice(at..at, DIRECT_ID.iter().copied());
+    out
+}
+
+/// The annotations of [`direct_annots_pdf`], as written in the page's list.
+pub const DIRECT_ANNOTS: [&[u8]; 3] = [
+    b"<< /Type /Annot /Subtype /Text /Rect [300 700 320 720] /C [1 1 0] /Name /Comment /Contents (Bl\xE5b\xE6r) /T (\xC6rlig \xD8yvind) /F 4 >>",
+    b"<< /Type /Annot /Subtype /Highlight /Rect [72 650 200 670] /QuadPoints [72 670 200 670 72 650 200 650] /C [1 0 0] /Contents (\xFE\xFF\x00B\x00l\x00\xE5\x00b\x00\xE6\x00r\x03\xA9\x65\xE5) /T (\xFE\xFF\x00\xC6\x00r\x00l\x00i\x00g\x00 \x00\xD8) /F 4 >>",
+    b"<< /Type /Annot /Subtype /Stamp /Rect [400 600 500 650] /Name /Approved /Contents (St\xF8tte \xE6\xF8\xE5) /T (\xD8yvind) /F 4 >>",
+];
+
+/// The `/ID` that [`direct_annots_pdf`] has in its trailer: two strings of binary bytes.
+pub const DIRECT_ID: &[u8] = b" /ID [(\x80\xFF\x00\x01\xE5\xA0bin\x7F) (\xFE\xFF\xC3\xA8id2\xE6)]";
+
 /// A document with annotations that try to make a reader misbehave: a comment and an author far
 /// longer than any limit, control characters and direction marks in the text, text that looks like
 /// markup, and a box that is a million points wide. The first page has them; the engine has to

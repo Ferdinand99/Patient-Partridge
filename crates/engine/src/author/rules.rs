@@ -119,9 +119,11 @@ pub fn check_export(value: &str) -> Result<(), AuthorError> {
     if value.len() > MAX_EXPORT_VALUE {
         return Err(refused("A button value is too long."));
     }
-    if let Some(c) = value.chars().find(|c| is_unsafe_in_text(*c)) {
+    // A value is written as a name, which is bytes, and the readers that show it read the bytes in
+    // their own encoding. Plain ASCII is the one spelling that every reader shows the same.
+    if let Some(c) = value.chars().find(|c| !(' '..='~').contains(c)) {
         return Err(refused(format!(
-            "A button value has a character that cannot be used ({}).",
+            "A button value can only use the letters a to z, digits and ordinary signs, so {} cannot be used. Use a word without accents.",
             show(c)
         )));
     }
@@ -354,6 +356,11 @@ mod tests {
         assert!(check_exports(&e(&["S", ""]), "").is_err());
         assert!(check_exports(&e(&["S", "Off"]), "").is_err());
         assert!(check_exports(&e(&["S", "M"]), "XL").is_err());
+        // A value is plain ASCII: the same bytes in every reader.
+        assert!(check_export("Yes please-2_x.y").is_ok());
+        assert!(check_export("Ja \u{f8}").is_err());
+        assert!(check_export("\u{65e5}").is_err());
+        assert!(check_export("a\tb").is_err());
     }
 
     #[test]
@@ -370,5 +377,76 @@ mod tests {
         let turned = PageGeo { turns: 1, ..geo };
         assert!(check_rect([10.0, 10.0, 250.0, 40.0], &turned).is_ok());
         assert!(check_rect([10.0, 10.0, 250.0, 250.0], &turned).is_err());
+    }
+
+    /// The text of a line of `formrules.cases.txt`: `\uXXXX` is a character, `\n` a line break.
+    fn unescape(text: &str) -> String {
+        let mut out = String::new();
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c != '\\' {
+                out.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some('u') => {
+                    let hex: String = chars.by_ref().take(4).collect();
+                    out.push(
+                        char::from_u32(u32::from_str_radix(&hex, 16).expect("four hex digits"))
+                            .expect("a character"),
+                    );
+                }
+                Some('n') => out.push('\n'),
+                other => panic!("an escape that is not known: {other:?}"),
+            }
+        }
+        out
+    }
+
+    /// The window checks the same cases (src/lib/formdesign.test.ts reads the same file): the two
+    /// sides have one set of rules, and a change to one that is not made to the other fails here or
+    /// there.
+    #[test]
+    fn the_engine_agrees_with_the_cases_the_window_is_held_to() {
+        let file = include_str!("../../../../src/lib/formrules.cases.txt");
+        let mut seen = 0;
+        for line in file.lines() {
+            let line = line.trim_end_matches('\r');
+            if line.trim().is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut parts = line.splitn(3, '\t');
+            let kind = parts.next().expect("a kind");
+            let verdict = parts.next().expect("a verdict");
+            let text = unescape(parts.next().unwrap_or(""));
+            let props = |f: &dyn Fn(&mut DesignProps)| {
+                let mut p = DesignProps::default();
+                f(&mut p);
+                p
+            };
+            let result = match kind {
+                "name" => check_name(&text),
+                "tooltip" => check_tooltip(&text),
+                "export" => check_export(&text),
+                "drawn" => check_drawable("x", &text, false),
+                "multiline" => check_drawable("x", &text, true),
+                "fontsize" => check_props(
+                    DesignKind::Text,
+                    &props(&|p| p.font_size = text.parse().expect("a number")),
+                ),
+                "maxlen" => check_props(
+                    DesignKind::Text,
+                    &props(&|p| p.max_len = text.parse().expect("a number")),
+                ),
+                other => panic!("a kind of case that is not known: {other}"),
+            };
+            assert_eq!(
+                result.is_ok(),
+                verdict == "ok",
+                "{kind} {text:?}: {result:?}"
+            );
+            seen += 1;
+        }
+        assert!(seen > 40, "{seen} cases");
     }
 }

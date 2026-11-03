@@ -1073,3 +1073,223 @@ fn the_files_for_other_programs_are_written() {
     )
     .unwrap();
 }
+
+// ---- text that is not ASCII, in the annotations of a page that gets fields -----------------------
+
+/// The id, the text and the author of every annotation the reader lists on a page.
+fn annotation_words(e: &mut Engine, doc: u32, page: u32) -> Vec<(u32, String, String)> {
+    common::list(e, doc, page)
+        .into_iter()
+        .map(|a| (a.id, a.text, a.author))
+        .collect()
+}
+
+/// Makes, moves, reorders and takes away fields on page 0, and says after each step that the words
+/// of the annotations on the page are the words they were.
+fn change_the_fields_and_look(e: &mut Engine, doc: u32, words: &[(u32, String, String)]) {
+    let again = |e: &mut Engine, what: &str| {
+        assert_eq!(
+            &annotation_words(e, doc, 0),
+            words,
+            "the words of the annotations changed after: {what}"
+        );
+    };
+    apply_ok(
+        e,
+        doc,
+        vec![
+            add(text("a", [72.0, 72.0, 272.0, 94.0])),
+            add(text("b", [72.0, 104.0, 272.0, 126.0])),
+        ],
+    );
+    again(e, "two fields were made");
+    apply_ok(
+        e,
+        doc,
+        vec![AuthorOp::Move {
+            name: "a".into(),
+            widget: 0,
+            page: 0,
+            rect: [100.0, 300.0, 300.0, 322.0],
+        }],
+    );
+    again(e, "one was moved");
+    apply_ok(
+        e,
+        doc,
+        vec![AuthorOp::Reorder {
+            page: 0,
+            order: ["b", "a"]
+                .map(|n| WidgetRef {
+                    name: n.into(),
+                    widget: 0,
+                })
+                .to_vec(),
+        }],
+    );
+    again(e, "they were put in another order");
+    apply_ok(e, doc, vec![AuthorOp::Remove { name: "a".into() }]);
+    again(e, "one was taken away");
+}
+
+#[test]
+fn the_words_of_annotations_made_in_place_are_kept_when_fields_change_on_their_page() {
+    // Text in single bytes above 127 and in UTF-16, an author likewise, a stamp: none of it is
+    // text the writer may read, and all of it has to be what it was in the reloaded document, in
+    // the file saved afterwards, and in the document read again from that file.
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let (doc, _file) = open(e, &kit::direct_annots_pdf());
+    let words = annotation_words(e, doc, 0);
+    let texts: Vec<&str> = words.iter().map(|w| w.1.as_str()).collect();
+    assert!(texts.contains(&"Bl\u{e5}b\u{e6}r"), "{words:?}");
+    assert!(
+        texts.contains(&"Bl\u{e5}b\u{e6}r\u{3a9}\u{65e5}"),
+        "{words:?}"
+    );
+    let authors: Vec<&str> = words.iter().map(|w| w.2.as_str()).collect();
+    assert!(authors.contains(&"\u{c6}rlig \u{d8}yvind"), "{words:?}");
+    change_the_fields_and_look(e, doc, &words);
+    let saved = save_all(e, doc);
+    let (reopened, _file2) = open(e, &saved);
+    let after: Vec<(String, String)> = annotation_words(e, reopened, 0)
+        .into_iter()
+        .filter(|w| !w.1.is_empty() || !w.2.is_empty())
+        .map(|w| (w.1, w.2))
+        .collect();
+    let before: Vec<(String, String)> = words.iter().map(|w| (w.1.clone(), w.2.clone())).collect();
+    assert_eq!(after, before, "the saved file has other words");
+}
+
+#[test]
+fn the_words_of_notes_made_here_are_kept_when_fields_change_on_their_page() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let (doc, _file) = open(e, &kit::simple_pdf(1));
+    for (i, note) in [
+        "Bl\u{e5}b\u{e6}r",
+        "\u{c6}rlig \u{d8}yvind",
+        "\u{3a9} \u{65e5}\u{672c}",
+    ]
+    .iter()
+    .enumerate()
+    {
+        common::annot(ask(
+            e,
+            RequestBody::AddNote {
+                doc,
+                page: 0,
+                x: 400.0,
+                y: 100.0 + 60.0 * i as f32,
+                color: common::YELLOW,
+                text: (*note).into(),
+            },
+        ));
+    }
+    common::annot(ask(
+        e,
+        RequestBody::AddStamp {
+            doc,
+            page: 0,
+            x: 300.0,
+            y: 500.0,
+            stamp: partridge_protocol::StampKind::Approved,
+        },
+    ));
+    let (start, len) = common::find(e, doc, 0, "Line 3");
+    common::annot(ask(
+        e,
+        RequestBody::AddMarkup {
+            doc,
+            page: 0,
+            kind: partridge_protocol::AnnotKind::Highlight,
+            color: common::YELLOW,
+            start,
+            end: start + len,
+        },
+    ));
+    let words = annotation_words(e, doc, 0);
+    assert!(words.iter().any(|w| w.1 == "Bl\u{e5}b\u{e6}r"), "{words:?}");
+    assert!(
+        words.iter().any(|w| w.1 == "\u{3a9} \u{65e5}\u{672c}"),
+        "{words:?}"
+    );
+    change_the_fields_and_look(e, doc, &words);
+    let saved = save_all(e, doc);
+    let (reopened, _file2) = open(e, &saved);
+    let after = annotation_words(e, reopened, 0);
+    let texts: Vec<&str> = after.iter().map(|w| w.1.as_str()).collect();
+    for note in [
+        "Bl\u{e5}b\u{e6}r",
+        "\u{c6}rlig \u{d8}yvind",
+        "\u{3a9} \u{65e5}\u{672c}",
+    ] {
+        assert!(texts.contains(&note), "{note:?} is not in {texts:?}");
+    }
+}
+
+// ---- what was taken away is gone --------------------------------------------------------------
+
+#[test]
+fn a_field_that_was_taken_away_is_not_in_the_saved_file() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let (doc, _file) = open(e, &kit::simple_pdf(1));
+    let secret = DesignField {
+        name: "SECRETNAME".into(),
+        kind: DesignKind::Combo,
+        props: DesignProps {
+            tooltip: "SECRETTIP".into(),
+            choices: vec!["SECRETCHOICE".into(), "OTHER".into()],
+            default_value: "SECRETCHOICE".into(),
+            ..DesignProps::default()
+        },
+        widgets: vec![widget(0, [72.0, 72.0, 272.0, 94.0])],
+    };
+    let typed = DesignField {
+        name: "SECRETTEXT".into(),
+        kind: DesignKind::Text,
+        props: DesignProps {
+            default_value: "SECRETDEFAULT".into(),
+            ..DesignProps::default()
+        },
+        widgets: vec![widget(0, [72.0, 120.0, 272.0, 142.0])],
+    };
+    apply_ok(e, doc, vec![AuthorOp::Add(secret), AuthorOp::Add(typed)]);
+    // While they are there, they are in the file.
+    let with = save_all(e, doc);
+    for word in [
+        "SECRETNAME",
+        "SECRETTIP",
+        "SECRETCHOICE",
+        "SECRETTEXT",
+        "SECRETDEFAULT",
+    ] {
+        assert!(kit::text_in_file(&with, word), "{word} is not in the file");
+    }
+    apply_ok(
+        e,
+        doc,
+        vec![
+            AuthorOp::Remove {
+                name: "SECRETNAME".into(),
+            },
+            AuthorOp::Remove {
+                name: "SECRETTEXT".into(),
+            },
+        ],
+    );
+    let without = save_all(e, doc);
+    for word in [
+        "SECRETNAME",
+        "SECRETTIP",
+        "SECRETCHOICE",
+        "SECRETTEXT",
+        "SECRETDEFAULT",
+    ] {
+        assert!(
+            !kit::text_in_file(&without, word),
+            "{word} is still in the file after the field was taken away"
+        );
+    }
+}
