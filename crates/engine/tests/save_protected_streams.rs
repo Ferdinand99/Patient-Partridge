@@ -663,3 +663,23 @@ fn a_stream_whose_type_is_a_reference_is_encrypted_like_any_other() {
         ask(e, RequestBody::Close { doc });
     }
 }
+
+#[test]
+fn a_file_with_a_trailer_of_many_keys_is_saved_in_seconds() {
+    // PDFium copies the keys of the trailer that it does not know into the file it writes, so
+    // their number is the input's. The check reads them in one pass: the save of this file (an
+    // unprotected one with metadata, which is saved as it is) takes about as long as the write.
+    let plain = kit::xmp_pdf_with_trailer_keys(200_000);
+    assert!(plain.len() > 2_000_000);
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let doc = open(e, &plain, None).unwrap();
+    let started = std::time::Instant::now();
+    let saved = try_save(e, doc).expect("an unprotected file is saved");
+    let took = started.elapsed();
+    assert!(
+        plain_in(&saved, &kit::xmp_packet(kit::XMP_CATALOG_TITLE)),
+        "the metadata changed"
+    );
+    assert!(took.as_secs() < 10, "the save took {took:?}");
+}

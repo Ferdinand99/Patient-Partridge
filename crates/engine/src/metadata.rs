@@ -31,7 +31,7 @@
 //! the plain bytes as a second opinion. Whatever it cannot read or bound counts as unsafe.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// How many bytes are read between two reports of progress.
 const PROGRESS_STEP: usize = 4 * 1024 * 1024;
@@ -347,6 +347,9 @@ fn parse_dictionary(bytes: &[u8], at: usize) -> Option<Dict<'_>> {
     }
     pos += 2;
     let mut entries: Vec<(Cow<'_, [u8]>, Value<'_>)> = Vec::new();
+    // A key twice is not a dictionary to trust. A short dictionary is searched; a long one gets a
+    // set of its keys, so that the cost does not grow with the square of their number.
+    let mut seen: Option<HashSet<Cow<'_, [u8]>>> = None;
     loop {
         skip_space(bytes, &mut pos);
         if bytes.get(pos..pos + 2)? == b">>" {
@@ -356,7 +359,20 @@ fn parse_dictionary(bytes: &[u8], at: usize) -> Option<Dict<'_>> {
             });
         }
         let key = name(bytes, &mut pos)?;
-        if entries.iter().any(|(k, _)| *k == key) {
+        let twice = match &mut seen {
+            Some(set) => !set.insert(key.clone()),
+            None => {
+                let twice = entries.iter().any(|(k, _)| *k == key);
+                if !twice && entries.len() >= 16 {
+                    let mut set: HashSet<Cow<'_, [u8]>> =
+                        entries.iter().map(|(k, _)| k.clone()).collect();
+                    set.insert(key.clone());
+                    seen = Some(set);
+                }
+                twice
+            }
+        };
+        if twice {
             return None;
         }
         let value = value(bytes, &mut pos)?;
@@ -829,6 +845,63 @@ endstream";
         let (a, b) = (first - 10, second - 10);
         let copy: Vec<u8> = f[a..a + 10].to_vec();
         f[b..b + 10].copy_from_slice(&copy);
+        assert!(unsafe_file(&f));
+    }
+
+    #[test]
+    fn a_name_that_looks_like_a_keyword_does_not_hide_a_stream_in_a_file_that_leaves_the_metadata_clear(
+    ) {
+        // The structure is read in this branch. A second stream whose dictionary has a name that
+        // looks like a keyword is found, and the file is refused.
+        for word in ["stream", "endobj", "obj"] {
+            let second = format!(
+                "<</A/{word}/Length 12/Subtype/XML/Type/Metadata>>stream\r\n<x:xmpmeta/>\r\nendstream"
+            );
+            let f = file(
+                &[&catalog("4"), CLEAR, "<</Type/Pages>>", XMP, &second],
+                "/Root 1 0 R /Encrypt 2 0 R /Size 6",
+            );
+            assert!(unsafe_file(&f), "{word}");
+            // The same name in the dictionary of the clear stream itself changes nothing.
+            assert!(!unsafe_file(&four(CLEAR, &second)), "{word}");
+        }
+        // A string with an escaped parenthesis and the key inside it, before the real key.
+        let encrypt =
+            "<</Filter/Standard/Note(a \\) /EncryptMetadata true)/EncryptMetadata false>>";
+        assert!(!unsafe_file(&four(encrypt, XMP)));
+    }
+
+    #[test]
+    fn a_dictionary_of_many_keys_is_read_in_one_pass() {
+        // The keys of a trailer and of an encryption dictionary come from the input.
+        let keys: String = (0..200_000)
+            .map(|i| format!("/K{i} 1"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let encrypt = format!("<</EncryptMetadata false/Filter/Standard {keys}>>");
+        let f = file(
+            &[&catalog("4"), &encrypt, "<</Type/Pages>>", XMP],
+            PROTECTED,
+        );
+        let start = std::time::Instant::now();
+        assert!(!unsafe_file(&f));
+        let took = start.elapsed();
+        eprintln!("an encryption dictionary of 200 000 keys: {took:?}");
+        assert!(took.as_millis() < 1000, "took {took:?}");
+        let f = file(
+            &[&catalog("4"), CLEAR, "<</Type/Pages>>", XMP],
+            &format!("{PROTECTED} {keys}"),
+        );
+        let start = std::time::Instant::now();
+        assert!(!unsafe_file(&f));
+        let took = start.elapsed();
+        eprintln!("a trailer of 200 000 keys: {took:?}");
+        assert!(took.as_millis() < 1000, "took {took:?}");
+        // A key twice is still found among them.
+        let f = file(
+            &[&catalog("4"), CLEAR, "<</Type/Pages>>", XMP],
+            &format!("{PROTECTED} {keys} /K777 2"),
+        );
         assert!(unsafe_file(&f));
     }
 

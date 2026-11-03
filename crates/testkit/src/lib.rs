@@ -1475,14 +1475,21 @@ pub fn xmp_pdf(catalog_xmp: bool, page_xmp: bool) -> Vec<u8> {
 
 /// As [`xmp_pdf`]; with `compressed` the XMP streams are Flate compressed, as some writers make them.
 pub fn xmp_pdf_with(catalog_xmp: bool, page_xmp: bool, compressed: bool) -> Vec<u8> {
-    xmp_pdf_impl(catalog_xmp, page_xmp, compressed, false)
+    xmp_pdf_impl(catalog_xmp, page_xmp, compressed, false, "")
 }
 
 /// As [`xmp_pdf`] with a catalog stream whose `/Type` is an indirect reference to the name
 /// `/Metadata` (object 11). A reader that does not follow the reference does not take the stream
 /// for a metadata stream, and encrypts it like any other.
 pub fn xmp_indirect_type_pdf() -> Vec<u8> {
-    xmp_pdf_impl(true, false, false, true)
+    xmp_pdf_impl(true, false, false, true, "")
+}
+
+/// As [`xmp_pdf`] with a catalog stream and `keys` keys of no meaning in the trailer. A writer
+/// copies the keys of a trailer that it does not know, so their number is the file's own.
+pub fn xmp_pdf_with_trailer_keys(keys: usize) -> Vec<u8> {
+    let extra: String = (0..keys).map(|i| format!(" /K{i} 1")).collect();
+    xmp_pdf_impl(true, false, false, false, &extra)
 }
 
 fn xmp_pdf_impl(
@@ -1490,6 +1497,7 @@ fn xmp_pdf_impl(
     page_xmp: bool,
     compressed: bool,
     indirect_type: bool,
+    trailer_extra: &str,
 ) -> Vec<u8> {
     let catalog_id = 10;
     let page_id = if catalog_xmp { 11 } else { 10 };
@@ -1557,7 +1565,7 @@ endcmap CMapName currentdict /CMap defineresource pop end end\n% {}\n",
     if indirect_type {
         objects.push(b"/Metadata".to_vec());
     }
-    assemble(&objects, "")
+    assemble(&objects, trailer_extra)
 }
 
 /// Folder name used for a platform in `vendor/pdfium` and in the pinned PDFium list.

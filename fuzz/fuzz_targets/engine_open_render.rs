@@ -467,9 +467,14 @@ impl State {
         let size = match self.ask(RequestBody::SaveBegin { doc }) {
             ResponseBody::SaveReady { size } => size as usize,
             ResponseBody::Error {
-                code: ErrorCode::SaveFailed | ErrorCode::SaveMetadataNotEncrypted,
+                code: ErrorCode::SaveFailed,
                 ..
             } => return,
+            // Only a protected document may be refused for its metadata.
+            ResponseBody::Error {
+                code: ErrorCode::SaveMetadataNotEncrypted,
+                ..
+            } if security != 0 => return,
             other => panic!("unexpected answer to SaveBegin: {other:?}"),
         };
         assert!(size <= MAX_SAVE_BYTES);
