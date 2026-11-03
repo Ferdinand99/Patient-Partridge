@@ -262,6 +262,17 @@ pub fn doc_info(
 /// of page objects and of annotations. The same document written out and read again gives the
 /// same digest; a page that lost its text or its drawing instructions does not.
 pub fn fingerprint(document: &PdfDocument<'_>, progress: &mut dyn FnMut(u32)) -> ResponseBody {
+    fingerprint_with(document, false, progress)
+}
+
+/// As [`fingerprint`]. With `skip_signature_fields` a signature field is not counted among the
+/// annotations of its page: the document before it was signed and the file after it have the same
+/// description then, and anything else that is different shows.
+pub fn fingerprint_with(
+    document: &PdfDocument<'_>,
+    skip_signature_fields: bool,
+    progress: &mut dyn FnMut(u32),
+) -> ResponseBody {
     let pages = document.pages();
     let mut failed = 0u32;
     let mut digest: u64 = 0xcbf2_9ce4_8422_2325;
@@ -288,7 +299,18 @@ pub fn fingerprint(document: &PdfDocument<'_>, progress: &mut dyn FnMut(u32)) ->
             }
         }
         put(&(page.objects().len() as u64).to_le_bytes());
-        put(&(page.annotations().len() as u64).to_le_bytes());
+        let annotations = if skip_signature_fields {
+            page.annotations()
+                .iter()
+                .filter(|a| {
+                    !a.as_form_field()
+                        .is_some_and(|f| f.field_type() == PdfFormFieldType::Signature)
+                })
+                .count()
+        } else {
+            page.annotations().len() as usize
+        };
+        put(&(annotations as u64).to_le_bytes());
         if index % 32 == 31 {
             progress(index as u32 + 1);
         }

@@ -9,6 +9,12 @@ description = "Starts and talks to the Patient Partridge PDF engine process and 
 
 [dependencies]
 partridge-protocol = { path = "../protocol" }
+partridge-signer-protocol = { path = "../signer-protocol" }
+# SHA-256 and SHA-384 of the part of a file that is signed. The same library the engine and the
+# signer use; it has no network code.
+ring = { version = "=0.17.14", default-features = false, features = ["alloc"] }
+# The password and the messages that carry it are overwritten after use.
+zeroize = "=1.9.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.191"

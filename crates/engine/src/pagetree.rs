@@ -92,9 +92,9 @@ impl TreeError {
     }
 }
 
-type Found<T> = Result<T, TreeError>;
+pub(crate) type Found<T> = Result<T, TreeError>;
 
-fn is_white(b: u8) -> bool {
+pub(crate) fn is_white(b: u8) -> bool {
     matches!(b, 0 | 9 | 10 | 12 | 13 | 32)
 }
 
@@ -110,7 +110,7 @@ fn is_regular(b: u8) -> bool {
 }
 
 /// The position after white space and comments.
-fn skip_white(b: &[u8], mut p: usize) -> usize {
+pub(crate) fn skip_white(b: &[u8], mut p: usize) -> usize {
     loop {
         match b.get(p) {
             Some(&c) if is_white(c) => p += 1,
@@ -128,7 +128,7 @@ fn skip_white(b: &[u8], mut p: usize) -> usize {
 }
 
 /// The end of the run of ordinary characters that starts at `p`.
-fn token_end(b: &[u8], mut p: usize) -> usize {
+pub(crate) fn token_end(b: &[u8], mut p: usize) -> usize {
     while b.get(p).is_some_and(|&c| is_regular(c)) {
         p += 1;
     }
@@ -174,7 +174,7 @@ fn is_uint(text: &[u8]) -> bool {
     !text.is_empty() && text.len() <= 10 && text.iter().all(u8::is_ascii_digit)
 }
 
-fn uint(text: &[u8]) -> Option<u64> {
+pub(crate) fn uint(text: &[u8]) -> Option<u64> {
     if !is_uint(text) {
         return None;
     }
@@ -199,7 +199,7 @@ fn reference_end(b: &[u8], start: usize, end: usize) -> Option<usize> {
 /// The end of the object that starts at `start` (after white space), without reading what is in
 /// it: arrays and dictionaries are followed to their end with strings, names and comments skipped
 /// as the format says.
-fn skip_value(b: &[u8], start: usize) -> Option<usize> {
+pub(crate) fn skip_value(b: &[u8], start: usize) -> Option<usize> {
     let mut stack: Vec<u8> = Vec::new();
     let mut p = start;
     loop {
@@ -259,7 +259,7 @@ fn skip_value(b: &[u8], start: usize) -> Option<usize> {
 }
 
 /// The name as the format reads it: `#41` is `A`.
-fn decode_name(raw: &[u8]) -> Vec<u8> {
+pub(crate) fn decode_name(raw: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(raw.len());
     let mut i = 0;
     while i < raw.len() {
@@ -278,18 +278,18 @@ fn decode_name(raw: &[u8]) -> Vec<u8> {
 }
 
 /// One entry of a dictionary.
-struct Entry {
+pub(crate) struct Entry {
     /// The key as the format reads it (`#41` is `A`).
-    key: Vec<u8>,
+    pub(crate) key: Vec<u8>,
     /// Where the slash of the key is.
-    at: usize,
+    pub(crate) at: usize,
     /// Where the value is.
-    value: Range<usize>,
+    pub(crate) value: Range<usize>,
 }
 
 /// The entries of the dictionary at `value`. A key that stands twice counts with its last value,
 /// as PDFium keeps it.
-fn dictionary(b: &[u8], value: &Range<usize>) -> Option<Vec<Entry>> {
+pub(crate) fn dictionary(b: &[u8], value: &Range<usize>) -> Option<Vec<Entry>> {
     if !b.get(value.clone())?.starts_with(b"<<") {
         return None;
     }
@@ -321,7 +321,7 @@ fn dictionary(b: &[u8], value: &Range<usize>) -> Option<Vec<Entry>> {
     (p <= value.end).then_some(entries)
 }
 
-fn entry<'a>(entries: &'a [Entry], key: &[u8]) -> Option<&'a Range<usize>> {
+pub(crate) fn entry<'a>(entries: &'a [Entry], key: &[u8]) -> Option<&'a Range<usize>> {
     entries
         .iter()
         .rev()
@@ -330,7 +330,7 @@ fn entry<'a>(entries: &'a [Entry], key: &[u8]) -> Option<&'a Range<usize>> {
 }
 
 /// The object number of the reference that `value` is, if it is one and nothing else.
-fn reference_number(b: &[u8], value: &Range<usize>) -> Option<u32> {
+pub(crate) fn reference_number(b: &[u8], value: &Range<usize>) -> Option<u32> {
     let end = token_end(b, value.start);
     if reference_end(b, value.start, end)? != value.end {
         return None;
@@ -366,7 +366,7 @@ fn kids_of(b: &[u8], value: &Range<usize>, most: usize) -> Found<Vec<Range<usize
     }
 }
 
-fn number(b: &[u8], value: &Range<usize>) -> Option<i64> {
+pub(crate) fn number(b: &[u8], value: &Range<usize>) -> Option<i64> {
     let text = std::str::from_utf8(b.get(value.clone())?).ok()?;
     let text = text.trim();
     if let Ok(n) = text.parse::<i64>() {
@@ -380,12 +380,12 @@ fn number(b: &[u8], value: &Range<usize>) -> Option<i64> {
 pub const INHERITED: [&str; 4] = ["Resources", "MediaBox", "CropBox", "Rotate"];
 
 /// The table of the places of the objects, and the trailer, of a document PDFium wrote.
-struct Table<'a> {
-    bytes: &'a [u8],
+pub(crate) struct Table<'a> {
+    pub(crate) bytes: &'a [u8],
     sections: Vec<Section>,
-    trailer: Vec<Entry>,
+    pub(crate) trailer: Vec<Entry>,
     /// Where the table starts, as the file says.
-    start: usize,
+    pub(crate) start: usize,
     /// The objects read so far: each is read once, however often it is asked for.
     read: RefCell<HashMap<u32, Option<Object>>>,
     /// The bytes the walk has read, and the most it may read.
@@ -401,7 +401,7 @@ struct Section {
 }
 
 impl<'a> Table<'a> {
-    fn read(bytes: &'a [u8], limit: usize) -> Found<Table<'a>> {
+    pub(crate) fn read(bytes: &'a [u8], limit: usize) -> Found<Table<'a>> {
         let unreadable = |why| Err(TreeError::Unreadable(why));
         let tail = bytes.len().saturating_sub(TAIL);
         let Some(word) = bytes[tail..]
@@ -523,7 +523,7 @@ impl<'a> Table<'a> {
     /// The value of object `number`: the place of what stands between `obj` and `endobj`. `None`
     /// for an object that is not there. An object is read the first time it is asked for, and the
     /// bytes it takes are counted then.
-    fn object(&self, number: u32) -> Found<Option<Object>> {
+    pub(crate) fn object(&self, number: u32) -> Found<Option<Object>> {
         if let Some(known) = self.read.borrow().get(&number) {
             return Ok(known.clone());
         }
@@ -570,7 +570,7 @@ impl<'a> Table<'a> {
 
     /// Follows references from `value` to the value they lead to. `None` when a reference leads
     /// to an object that is not there.
-    fn resolve(&self, value: &Range<usize>) -> Found<Option<Range<usize>>> {
+    pub(crate) fn resolve(&self, value: &Range<usize>) -> Found<Option<Range<usize>>> {
         let mut value = value.clone();
         for _ in 0..MAX_HOPS {
             match reference_number(self.bytes, &value) {
@@ -584,7 +584,7 @@ impl<'a> Table<'a> {
         Err(TreeError::Unreadable("a chain of references is too long"))
     }
 
-    fn name_of(&self, value: &Range<usize>) -> Found<Option<Vec<u8>>> {
+    pub(crate) fn name_of(&self, value: &Range<usize>) -> Found<Option<Vec<u8>>> {
         Ok(self.resolve(value)?.and_then(|v| {
             (self.bytes.get(v.start) == Some(&b'/'))
                 .then(|| decode_name(&self.bytes[v.start + 1..v.end]))
@@ -636,9 +636,9 @@ fn is_null(value: &[u8]) -> bool {
 }
 
 #[derive(Clone)]
-struct Object {
-    value: Range<usize>,
-    generation: u32,
+pub(crate) struct Object {
+    pub(crate) value: Range<usize>,
+    pub(crate) generation: u32,
 }
 
 /// What the walk needs of a page or a node once its dictionary is read. The dictionary itself is

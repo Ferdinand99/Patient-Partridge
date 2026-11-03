@@ -33,6 +33,9 @@ pub mod save;
 pub mod sigcheck;
 pub mod sigmark;
 pub mod signatures;
+pub mod signing;
+pub mod signlook;
+pub mod signprep;
 pub mod source;
 pub mod startup;
 mod sysfontinfo;
@@ -358,6 +361,7 @@ impl Engine {
                 Ok(ResponseBody::Closed)
             }
             RequestBody::Pages(request) => pages::handle(self, pdfium, request, progress),
+            RequestBody::Sign(request) => signing::handle(self, pdfium, request, progress),
             RequestBody::Outline { doc } => {
                 let document = self.document(doc)?;
                 let items = text::outline(document);

@@ -28,13 +28,17 @@ pub use marks::*;
 mod marks_tests;
 mod pages;
 pub use pages::*;
+mod sign;
+pub use sign::*;
+#[cfg(test)]
+mod sign_tests;
 mod signatures;
 pub use signatures::*;
 #[cfg(test)]
 mod signatures_tests;
 
 /// Version of this protocol. Both sides check it in the `Hello` exchange.
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// Largest frame (payload) either side accepts: 128 MiB, enough for the biggest allowed bitmap.
 pub const MAX_FRAME_LEN: usize = 128 * 1024 * 1024;
@@ -262,6 +266,18 @@ pub enum ErrorCode {
     AnnotationRefused = 19,
     /// The document's own permissions do not allow annotations to be added or changed.
     AnnotationsNotAllowed = 20,
+    /// The document is encrypted, so the engine does not write a signature into it.
+    SignEncrypted = 90,
+    /// The document has an XFA form, which a signature would not survive.
+    SignXfa = 91,
+    /// The document holds signatures already (or something that looks like one), and signing it
+    /// again would break them.
+    SignAlreadySigned = 92,
+    /// The structure of the document is not one the engine can write a signature into (it could not
+    /// be checked, or it is damaged where the signature has to go).
+    SignStructure = 93,
+    /// The place, the field or the texts of the signature cannot be used.
+    SignRefused = 94,
 }
 
 impl ErrorCode {
@@ -296,6 +312,11 @@ impl ErrorCode {
             18 => ErrorCode::NoSuchAnnotation,
             19 => ErrorCode::AnnotationRefused,
             20 => ErrorCode::AnnotationsNotAllowed,
+            90 => ErrorCode::SignEncrypted,
+            91 => ErrorCode::SignXfa,
+            92 => ErrorCode::SignAlreadySigned,
+            93 => ErrorCode::SignStructure,
+            94 => ErrorCode::SignRefused,
             _ => return None,
         })
     }
@@ -332,6 +353,11 @@ impl ErrorCode {
             ErrorCode::NoSuchAnnotation => "no_such_annotation",
             ErrorCode::AnnotationRefused => "annotation_refused",
             ErrorCode::AnnotationsNotAllowed => "annotations_not_allowed",
+            ErrorCode::SignEncrypted => "sign_encrypted",
+            ErrorCode::SignXfa => "sign_xfa",
+            ErrorCode::SignAlreadySigned => "sign_already_signed",
+            ErrorCode::SignStructure => "sign_structure",
+            ErrorCode::SignRefused => "sign_refused",
         }
     }
 }
@@ -409,6 +435,9 @@ pub enum RequestBody {
     FontReport,
     /// A page tool: delete, reorder, rotate, crop, insert, extract (see the `pages` module).
     Pages(PagesRequest),
+    /// Signing with a certificate: the engine prepares the file, the app and the signer make the
+    /// signature (see the `sign` module).
+    Sign(SignRequest),
     /// The annotations of one page that the reader can show and change: markup (highlight,
     /// underline, strike-out), notes, drawings and stamps, and a few kinds that can only be removed.
     /// Links and form fields are not in the list.
@@ -626,6 +655,8 @@ pub enum ResponseBody {
     },
     /// The answer to a page tool.
     Pages(PagesResponse),
+    /// The answer to a request about signing.
+    Sign(SignResponse),
     /// Answer to `ListAnnots`, at most [`MAX_ANNOTS_PER_PAGE`] entries.
     Annots {
         items: Vec<AnnotInfo>,
@@ -818,6 +849,7 @@ impl Request {
                 put_u32(&mut out, self.id);
             }
             RequestBody::Pages(request) => request.encode(self.id, &mut out),
+            RequestBody::Sign(request) => request.encode(self.id, &mut out),
             RequestBody::ListAnnots { doc, page } => {
                 out.push(TAG_REQ_LIST_ANNOTS);
                 put_u32(&mut out, self.id);
@@ -1009,6 +1041,9 @@ impl Request {
             }
             t if (pages::FIRST_REQUEST_TAG..=pages::LAST_REQUEST_TAG).contains(&t) => {
                 RequestBody::Pages(PagesRequest::decode(t, &mut r)?)
+            }
+            t if (sign::FIRST_REQUEST_TAG..=sign::LAST_REQUEST_TAG).contains(&t) => {
+                RequestBody::Sign(SignRequest::decode(t, &mut r)?)
             }
             TAG_REQ_FORM_INFO => RequestBody::FormInfo { doc: r.u32()? },
             TAG_REQ_LIST_FORM_FIELDS => RequestBody::ListFormFields {
@@ -1316,6 +1351,7 @@ impl Response {
                 }
             }
             ResponseBody::Pages(response) => response.encode(self.id, &mut out),
+            ResponseBody::Sign(response) => response.encode(self.id, &mut out),
             ResponseBody::Annots { items } => {
                 out.push(TAG_RES_ANNOTS);
                 put_u32(&mut out, self.id);
@@ -1582,6 +1618,9 @@ impl Response {
             t if (pages::FIRST_RESPONSE_TAG..=pages::LAST_RESPONSE_TAG).contains(&t) => {
                 ResponseBody::Pages(PagesResponse::decode(t, &mut r)?)
             }
+            t if (sign::FIRST_RESPONSE_TAG..=sign::LAST_RESPONSE_TAG).contains(&t) => {
+                ResponseBody::Sign(SignResponse::decode(t, &mut r)?)
+            }
             TAG_RES_ANNOTS => {
                 let count = r.u32()? as usize;
                 if count > MAX_ANNOTS_PER_PAGE || count > r.remaining() / ANNOT_INFO_MIN {
@@ -1799,6 +1838,31 @@ mod tests {
     fn requests() -> Vec<Request> {
         vec![
             Request {
+                id: 90,
+                body: RequestBody::Sign(SignRequest::Begin(SignSpec {
+                    doc: 7,
+                    place: SignPlace::Rect {
+                        page: 1,
+                        rect: [10.0, 20.0, 210.0, 80.0],
+                    },
+                    name: "Anna".into(),
+                    reason: "Read".into(),
+                    location: "Oslo".into(),
+                    signed_at: 1_700_000_000,
+                    mark: None,
+                    color: [0, 0, 0, 255],
+                    reserve: 4_000,
+                })),
+            },
+            Request {
+                id: 91,
+                body: RequestBody::Sign(SignRequest::Fields { doc: 7 }),
+            },
+            Request {
+                id: 92,
+                body: RequestBody::Sign(SignRequest::Fingerprint { doc: 7 }),
+            },
+            Request {
                 id: 1,
                 body: RequestBody::Hello {
                     protocol_version: PROTOCOL_VERSION,
@@ -1856,6 +1920,25 @@ mod tests {
 
     fn responses() -> Vec<Response> {
         vec![
+            Response {
+                id: 90,
+                body: ResponseBody::Sign(SignResponse::Ready {
+                    size: 20_000,
+                    hole_start: 10_000,
+                    hole_end: 10_000 + 2 + 8_000,
+                    field: "Signature1".into(),
+                }),
+            },
+            Response {
+                id: 91,
+                body: ResponseBody::Sign(SignResponse::Fields {
+                    fields: vec![SignField {
+                        page: 0,
+                        rect: [1.0, 2.0, 3.0, 4.0],
+                        name: "S".into(),
+                    }],
+                }),
+            },
             Response {
                 id: 1,
                 body: ResponseBody::Hello {
@@ -2189,8 +2272,10 @@ mod tests {
     fn the_numbers_of_the_page_tools_meet_no_other_feature() {
         let pages_requests = pages::FIRST_REQUEST_TAG..=pages::LAST_REQUEST_TAG;
         let pages_answers = pages::FIRST_RESPONSE_TAG..=pages::LAST_RESPONSE_TAG;
-        let others_requests: [std::ops::RangeInclusive<u8>; 3] = [15..=22, 40..=42, 60..=60];
-        let others_answers: [std::ops::RangeInclusive<u8>; 3] = [144..=146, 170..=171, 190..=190];
+        let others_requests: [std::ops::RangeInclusive<u8>; 4] =
+            [15..=22, 40..=42, 60..=60, 110..=112];
+        let others_answers: [std::ops::RangeInclusive<u8>; 4] =
+            [144..=146, 170..=171, 190..=190, 220..=221];
         for other in &others_requests {
             assert!(
                 other.end() < pages_requests.start() || other.start() > pages_requests.end(),
@@ -3171,6 +3256,6 @@ mod tags {
                 "error code {raw} is missing"
             );
         }
-        assert_eq!(PROTOCOL_VERSION, 10);
+        assert_eq!(PROTOCOL_VERSION, 12);
     }
 }

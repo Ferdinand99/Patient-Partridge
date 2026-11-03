@@ -59,3 +59,6 @@ windows-sys = { version = "=0.61.2", features = [
 [dev-dependencies]
 partridge-engine-client = { path = "../engine-client" }
 partridge-testkit = { path = "../testkit" }
+# The tests of signing make real signatures with the signer, and check them with the engine.
+partridge-signer = { path = "../signer" }
+partridge-signer-protocol = { path = "../signer-protocol" }
