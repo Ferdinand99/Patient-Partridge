@@ -361,6 +361,16 @@ fn settle(page: &PdfPage) {
 }
 
 impl DocAnnots {
+    /// The bytes of signature pictures made in PDFium so far (see [`MAX_MARK_MADE_BYTES`]).
+    pub fn made_bytes(&self) -> usize {
+        self.made_bytes
+    }
+
+    /// Sets that count, for a record that is made again after a change to the pages.
+    pub fn set_made_bytes(&mut self, bytes: usize) {
+        self.made_bytes = bytes;
+    }
+
     /// The ids of the annotations of a page, brought in step with the page's list.
     fn ids(&mut self, page: u32, count: usize) -> &mut Vec<u32> {
         let next = &mut self.next_id;

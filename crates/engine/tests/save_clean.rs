@@ -10,7 +10,7 @@ mod common;
 use common::*;
 use partridge_engine::Engine;
 use partridge_protocol::{
-    ErrorCode, RequestBody, ResponseBody, SignatureFont, SignatureMark, StampKind,
+    ErrorCode, PagesRequest, RequestBody, ResponseBody, SignatureFont, SignatureMark, StampKind,
 };
 use partridge_testkit as kit;
 
@@ -329,4 +329,47 @@ fn putting_a_big_picture_back_again_and_again_is_stopped_before_the_engine_runs_
     assert!(list(e, doc, 0).is_empty());
     let saved = save_all(e, doc);
     assert_eq!(count(&saved, b"/Subtype/Image"), 0);
+}
+
+#[test]
+fn the_limit_on_pictures_made_goes_on_across_a_change_to_the_pages() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    let doc = open(e, &kit::blank_pages_pdf(1), None).unwrap();
+    let id = place(e, doc, noise_image(1_024, 512));
+    let mut stopped = false;
+    for _ in 0..400 {
+        take_off(e, doc, id);
+        if !matches!(
+            ask(e, RequestBody::RestoreAnnot { doc, page: 0, id }),
+            ResponseBody::Annot { .. }
+        ) {
+            stopped = true;
+            break;
+        }
+    }
+    assert!(stopped);
+    // PDFium keeps what it made, and the document is changed in place: a new page does not give
+    // the allowance back.
+    let added = ask(
+        e,
+        RequestBody::Pages(PagesRequest::InsertBlank {
+            doc,
+            at: 1,
+            width: 300.0,
+            height: 200.0,
+        }),
+    );
+    assert!(matches!(added, ResponseBody::Pages(_)), "{added:?}");
+    let more = ask(
+        e,
+        RequestBody::AddSignature {
+            doc,
+            page: 1,
+            rect: [100.0, 100.0, 200.0, 150.0],
+            color: INK,
+            mark: noise_image(1_024, 512),
+        },
+    );
+    assert_eq!(error_code(more), ErrorCode::AnnotationRefused);
 }

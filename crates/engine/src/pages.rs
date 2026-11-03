@@ -976,10 +976,20 @@ fn lose(engine: &mut Engine, doc: u32) -> Failure {
 /// The pages of a document are not the ones the form environment and the record of the annotations
 /// were made for (a page was deleted, moved or added): both go, and are made again, from the
 /// document as it is, when they are next asked for. Taking the change back brings back the record
-/// that belongs to the earlier state (see [`Snapshot`]).
+/// that belongs to the earlier state (see [`Snapshot`]). What PDFium made for the pictures of
+/// signatures stays in the document it holds, which is changed in place, so the count of it (and
+/// the limit on it) goes on across the change.
 fn pages_replaced(engine: &mut Engine, doc: u32) {
     engine.forms.remove(&doc);
-    engine.annots.remove(&doc);
+    let made = engine
+        .annots
+        .remove(&doc)
+        .map_or(0, |annots| annots.made_bytes());
+    if made > 0 {
+        let mut fresh = DocAnnots::default();
+        fresh.set_made_bytes(made);
+        engine.annots.insert(doc, fresh);
+    }
 }
 
 fn changed(
