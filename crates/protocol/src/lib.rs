@@ -16,6 +16,12 @@
 use std::fmt;
 use std::io::{self, Read, Write};
 
+mod annots;
+pub use annots::*;
+#[cfg(test)]
+mod annots_tests;
+mod forms;
+pub use forms::*;
 mod pages;
 pub use pages::*;
 mod signatures;
@@ -93,6 +99,17 @@ const TAG_REQ_SAVE_CHUNK: u8 = 12;
 const TAG_REQ_SAVE_END: u8 = 13;
 const TAG_REQ_FINGERPRINT: u8 = 14;
 const TAG_REQ_SIGNATURES: u8 = 60;
+const TAG_REQ_FORM_INFO: u8 = 40;
+const TAG_REQ_LIST_FORM_FIELDS: u8 = 41;
+const TAG_REQ_SET_FORM_FIELD: u8 = 42;
+const TAG_REQ_LIST_ANNOTS: u8 = 15;
+const TAG_REQ_ADD_MARKUP: u8 = 16;
+const TAG_REQ_ADD_NOTE: u8 = 17;
+const TAG_REQ_ADD_INK: u8 = 18;
+const TAG_REQ_ADD_STAMP: u8 = 19;
+const TAG_REQ_UPDATE_ANNOT: u8 = 20;
+const TAG_REQ_REMOVE_ANNOT: u8 = 21;
+const TAG_REQ_RESTORE_ANNOT: u8 = 22;
 
 const TAG_RES_HELLO: u8 = 129;
 const TAG_RES_OPENED: u8 = 130;
@@ -110,6 +127,11 @@ const TAG_RES_SAVE_ENDED: u8 = 141;
 const TAG_RES_PROGRESS: u8 = 142;
 const TAG_RES_FINGERPRINT: u8 = 143;
 const TAG_RES_SIGNATURES: u8 = 190;
+const TAG_RES_FORM_INFO: u8 = 170;
+const TAG_RES_FORM_FIELDS: u8 = 171;
+const TAG_RES_ANNOTS: u8 = 144;
+const TAG_RES_ANNOT: u8 = 145;
+const TAG_RES_ANNOT_REMOVED: u8 = 146;
 const TAG_RES_ERROR: u8 = 255;
 
 /// What went wrong while reading or decoding a frame.
@@ -222,6 +244,18 @@ pub enum ErrorCode {
     /// The permissions of the document do not allow the change (inserting, deleting, moving or
     /// turning pages, changing a page's boxes, or copying pages out).
     PagesNotAllowed = 56,
+    /// The document has no form the reader can fill in (it has none, or it is an XFA form).
+    FormUnsupported = 24,
+    /// The field is not there any more, is not the one named, is read only, or cannot be set to
+    /// what was asked.
+    FormFieldRefused = 25,
+    /// The annotation does not exist (any more), or the page changed under the window.
+    NoSuchAnnotation = 18,
+    /// The annotation exists but does not allow this change (for example, a drawing has no colour
+    /// to change), or nothing is left to put back.
+    AnnotationRefused = 19,
+    /// The document's own permissions do not allow annotations to be added or changed.
+    AnnotationsNotAllowed = 20,
 }
 
 impl ErrorCode {
@@ -251,6 +285,11 @@ impl ErrorCode {
             54 => ErrorCode::Busy,
             55 => ErrorCode::InsertSourceFailed,
             56 => ErrorCode::PagesNotAllowed,
+            24 => ErrorCode::FormUnsupported,
+            25 => ErrorCode::FormFieldRefused,
+            18 => ErrorCode::NoSuchAnnotation,
+            19 => ErrorCode::AnnotationRefused,
+            20 => ErrorCode::AnnotationsNotAllowed,
             _ => return None,
         })
     }
@@ -282,6 +321,11 @@ impl ErrorCode {
             ErrorCode::Busy => "busy",
             ErrorCode::InsertSourceFailed => "insert_source_failed",
             ErrorCode::PagesNotAllowed => "pages_not_allowed",
+            ErrorCode::FormUnsupported => "form_unsupported",
+            ErrorCode::FormFieldRefused => "form_field_refused",
+            ErrorCode::NoSuchAnnotation => "no_such_annotation",
+            ErrorCode::AnnotationRefused => "annotation_refused",
+            ErrorCode::AnnotationsNotAllowed => "annotations_not_allowed",
         }
     }
 }
@@ -339,12 +383,83 @@ pub enum RequestBody {
     /// the validity of certificates is judged against it. The check reads the whole file, so it
     /// reports progress like `DocInfo`. `now` is at most [`MAX_UNIX_TIME`].
     Signatures { doc: u32, now: i64 },
+    /// What kind of form the document has, and whether it has scripts, which never run, or actions
+    /// on fields.
+    FormInfo { doc: u32 },
+    /// The fields of one page that the reader fills in, with their values.
+    ListFormFields { doc: u32, page: u32 },
+    /// Sets one field. `index` and `name` say which: the place of the widget on its page, and the full
+    /// name the window saw there. The answer is the fields of the page as they are now.
+    SetFormField {
+        doc: u32,
+        page: u32,
+        index: u32,
+        name: String,
+        value: FormValue,
+    },
     /// The scripts for which PDFium asked the engine for a font and got none (no system font for
     /// the script, a font that did not pass the check, or the budget of font data used up).
     /// Text in those scripts that the PDF does not carry a font for is drawn as blanks.
     FontReport,
     /// A page tool: delete, reorder, rotate, crop, insert, extract (see the `pages` module).
     Pages(PagesRequest),
+    /// The annotations of one page that the reader can show and change: markup (highlight,
+    /// underline, strike-out), notes, drawings and stamps, and a few kinds that can only be removed.
+    /// Links and form fields are not in the list.
+    ListAnnots { doc: u32, page: u32 },
+    /// Marks the characters `start..end` of the page text (the same numbering as `PageText`) with a
+    /// highlight, an underline or a strike-out. The engine finds the boxes of the characters
+    /// itself, so the window never says where the marks go.
+    AddMarkup {
+        doc: u32,
+        page: u32,
+        kind: AnnotKind,
+        color: [u8; 4],
+        start: u32,
+        end: u32,
+    },
+    /// A sticky note with `text` at a point of the page, in points from the top left of the page
+    /// as it is drawn.
+    AddNote {
+        doc: u32,
+        page: u32,
+        x: f32,
+        y: f32,
+        color: [u8; 4],
+        text: String,
+    },
+    /// A free drawing: one or more strokes of points in points from the top left of the page as it
+    /// is drawn, with a line `width` in points.
+    AddInk {
+        doc: u32,
+        page: u32,
+        color: [u8; 4],
+        width: f32,
+        strokes: Vec<Vec<[f32; 2]>>,
+    },
+    /// A stamp with a fixed wording, its top left corner at a point of the page.
+    AddStamp {
+        doc: u32,
+        page: u32,
+        x: f32,
+        y: f32,
+        stamp: StampKind,
+    },
+    /// Changes an annotation: its text, its colour and its place (`dx` and `dy` in points on the
+    /// drawn page). What the annotation does not allow is refused.
+    UpdateAnnot {
+        doc: u32,
+        page: u32,
+        id: u32,
+        text: Option<String>,
+        color: Option<[u8; 4]>,
+        dx: f32,
+        dy: f32,
+    },
+    /// Takes an annotation off the page.
+    RemoveAnnot { doc: u32, page: u32, id: u32 },
+    /// Puts back an annotation that `RemoveAnnot` took off (`id` is the id it had). It gets a new id.
+    RestoreAnnot { doc: u32, page: u32, id: u32 },
 }
 
 /// One entry of the table of contents.
@@ -460,6 +575,16 @@ pub enum ResponseBody {
     Signatures {
         report: SignatureReport,
     },
+    /// Answer to `FormInfo`. `has_actions` is true when the document has scripts or actions on its
+    /// fields, which the reader never runs: fields that add up or format values are not updated.
+    FormInfo {
+        kind: FormKind,
+        has_actions: bool,
+    },
+    /// Answer to `ListFormFields` and `SetFormField`, at most [`MAX_FORM_FIELDS_PER_PAGE`] fields.
+    FormFields {
+        fields: Vec<FormField>,
+    },
     /// Answer to `SaveBegin`: the size of the serialised document, at most [`MAX_SAVE_BYTES`].
     SaveReady {
         size: u32,
@@ -476,6 +601,16 @@ pub enum ResponseBody {
     },
     /// The answer to a page tool.
     Pages(PagesResponse),
+    /// Answer to `ListAnnots`, at most [`MAX_ANNOTS_PER_PAGE`] entries.
+    Annots {
+        items: Vec<AnnotInfo>,
+    },
+    /// Answer to an `Add*`, `UpdateAnnot` or `RestoreAnnot`: the annotation as it is now.
+    Annot {
+        item: AnnotInfo,
+    },
+    /// Answer to `RemoveAnnot`.
+    AnnotRemoved,
     Error {
         code: ErrorCode,
         message: String,
@@ -627,11 +762,137 @@ impl Request {
                 put_u32(&mut out, *now as u32);
                 put_u32(&mut out, (*now >> 32) as u32);
             }
+            RequestBody::FormInfo { doc } => {
+                out.push(TAG_REQ_FORM_INFO);
+                put_u32(&mut out, self.id);
+                put_u32(&mut out, *doc);
+            }
+            RequestBody::ListFormFields { doc, page } => {
+                out.push(TAG_REQ_LIST_FORM_FIELDS);
+                put_u32(&mut out, self.id);
+                put_u32(&mut out, *doc);
+                put_u32(&mut out, *page);
+            }
+            RequestBody::SetFormField {
+                doc,
+                page,
+                index,
+                name,
+                value,
+            } => {
+                out.push(TAG_REQ_SET_FORM_FIELD);
+                put_u32(&mut out, self.id);
+                put_u32(&mut out, *doc);
+                put_u32(&mut out, *page);
+                put_u32(&mut out, *index);
+                put_str_max(&mut out, name, MAX_FORM_NAME);
+                put_form_value(&mut out, value);
+            }
             RequestBody::FontReport => {
                 out.push(TAG_REQ_FONT_REPORT);
                 put_u32(&mut out, self.id);
             }
             RequestBody::Pages(request) => request.encode(self.id, &mut out),
+            RequestBody::ListAnnots { doc, page } => {
+                out.push(TAG_REQ_LIST_ANNOTS);
+                put_u32(&mut out, self.id);
+                put_u32(&mut out, *doc);
+                put_u32(&mut out, *page);
+            }
+            RequestBody::AddMarkup {
+                doc,
+                page,
+                kind,
+                color,
+                start,
+                end,
+            } => {
+                out.push(TAG_REQ_ADD_MARKUP);
+                put_u32(&mut out, self.id);
+                put_u32(&mut out, *doc);
+                put_u32(&mut out, *page);
+                out.push(*kind as u8);
+                out.extend_from_slice(color);
+                put_u32(&mut out, *start);
+                put_u32(&mut out, *end);
+            }
+            RequestBody::AddNote {
+                doc,
+                page,
+                x,
+                y,
+                color,
+                text,
+            } => {
+                out.push(TAG_REQ_ADD_NOTE);
+                put_u32(&mut out, self.id);
+                put_u32(&mut out, *doc);
+                put_u32(&mut out, *page);
+                put_f32(&mut out, *x);
+                put_f32(&mut out, *y);
+                out.extend_from_slice(color);
+                put_str_max(&mut out, text, MAX_ANNOT_TEXT);
+            }
+            RequestBody::AddInk {
+                doc,
+                page,
+                color,
+                width,
+                strokes,
+            } => {
+                out.push(TAG_REQ_ADD_INK);
+                put_u32(&mut out, self.id);
+                put_u32(&mut out, *doc);
+                put_u32(&mut out, *page);
+                out.extend_from_slice(color);
+                put_f32(&mut out, *width);
+                annots::put_strokes(&mut out, strokes);
+            }
+            RequestBody::AddStamp {
+                doc,
+                page,
+                x,
+                y,
+                stamp,
+            } => {
+                out.push(TAG_REQ_ADD_STAMP);
+                put_u32(&mut out, self.id);
+                put_u32(&mut out, *doc);
+                put_u32(&mut out, *page);
+                put_f32(&mut out, *x);
+                put_f32(&mut out, *y);
+                out.push(*stamp as u8);
+            }
+            RequestBody::UpdateAnnot {
+                doc,
+                page,
+                id,
+                text,
+                color,
+                dx,
+                dy,
+            } => {
+                out.push(TAG_REQ_UPDATE_ANNOT);
+                put_u32(&mut out, self.id);
+                put_u32(&mut out, *doc);
+                put_u32(&mut out, *page);
+                put_u32(&mut out, *id);
+                annots::put_update(&mut out, text.as_deref(), color.as_ref(), *dx, *dy);
+            }
+            RequestBody::RemoveAnnot { doc, page, id } => {
+                out.push(TAG_REQ_REMOVE_ANNOT);
+                put_u32(&mut out, self.id);
+                put_u32(&mut out, *doc);
+                put_u32(&mut out, *page);
+                put_u32(&mut out, *id);
+            }
+            RequestBody::RestoreAnnot { doc, page, id } => {
+                out.push(TAG_REQ_RESTORE_ANNOT);
+                put_u32(&mut out, self.id);
+                put_u32(&mut out, *doc);
+                put_u32(&mut out, *page);
+                put_u32(&mut out, *id);
+            }
         }
         out
     }
@@ -689,10 +950,102 @@ impl Request {
                 }
                 RequestBody::Signatures { doc, now }
             }
-            TAG_REQ_FONT_REPORT => RequestBody::FontReport,
             t if (pages::FIRST_REQUEST_TAG..=pages::LAST_REQUEST_TAG).contains(&t) => {
                 RequestBody::Pages(PagesRequest::decode(t, &mut r)?)
             }
+            TAG_REQ_FORM_INFO => RequestBody::FormInfo { doc: r.u32()? },
+            TAG_REQ_LIST_FORM_FIELDS => RequestBody::ListFormFields {
+                doc: r.u32()?,
+                page: r.u32()?,
+            },
+            TAG_REQ_SET_FORM_FIELD => RequestBody::SetFormField {
+                doc: r.u32()?,
+                page: r.u32()?,
+                index: r.u32()?,
+                name: r.string_max(MAX_FORM_NAME)?,
+                value: read_form_value(&mut r)?,
+            },
+            TAG_REQ_FONT_REPORT => RequestBody::FontReport,
+            TAG_REQ_LIST_ANNOTS => RequestBody::ListAnnots {
+                doc: r.u32()?,
+                page: r.u32()?,
+            },
+            TAG_REQ_ADD_MARKUP => {
+                let doc = r.u32()?;
+                let page = r.u32()?;
+                let kind = AnnotKind::markup_from(r.u8()?)?;
+                let color = r.color()?;
+                let start = r.u32()?;
+                let end = r.u32()?;
+                // At least one character, and no more than a page holds.
+                if end <= start || (end - start) as usize > MAX_MARKUP_CHARS {
+                    return Err(ProtocolError::InvalidLength);
+                }
+                RequestBody::AddMarkup {
+                    doc,
+                    page,
+                    kind,
+                    color,
+                    start,
+                    end,
+                }
+            }
+            TAG_REQ_ADD_NOTE => RequestBody::AddNote {
+                doc: r.u32()?,
+                page: r.u32()?,
+                x: r.coordinate()?,
+                y: r.coordinate()?,
+                color: r.color()?,
+                text: r.string_max(MAX_ANNOT_TEXT)?,
+            },
+            TAG_REQ_ADD_INK => {
+                let doc = r.u32()?;
+                let page = r.u32()?;
+                let color = r.color()?;
+                let width = r.f32()?;
+                if !(MIN_INK_WIDTH..=MAX_INK_WIDTH).contains(&width) {
+                    return Err(ProtocolError::InvalidLength);
+                }
+                RequestBody::AddInk {
+                    doc,
+                    page,
+                    color,
+                    width,
+                    strokes: annots::read_strokes(&mut r)?,
+                }
+            }
+            TAG_REQ_ADD_STAMP => RequestBody::AddStamp {
+                doc: r.u32()?,
+                page: r.u32()?,
+                x: r.coordinate()?,
+                y: r.coordinate()?,
+                stamp: StampKind::from_u8(r.u8()?)?,
+            },
+            TAG_REQ_UPDATE_ANNOT => {
+                let doc = r.u32()?;
+                let page = r.u32()?;
+                let id = r.u32()?;
+                let (text, color, dx, dy) = annots::read_update(&mut r)?;
+                RequestBody::UpdateAnnot {
+                    doc,
+                    page,
+                    id,
+                    text,
+                    color,
+                    dx,
+                    dy,
+                }
+            }
+            TAG_REQ_REMOVE_ANNOT => RequestBody::RemoveAnnot {
+                doc: r.u32()?,
+                page: r.u32()?,
+                id: r.u32()?,
+            },
+            TAG_REQ_RESTORE_ANNOT => RequestBody::RestoreAnnot {
+                doc: r.u32()?,
+                page: r.u32()?,
+                id: r.u32()?,
+            },
             other => return Err(ProtocolError::UnknownTag(other)),
         };
         r.finish()?;
@@ -862,6 +1215,17 @@ impl Response {
                 out.push(TAG_RES_SAVE_ENDED);
                 put_u32(&mut out, self.id);
             }
+            ResponseBody::FormInfo { kind, has_actions } => {
+                out.push(TAG_RES_FORM_INFO);
+                put_u32(&mut out, self.id);
+                out.push(*kind as u8);
+                out.push(u8::from(*has_actions));
+            }
+            ResponseBody::FormFields { fields } => {
+                out.push(TAG_RES_FORM_FIELDS);
+                put_u32(&mut out, self.id);
+                put_fields(&mut out, fields);
+            }
             ResponseBody::FontReport { missed } => {
                 out.push(TAG_RES_FONT_REPORT);
                 put_u32(&mut out, self.id);
@@ -872,6 +1236,24 @@ impl Response {
                 }
             }
             ResponseBody::Pages(response) => response.encode(self.id, &mut out),
+            ResponseBody::Annots { items } => {
+                out.push(TAG_RES_ANNOTS);
+                put_u32(&mut out, self.id);
+                let items = &items[..items.len().min(MAX_ANNOTS_PER_PAGE)];
+                put_u32(&mut out, items.len() as u32);
+                for item in items {
+                    annots::put_info(&mut out, item);
+                }
+            }
+            ResponseBody::Annot { item } => {
+                out.push(TAG_RES_ANNOT);
+                put_u32(&mut out, self.id);
+                annots::put_info(&mut out, item);
+            }
+            ResponseBody::AnnotRemoved => {
+                out.push(TAG_RES_ANNOT_REMOVED);
+                put_u32(&mut out, self.id);
+            }
             ResponseBody::Error { code, message } => {
                 out.push(TAG_RES_ERROR);
                 put_u32(&mut out, self.id);
@@ -1093,6 +1475,17 @@ impl Response {
                 report: SignatureReport::decode(&mut r)?,
             },
             TAG_RES_SAVE_ENDED => ResponseBody::SaveEnded,
+            TAG_RES_FORM_INFO => ResponseBody::FormInfo {
+                kind: FormKind::from_u8(r.u8()?)?,
+                has_actions: match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    other => return Err(ProtocolError::UnknownValue(other)),
+                },
+            },
+            TAG_RES_FORM_FIELDS => ResponseBody::FormFields {
+                fields: read_fields(&mut r)?,
+            },
             TAG_RES_FONT_REPORT => {
                 let count = r.u8()? as usize;
                 if count > FontScript::ALL.len() {
@@ -1109,6 +1502,21 @@ impl Response {
             t if (pages::FIRST_RESPONSE_TAG..=pages::LAST_RESPONSE_TAG).contains(&t) => {
                 ResponseBody::Pages(PagesResponse::decode(t, &mut r)?)
             }
+            TAG_RES_ANNOTS => {
+                let count = r.u32()? as usize;
+                if count > MAX_ANNOTS_PER_PAGE || count > r.remaining() / ANNOT_INFO_MIN {
+                    return Err(ProtocolError::InvalidLength);
+                }
+                let mut items = Vec::with_capacity(count);
+                for _ in 0..count {
+                    items.push(annots::read_info(&mut r)?);
+                }
+                ResponseBody::Annots { items }
+            }
+            TAG_RES_ANNOT => ResponseBody::Annot {
+                item: annots::read_info(&mut r)?,
+            },
+            TAG_RES_ANNOT_REMOVED => ResponseBody::AnnotRemoved,
             TAG_RES_ERROR => {
                 let raw = r.u8()?;
                 let code = ErrorCode::from_u8(raw).ok_or(ProtocolError::UnknownValue(raw))?;
@@ -1170,6 +1578,23 @@ impl<'a> Reader<'a> {
             *v = if x.is_finite() { x } else { 0.0 };
         }
         Ok(out)
+    }
+
+    /// A colour as red, green, blue and alpha.
+    fn color(&mut self) -> Result<[u8; 4], ProtocolError> {
+        let b = self.take(4)?;
+        Ok([b[0], b[1], b[2], b[3]])
+    }
+
+    /// A place on a page: a number that is finite and not absurdly large. A request that carries
+    /// anything else is refused, not repaired.
+    fn coordinate(&mut self) -> Result<f32, ProtocolError> {
+        let x = self.f32()?;
+        if x.is_finite() && x.abs() <= annots::MAX_COORDINATE {
+            Ok(x)
+        } else {
+            Err(ProtocolError::InvalidLength)
+        }
     }
 
     fn string(&mut self) -> Result<String, ProtocolError> {
@@ -2275,13 +2700,13 @@ mod tests {
 
     #[test]
     fn error_codes_round_trip_and_have_names() {
-        for v in 1..=17u8 {
+        for v in 1..=20u8 {
             let code = ErrorCode::from_u8(v).unwrap();
             assert_eq!(code as u8, v);
             assert!(!code.name().is_empty());
         }
         assert!(ErrorCode::from_u8(0).is_none());
-        assert!(ErrorCode::from_u8(18).is_none());
+        assert!(ErrorCode::from_u8(21).is_none());
         assert_eq!(ErrorCode::from_u8(16).unwrap().name(), "source_changed");
         assert_eq!(ErrorCode::from_u8(17).unwrap().name(), "source_unreadable");
         assert_eq!(ErrorCode::from_u8(14).unwrap().name(), "save_failed");
@@ -2566,5 +2991,104 @@ mod font_script_tests {
             assert_eq!(FontScript::from_name(script.name()), Some(script));
         }
         assert_eq!(FontScript::from_name("latin"), None);
+    }
+}
+
+#[cfg(test)]
+mod tags {
+    use super::*;
+
+    /// The two lines of development that were merged each gave out tags and error codes, and no
+    /// tag may stand for two messages: the decoders tell messages apart by it alone.
+    #[test]
+    fn no_tag_or_error_code_stands_for_two_things() {
+        let requests: Vec<u8> = vec![
+            TAG_REQ_HELLO,
+            TAG_REQ_OPEN,
+            TAG_REQ_RENDER,
+            TAG_REQ_CLOSE,
+            TAG_REQ_OUTLINE,
+            TAG_REQ_PAGE_TEXT,
+            TAG_REQ_PAGE_LINKS,
+            TAG_REQ_SEARCH,
+            TAG_REQ_FONT_REPORT,
+            TAG_REQ_DOC_INFO,
+            TAG_REQ_SAVE_BEGIN,
+            TAG_REQ_SAVE_CHUNK,
+            TAG_REQ_SAVE_END,
+            TAG_REQ_FINGERPRINT,
+            TAG_REQ_SIGNATURES,
+            TAG_REQ_FORM_INFO,
+            TAG_REQ_LIST_FORM_FIELDS,
+            TAG_REQ_SET_FORM_FIELD,
+            TAG_REQ_LIST_ANNOTS,
+            TAG_REQ_ADD_MARKUP,
+            TAG_REQ_ADD_NOTE,
+            TAG_REQ_ADD_INK,
+            TAG_REQ_ADD_STAMP,
+            TAG_REQ_UPDATE_ANNOT,
+            TAG_REQ_REMOVE_ANNOT,
+            TAG_REQ_RESTORE_ANNOT,
+        ];
+        let responses: Vec<u8> = vec![
+            TAG_RES_HELLO,
+            TAG_RES_OPENED,
+            TAG_RES_RENDERED,
+            TAG_RES_CLOSED,
+            TAG_RES_OUTLINE,
+            TAG_RES_PAGE_TEXT,
+            TAG_RES_PAGE_LINKS,
+            TAG_RES_MATCHES,
+            TAG_RES_FONT_REPORT,
+            TAG_RES_DOC_INFO,
+            TAG_RES_SAVE_READY,
+            TAG_RES_SAVE_DATA,
+            TAG_RES_SAVE_ENDED,
+            TAG_RES_PROGRESS,
+            TAG_RES_FINGERPRINT,
+            TAG_RES_SIGNATURES,
+            TAG_RES_FORM_INFO,
+            TAG_RES_FORM_FIELDS,
+            TAG_RES_ANNOTS,
+            TAG_RES_ANNOT,
+            TAG_RES_ANNOT_REMOVED,
+            TAG_RES_ERROR,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for tag in &requests {
+            assert!(seen.insert(*tag), "request tag {tag} is used twice");
+            assert!(
+                !(pages::FIRST_REQUEST_TAG..=pages::LAST_REQUEST_TAG).contains(tag),
+                "request tag {tag} is in the range of the page tools"
+            );
+        }
+        let mut seen = std::collections::HashSet::new();
+        for tag in &responses {
+            assert!(seen.insert(*tag), "answer tag {tag} is used twice");
+            assert!(
+                !(pages::FIRST_RESPONSE_TAG..=pages::LAST_RESPONSE_TAG).contains(tag),
+                "answer tag {tag} is in the range of the page tools"
+            );
+        }
+        // Every error code reads back as itself and has a name of its own.
+        let mut names = std::collections::HashSet::new();
+        for raw in 0..=255u8 {
+            if let Some(code) = ErrorCode::from_u8(raw) {
+                assert_eq!(code as u8, raw);
+                assert!(
+                    names.insert(code.name()),
+                    "two error codes are called {}",
+                    code.name()
+                );
+            }
+        }
+        // The codes of the annotations and forms, and those of the page tools, are all there.
+        for raw in [18u8, 19, 20, 24, 25, 50, 51, 52, 53, 54, 55, 56] {
+            assert!(
+                ErrorCode::from_u8(raw).is_some(),
+                "error code {raw} is missing"
+            );
+        }
+        assert_eq!(PROTOCOL_VERSION, 9);
     }
 }

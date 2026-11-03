@@ -217,6 +217,21 @@ const tab = (title: string) =>
 const key = (k: string, init: KeyboardEventInit = {}) =>
   document.body.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true, cancelable: true, ...init }));
 
+describe("App: the name in the window title", () => {
+  it("is the product name of the build, and falls back to the plain name", async () => {
+    const { app, deps } = make();
+    app.setAppName("Patient Partridge Beta");
+    expect(deps.setWindowTitle).toHaveBeenLastCalledWith("Patient Partridge Beta");
+    await app.openPath("/docs/book.pdf");
+    await flush();
+    expect(deps.setWindowTitle).toHaveBeenLastCalledWith("book.pdf - Patient Partridge Beta");
+    app.setAppName(undefined);
+    expect(deps.setWindowTitle).toHaveBeenLastCalledWith("book.pdf - Patient Partridge");
+    app.setAppName("  ");
+    expect(deps.setWindowTitle).toHaveBeenLastCalledWith("book.pdf - Patient Partridge");
+  });
+});
+
 describe("App: opening a file", () => {
   it("shows the document, the page count, the tab and the title", async () => {
     const { app, deps } = make();

@@ -2702,7 +2702,7 @@ dependencies = [
 
 [[package]]
 name = "partridge-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cms",
  "const-oid 0.9.6",
@@ -2720,7 +2720,7 @@ dependencies = [
 
 [[package]]
 name = "partridge-engine-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "partridge-protocol",
@@ -2730,12 +2730,13 @@ dependencies = [
 
 [[package]]
 name = "partridge-protocol"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "partridge-testkit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "flate2",
  "md-5",
  "num-bigint",
  "ring",
@@ -2743,7 +2744,7 @@ dependencies = [
 
 [[package]]
 name = "patient-partridge"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "partridge-engine-client",
  "partridge-protocol",

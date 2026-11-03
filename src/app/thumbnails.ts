@@ -226,6 +226,14 @@ export class ThumbnailList {
     this.refresh();
   }
 
+  /** The picture of a page changed (an annotation was added, say): its thumbnail is drawn again. */
+  invalidate(page: number): void {
+    const m = this.mounted.get(page);
+    if (this.destroyed || !m) return;
+    m.drawn = false;
+    if (this.enabled) this.scheduleRender();
+  }
+
   /** How many thumbnail elements exist right now. */
   get mountedCount(): number {
     return this.mounted.size;

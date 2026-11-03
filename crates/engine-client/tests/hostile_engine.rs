@@ -194,7 +194,7 @@ fn handles_do_not_survive_an_engine_restart() {
 }
 
 #[test]
-fn i3_a_slow_save_is_not_taken_for_a_hung_engine() {
+fn a_slow_save_is_not_taken_for_a_hung_engine() {
     // The answer to SaveBegin takes 1.5 s, three times the limit that a render gets here.
     let mut config = EngineConfig::new(fake_engine());
     config.args = vec!["save-slow".into()];
@@ -213,7 +213,7 @@ fn i3_a_slow_save_is_not_taken_for_a_hung_engine() {
 }
 
 #[test]
-fn i3_progress_keeps_a_save_alive_for_longer_than_the_limit_and_silence_does_not() {
+fn progress_keeps_a_save_alive_for_longer_than_the_limit_and_silence_does_not() {
     // The save takes 1.8 s with a sign of life every 0.3 s; the engine may be silent for 1 s.
     let mut config = EngineConfig::new(fake_engine());
     config.args = vec!["save-progress".into()];
@@ -237,7 +237,7 @@ fn i3_progress_keeps_a_save_alive_for_longer_than_the_limit_and_silence_does_not
 }
 
 #[test]
-fn i3_a_sign_of_life_that_shows_no_more_work_than_the_last_is_refused() {
+fn a_sign_of_life_that_shows_no_more_work_than_the_last_is_refused() {
     let mut config = EngineConfig::new(fake_engine());
     config.args = vec!["save-stuck".into()];
     config.timeout = Duration::from_millis(500);
@@ -253,7 +253,7 @@ fn i3_a_sign_of_life_that_shows_no_more_work_than_the_last_is_refused() {
 }
 
 #[test]
-fn n5_signs_of_life_do_not_keep_a_save_open_for_ever() {
+fn signs_of_life_do_not_keep_a_save_open_for_ever() {
     // The engine reports more work every 0.1 s for a minute. Each sign renews the stall limit of
     // 1 s, so only the overall limit (1 s for this small file) can end it.
     let mut config = EngineConfig::new(fake_engine());
@@ -282,7 +282,7 @@ fn n5_signs_of_life_do_not_keep_a_save_open_for_ever() {
 }
 
 #[test]
-fn n5_the_overall_limit_grows_with_the_size_of_the_file() {
+fn the_overall_limit_grows_with_the_size_of_the_file() {
     // A file of 4 MiB at 1 MiB a second, four passes: 16 s more than the floor. A save that takes
     // 1.8 s with signs of life every 0.3 s is far inside it, and a floor of 0 does not matter.
     let mut config = EngineConfig::new(fake_engine());

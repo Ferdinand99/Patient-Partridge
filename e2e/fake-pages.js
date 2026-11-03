@@ -8,6 +8,7 @@
 //   - /docs/many.pdf: 3000 Letter pages
 //   - /docs/locked-doc.pdf: four pages, protected by a password (it is open already)
 //   - /docs/signed-doc.pdf: three pages, signed
+//   - /docs/form-ten.pdf: four Letter pages, a form with one text field ("Full name") on every
 //
 // and the files that pages can be inserted from (the file dialog answers with the paths in
 // `__E2E__.dialog`):
@@ -66,6 +67,7 @@
     "/docs/many.pdf": { sizes: Array.from({ length: 3000 }, () => LETTER) },
     "/docs/locked-doc.pdf": { sizes: Array.from({ length: 4 }, () => LETTER), protected: true },
     "/docs/signed-doc.pdf": { sizes: Array.from({ length: 3 }, () => LETTER), signed: true },
+    "/docs/form-ten.pdf": { sizes: Array.from({ length: 4 }, () => LETTER), form: true },
   };
   const SOURCES = {
     "/docs/second.pdf": { pages: 2 },
@@ -95,12 +97,42 @@
       nextSnap: 1,
       protected: Boolean(spec.protected),
       signed: Boolean(spec.signed),
+      // The made-up form: one text field on every page.
+      fields: spec.form ? [textField()] : null,
     });
     return {
       doc,
       name: path.split("/").pop(),
       pages: spec.sizes.map((s) => [s[0], s[1]]),
       position: null,
+    };
+  }
+
+  function textField() {
+    return {
+      index: 0,
+      name: "fullname",
+      kind: "text",
+      readOnly: false,
+      required: false,
+      multiline: false,
+      password: false,
+      editable: false,
+      multiselect: false,
+      checked: false,
+      valueCut: false,
+      noToggleOff: false,
+      comb: false,
+      action: false,
+      actionBlocked: false,
+      formBlocked: false,
+      turns: 0,
+      fontSize: 12,
+      tooltip: "Full name",
+      value: "",
+      maxLen: 0,
+      options: [],
+      rect: [150, 68, 400, 92],
     };
   }
 
@@ -205,6 +237,22 @@
       case "close_pdf":
         models.delete(args.doc);
         return null;
+      case "form_info":
+        if (!model(args.doc).fields) return baseInvoke(cmd, args);
+        return { kind: "acro", actions: false };
+      case "get_form_fields": {
+        const { fields } = model(args.doc);
+        if (!fields) return baseInvoke(cmd, args);
+        return structuredClone(fields);
+      }
+      case "set_form_field": {
+        const { fields } = model(args.doc);
+        if (!fields) return baseInvoke(cmd, args);
+        const f = fields.find((x) => x.index === args.index && x.name === args.name);
+        if (!f) throw { code: "form_field_refused", message: "not the field" };
+        if (args.value.kind === "text") f.value = args.value.text;
+        return structuredClone(fields);
+      }
       case "get_outline":
       case "get_page_links":
       case "search_page":

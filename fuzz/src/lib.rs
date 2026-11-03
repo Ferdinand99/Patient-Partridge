@@ -17,12 +17,15 @@ use std::io::{self, Read};
 
 use arbitrary::{Result, Unstructured};
 use partridge_protocol::{
-    ErrorCode, FontScript, LinkTarget, OutlineItem, PageLink, PageSize, Request, RequestBody,
-    Response, ResponseBody, TextMatch, MAX_LINKS_PER_PAGE, MAX_MATCHES_PER_PAGE, MAX_OUTLINE_DEPTH,
-    MAX_OUTLINE_ITEMS, MAX_OUTLINE_TITLE, MAX_QUERY_LEN, MAX_SAVE_BYTES, MAX_SAVE_CHUNK,
-    MAX_SIGNATURES, MAX_STRING_LEN, MAX_UNIX_TIME, MAX_URI_LEN,
+    ability, field_flag, AnnotInfo, AnnotKind, ErrorCode, FontScript, FormField, FormFieldKind,
+    FormKind, FormOption, FormValue, LinkTarget, OutlineItem, PageLink, PageSize, Request,
+    RequestBody, Response, ResponseBody, StampKind, TextMatch, MAX_ANNOTS_PER_PAGE,
+    MAX_ANNOT_AUTHOR, MAX_ANNOT_TEXT, MAX_COORDINATE, MAX_FORM_FIELDS_PER_PAGE, MAX_FORM_NAME,
+    MAX_FORM_OPTIONS, MAX_FORM_OPTION_LABEL, MAX_FORM_TOOLTIP, MAX_FORM_VALUE, MAX_INK_POINTS,
+    MAX_INK_STROKES, MAX_INK_WIDTH, MAX_LINKS_PER_PAGE, MAX_MARKUP_CHARS, MAX_MATCHES_PER_PAGE,
+    MAX_OUTLINE_DEPTH, MAX_OUTLINE_ITEMS, MAX_OUTLINE_TITLE, MAX_QUERY_LEN, MAX_SAVE_BYTES,
+    MAX_SAVE_CHUNK, MAX_SIGNATURES, MAX_STRING_LEN, MAX_UNIX_TIME, MAX_URI_LEN, MIN_INK_WIDTH,
 };
-
 /// True about one time in `n`, and never when the input has run out: `Unstructured` answers
 /// `true` to every `ratio` once its bytes are used up, which would make the biggest case the
 /// usual one.
@@ -79,10 +82,59 @@ pub fn sanitized(rect: [f32; 4]) -> [f32; 4] {
     rect.map(|v| if v.is_finite() { v } else { 0.0 })
 }
 
+/// A place on a page that a request may carry: finite, and now and then exactly at the limit.
+fn coordinate(u: &mut Unstructured) -> Result<f32> {
+    if chance(u, 16)? {
+        return Ok(if u.arbitrary()? {
+            MAX_COORDINATE
+        } else {
+            -MAX_COORDINATE
+        });
+    }
+    let v: f32 = u.arbitrary()?;
+    Ok(if v.is_finite() && v.abs() <= MAX_COORDINATE {
+        v
+    } else {
+        0.5
+    })
+}
+
+fn markup_kind(u: &mut Unstructured) -> Result<AnnotKind> {
+    Ok([
+        AnnotKind::Highlight,
+        AnnotKind::Underline,
+        AnnotKind::Strikeout,
+    ][u.int_in_range(0..=2usize)?])
+}
+
+/// The strokes of a drawing inside the caps: a few short ones mostly, and now and then the most
+/// strokes, or the most points, the protocol allows (made of one repeated point, so that they cost
+/// the fuzzer's input nothing).
+fn arb_strokes(u: &mut Unstructured) -> Result<Vec<Vec<[f32; 2]>>> {
+    if chance(u, 24)? {
+        return Ok(if u.arbitrary()? {
+            vec![vec![[1.0, 1.0]]; MAX_INK_STROKES]
+        } else {
+            vec![vec![[2.0, 3.0]; MAX_INK_POINTS]]
+        });
+    }
+    let count = u.int_in_range(1..=4usize)?;
+    let mut strokes = Vec::new();
+    for _ in 0..count {
+        let points = u.int_in_range(1..=6usize)?;
+        let mut stroke = Vec::new();
+        for _ in 0..points {
+            stroke.push([coordinate(u)?, coordinate(u)?]);
+        }
+        strokes.push(stroke);
+    }
+    Ok(strokes)
+}
+
 /// A request that the encoder writes without cutting anything.
 pub fn arb_request(u: &mut Unstructured) -> Result<Request> {
     let id: u32 = u.arbitrary()?;
-    let body = match u.int_in_range(0..=15u8)? {
+    let body = match u.int_in_range(0..=26u8)? {
         0 => RequestBody::Hello {
             protocol_version: u.arbitrary()?,
         },
@@ -140,7 +192,97 @@ pub fn arb_request(u: &mut Unstructured) -> Result<Request> {
         12 => RequestBody::Fingerprint {
             doc: u.arbitrary()?,
         },
-        13 => RequestBody::Signatures {
+        13 => RequestBody::ListAnnots {
+            doc: u.arbitrary()?,
+            page: u.arbitrary()?,
+        },
+        14 => {
+            // At least one character, at most a page of them, and the end still a u32.
+            let start = u.int_in_range(0..=u32::MAX - MAX_MARKUP_CHARS as u32)?;
+            let len = if chance(u, 8)? {
+                MAX_MARKUP_CHARS as u32
+            } else {
+                u.int_in_range(1..=64u32)?
+            };
+            RequestBody::AddMarkup {
+                doc: u.arbitrary()?,
+                page: u.arbitrary()?,
+                kind: markup_kind(u)?,
+                color: u.arbitrary()?,
+                start,
+                end: start + len,
+            }
+        }
+        15 => RequestBody::AddNote {
+            doc: u.arbitrary()?,
+            page: u.arbitrary()?,
+            x: coordinate(u)?,
+            y: coordinate(u)?,
+            color: u.arbitrary()?,
+            text: string_up_to(u, MAX_ANNOT_TEXT)?,
+        },
+        16 => RequestBody::AddInk {
+            doc: u.arbitrary()?,
+            page: u.arbitrary()?,
+            color: u.arbitrary()?,
+            // Quarter points from the thinnest to the thickest line, edges included.
+            width: if chance(u, 8)? {
+                [MIN_INK_WIDTH, MAX_INK_WIDTH][u.int_in_range(0..=1usize)?]
+            } else {
+                u.int_in_range(1..=288u32)? as f32 * 0.25
+            },
+            strokes: arb_strokes(u)?,
+        },
+        17 => RequestBody::AddStamp {
+            doc: u.arbitrary()?,
+            page: u.arbitrary()?,
+            x: coordinate(u)?,
+            y: coordinate(u)?,
+            stamp: StampKind::ALL[u.int_in_range(0..=StampKind::ALL.len() - 1)?],
+        },
+        18 => RequestBody::UpdateAnnot {
+            doc: u.arbitrary()?,
+            page: u.arbitrary()?,
+            id: u.arbitrary()?,
+            text: if u.arbitrary()? {
+                Some(string_up_to(u, MAX_ANNOT_TEXT)?)
+            } else {
+                None
+            },
+            color: if u.arbitrary()? {
+                Some(u.arbitrary()?)
+            } else {
+                None
+            },
+            dx: coordinate(u)?,
+            dy: coordinate(u)?,
+        },
+        19 => RequestBody::RemoveAnnot {
+            doc: u.arbitrary()?,
+            page: u.arbitrary()?,
+            id: u.arbitrary()?,
+        },
+        20 => RequestBody::RestoreAnnot {
+            doc: u.arbitrary()?,
+            page: u.arbitrary()?,
+            id: u.arbitrary()?,
+        },
+        21 => RequestBody::FontReport,
+        22 => RequestBody::FormInfo {
+            doc: u.arbitrary()?,
+        },
+        23 => RequestBody::ListFormFields {
+            doc: u.arbitrary()?,
+            page: u.arbitrary()?,
+        },
+        24 => RequestBody::SetFormField {
+            doc: u.arbitrary()?,
+            page: u.arbitrary()?,
+            index: u.arbitrary()?,
+            name: string_up_to(u, MAX_FORM_NAME)?,
+            value: arb_form_value(u)?,
+        },
+        25 => RequestBody::Signatures {
             doc: u.arbitrary()?,
             now: if chance(u, 8)? {
                 MAX_UNIX_TIME
@@ -148,7 +290,6 @@ pub fn arb_request(u: &mut Unstructured) -> Result<Request> {
                 u.int_in_range(0..=MAX_UNIX_TIME)?
             },
         },
-        14 => RequestBody::FontReport,
         _ => RequestBody::Pages(arb_pages_request(u)?),
     };
     Ok(Request { id, body })
@@ -172,9 +313,29 @@ pub struct GeneratedResponse {
     pub expected: Response,
 }
 
+/// One listed annotation inside the caps: any defined abilities, a box that may hold numbers that
+/// are not numbers (the decoder turns those into zeros), text and an author up to the caps. Returns
+/// what is sent and what must come back.
+fn arb_annot(u: &mut Unstructured) -> Result<(AnnotInfo, AnnotInfo)> {
+    let sent = AnnotInfo {
+        id: u.arbitrary()?,
+        kind: AnnotKind::from_u8(u.int_in_range(1..=7u8)?).expect("1 to 7 are kinds"),
+        abilities: u.int_in_range(0..=ability::ALL)?,
+        rect: any_rect(u)?,
+        color: u.arbitrary()?,
+        text: string_up_to(u, MAX_ANNOT_TEXT)?,
+        author: string_up_to(u, MAX_ANNOT_AUTHOR)?,
+    };
+    let expected = AnnotInfo {
+        rect: sanitized(sent.rect),
+        ..sent.clone()
+    };
+    Ok((sent, expected))
+}
+
 pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
     let id: u32 = u.arbitrary()?;
-    let (sent, expected) = match u.int_in_range(0..=17u8)? {
+    let (sent, expected) = match u.int_in_range(0..=22u8)? {
         0 => {
             let b = ResponseBody::Hello {
                 protocol_version: u.arbitrary()?,
@@ -302,13 +463,14 @@ pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
             (b.clone(), b)
         }
         8 => {
-            // The codes of the reader and the save, and now and then those of the page tools.
-            let raw = if chance(u, 6)? {
-                u.int_in_range(50..=56u8)?
+            // The codes of the reader, the save, the annotations and the forms (1 to 20, then 24 and
+            // 25), and now and then those of the page tools (50 to 56).
+            let code = if chance(u, 6)? {
+                ErrorCode::from_u8(u.int_in_range(50..=56u8)?).expect("50 to 56 are codes")
             } else {
-                u.int_in_range(1..=17u8)?
+                let n = u.int_in_range(1..=22u8)?;
+                ErrorCode::from_u8(if n > 20 { n + 3 } else { n }).expect("a known code")
             };
-            let code = ErrorCode::from_u8(raw).expect("1 to 17 and 50 to 56 are codes");
             let b = ResponseBody::Error {
                 code,
                 message: string_up_to(u, MAX_STRING_LEN)?,
@@ -365,13 +527,25 @@ pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
             (b.clone(), b)
         }
         15 => {
-            let count = count_up_to(u, MAX_SIGNATURES)?;
-            let b = ResponseBody::Signatures {
-                report: arb_signature_report(u, count)?,
-            };
-            (b.clone(), b)
+            let count = count_up_to(u, MAX_ANNOTS_PER_PAGE)?;
+            let mut sent = Vec::new();
+            let mut expected = Vec::new();
+            for _ in 0..count {
+                let (s, e) = arb_annot(u)?;
+                sent.push(s);
+                expected.push(e);
+            }
+            (
+                ResponseBody::Annots { items: sent },
+                ResponseBody::Annots { items: expected },
+            )
         }
         16 => {
+            let (s, e) = arb_annot(u)?;
+            (ResponseBody::Annot { item: s }, ResponseBody::Annot { item: e })
+        }
+        17 => (ResponseBody::AnnotRemoved, ResponseBody::AnnotRemoved),
+        18 => {
             // Any scripts, in the order of the list, as the engine reports them.
             let mut missed = Vec::new();
             for script in FontScript::ALL {
@@ -380,6 +554,41 @@ pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
                 }
             }
             let b = ResponseBody::FontReport { missed };
+            (b.clone(), b)
+        }
+        19 => {
+            let b = ResponseBody::FormInfo {
+                kind: match u.int_in_range(0..=2u8)? {
+                    0 => FormKind::None,
+                    1 => FormKind::Acro,
+                    _ => FormKind::Xfa,
+                },
+                has_actions: u.arbitrary()?,
+            };
+            (b.clone(), b)
+        }
+        20 => {
+            // The fields of a page. A long list gets short strings, so that the whole answer is
+            // under the limit the encoder keeps to (it leaves out what does not fit).
+            let count = count_up_to(u, MAX_FORM_FIELDS_PER_PAGE)?;
+            let heavy = count <= 8;
+            let mut sent = Vec::new();
+            let mut expected = Vec::new();
+            for index in 0..count {
+                let (s, e) = arb_form_field(u, index as u32, heavy)?;
+                sent.push(s);
+                expected.push(e);
+            }
+            (
+                ResponseBody::FormFields { fields: sent },
+                ResponseBody::FormFields { fields: expected },
+            )
+        }
+        21 => {
+            let count = count_up_to(u, MAX_SIGNATURES)?;
+            let b = ResponseBody::Signatures {
+                report: arb_signature_report(u, count)?,
+            };
             (b.clone(), b)
         }
         _ => {
@@ -434,4 +643,83 @@ impl Read for ChunkReader<'_> {
         self.data = &self.data[n..];
         Ok(n)
     }
+}
+
+/// What a request sets a field to: a text at most as long as the cap, a switch, or choices.
+fn arb_form_value(u: &mut Unstructured) -> Result<FormValue> {
+    Ok(match u.int_in_range(0..=2u8)? {
+        0 => FormValue::Text(string_up_to(u, MAX_FORM_VALUE)?),
+        1 => FormValue::Checked(u.arbitrary()?),
+        _ => {
+            let count = count_up_to(u, MAX_FORM_OPTIONS)?;
+            let mut picked = Vec::with_capacity(count);
+            for _ in 0..count {
+                picked.push(u.arbitrary()?);
+            }
+            FormValue::Choice(picked)
+        }
+    })
+}
+
+/// A string for a field of a long list: short, so that the answer fits.
+fn form_string(u: &mut Unstructured, max: usize, heavy: bool) -> Result<String> {
+    if heavy {
+        string_up_to(u, max)
+    } else {
+        let count = u.int_in_range(0..=12usize)?;
+        let mut s = String::new();
+        for _ in 0..count {
+            let c: char = u.arbitrary()?;
+            if s.len() + c.len_utf8() > max {
+                break;
+            }
+            s.push(c);
+        }
+        Ok(s)
+    }
+}
+
+/// A field, as the engine sends it, and as the decoder gives it back (a box that is not a number
+/// is zeros, a size of text that is not a size is zero).
+fn arb_form_field(u: &mut Unstructured, index: u32, heavy: bool) -> Result<(FormField, FormField)> {
+    let kind = match u.int_in_range(0..=4u8)? {
+        0 => FormFieldKind::Text,
+        1 => FormFieldKind::Checkbox,
+        2 => FormFieldKind::Radio,
+        3 => FormFieldKind::Combo,
+        _ => FormFieldKind::List,
+    };
+    let flags = u.arbitrary::<u16>()? & field_flag::ALL;
+    let options = if heavy {
+        let count = count_up_to(u, MAX_FORM_OPTIONS)?;
+        let mut options = Vec::with_capacity(count);
+        for _ in 0..count {
+            options.push(FormOption {
+                selected: u.arbitrary()?,
+                label: string_up_to(u, MAX_FORM_OPTION_LABEL)?,
+            });
+        }
+        options
+    } else {
+        Vec::new()
+    };
+    let rect = any_rect(u)?;
+    let font_size: f32 = if chance(u, 8)? { f32::NAN } else { finite(u)?.abs() };
+    let field = FormField {
+        index,
+        kind,
+        flags,
+        turns: u.int_in_range(0..=3u8)?,
+        rect,
+        font_size,
+        name: form_string(u, MAX_FORM_NAME, heavy)?,
+        tooltip: form_string(u, MAX_FORM_TOOLTIP, heavy)?,
+        value: form_string(u, MAX_FORM_VALUE, heavy)?,
+        max_len: u.arbitrary()?,
+        options,
+    };
+    let mut expected = field.clone();
+    expected.rect = sanitized(rect);
+    expected.font_size = if font_size.is_finite() { font_size } else { 0.0 };
+    Ok((field, expected))
 }

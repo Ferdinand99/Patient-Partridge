@@ -133,6 +133,9 @@ class Budget {
   }
 }
 
+/** Most pages one selection is handed on for markup. */
+export const MAX_SELECTION_RANGES = 60;
+
 /** The engine cuts the text of one page at this many characters (see MAX_PAGE_CHARS there). */
 const ENGINE_PAGE_CHARS = 100_000;
 
@@ -205,6 +208,8 @@ export class PageOverlays {
   private find: ReadonlyMap<number, readonly [number, number][]> = new Map();
   private findCurrent: SearchMatch | null = null;
   private dragging = false;
+  /** True while a tool of the annotation bar takes the pointer: no text is selected then. */
+  private suspended = false;
   private pressed: { x: number; y: number; moved: boolean; detail: number } | null = null;
   private pointer: { x: number; y: number } | null = null;
   /** The last press, to count double and triple clicks (pointer events carry no click count). */
@@ -481,6 +486,47 @@ export class PageOverlays {
 
   // ---- selection ---------------------------------------------------------------
 
+  /** While suspended the pointer does not select text (a drawing tool has it). */
+  setSuspended(suspended: boolean): void {
+    this.suspended = suspended;
+    if (suspended) {
+      this.dragging = false;
+      this.pressed = null;
+    }
+  }
+
+  /**
+   * The selected text as stretches of single pages, with the numbers of the first character and of
+   * the one after the last, counted as the text of each page is counted. The text of a page that is
+   * not loaded yet is loaded first, because the end of a selection of everything is only known then.
+   * At most `MAX_SELECTION_RANGES` pages are given; `truncated` says there were more. A selection
+   * that changes while the text loads gives nothing.
+   */
+  async selectedRanges(): Promise<{
+    ranges: { page: number; start: number; end: number }[];
+    truncated: boolean;
+  }> {
+    const sel = this.selection;
+    if (!sel || isEmptySelection(sel)) return { ranges: [], truncated: false };
+    const { start, end } = orderSelection(sel);
+    const ranges: { page: number; start: number; end: number }[] = [];
+    let truncated = false;
+    for (let page = start.page; page <= end.page; page++) {
+      const range = rangeOnPage(sel, page);
+      if (!range) continue;
+      if (ranges.length >= MAX_SELECTION_RANGES) {
+        truncated = true;
+        break;
+      }
+      const text = this.texts.get(page) ?? (await this.texts.load(page));
+      if (this.destroyed || this.selection !== sel) return { ranges: [], truncated: false };
+      if (!text) continue;
+      const to = Math.min(range[1], text.chars.length);
+      if (to > range[0]) ranges.push({ page, start: range[0], end: to });
+    }
+    return { ranges, truncated };
+  }
+
   get hasSelection(): boolean {
     return !isEmptySelection(this.selection);
   }
@@ -661,7 +707,8 @@ export class PageOverlays {
     const p = e as PointerEvent;
     if (p.button !== 0 || this.destroyed) return;
     const target = p.target;
-    if (target instanceof Element && target.closest(".page-link")) return;
+    if (this.suspended) return;
+    if (target instanceof Element && target.closest(".page-link, .annot, .form-field, .form-bar")) return;
     const last = this.lastPress;
     const count =
       last &&

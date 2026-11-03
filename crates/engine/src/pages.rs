@@ -42,6 +42,7 @@ use partridge_protocol::{
 };
 use pdfium_render::prelude::*;
 
+use crate::annots::DocAnnots;
 use crate::{fail, pagetree, sane_size, save, Engine, Failure};
 
 /// A password kept in memory while its document is open (the engine has to load copies of the
@@ -70,6 +71,10 @@ struct Snapshot {
     /// back as other pages of the same number is not the document that was kept. `None` for a copy
     /// kept by a test without it.
     digest: Option<u64>,
+    /// What the engine knew of the annotations of the document in that state (their ids, and what
+    /// can be put back after a removal). Page numbers in it are those of that state, so it goes back
+    /// with the copy of the document and nowhere else. `None` when it knew nothing yet.
+    annots: Option<DocAnnots>,
 }
 
 struct Import {
@@ -141,7 +146,13 @@ impl PageTools {
         }
     }
 
-    fn keep(&mut self, bytes: Vec<u8>, pages: usize, digest: Option<u64>) -> u32 {
+    fn keep(
+        &mut self,
+        bytes: Vec<u8>,
+        pages: usize,
+        digest: Option<u64>,
+        annots: Option<DocAnnots>,
+    ) -> u32 {
         let token = self.next_token;
         self.next_token = self.next_token.wrapping_add(1).max(1);
         self.snapshots.push_back(Snapshot {
@@ -149,6 +160,7 @@ impl PageTools {
             bytes,
             pages,
             digest,
+            annots,
         });
         self.evict();
         // The copy just kept may be the one that was let go of, when it alone is too big.
@@ -253,14 +265,14 @@ impl PageTools {
     /// pages (for tests: a copy that does not read back with that many pages is refused).
     #[doc(hidden)]
     pub fn keep_for_tests(&mut self, bytes: Vec<u8>, pages: usize) -> u32 {
-        self.keep(bytes, pages, None)
+        self.keep(bytes, pages, None, None)
     }
 
     /// As [`PageTools::keep_for_tests`], with the sizes of the pages that the copy must show when it
     /// is read in again.
     #[doc(hidden)]
     pub fn keep_for_tests_as(&mut self, bytes: Vec<u8>, pages: usize, sizes: &[PageSize]) -> u32 {
-        self.keep(bytes, pages, Some(sizes_digest(sizes)))
+        self.keep(bytes, pages, Some(sizes_digest(sizes)), None)
     }
 
     /// How many bytes of copies are held, for tests.
@@ -457,6 +469,17 @@ pub(crate) fn handle(
     request: PagesRequest,
     progress: &mut dyn FnMut(u32),
 ) -> Result<ResponseBody, Failure> {
+    // The form environment of a document keeps hold of the document and of its pages as they are.
+    // A change to the list of pages (or putting a document in place of it) must not find one: it
+    // is made again, from the document as it is, when the window next asks about the form.
+    if let PagesRequest::Delete { doc, .. }
+    | PagesRequest::Reorder { doc, .. }
+    | PagesRequest::InsertBlank { doc, .. }
+    | PagesRequest::Restore { doc, .. }
+    | PagesRequest::ImportEnd { doc, .. } = &request
+    {
+        engine.forms.remove(doc);
+    }
     let response = match request {
         PagesRequest::Delete { doc, pages } => delete(engine, pdfium, doc, &pages, progress)?,
         PagesRequest::Reorder { doc, order } => reorder(engine, pdfium, doc, &order, progress)?,
@@ -685,6 +708,14 @@ impl Pace {
         }
     }
 
+    /// Work goes on inside a step: the app hears of it, and the count stays.
+    fn tick(&mut self, progress: &mut dyn FnMut(u32)) {
+        if self.last.elapsed() >= PACE {
+            self.last = Instant::now();
+            progress(self.done);
+        }
+    }
+
     /// One more step is done.
     fn step(&mut self, progress: &mut dyn FnMut(u32)) {
         self.done = self.done.saturating_add(1);
@@ -821,7 +852,10 @@ fn take_snapshot(
     let limit = tools(engine, doc).max_undo_bytes;
     let sizes = page_sizes(engine.document(doc)?);
     match serialise(engine, doc, limit, progress)? {
-        Some(bytes) => Ok(tools(engine, doc).keep(bytes, sizes.len(), Some(sizes_digest(&sizes)))),
+        Some(bytes) => {
+            let annots = engine.annots.get(&doc).cloned();
+            Ok(tools(engine, doc).keep(bytes, sizes.len(), Some(sizes_digest(&sizes)), annots))
+        }
         None => Ok(0),
     }
 }
@@ -845,8 +879,9 @@ fn take_checked_snapshot(
     };
     read_tree(&bytes, count, false, progress)?;
     let limit = tools(engine, doc).max_undo_bytes;
+    let annots = engine.annots.get(&doc).cloned();
     Ok(if bytes.len() <= limit {
-        tools(engine, doc).keep(bytes, count, Some(sizes_digest(&sizes)))
+        tools(engine, doc).keep(bytes, count, Some(sizes_digest(&sizes)), annots)
     } else {
         0
     })
@@ -929,11 +964,22 @@ fn put_back(
 }
 
 fn lose(engine: &mut Engine, doc: u32) -> Failure {
+    engine.forms.remove(&doc);
+    engine.annots.remove(&doc);
     engine.docs.remove(&doc);
     (
         ErrorCode::UnknownDocument,
         "a change to the pages failed half way and the document could not be put back, so it was closed; the file on the disk is untouched".to_string(),
     )
+}
+
+/// The pages of a document are not the ones the form environment and the record of the annotations
+/// were made for (a page was deleted, moved or added): both go, and are made again, from the
+/// document as it is, when they are next asked for. Taking the change back brings back the record
+/// that belongs to the earlier state (see [`Snapshot`]).
+fn pages_replaced(engine: &mut Engine, doc: u32) {
+    engine.forms.remove(&doc);
+    engine.annots.remove(&doc);
 }
 
 fn changed(
@@ -1122,6 +1168,9 @@ fn delete(
     let result = (|| {
         let document = engine.docs.get_mut(&doc).ok_or_else(gone)?;
         let mut pace = Pace::new();
+        // The words of the notes and other annotations of the pages go as well, except those of an
+        // annotation that a page which stays also shows.
+        crate::annots::scrub_pages(document, &sorted, count as u32, &mut || pace.tick(progress));
         for &index in &sorted {
             form_fields += clear_form_fields(document, index);
             pace.step(progress);
@@ -1157,6 +1206,7 @@ fn delete(
     if let Err(e) = result {
         return Err(recover(engine, pdfium, doc, token, e));
     }
+    pages_replaced(engine, doc);
     changed_with(engine, doc, token, sorted.len(), form_fields)
 }
 
@@ -1314,10 +1364,12 @@ fn reorder(
         ));
     }
     let token = if bytes.len() <= limit {
-        tools(engine, doc).keep(bytes, count, Some(digest))
+        let annots = engine.annots.get(&doc).cloned();
+        tools(engine, doc).keep(bytes, count, Some(digest), annots)
     } else {
         0
     };
+    pages_replaced(engine, doc);
     changed(engine, doc, token, moved)
 }
 
@@ -1616,6 +1668,7 @@ fn insert_blank(
     if let Err(e) = result {
         return Err(recover(engine, pdfium, doc, token, e));
     }
+    pages_replaced(engine, doc);
     changed(engine, doc, token, 1)
 }
 
@@ -1710,6 +1763,12 @@ fn restore(
     ) {
         Ok(loaded) => {
             engine.docs.insert(doc, loaded);
+            // What the engine knew of the annotations goes back with the document: ids and the
+            // annotations that can be put back belong to that state of the pages, not to this one.
+            engine.annots.remove(&doc);
+            if let Some(annots) = target.annots {
+                engine.annots.insert(doc, annots);
+            }
             changed(engine, doc, leaving, 0)
         }
         Err(e) => {
@@ -1880,10 +1939,12 @@ fn import_end(
     }
     let limit = tools(engine, doc).max_undo_bytes;
     let token = if bytes.len() <= limit {
-        tools(engine, doc).keep(bytes, count, Some(digest))
+        let annots = engine.annots.get(&doc).cloned();
+        tools(engine, doc).keep(bytes, count, Some(digest), annots)
     } else {
         0
     };
+    pages_replaced(engine, doc);
     changed(engine, doc, token, added)
 }
 

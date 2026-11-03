@@ -1348,11 +1348,6 @@ code.nw {
 .arch-wrap .headline {
   font-size: clamp(1.75rem, 3.4vw, 2.5rem);
 }
-.arch-agents {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
-}
 .arch-note {
   max-width: 44rem;
   margin: var(--sp-6) auto 0;
@@ -2039,8 +2034,7 @@ code.nw {
     top: -11px;
     transform: translateX(-50%) rotate(135deg);
   }
-  .arch-dbs,
-  .arch-agents {
+  .arch-dbs {
     grid-template-columns: minmax(0, 1fr);
   }
   .mock .list-row {

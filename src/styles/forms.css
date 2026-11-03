@@ -1,0 +1,187 @@
+/* The fields of a form over the pages.
+
+   Every field is a control placed over its picture (see src/viewer/forms.ts). At rest the control is
+   a faint tint that shows where the fields are, and the picture below it shows the value. While the
+   reader is in a field, or has just changed it and the page is being drawn again, the control covers
+   its picture and shows the value itself. Boxes are placed with percentages of the page and text is
+   sized from --form-k (pixels per point), so everything is right at every zoom. */
+
+.form-layer {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+/* A group of radio buttons is only there for the screen reader. */
+.form-group {
+  display: contents;
+}
+
+.form-field {
+  position: absolute;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0 calc(var(--form-k, 1) * 2px);
+  border: 0;
+  border-radius: 2px;
+  background: var(--form-tint, rgba(102, 86, 232, 0.1));
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  caret-color: #111111;
+  font: inherit;
+  font-size: calc(var(--form-k, 1) * 11px);
+  line-height: 1.2;
+  text-align: left;
+  pointer-events: auto;
+  cursor: text;
+  /* The page is not selectable text, but a field must take typing (Safari and WebKitGTK refuse
+     typing in a field whose ancestor cannot be selected). */
+  -webkit-user-select: text;
+  user-select: text;
+  transform-origin: 50% 50%;
+}
+
+textarea.form-field {
+  padding-top: calc(var(--form-k, 1) * 2px);
+  resize: none;
+  overflow: auto;
+}
+
+select.form-field {
+  padding: 0;
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: pointer;
+}
+
+button.form-field {
+  cursor: pointer;
+}
+
+/* A read-only field takes no tint: it is not for filling in. */
+.form-field.form-readonly {
+  background: transparent;
+  cursor: default;
+}
+
+/* A required field that is still empty is outlined. */
+.form-field.form-missing {
+  outline: 1.5px dashed var(--bad-text, #d70015);
+  outline-offset: -1.5px;
+}
+
+/* In use: the control covers its picture and shows the value. */
+.form-field:hover:not(.form-readonly) {
+  background: var(--brand-fill, rgba(102, 86, 232, 0.18));
+}
+
+.form-field:focus,
+.form-field.form-pending {
+  background: #ffffff;
+  color: #111111;
+  -webkit-text-fill-color: #111111;
+}
+
+.form-field:focus {
+  outline: 2px solid var(--brand, #6656e8);
+  outline-offset: 0;
+}
+
+/* Text the document did not accept stays visible and outlined until it is changed or put back. */
+.form-field.form-refused,
+.form-field.form-refused:hover:not(.form-readonly),
+.form-field.form-refused:focus {
+  background: #ffffff;
+  color: #111111;
+  -webkit-text-fill-color: #111111;
+  outline: 2px solid var(--bad-text, #d70015);
+  outline-offset: 0;
+}
+
+/* Check boxes and radio buttons have no text: they show their picture, and a mark while changing. */
+button.form-field,
+button.form-field:focus,
+button.form-field.form-pending {
+  background: transparent;
+  color: transparent;
+}
+
+button.form-field:hover:not(.form-readonly) {
+  background: var(--brand-fill, rgba(102, 86, 232, 0.18));
+}
+
+button.form-field:focus-visible {
+  outline: 2px solid var(--brand, #6656e8);
+  outline-offset: 1px;
+}
+
+button.form-field:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* The message bar over the pages: a form that cannot be filled in, scripts that do not run. It sits
+   at the top of the view and does not move the pages. */
+.form-bar {
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  height: 0;
+  overflow: visible;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.form-bar[hidden] {
+  display: none;
+}
+
+.form-bar-pill {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2, 8px);
+  max-width: min(46rem, calc(100% - 2rem));
+  margin-top: var(--sp-3, 12px);
+  padding: var(--sp-2, 8px) var(--sp-3, 12px);
+  border: 1px solid var(--line-strong, rgba(0, 0, 0, 0.15));
+  border-radius: 12px;
+  background: var(--material, rgba(255, 255, 255, 0.9));
+  -webkit-backdrop-filter: var(--blur-material, blur(20px));
+  backdrop-filter: var(--blur-material, blur(20px));
+  box-shadow: var(--shadow-pop, 0 8px 24px rgba(0, 0, 0, 0.15));
+  color: var(--text, #1d1d1f);
+  font-size: 0.8125rem;
+  line-height: 1.35;
+  pointer-events: auto;
+}
+
+.form-bar-close {
+  flex: none;
+  width: 1.5rem;
+  height: 1.5rem;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted, #6e6e73);
+  font-size: 1.125rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.form-bar-close:hover {
+  background: var(--hover, rgba(0, 0, 0, 0.05));
+}
+
+.form-bar-close:focus-visible {
+  outline: 2px solid var(--brand, #6656e8);
+}
+
+@media print {
+  .form-layer,
+  .form-bar {
+    display: none;
+  }
+}

@@ -15,8 +15,9 @@ use partridge_fuzz::{
     over_cap_request_case, over_cap_response_case, OVER_CAP_REQUESTS, OVER_CAP_RESPONSES,
 };
 use partridge_protocol::{
-    ErrorCode, FontScript, LinkTarget, OutlineItem, PageLink, PageSize, PagesRequest,
-    PagesResponse, Request, RequestBody, Response, ResponseBody, TextMatch, MAX_FRAME_LEN,
+    ability, field_flag, AnnotInfo, AnnotKind, ErrorCode, FontScript, FormField, FormFieldKind,
+    FormKind, FormOption, FormValue, LinkTarget, OutlineItem, PageLink, PageSize, PagesRequest,
+    PagesResponse, Request, RequestBody, Response, ResponseBody, StampKind, TextMatch, MAX_FRAME_LEN,
     MAX_LINKS_PER_PAGE, MAX_MATCHES_PER_PAGE,
     MAX_OUTLINE_DEPTH, MAX_OUTLINE_ITEMS, MAX_OUTLINE_TITLE, MAX_QUERY_LEN, MAX_SAVE_BYTES,
     MAX_SAVE_CHUNK, MAX_URI_LEN, PROTOCOL_VERSION,
@@ -101,6 +102,129 @@ fn requests() -> Vec<(&'static str, Request)> {
         ),
         ("save_end", b(13, RequestBody::SaveEnd { doc: 1 })),
         ("fingerprint", b(14, RequestBody::Fingerprint { doc: 1 })),
+        ("list_annots", b(15, RequestBody::ListAnnots { doc: 1, page: 0 })),
+        (
+            "add_markup",
+            b(
+                16,
+                RequestBody::AddMarkup {
+                    doc: 1,
+                    page: 0,
+                    kind: AnnotKind::Highlight,
+                    color: [255, 235, 59, 255],
+                    start: 4,
+                    end: 19,
+                },
+            ),
+        ),
+        (
+            "add_note",
+            b(
+                17,
+                RequestBody::AddNote {
+                    doc: 1,
+                    page: 0,
+                    x: 72.0,
+                    y: 100.5,
+                    color: [255, 235, 59, 255],
+                    text: "A note \u{2713}".into(),
+                },
+            ),
+        ),
+        (
+            "add_ink",
+            b(
+                18,
+                RequestBody::AddInk {
+                    doc: 1,
+                    page: 0,
+                    color: [0, 0, 255, 255],
+                    width: 2.5,
+                    strokes: vec![vec![[10.0, 10.0], [20.0, 30.0]], vec![[5.0, 5.0]]],
+                },
+            ),
+        ),
+        (
+            "add_stamp",
+            b(
+                19,
+                RequestBody::AddStamp {
+                    doc: 1,
+                    page: 0,
+                    x: 100.0,
+                    y: 200.0,
+                    stamp: StampKind::Approved,
+                },
+            ),
+        ),
+        (
+            "update_annot",
+            b(
+                20,
+                RequestBody::UpdateAnnot {
+                    doc: 1,
+                    page: 0,
+                    id: 3,
+                    text: Some("changed".into()),
+                    color: Some([1, 2, 3, 255]),
+                    dx: 4.0,
+                    dy: -4.0,
+                },
+            ),
+        ),
+        (
+            "remove_annot",
+            b(21, RequestBody::RemoveAnnot { doc: 1, page: 0, id: 3 }),
+        ),
+        (
+            "restore_annot",
+            b(22, RequestBody::RestoreAnnot { doc: 1, page: 0, id: 3 }),
+        ),
+        ("form_info", b(23, RequestBody::FormInfo { doc: 1 })),
+        (
+            "list_form_fields",
+            b(24, RequestBody::ListFormFields { doc: 1, page: 0 }),
+        ),
+        (
+            "set_form_text",
+            b(
+                25,
+                RequestBody::SetFormField {
+                    doc: 1,
+                    page: 0,
+                    index: 2,
+                    name: "fullname".into(),
+                    value: FormValue::Text("Ada
+Lovelace".into()),
+                },
+            ),
+        ),
+        (
+            "set_form_checked",
+            b(
+                26,
+                RequestBody::SetFormField {
+                    doc: 1,
+                    page: 0,
+                    index: 3,
+                    name: "agree".into(),
+                    value: FormValue::Checked(true),
+                },
+            ),
+        ),
+        (
+            "set_form_choice",
+            b(
+                27,
+                RequestBody::SetFormField {
+                    doc: 1,
+                    page: 0,
+                    index: 12,
+                    name: "toppings".into(),
+                    value: FormValue::Choice(vec![0, 2]),
+                },
+            ),
+        ),
         (
             "pages_delete",
             b(
@@ -258,6 +382,18 @@ fn signature_report() -> partridge_protocol::SignatureReport {
             item(0, SignatureReason::NoTrustList, "Test Signer"),
             item(1, SignatureReason::DataAfterSignature, "Second Signer"),
         ],
+    }
+}
+
+fn a_note(id: u32, text: &str) -> AnnotInfo {
+    AnnotInfo {
+        id,
+        kind: AnnotKind::Note,
+        abilities: ability::EDIT_TEXT | ability::MOVE | ability::REMOVE,
+        rect: [72.0, 100.0, 92.0, 120.0],
+        color: [255, 235, 59, 255],
+        text: text.into(),
+        author: "Someone".into(),
     }
 }
 
@@ -445,6 +581,83 @@ fn responses() -> Vec<(&'static str, Response)> {
                     pages: 12,
                     failed: 0,
                     digest: 0x0123_4567_89ab_cdef,
+                },
+            ),
+        ),
+        (
+            "annots",
+            b(
+                17,
+                ResponseBody::Annots {
+                    items: vec![a_note(1, "first"), a_note(2, "<b>second</b> \u{2713}")],
+                },
+            ),
+        ),
+        ("annot", b(18, ResponseBody::Annot { item: a_note(3, "") })),
+        ("annot_removed", b(19, ResponseBody::AnnotRemoved)),
+        (
+            "error_no_such_annotation",
+            b(
+                20,
+                ResponseBody::Error {
+                    code: ErrorCode::NoSuchAnnotation,
+                    message: "the annotation is not on the page any more".into(),
+                },
+            ),
+        ),
+        (
+            "form_info",
+            b(
+                21,
+                ResponseBody::FormInfo {
+                    kind: FormKind::Acro,
+                    has_actions: true,
+                },
+            ),
+        ),
+        (
+            "form_fields",
+            b(
+                22,
+                ResponseBody::FormFields {
+                    fields: vec![
+                        FormField {
+                            index: 0,
+                            kind: FormFieldKind::Text,
+                            flags: field_flag::REQUIRED | field_flag::MULTILINE,
+                            turns: 1,
+                            rect: [150.0, 68.0, 400.0, 92.0],
+                            font_size: 12.0,
+                            name: "person.first".into(),
+                            tooltip: "First name".into(),
+                            value: "Ada
+Lovelace".into(),
+                            max_len: 40,
+                            options: vec![],
+                        },
+                        FormField {
+                            index: 1,
+                            kind: FormFieldKind::Combo,
+                            flags: field_flag::EDITABLE,
+                            turns: 0,
+                            rect: [150.0, 108.0, 350.0, 130.0],
+                            font_size: 0.0,
+                            name: "country".into(),
+                            tooltip: String::new(),
+                            value: "Norway".into(),
+                            max_len: 0,
+                            options: vec![
+                                FormOption {
+                                    selected: true,
+                                    label: "Norway".into(),
+                                },
+                                FormOption {
+                                    selected: false,
+                                    label: "Sweden".into(),
+                                },
+                            ],
+                        },
+                    ],
                 },
             ),
         ),
@@ -693,7 +906,7 @@ fn main() {
     );
 
     // Round trips: one input per kind of message.
-    for kind in 0..16u8 {
+    for kind in 0..27u8 {
         write(
             &dir,
             "protocol_roundtrip_request",
@@ -701,7 +914,7 @@ fn main() {
             &generator_input(kind, kind as u32),
         );
     }
-    for kind in 0..18u8 {
+    for kind in 0..23u8 {
         write(
             &dir,
             "protocol_roundtrip_response",
@@ -853,6 +1066,9 @@ fn main() {
             "destinations_negative",
             hostile_destinations(&features, "-1111"),
         ),
+        ("annotated", kit::annotated_pdf()),
+        ("annotations_hostile", kit::hostile_annots_pdf()),
+        ("annotations_many", kit::many_annots_pdf(24)),
         ("simple", kit::simple_pdf(1)),
         ("two_pages", kit::simple_pdf(2)),
         ("mixed_sizes", kit::mixed_size_pdf()),
@@ -905,6 +1121,27 @@ fn main() {
         ("page_count_lost", kit::page_count_lost_pdf()),
         ("mixed_sizes", kit::mixed_size_pdf()),
         ("truncated", kit::truncated_pdf()),
+        // Forms: every kind of field, a turned page, XFA, scripts and actions, a signature, fields
+        // that sit under a parent, and a page with many fields.
+        ("form", kit::forms_pdf()),
+        ("form_rotated", kit::forms_rotated_pdf(90)),
+        ("form_scripts", kit::forms_script_pdf()),
+        ("form_xfa", kit::xfa_pdf()),
+        ("form_xfa_full", kit::xfa_full_pdf()),
+        ("form_signed", kit::forms_signed_pdf()),
+        ("form_nested", kit::forms_nested_pdf()),
+        ("form_many", kit::forms_many_pdf(40)),
+        ("form_actions", kit::forms_actions_pdf()),
+        ("form_harmless_actions", kit::forms_harmless_actions_pdf()),
+        ("form_multipage", kit::forms_multipage_pdf(false)),
+        ("form_multipage_no_page", kit::forms_multipage_pdf(true)),
+        ("form_loop", kit::forms_loop_pdf()),
+        ("form_parent_event", kit::forms_parent_event_pdf()),
+        (
+            "form_kids_actions",
+            kit::forms_kids_actions_pdf(Some("/K << /S /ResetForm >>"), kit::KidsParent::Absent),
+        ),
+        ("form_awkward_values", kit::forms_awkward_values_pdf()),
         ("corrupt", kit::corrupt_pdf()),
     ];
     for (name, bytes) in pdfs {

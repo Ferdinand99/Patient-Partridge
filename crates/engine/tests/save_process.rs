@@ -365,7 +365,7 @@ fn a_document_that_is_closed_cannot_be_saved() {
     assert_eq!(pool.source_path(handle), None);
 }
 
-// ---- findings of the review of PR 31: each of these failed on the first version --------------
+// ---- a file that changes or is replaced after it was opened: each of these failed on the first version ----
 
 /// Rewrites a file in place: the same file (same inode), new bytes.
 fn rewrite_in_place(path: &Path, bytes: &[u8]) {
@@ -380,7 +380,7 @@ fn rewrite_in_place(path: &Path, bytes: &[u8]) {
 }
 
 #[test]
-fn c1_a_file_rewritten_in_place_is_not_saved_over_with_a_mix_of_both() {
+fn a_file_rewritten_in_place_is_not_saved_over_with_a_mix_of_both() {
     let dir = Dir::new("c1");
     let path = dir.write("a.pdf", &kit::simple_pdf(3));
     let pool = pool();
@@ -410,7 +410,7 @@ fn c1_a_file_rewritten_in_place_is_not_saved_over_with_a_mix_of_both() {
 }
 
 #[test]
-fn c1_a_same_size_rewrite_with_the_old_time_is_seen_in_the_part_that_was_read() {
+fn a_same_size_rewrite_with_the_old_time_is_seen_in_the_part_that_was_read() {
     let dir = Dir::new("c1b");
     let original = kit::simple_pdf(2);
     let path = dir.write("a.pdf", &original);
@@ -441,7 +441,7 @@ fn c1_a_same_size_rewrite_with_the_old_time_is_seen_in_the_part_that_was_read() 
 }
 
 #[test]
-fn m1_a_touch_before_the_first_save_still_lets_the_edits_out_as_a_copy() {
+fn a_touch_before_the_first_save_still_lets_the_edits_out_as_a_copy() {
     let dir = Dir::new("m1");
     let original = kit::padded_pdf(1024 * 1024);
     let path = dir.write("a.pdf", &original);
@@ -480,7 +480,7 @@ fn m1_a_touch_before_the_first_save_still_lets_the_edits_out_as_a_copy() {
 }
 
 #[test]
-fn m1_a_file_that_was_not_touched_is_replaced_and_says_nothing() {
+fn a_file_that_was_not_touched_is_replaced_and_says_nothing() {
     let dir = Dir::new("m1b");
     let path = dir.write("a.pdf", &kit::simple_pdf(2));
     let pool = pool();
@@ -490,7 +490,7 @@ fn m1_a_file_that_was_not_touched_is_replaced_and_says_nothing() {
 }
 
 #[test]
-fn c1_a_file_replaced_by_a_rename_keeps_the_old_handle_and_a_copy_is_safe() {
+fn a_file_replaced_by_a_rename_keeps_the_old_handle_and_a_copy_is_safe() {
     let dir = Dir::new("c1c");
     let path = dir.write("a.pdf", &kit::simple_pdf(3));
     let pool = pool();
@@ -515,7 +515,7 @@ fn c1_a_file_replaced_by_a_rename_keeps_the_old_handle_and_a_copy_is_safe() {
 }
 
 #[test]
-fn c2_a_file_cut_off_after_it_was_opened_does_not_become_a_save_with_blank_pages() {
+fn a_file_cut_off_after_it_was_opened_does_not_become_a_save_with_blank_pages() {
     let dir = Dir::new("c2");
     let original = kit::simple_pdf(6);
     let path = dir.write("a.pdf", &original);
@@ -539,7 +539,7 @@ fn c2_a_file_cut_off_after_it_was_opened_does_not_become_a_save_with_blank_pages
 }
 
 #[test]
-fn i5_a_signature_field_under_a_grouping_field_is_still_a_signed_document() {
+fn a_signature_field_under_a_grouping_field_is_still_a_signed_document() {
     let dir = Dir::new("i5");
     let path = dir.write("a.pdf", &kit::signed_nested_pdf());
     let pool = pool();
@@ -561,7 +561,7 @@ fn running_as_root() -> bool {
 
 #[cfg(unix)]
 #[test]
-fn i6_a_file_the_user_cannot_write_is_refused_although_its_folder_is_writable() {
+fn a_file_the_user_cannot_write_is_refused_although_its_folder_is_writable() {
     use std::os::unix::fs::PermissionsExt;
     if running_as_root() {
         eprintln!("skipped: the super user can write every file");
@@ -582,7 +582,7 @@ fn i6_a_file_the_user_cannot_write_is_refused_although_its_folder_is_writable() 
 }
 
 #[test]
-fn i8_a_file_with_two_names_is_not_silently_split_in_two() {
+fn a_file_with_two_names_is_not_silently_split_in_two() {
     let dir = Dir::new("i8h");
     let original = kit::simple_pdf(1);
     let path = dir.write("a.pdf", &original);
@@ -598,7 +598,7 @@ fn i8_a_file_with_two_names_is_not_silently_split_in_two() {
 
 #[cfg(unix)]
 #[test]
-fn i8_the_owner_and_the_group_of_a_file_are_kept_where_the_system_allows() {
+fn the_owner_and_the_group_of_a_file_are_kept_where_the_system_allows() {
     use std::os::unix::fs::MetadataExt;
     if !running_as_root() {
         eprintln!("skipped: only the super user can make a file of another owner");
@@ -615,7 +615,7 @@ fn i8_the_owner_and_the_group_of_a_file_are_kept_where_the_system_allows() {
 }
 
 #[test]
-fn i5_a_signature_that_no_field_points_to_is_found_by_the_words_in_the_file() {
+fn a_signature_that_no_field_points_to_is_found_by_the_words_in_the_file() {
     let dir = Dir::new("i5b");
     let original = kit::signed_without_field_pdf();
     let path = dir.write("a.pdf", &original);
@@ -632,7 +632,7 @@ fn i5_a_signature_that_no_field_points_to_is_found_by_the_words_in_the_file() {
 }
 
 #[test]
-fn c2_the_check_sees_a_file_with_the_same_pages_but_other_content() {
+fn the_check_sees_a_file_with_the_same_pages_but_other_content() {
     let dir = Dir::new("c2c");
     let a = dir.write("a.pdf", &kit::simple_pdf(3));
     // Three pages as well, but the text of every page is another text.

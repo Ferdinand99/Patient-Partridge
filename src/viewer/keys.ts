@@ -1,7 +1,11 @@
 // Keyboard shortcuts of the viewer, as pure data: a key press goes in, an action comes out.
 
+import { type Tool, toolForKey } from "../lib/annotations";
+
 export interface KeyInfo {
   key: string;
+  /** The physical key. Optional, so that callers that only have the character still work. */
+  code?: string;
   ctrlKey: boolean;
   metaKey: boolean;
   shiftKey: boolean;
@@ -31,10 +35,31 @@ export type Action =
   | { type: "save" }
   | { type: "save-as" }
   | { type: "undo" }
-  | { type: "redo" };
+  | { type: "redo" }
+  /** A plain letter that picks a tool of the annotation bar. */
+  | { type: "tool"; tool: Tool }
+  | { type: "toggle-annotations" };
 
 /** CSS pixels one arrow key press scrolls. */
 export const LINE_SCROLL = 48;
+
+/** A character of a script other than Latin. Punctuation, digits and marks belong to no script. */
+const OTHER_SCRIPT = /^[^\p{Script=Latin}\p{Script=Common}\p{Script=Inherited}]$/u;
+
+/**
+ * The key a shortcut is matched on. What the key prints is taken as it is when the layout has
+ * Latin letters: a letter of the Latin alphabet, but also punctuation and accented letters (the
+ * comma of Dvorak, the e with an acute accent of the French BEPO layout), which are not the key
+ * that letter of the US layout stands for. Only a key that prints a letter of another script
+ * (Russian, Greek, Hebrew, Arabic) falls back to its place: the web view reports the letter of that
+ * layout, so the key that prints S on a US keyboard counts as S.
+ */
+export function shortcutKey(e: KeyInfo): string {
+  if (/^[a-z]$/i.test(e.key)) return e.key.toLowerCase();
+  const place = /^Key([A-Z])$/.exec(e.code ?? "");
+  if (place && [...e.key].length === 1 && OTHER_SCRIPT.test(e.key)) return place[1].toLowerCase();
+  return e.key;
+}
 
 /**
  * What a key press means for the viewer, or null when the viewer does not use it.
@@ -45,7 +70,7 @@ export function actionForKey(e: KeyInfo): Action | null {
   if (e.altKey) return null;
 
   if (mod) {
-    switch (e.key) {
+    switch (shortcutKey(e)) {
       case "+":
       case "=":
         return { type: "zoom-in" };
@@ -57,34 +82,24 @@ export function actionForKey(e: KeyInfo): Action | null {
       case "1":
         return { type: "zoom-actual" };
       case "g":
-      case "G":
         return { type: "focus-page-box" };
       case "o":
-      case "O":
         return { type: "open-file" };
       case "w":
-      case "W":
         return { type: "close-tab" };
       case "b":
-      case "B":
         return { type: "toggle-sidebar" };
       case "f":
-      case "F":
         return { type: "find" };
       case "a":
-      case "A":
-        return { type: "select-all" };
+        return { type: e.shiftKey ? "toggle-annotations" : "select-all" };
       case "p":
-      case "P":
         return { type: "print" };
       case "s":
-      case "S":
         return { type: e.shiftKey ? "save-as" : "save" };
       case "z":
-      case "Z":
         return { type: e.shiftKey ? "redo" : "undo" };
       case "y":
-      case "Y":
         return { type: "redo" };
       case "Tab":
         return { type: e.shiftKey ? "previous-tab" : "next-tab" };
@@ -122,8 +137,11 @@ export function actionForKey(e: KeyInfo): Action | null {
       return { type: "go-first" };
     case "End":
       return { type: "go-last" };
-    default:
-      return null;
+    default: {
+      // A single letter picks a tool of the annotation bar (V, H, U, T, N, P, M).
+      const tool = e.shiftKey ? null : toolForKey(e.key);
+      return tool ? { type: "tool", tool } : null;
+    }
   }
 }
 

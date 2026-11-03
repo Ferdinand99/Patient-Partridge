@@ -1,0 +1,176 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [6 0 R 7 0 R 10 0 R 13 0 R 16 0 R 17 0 R 18 0 R 19 0 R 22 0 R 23 0 R 26 0 R 27 0 R 30 0 R 31 0 R ] /DA (/Helv 0 Tf 0 g) /DR << /Font << /Helv 3 0 R >> >> >> >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R ] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Resources << /Font << /F1 3 0 R >> >> /Annots [6 0 R 7 0 R 10 0 R 13 0 R 16 0 R 17 0 R 18 0 R 19 0 R 22 0 R 23 0 R 26 0 R 27 0 R 30 0 R 31 0 R ] >>
+endobj
+5 0 obj
+<< /Length 19 >>
+stream
+0 g 10 10 1 1 re f
+
+endstream
+endobj
+6 0 obj
+<< /Type /Annot /Subtype /Widget /FT /Tx /T (keep) /V (kept) /DV () /Rect [100 740 300 760] /F 4 /P 4 0 R /DA (/Helv 12 Tf 0 g)  >>
+endobj
+7 0 obj
+<< /Type /Annot /Subtype /Widget /FT /Tx /T (victim) /V (victim value) /DV () /Rect [100 710 300 730] /F 4 /P 4 0 R /DA (/Helv 12 Tf 0 g)  >>
+endobj
+8 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 16 16] /Length 22 >>
+stream
+q 0 g 3 3 10 10 re f Q
+endstream
+endobj
+9 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 16 16] /Length 0 >>
+stream
+
+endstream
+endobj
+10 0 obj
+<< /Type /Annot /Subtype /Widget /FT /Btn /T (box_a) /V /Off /AS /Off /Rect [320 680 336 696] /F 4 /P 4 0 R /AP << /N << /Yes 8 0 R /Off 9 0 R >> >> /A << /S /ResetForm >> >>
+endobj
+11 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 16 16] /Length 22 >>
+stream
+q 0 g 3 3 10 10 re f Q
+endstream
+endobj
+12 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 16 16] /Length 0 >>
+stream
+
+endstream
+endobj
+13 0 obj
+<< /Type /Annot /Subtype /Widget /FT /Btn /T (box_u) /V /Off /AS /Off /Rect [320 650 336 666] /F 4 /P 4 0 R /AP << /N << /Yes 11 0 R /Off 12 0 R >> >> /AA << /U << /S /ResetForm >> >> >>
+endobj
+14 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 16 16] /Length 22 >>
+stream
+q 0 g 3 3 10 10 re f Q
+endstream
+endobj
+15 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 16 16] /Length 0 >>
+stream
+
+endstream
+endobj
+16 0 obj
+<< /Type /Annot /Subtype /Widget /FT /Btn /T (box_d) /V /Off /AS /Off /Rect [320 620 336 636] /F 4 /P 4 0 R /AP << /N << /Yes 14 0 R /Off 15 0 R >> >> /AA << /D << /S /Hide /T (victim) /H true >> >> >>
+endobj
+17 0 obj
+<< /Type /Annot /Subtype /Widget /FT /Tx /T (text_fo)  /Rect [100 590 300 610] /F 4 /P 4 0 R /DA (/Helv 12 Tf 0 g) /AA << /Fo << /S /ResetForm >> >> >>
+endobj
+18 0 obj
+<< /Type /Annot /Subtype /Widget /FT /Tx /T (text_bl)  /Rect [100 560 300 580] /F 4 /P 4 0 R /DA (/Helv 12 Tf 0 g) /AA << /Bl << /S /ResetForm >> >> >>
+endobj
+19 0 obj
+<< /Type /Annot /Subtype /Widget /FT /Tx /T (text_script)  /Rect [100 500 300 520] /F 4 /P 4 0 R /DA (/Helv 12 Tf 0 g) /AA << /Bl << /S /JavaScript /JS (1;) >> /K << /S /JavaScript /JS (event.rc = true;) >> >> >>
+endobj
+20 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 16 16] /Length 22 >>
+stream
+q 0 g 3 3 10 10 re f Q
+endstream
+endobj
+21 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 16 16] /Length 0 >>
+stream
+
+endstream
+endobj
+22 0 obj
+<< /Type /Annot /Subtype /Widget /FT /Btn /T (box_link) /V /Off /AS /Off /Rect [320 470 336 486] /F 4 /P 4 0 R /AP << /N << /Yes 20 0 R /Off 21 0 R >> >> /A << /S /URI /URI (https://example.com/) >> >>
+endobj
+23 0 obj
+<< /Type /Annot /Subtype /Widget /FT /Tx /T (plain)  /Rect [100 410 300 430] /F 4 /P 4 0 R /DA (/Helv 12 Tf 0 g)  >>
+endobj
+24 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 16 16] /Length 22 >>
+stream
+q 0 g 3 3 10 10 re f Q
+endstream
+endobj
+25 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 16 16] /Length 0 >>
+stream
+
+endstream
+endobj
+26 0 obj
+<< /Type /Annot /Subtype /Widget /FT /Btn /T (plain_box) /V /Off /AS /Off /Rect [320 380 336 396] /F 4 /P 4 0 R /AP << /N << /Yes 24 0 R /Off 25 0 R >> >>  >>
+endobj
+27 0 obj
+<< /Type /Annot /Subtype /Widget /FT /Btn /Ff 65536 /T (over_first) 
+         /Rect [316 346 340 370] /F 4 /P 4 0 R /MK << /BG [0.8 0.8 0.8] /CA (Reset) >> 
+         /A << /S /ResetForm >> >>
+endobj
+28 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 16 16] /Length 22 >>
+stream
+q 0 g 3 3 10 10 re f Q
+endstream
+endobj
+29 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 16 16] /Length 0 >>
+stream
+
+endstream
+endobj
+30 0 obj
+<< /Type /Annot /Subtype /Widget /FT /Btn /T (under_box) /V /Off /AS /Off /Rect [320 350 336 366] /F 4 /P 4 0 R /AP << /N << /Yes 28 0 R /Off 29 0 R >> >>  >>
+endobj
+31 0 obj
+<< /Type /Annot /Subtype /Widget /FT /Btn /Ff 65536 /T (over) /Rect [316 346 340 370] /F 4 /P 4 0 R /MK << /BG [0.8 0.8 0.8] /CA (Reset) >> /A << /S /ResetForm >> >>
+endobj
+xref
+0 32
+0000000000 65535 f 
+0000000015 00000 n 
+0000000242 00000 n 
+0000000300 00000 n 
+0000000370 00000 n 
+0000000603 00000 n 
+0000000672 00000 n 
+0000000819 00000 n 
+0000000976 00000 n 
+0000001096 00000 n 
+0000001193 00000 n 
+0000001384 00000 n 
+0000001505 00000 n 
+0000001603 00000 n 
+0000001806 00000 n 
+0000001927 00000 n 
+0000002025 00000 n 
+0000002243 00000 n 
+0000002411 00000 n 
+0000002579 00000 n 
+0000002808 00000 n 
+0000002929 00000 n 
+0000003027 00000 n 
+0000003245 00000 n 
+0000003378 00000 n 
+0000003499 00000 n 
+0000003597 00000 n 
+0000003772 00000 n 
+0000003980 00000 n 
+0000004101 00000 n 
+0000004199 00000 n 
+0000004374 00000 n 
+trailer
+<< /Size 32 /Root 1 0 R  >>
+startxref
+4556
+%%EOF

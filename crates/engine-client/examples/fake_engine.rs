@@ -14,6 +14,11 @@
 //! - `no-sandbox`: like `good`, but greets without naming a sandbox.
 //! - `save-good`: like `good`, and saves a made-up file of 2 500 000 bytes (byte `i` is `i % 251`).
 //! - `save-signed`: like `save-good`, but the document holds two signatures.
+//! - `annot-good`: like `good`, and keeps annotations of one page: it lists one note, and adds,
+//!   changes, removes and puts back annotations the way the engine does.
+//! - `annot-wrong-kind`, `annot-wrong-id`, `annot-wrong-answer`, `annot-big`: like `annot-good`,
+//!   but an addition is answered with an annotation of another kind, a change with another id, a
+//!   list with something that is not a list, or a list with a 10 MiB frame.
 //! - `save-touched`: like `save-good`, but the description says the file was touched while parts of
 //!   it were unread.
 //! - `save-no-pages`: like `save-good`, but the document describes itself as one of no pages.
@@ -33,10 +38,23 @@
 use std::io::{self, BufReader, BufWriter};
 
 use partridge_protocol::{
-    read_frame, write_frame, write_response, CertificateTime, ErrorCode, PageSize, Request,
-    RequestBody, Response, ResponseBody, SignatureInfo, SignatureReason, SignatureReport,
-    SignatureState, PROTOCOL_VERSION,
+    ability, read_frame, write_frame, write_response, AnnotInfo, AnnotKind, CertificateTime,
+    ErrorCode, PageSize, Request, RequestBody, Response, ResponseBody, SignatureInfo,
+    SignatureReason, SignatureReport, SignatureState, PROTOCOL_VERSION,
 };
+
+/// An annotation the stand-in makes up.
+fn made_up(id: u32, kind: AnnotKind, text: &str) -> AnnotInfo {
+    AnnotInfo {
+        id,
+        kind,
+        abilities: ability::EDIT_TEXT | ability::REMOVE | ability::RESTORE,
+        rect: [10.0, 20.0, 30.0, 40.0],
+        color: [255, 235, 59, 255],
+        text: text.to_string(),
+        author: String::new(),
+    }
+}
 
 /// The size of the file the stand-in saves.
 const SAVE_SIZE: u32 = 2_500_000;
@@ -288,6 +306,106 @@ fn main() {
                 }
             }
             RequestBody::SaveEnd { .. } => reply(&mut output, id, ResponseBody::SaveEnded),
+            RequestBody::ListAnnots { .. } => match mode.as_str() {
+                "annot-wrong-answer" => reply(&mut output, id, ResponseBody::Closed),
+                "annot-big" => {
+                    let _ = write_frame(&mut output, &vec![0u8; 10 * 1024 * 1024]);
+                }
+                _ => reply(
+                    &mut output,
+                    id,
+                    ResponseBody::Annots {
+                        items: vec![made_up(1, AnnotKind::Note, "from the stand-in")],
+                    },
+                ),
+            },
+            RequestBody::AddMarkup { kind, .. } => {
+                let kind = if mode == "annot-wrong-kind" {
+                    AnnotKind::Ink
+                } else {
+                    kind
+                };
+                reply(
+                    &mut output,
+                    id,
+                    ResponseBody::Annot {
+                        item: made_up(2, kind, ""),
+                    },
+                );
+            }
+            RequestBody::AddNote { text, .. } => {
+                let kind = if mode == "annot-wrong-kind" {
+                    AnnotKind::Stamp
+                } else {
+                    AnnotKind::Note
+                };
+                reply(
+                    &mut output,
+                    id,
+                    ResponseBody::Annot {
+                        item: made_up(3, kind, &text),
+                    },
+                );
+            }
+            RequestBody::AddInk { .. } => {
+                let kind = if mode == "annot-wrong-kind" {
+                    AnnotKind::Note
+                } else {
+                    AnnotKind::Ink
+                };
+                reply(
+                    &mut output,
+                    id,
+                    ResponseBody::Annot {
+                        item: made_up(4, kind, ""),
+                    },
+                );
+            }
+            RequestBody::AddStamp { .. } => {
+                let kind = if mode == "annot-wrong-kind" {
+                    AnnotKind::Note
+                } else {
+                    AnnotKind::Stamp
+                };
+                reply(
+                    &mut output,
+                    id,
+                    ResponseBody::Annot {
+                        item: made_up(5, kind, ""),
+                    },
+                );
+            }
+            RequestBody::UpdateAnnot {
+                id: annot, text, ..
+            } => {
+                let annot = if mode == "annot-wrong-id" {
+                    annot + 1
+                } else {
+                    annot
+                };
+                reply(
+                    &mut output,
+                    id,
+                    ResponseBody::Annot {
+                        item: made_up(annot, AnnotKind::Note, &text.unwrap_or_default()),
+                    },
+                );
+            }
+            RequestBody::RemoveAnnot { .. } => reply(&mut output, id, ResponseBody::AnnotRemoved),
+            RequestBody::RestoreAnnot { id: annot, .. } => {
+                let annot = if mode == "annot-wrong-id" {
+                    annot + 1
+                } else {
+                    annot
+                };
+                reply(
+                    &mut output,
+                    id,
+                    ResponseBody::Annot {
+                        item: made_up(annot, AnnotKind::Note, "restored"),
+                    },
+                );
+            }
             RequestBody::Signatures { .. } => {
                 let item = |index: u32, state, reason, anchor: Option<&str>| SignatureInfo {
                     index,
@@ -360,6 +478,10 @@ fn main() {
                     digest: 7,
                 },
             ),
+            // The form requests have a stand-in of their own (examples/fake_forms_engine.rs).
+            RequestBody::FormInfo { .. }
+            | RequestBody::ListFormFields { .. }
+            | RequestBody::SetFormField { .. } => return,
             // The page tools have a stand-in of their own (fake_pages_engine).
             RequestBody::Pages(_) => reply(
                 &mut output,

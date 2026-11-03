@@ -1929,7 +1929,7 @@ mod tests {
         assert_eq!(names, vec!["report.pdf".to_string()]);
     }
 
-    // ---- who may open the file (N3) -------------------------------------------------------
+    // ---- who may open the file -------------------------------------------------------
 
     #[test]
     fn a_file_with_two_names_is_not_saved_in_place_on_any_system() {
@@ -1989,7 +1989,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn n3_a_posix_acl_is_kept_by_a_save() {
+    fn a_posix_acl_is_kept_by_a_save() {
         use std::os::unix::fs::PermissionsExt;
         let dir = Dir::new("acl");
         let path = original_in(&dir);
@@ -2016,7 +2016,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn n3_a_file_with_only_mode_bits_gets_no_acl() {
+    fn a_file_with_only_mode_bits_gets_no_acl() {
         let dir = Dir::new("noacl");
         let path = original_in(&dir);
         let (client, doc) = client("save-good");
@@ -2026,7 +2026,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn n3_an_extended_acl_is_kept_by_a_save() {
+    fn an_extended_acl_is_kept_by_a_save() {
         let dir = Dir::new("macacl");
         let path = original_in(&dir);
         let added = std::process::Command::new("chmod")
@@ -2100,7 +2100,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn n3_a_protected_dacl_is_kept_with_its_protection() {
+    fn a_protected_dacl_is_kept_with_its_protection() {
         let dir = Dir::new("dacl");
         share_with_users(&dir);
         let path = original_in(&dir);
@@ -2146,7 +2146,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn n3_an_unprotected_dacl_still_follows_the_folder() {
+    fn an_unprotected_dacl_still_follows_the_folder() {
         let dir = Dir::new("dacl-open");
         share_with_users(&dir);
         let path = original_in(&dir);
@@ -2162,7 +2162,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn n3_the_owner_of_a_file_is_kept_or_the_save_stops() {
+    fn the_owner_of_a_file_is_kept_or_the_save_stops() {
         let dir = Dir::new("owner");
         let path = original_in(&dir);
         let user = std::env::var("USERNAME")
