@@ -1,11 +1,17 @@
 //! Pictures of signatures that the reader keeps to use again, and the commands that put a picture
 //! on a page.
 //!
-//! The pictures live in one small JSON file in the app's data folder on this computer, kept the way
-//! `positions.rs` keeps its file: the folder and the file are for the user alone on Unix, a
-//! damaged or oversized file is ignored (the list starts empty), and "Forget saved signatures" in
-//! the settings menu empties it. Nothing is sent anywhere. Anyone who can read the folder can use
-//! the pictures: they are pictures, and prove nothing about who placed them.
+//! The pictures live in one small JSON file in the app's local data folder on this computer (on
+//! Windows that is Local AppData, which does not roam with a profile and is not redirected to a
+//! server the way Roaming AppData can be), kept much the way `positions.rs` keeps its file: the
+//! folder and the file are for the user alone on Unix, a damaged or oversized file is ignored (the
+//! list starts empty), and "Forget saved signatures" in the settings menu empties it. Nothing is
+//! sent anywhere. Anyone who can read the folder can use the pictures: they are pictures, and
+//! prove nothing about who placed them.
+//!
+//! Another program may change the file while the app runs. Before every change the app looks at
+//! the file again: when its size or its time has changed since the app last read or wrote it, the
+//! list is read from the file first, so a change made elsewhere is built on and not overwritten.
 //!
 //! The file is user data on a disk that other programs can write, so everything in it is checked
 //! again when it is read, with the same caps as a picture that is sent to the engine. An imported
@@ -13,8 +19,9 @@
 
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::SystemTime;
 
 use partridge_engine_client::{ClientError, SignatureFont, SignatureMark};
 use partridge_protocol::{mark_image_size_ok, mark_text_ok, ErrorCode};
@@ -22,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::annotations::AnnotationInfo;
-use crate::positions::{create_private_dir, read_plain_file, write_private_file};
+use crate::positions::{create_private_dir, read_plain_file};
 use crate::updates::{self, UpdateState};
 use crate::{blocking, CommandError, Engine};
 
@@ -38,8 +45,45 @@ pub const MAX_PNG_BASE64: usize = 540_000;
 /// Largest file read back. Twenty pictures at the most, each far below the cap of an image.
 const MAX_FILE_BYTES: u64 = (MAX_MARKS * (MAX_PNG_BASE64 + 4_096) + 65_536) as u64;
 
-/// The first characters of a PNG file in base64 (its eight byte signature).
-const PNG_BASE64_START: &str = "iVBORw0KGg";
+/// The part of a PNG file that holds its size: the eight byte signature, the length and the name of
+/// the header chunk, and then the width and the height. In base64 these 24 bytes are the first 32
+/// characters.
+const PNG_HEAD_BYTES: usize = 24;
+const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+
+/// The value of one character of the base64 alphabet.
+fn base64_value(c: u8) -> Option<u32> {
+    match c {
+        b'A'..=b'Z' => Some(u32::from(c - b'A')),
+        b'a'..=b'z' => Some(u32::from(c - b'a') + 26),
+        b'0'..=b'9' => Some(u32::from(c - b'0') + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+/// The width and the height a PNG declares in its header chunk, from the start of the base64 text
+/// of the file. `None` when the text does not start like a PNG. Nothing is decoded: the window
+/// decodes the picture, and it must not be asked to make one that is far bigger than the size that
+/// was stored beside it.
+pub fn png_text_size(png: &str) -> Option<(u32, u32)> {
+    let text = png.as_bytes().get(..PNG_HEAD_BYTES / 3 * 4)?;
+    let mut head = [0u8; PNG_HEAD_BYTES];
+    for (group, out) in text.chunks(4).zip(head.chunks_mut(3)) {
+        let mut value = 0u32;
+        for c in group {
+            value = (value << 6) | base64_value(*c)?;
+        }
+        out.copy_from_slice(&value.to_be_bytes()[1..]);
+    }
+    if head[..8] != PNG_SIGNATURE || head[8..12] != [0, 0, 0, 13] || &head[12..16] != b"IHDR" {
+        return None;
+    }
+    let width = u32::from_be_bytes([head[16], head[17], head[18], head[19]]);
+    let height = u32::from_be_bytes([head[20], head[21], head[22], head[23]]);
+    Some((width, height))
+}
 
 /// What a kept picture is made of. The window makes these three, and the same shapes go between
 /// the window and this file.
@@ -85,8 +129,9 @@ impl MarkBody {
             MarkBody::Image { width, height, png } => {
                 mark_image_size_ok(*width, *height)
                     && png.len() <= MAX_PNG_BASE64
-                    && png.starts_with(PNG_BASE64_START)
                     && is_base64(png)
+                    // The size in the header of the PNG is the size stored beside it.
+                    && png_text_size(png) == Some((*width, *height))
             }
         };
         ok.then_some(self)
@@ -180,16 +225,41 @@ fn id_ok(id: &str) -> bool {
 pub struct SignatureMarks {
     file: Option<PathBuf>,
     marks: Vec<StoredMark>,
+    /// The size and the time of change of the file when the app last read or wrote it.
+    seen: Option<FileStamp>,
+}
+
+/// What tells that a file was changed by someone else: its size and its time of change.
+type FileStamp = (u64, SystemTime);
+
+fn stamp_of(file: &Path) -> Option<FileStamp> {
+    let meta = fs::metadata(file).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
 }
 
 impl SignatureMarks {
     /// Loads the list from `file`. With no file the list lives only as long as the app.
     pub fn load(file: Option<PathBuf>) -> SignatureMarks {
+        let seen = file.as_deref().and_then(stamp_of);
         let marks = file.as_deref().map(read_marks).unwrap_or_default();
-        SignatureMarks { file, marks }
+        SignatureMarks { file, marks, seen }
     }
 
-    pub fn list(&self) -> Vec<StoredMark> {
+    /// Reads the list again when the file is not the one the app last saw. A file that is gone
+    /// leaves the list as it is: the next change writes it again.
+    fn refresh(&mut self) {
+        let Some(file) = &self.file else {
+            return;
+        };
+        let now = stamp_of(file);
+        if now.is_some() && now != self.seen {
+            self.marks = read_marks(file);
+            self.seen = now;
+        }
+    }
+
+    pub fn list(&mut self) -> Vec<StoredMark> {
+        self.refresh();
         self.marks.clone()
     }
 
@@ -207,6 +277,7 @@ impl SignatureMarks {
     pub fn add(&mut self, name: &str, body: MarkBody, now: u64) -> Result<StoredMark, StoreError> {
         let name = clean_name(name).ok_or(StoreError::Name)?;
         let body = body.checked().ok_or(StoreError::Picture)?;
+        self.refresh();
         if self.marks.len() >= MAX_MARKS {
             return Err(StoreError::Full);
         }
@@ -232,6 +303,7 @@ impl SignatureMarks {
 
     pub fn rename(&mut self, id: &str, name: &str) -> Result<StoredMark, StoreError> {
         let name = clean_name(name).ok_or(StoreError::Name)?;
+        self.refresh();
         let before = self.marks.clone();
         let mark = self
             .marks
@@ -245,6 +317,7 @@ impl SignatureMarks {
     }
 
     pub fn delete(&mut self, id: &str) -> Result<(), StoreError> {
+        self.refresh();
         let before = self.marks.clone();
         let at = self
             .marks
@@ -272,7 +345,7 @@ impl SignatureMarks {
         }
     }
 
-    fn save(&self) -> io::Result<()> {
+    fn save(&mut self) -> io::Result<()> {
         let Some(file) = &self.file else {
             return Ok(());
         };
@@ -284,11 +357,73 @@ impl SignatureMarks {
             marks: self.marks.clone(),
         };
         let json = serde_json::to_vec(&stored).map_err(io::Error::other)?;
-        // Write beside the file and move it into place, so a crash cannot leave half a file.
-        let temp = file.with_extension("json.tmp");
-        write_private_file(&temp, &json)?;
-        fs::rename(&temp, file)
+        write_replacing(file, &json)?;
+        self.seen = stamp_of(file);
+        Ok(())
     }
+}
+
+/// Writes `bytes` to `file` so that a crash or a failure leaves either the old file or the new
+/// one: they go to a new file beside it, which is flushed to the disk before it is moved into
+/// place, and which is removed again when anything fails. A temporary file left over from an
+/// earlier crash is removed first, so the new one is made fresh (for the user alone on Unix).
+fn write_replacing(file: &Path, bytes: &[u8]) -> io::Result<()> {
+    let temp = file.with_extension("json.tmp");
+    match fs::remove_file(&temp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let done = write_flushed(&temp, bytes).and_then(|()| fs::rename(&temp, file));
+    if done.is_err() {
+        let _ = fs::remove_file(&temp);
+        return done;
+    }
+    // The move itself is flushed too, where a folder can be.
+    #[cfg(unix)]
+    if let Some(dir) = file.parent() {
+        if let Ok(dir) = fs::File::open(dir) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
+/// Makes a new file that, on Unix, only the user can read, writes `bytes` to it and flushes it to
+/// the disk. It fails when the file is there already.
+fn write_flushed(file: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut out = options.open(file)?;
+    out.write_all(bytes)?;
+    out.sync_all()
+}
+
+/// Moves the file of an earlier version to its place in the local data folder, once. Before, the
+/// file lived in the app's data folder, which on Windows is Roaming AppData and can be copied to a
+/// server with the profile. Nothing happens when `from` and `to` are the same file, when there is
+/// no earlier file, or when the new place already has one (the new one is the list, and the old
+/// file is left alone). The old file is removed only after the new one is written and flushed.
+pub fn move_earlier_file(from: &Path, to: &Path) {
+    if from == to || fs::symlink_metadata(to).is_ok() {
+        return;
+    }
+    let Some(bytes) = read_plain_file(from, MAX_FILE_BYTES) else {
+        return;
+    };
+    let Some(dir) = to.parent() else {
+        return;
+    };
+    if create_private_dir(dir).is_err() || write_replacing(to, &bytes).is_err() {
+        return;
+    }
+    let _ = fs::remove_file(from);
 }
 
 fn read_marks(file: &std::path::Path) -> Vec<StoredMark> {
@@ -457,6 +592,34 @@ struct ImageArgs {
 /// The name of the header that carries [`ImageArgs`].
 const IMAGE_HEADER: &str = "x-signature-image";
 
+/// The pixels of the request. The window sends them as the raw body of the request. If the webview
+/// cannot use its custom protocol for the call it falls back to a message, and Tauri then delivers
+/// the same bytes as a JSON array of numbers; those are taken too, after their number is checked
+/// against the size the window declared and before anything is made of them.
+fn pixels_of(
+    body: &tauri::ipc::InvokeBody,
+    expected: usize,
+) -> Result<std::borrow::Cow<'_, [u8]>, CommandError> {
+    match body {
+        tauri::ipc::InvokeBody::Raw(bytes) => Ok(std::borrow::Cow::Borrowed(bytes.as_slice())),
+        tauri::ipc::InvokeBody::Json(serde_json::Value::Array(items)) => {
+            if items.len() != expected {
+                return Err(bad("the pixels do not fit the size of the image"));
+            }
+            let mut out = Vec::with_capacity(expected);
+            for item in items {
+                let byte = item
+                    .as_u64()
+                    .and_then(|n| u8::try_from(n).ok())
+                    .ok_or_else(|| bad("the pixels of the image are not bytes"))?;
+                out.push(byte);
+            }
+            Ok(std::borrow::Cow::Owned(out))
+        }
+        tauri::ipc::InvokeBody::Json(_) => Err(bad("the pixels of the image are missing")),
+    }
+}
+
 fn image_mark(args: &ImageArgs, body: &[u8]) -> Result<SignatureMark, CommandError> {
     if !mark_image_size_ok(args.width, args.height) {
         return Err(bad("that image is bigger than a signature picture may be"));
@@ -478,16 +641,20 @@ pub async fn add_signature_image(
     update_state: State<'_, UpdateState>,
     request: tauri::ipc::Request<'_>,
 ) -> Result<AnnotationInfo, CommandError> {
-    let tauri::ipc::InvokeBody::Raw(pixels) = request.body() else {
-        return Err(bad("the pixels of the image are missing"));
-    };
     let args: ImageArgs = request
         .headers()
         .get(IMAGE_HEADER)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| serde_json::from_str(v).ok())
         .ok_or_else(|| bad("the description of the image is missing"))?;
-    let mark = image_mark(&args, pixels)?;
+    if !mark_image_size_ok(args.width, args.height) {
+        return Err(bad("that image is bigger than a signature picture may be"));
+    }
+    let pixels = pixels_of(
+        request.body(),
+        args.width as usize * args.height as usize * 4,
+    )?;
+    let mark = image_mark(&args, &pixels)?;
     let _permit = update_state
         .gate()
         .enter()
@@ -566,11 +733,48 @@ mod tests {
         }
     }
 
+    /// Base64 text.
+    fn base64(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for group in bytes.chunks(3) {
+            let value = group
+                .iter()
+                .enumerate()
+                .fold(0u32, |v, (i, b)| v | (u32::from(*b) << (16 - 8 * i)));
+            for i in 0..4 {
+                if i <= group.len() {
+                    out.push(ALPHABET[((value >> (18 - 6 * i)) & 63) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    /// The start of a PNG that declares the size `width` by `height`, as base64 text (the rest of a
+    /// file is not looked at). 24 bytes make 32 characters, so nothing is padded.
+    fn png_text(width: u32, height: u32) -> String {
+        let mut bytes = PNG_SIGNATURE.to_vec();
+        bytes.extend_from_slice(&[0, 0, 0, 13]);
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        base64(&bytes)
+    }
+
+    /// As [`png_text`], followed by `more` characters of base64 as the rest of the file.
+    fn png_text_with(width: u32, height: u32, more: usize) -> String {
+        format!("{}{}", png_text(width, height), "A".repeat(more))
+    }
+
     fn image() -> MarkBody {
         MarkBody::Image {
             width: 4,
             height: 2,
-            png: format!("{PNG_BASE64_START}AAAAAA"),
+            png: png_text_with(4, 2, 8),
         }
     }
 
@@ -584,7 +788,7 @@ mod tests {
         let c = marks.add("Stamp image", image(), 102).unwrap();
         assert_eq!(marks.len(), 3);
         assert_ne!(a.id, b.id);
-        let again = SignatureMarks::load(Some(dir.file()));
+        let mut again = SignatureMarks::load(Some(dir.file()));
         assert_eq!(again.list(), vec![a, b, c]);
     }
 
@@ -600,9 +804,16 @@ mod tests {
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&file), 0o600);
         assert_eq!(mode(&inner), 0o700);
-        // Writing again keeps it so, also when the file is made wide open in the meantime.
+        // Writing again keeps it so, also when the file is made wide open in the meantime, and
+        // when a temporary file that is wide open was left behind by a crash.
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        let stale = file.with_extension("json.tmp");
+        fs::write(&stale, b"left over").unwrap();
+        fs::set_permissions(&stale, fs::Permissions::from_mode(0o644)).unwrap();
         marks.add("Two", typed(), 2).unwrap();
         assert_eq!(mode(&file), 0o600);
+        assert!(!stale.exists());
+        assert_eq!(SignatureMarks::load(Some(file)).len(), 2);
     }
 
     #[test]
@@ -614,7 +825,7 @@ mod tests {
         let renamed = marks.rename(&a.id, "  Formal  ").unwrap();
         assert_eq!(renamed.name, "Formal");
         marks.delete(&b.id).unwrap();
-        let again = SignatureMarks::load(Some(dir.file()));
+        let mut again = SignatureMarks::load(Some(dir.file()));
         assert_eq!(again.list().len(), 1);
         assert_eq!(again.list()[0].name, "Formal");
         assert!(matches!(marks.delete(&b.id), Err(StoreError::Missing)));
@@ -734,7 +945,7 @@ mod tests {
                 MarkBody::Image {
                     width: MAX_MARK_IMAGE_SIDE + 1,
                     height: 1,
-                    png: format!("{PNG_BASE64_START}AAAAAA"),
+                    png: png_text_with(MAX_MARK_IMAGE_SIDE + 1, 1, 8),
                 },
             ),
             (
@@ -742,7 +953,11 @@ mod tests {
                 MarkBody::Image {
                     width: MAX_MARK_IMAGE_SIDE,
                     height: MAX_MARK_IMAGE_PIXELS / MAX_MARK_IMAGE_SIDE + 1,
-                    png: format!("{PNG_BASE64_START}AAAAAA"),
+                    png: png_text_with(
+                        MAX_MARK_IMAGE_SIDE,
+                        MAX_MARK_IMAGE_PIXELS / MAX_MARK_IMAGE_SIDE + 1,
+                        8,
+                    ),
                 },
             ),
             (
@@ -750,7 +965,7 @@ mod tests {
                 MarkBody::Image {
                     width: 4,
                     height: 4,
-                    png: "AAAAAAAAAAAAAAAA".into(),
+                    png: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
                 },
             ),
             (
@@ -758,7 +973,31 @@ mod tests {
                 MarkBody::Image {
                     width: 4,
                     height: 4,
-                    png: format!("{PNG_BASE64_START}<script>x</script>"),
+                    png: format!("{}<script>x</script>", png_text(4, 4)),
+                },
+            ),
+            (
+                "an image whose header says another size than the one stored",
+                MarkBody::Image {
+                    width: 4,
+                    height: 4,
+                    png: png_text_with(4, 5, 8),
+                },
+            ),
+            (
+                "an image whose header says it is huge",
+                MarkBody::Image {
+                    width: 4,
+                    height: 4,
+                    png: png_text_with(30_000, 30_000, 8),
+                },
+            ),
+            (
+                "an image that is only the start of a signature",
+                MarkBody::Image {
+                    width: 4,
+                    height: 4,
+                    png: png_text(4, 4)[..28].to_string(),
                 },
             ),
             (
@@ -766,7 +1005,7 @@ mod tests {
                 MarkBody::Image {
                     width: 4,
                     height: 4,
-                    png: format!("{PNG_BASE64_START}{}", "A".repeat(MAX_PNG_BASE64)),
+                    png: png_text_with(4, 4, MAX_PNG_BASE64),
                 },
             ),
         ] {
@@ -776,9 +1015,10 @@ mod tests {
             );
         }
         // At the caps it works: the biggest image text, the longest typed text.
-        let big = format!(
-            "{PNG_BASE64_START}{}",
-            "A".repeat(MAX_PNG_BASE64 - PNG_BASE64_START.len())
+        let big = png_text_with(
+            MAX_MARK_IMAGE_SIDE,
+            MAX_MARK_IMAGE_PIXELS / MAX_MARK_IMAGE_SIDE,
+            MAX_PNG_BASE64 - 32,
         );
         assert!(marks
             .add(
@@ -869,7 +1109,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let loaded = SignatureMarks::load(Some(dir.file()));
+        let mut loaded = SignatureMarks::load(Some(dir.file()));
         let ids: Vec<String> = loaded.list().into_iter().map(|m| m.id).collect();
         assert_eq!(ids, vec!["good".to_string(), "fine".to_string()]);
         assert_eq!(loaded.list()[1].name, "Fine");
@@ -887,6 +1127,129 @@ mod tests {
         )
         .unwrap();
         assert!(SignatureMarks::load(Some(dir.file())).is_empty());
+    }
+
+    #[test]
+    fn the_size_in_the_header_of_a_png_is_read_from_its_text() {
+        assert_eq!(png_text_size(&png_text(640, 480)), Some((640, 480)));
+        assert_eq!(png_text_size(&png_text_with(1, 2, 100)), Some((1, 2)));
+        assert_eq!(png_text_size(&png_text(u32::MAX, 7)), Some((u32::MAX, 7)));
+        // Too short, not a PNG, a header chunk that is not the header, not base64.
+        assert_eq!(png_text_size(""), None);
+        assert_eq!(png_text_size(&png_text(1, 1)[..31]), None);
+        assert_eq!(png_text_size(&"A".repeat(40)), None);
+        let mut other = PNG_SIGNATURE.to_vec();
+        other.extend_from_slice(&[0, 0, 0, 13]);
+        other.extend_from_slice(b"IDAT");
+        other.extend_from_slice(&[0; 8]);
+        assert_eq!(png_text_size(&base64(&other)), None);
+        assert_eq!(png_text_size(&format!("!{}", &png_text(1, 1)[1..])), None);
+    }
+
+    #[test]
+    fn a_saved_image_whose_header_disagrees_with_its_size_is_dropped_on_load_and_on_add() {
+        let dir = TempDir::new();
+        let entry = |id: &str, w: u32, h: u32, header: (u32, u32)| {
+            format!(
+                r#"{{"id":"{id}","name":"{id}","created":1,"kind":"image","width":{w},"height":{h},"png":"{}"}}"#,
+                png_text_with(header.0, header.1, 8)
+            )
+        };
+        fs::write(
+            dir.file(),
+            format!(
+                r#"{{"version":1,"marks":[{},{},{}]}}"#,
+                entry("agrees", 4, 2, (4, 2)),
+                entry("wider", 4, 2, (40_000, 2)),
+                entry("bomb", 4, 2, (30_000, 30_000)),
+            ),
+        )
+        .unwrap();
+        let mut loaded = SignatureMarks::load(Some(dir.file()));
+        let ids: Vec<String> = loaded.list().into_iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec!["agrees".to_string()]);
+        let disagree = MarkBody::Image {
+            width: 4,
+            height: 2,
+            png: png_text_with(30_000, 30_000, 8),
+        };
+        assert!(matches!(
+            loaded.add("Bomb", disagree, 5),
+            Err(StoreError::Picture)
+        ));
+    }
+
+    #[test]
+    fn a_change_made_to_the_file_by_another_program_is_built_on_not_overwritten() {
+        let dir = TempDir::new();
+        let mut marks = SignatureMarks::load(Some(dir.file()));
+        marks.add("Mine", draw(), 1).unwrap();
+        // Another program writes a longer list.
+        let mut other = SignatureMarks::load(Some(dir.file()));
+        other.add("Theirs", typed(), 2).unwrap();
+        other.add("Theirs too", typed(), 3).unwrap();
+        // The app lists what is in the file now, and a change keeps the others.
+        assert_eq!(marks.list().len(), 3);
+        other.add("Later", typed(), 4).unwrap();
+        let added = marks.add("Mine again", draw(), 5).unwrap();
+        let names: Vec<String> = SignatureMarks::load(Some(dir.file()))
+            .list()
+            .into_iter()
+            .map(|m| m.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["Mine", "Theirs", "Theirs too", "Later", "Mine again"]
+        );
+        // The same for a rename after the other program added something.
+        let mut third = SignatureMarks::load(Some(dir.file()));
+        third.add("Third", typed(), 6).unwrap();
+        marks.rename(&added.id, "Renamed").unwrap();
+        let names: Vec<String> = marks.list().into_iter().map(|m| m.name).collect();
+        assert!(names.contains(&"Third".to_string()) && names.contains(&"Renamed".to_string()));
+    }
+
+    #[test]
+    fn a_failed_move_into_place_leaves_no_temporary_file_and_the_old_file_stays() {
+        let dir = TempDir::new();
+        // The place of the file is a folder with something in it, so the move cannot replace it.
+        fs::create_dir(dir.file()).unwrap();
+        fs::write(dir.file().join("inside"), b"x").unwrap();
+        assert!(write_replacing(&dir.file(), b"{}").is_err());
+        assert!(!dir.file().with_extension("json.tmp").exists());
+        assert!(dir.file().join("inside").exists());
+        // The same through the list: the change is refused and the list is as it was.
+        let mut marks = SignatureMarks::load(Some(dir.file()));
+        assert!(matches!(
+            marks.add("Two", typed(), 2),
+            Err(StoreError::Write(_))
+        ));
+        assert!(marks.is_empty());
+        assert!(!dir.file().with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn a_file_from_the_roaming_folder_is_moved_once_to_the_local_one() {
+        let dir = TempDir::new();
+        let from = dir.0.join("roaming").join("signatures.json");
+        let to = dir.0.join("local").join("signatures.json");
+        let mut old = SignatureMarks::load(Some(from.clone()));
+        old.add("Kept", draw(), 1).unwrap();
+        move_earlier_file(&from, &to);
+        assert!(!from.exists(), "the old file is gone");
+        let marks = SignatureMarks::load(Some(to.clone()));
+        assert_eq!(marks.len(), 1);
+        // A new place that has a file already is not touched, and the old file is left where it is.
+        let mut again = SignatureMarks::load(Some(from.clone()));
+        again.add("Second", typed(), 2).unwrap();
+        move_earlier_file(&from, &to);
+        assert!(from.exists());
+        assert_eq!(SignatureMarks::load(Some(to.clone())).len(), 1);
+        // The same place, or no earlier file, is nothing to do.
+        move_earlier_file(&to, &to);
+        move_earlier_file(&dir.0.join("nothing.json"), &dir.0.join("elsewhere.json"));
+        assert!(!dir.0.join("elsewhere.json").exists());
+        assert_eq!(SignatureMarks::load(Some(to)).len(), 1);
     }
 
     #[cfg(unix)]
@@ -926,6 +1289,36 @@ mod tests {
         // A size over a cap.
         assert!(image_mark(&args(MAX_MARK_IMAGE_SIDE + 1, 1), &[]).is_err());
         assert!(image_mark(&args(0, 0), &[]).is_err());
+    }
+
+    #[test]
+    fn the_pixels_come_as_the_raw_body_or_as_a_list_of_numbers_when_the_webview_fell_back() {
+        use tauri::ipc::InvokeBody;
+        let raw = InvokeBody::Raw(vec![7; 32]);
+        assert_eq!(pixels_of(&raw, 32).unwrap().as_ref(), &[7u8; 32][..]);
+        let list =
+            |items: Vec<serde_json::Value>| InvokeBody::Json(serde_json::Value::Array(items));
+        let numbers = list((0..32).map(|i| serde_json::json!(i * 8)).collect());
+        let got = pixels_of(&numbers, 32).unwrap();
+        assert_eq!(got.len(), 32);
+        assert_eq!((got[0], got[1], got[31]), (0, 8, 248));
+        // Too few or too many numbers, a number that is not a byte, something that is not a number.
+        assert!(pixels_of(&list(vec![serde_json::json!(1); 31]), 32).is_err());
+        assert!(pixels_of(&list(vec![serde_json::json!(1); 33]), 32).is_err());
+        for bad_item in [
+            serde_json::json!(256),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("1"),
+            serde_json::json!(null),
+        ] {
+            let mut items = vec![serde_json::json!(1); 32];
+            items[10] = bad_item;
+            assert!(pixels_of(&list(items), 32).is_err());
+        }
+        // A body that is not a list of bytes.
+        assert!(pixels_of(&InvokeBody::Json(serde_json::json!({})), 32).is_err());
+        assert!(pixels_of(&InvokeBody::Json(serde_json::Value::Null), 32).is_err());
     }
 
     #[test]
