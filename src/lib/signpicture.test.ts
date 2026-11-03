@@ -421,6 +421,73 @@ describe("the size an image file declares", () => {
     expect(imageSizeOf(gifBytes(300, 200, [gifFrame(300, 200), gifFrame(100, 100, 10, 10)]))).toEqual({ width: 300, height: 200 });
   });
 
+  it("is read from a GIF only in the form the format gives, so that no decoder finds another frame", () => {
+    const big = gifFrame(16_000, 16_000);
+    const withHead = (...parts: number[][]) => new Uint8Array([...ascii("GIF89a"), ...le16(1), ...le16(1), 0x80, 0, 0, 0, 0, 0, 255, 255, 255, ...parts.flat(), ...gifFrame(1, 1), 0x3b]);
+    // A graphic control extension of length 0, then a comment whose one sub-block holds, behind a
+    // zero, the descriptor of a big frame: a lenient decoder reads the first four bytes after the
+    // length as the extension and the descriptor as the first frame.
+    const hidden = [0x2c, 0, 0, 0, 0, ...le16(16_000), ...le16(16_000), 0, 2, 2, 0x44, 0x01, 0];
+    const comment = [0x21, 0xfe, 2 + hidden.length, 0xaa, 0, ...hidden, 0];
+    const short = withHead([0x21, 0xf9, 0], comment);
+    expect(short.length).toBeLessThan(260);
+    expect(imageSizeOf(short)).toBeNull();
+    // The same with the loop extension: a sub-block of length 1 is read as 3 bytes by some decoders.
+    const netscape = [0x21, 0xff, 11, ...ascii("NETSCAPE2.0"), 1, 1, 2 + hidden.length, 0xaa, 0, ...hidden, 0];
+    expect(imageSizeOf(withHead(netscape))).toBeNull();
+    const animexts = [0x21, 0xff, 11, ...ascii("ANIMEXTS1.0"), 2, 1, 0, 0];
+    expect(imageSizeOf(withHead(animexts))).toBeNull();
+    // A graphic control extension of length 5, or one that does not end where it should.
+    expect(imageSizeOf(withHead([0x21, 0xf9, 5, 0, 0, 0, 0, 0, 0]))).toBeNull();
+    expect(imageSizeOf(withHead([0x21, 0xf9, 4, 0, 0, 0, 0, 1, 0]))).toBeNull();
+    // An application extension that does not start with its 11 bytes, and an unknown kind.
+    expect(imageSizeOf(withHead([0x21, 0xff, 3, 1, 2, 3, 0]))).toBeNull();
+    expect(imageSizeOf(withHead([0x21, 0x77, 0]))).toBeNull();
+    // What the format gives is read: the loop extension (3 bytes), the buffer one (5), a graphic
+    // control extension, a comment, plain text and an application extension of another kind.
+    const loop = [0x21, 0xff, 11, ...ascii("NETSCAPE2.0"), 3, 1, 0, 0, 0];
+    const buffer = [0x21, 0xff, 11, ...ascii("NETSCAPE2.0"), 3, 1, 0, 0, 5, 2, 1, 2, 3, 4, 0];
+    const control = [0x21, 0xf9, 4, 1, 10, 0, 0, 0];
+    const text = [0x21, 0x01, 12, 0, 0, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 2, 0x41, 0x42, 0];
+    const other = [0x21, 0xff, 11, ...ascii("XMP DataXMP"), 1, 0x41, 0];
+    for (const parts of [[loop], [buffer], [control], [[0x21, 0xfe, 3, 1, 2, 3, 0]], [text], [other], [loop, control]]) {
+      expect(imageSizeOf(withHead(...parts)), JSON.stringify(parts)).toEqual({ width: 1, height: 1 });
+    }
+    expect(imageSizeOf(gifBytes(5, 5, [big]))).toEqual({ width: 16_000, height: 16_000 });
+  });
+
+  it("is read from a JPEG by every start of frame in the file, and not by a marker that is not one", () => {
+    const segment = (marker: number, payload: number[]) => [0xff, marker, ...be16(2 + payload.length), ...payload];
+    const be16 = (n: number) => [(n >> 8) & 255, n & 255];
+    const quant = segment(0xdb, [0, ...new Array(64).fill(1)]);
+    const tables = segment(0xc4, [0, 1, ...new Array(15).fill(0), 0]);
+    const frame = (w: number, h: number, marker = 0xc0) => segment(marker, [8, ...be16(h), ...be16(w), 1, 1, 0x11, 0]);
+    const scan = (bytes: number) => [...segment(0xda, [1, 1, 0, 0, 0x3f, 0]), ...new Array(bytes).fill(0), 0xff, 0xd9];
+    const file = (...parts: number[][]) => new Uint8Array([0xff, 0xd8, ...parts.flat()]);
+    // The file of a normal picture, a progressive one, and one with a thumbnail in its first segment.
+    expect(judgeImageSize(imageSizeOf(file(quant, frame(100, 100), tables, scan(50))))).toBe("ok");
+    expect(imageSizeOf(file(quant, frame(100, 80, 0xc2), tables, scan(50)))).toEqual({ width: 100, height: 80 });
+    const thumbnail = [0xff, 0xd8, ...frame(160, 120), 0xff, 0xd9];
+    const exif = file(segment(0xe1, [...ascii("Exif"), 0, 0, ...thumbnail]), quant, frame(4_000, 3_000), tables, scan(50));
+    expect(imageSizeOf(exif)).toEqual({ width: 4_000, height: 3_000 });
+    // A picture that declares too much.
+    expect(judgeImageSize(imageSizeOf(file(quant, frame(16_000, 16_000), tables, scan(50))))).toBe("too-big");
+    // A "marker" of 0xFF 0x00 with a length that covers the real start of frame (16000 by 16000),
+    // and a small start of frame after it that a strict reader finds (and a lenient one takes for
+    // the content of a comment). The file is a megabyte, as the data that follows is.
+    const small = frame(100, 100);
+    const covered = [...quant, ...frame(16_000, 16_000), ...tables, 0xff, 0xfe, ...be16(2 + small.length)];
+    const hiddenFrame = new Uint8Array([0xff, 0xd8, 0xff, 0x00, ...be16(2 + covered.length), ...covered, ...small, ...scan(1_000_000)]);
+    expect(hiddenFrame.length).toBeGreaterThan(1_000_000);
+    expect(imageSizeOf(hiddenFrame)).toBeNull();
+    // The same where the 0xFF 0x00 is not in the way of the walk: the start of frame is still found.
+    const behind = new Uint8Array([0xff, 0xd8, ...quant, ...frame(100, 100), ...segment(0xfe, [0xff, 0xc0, 0, 17, 8, ...be16(16_000), ...be16(16_000), 1, 1, 0x11, 0]), ...scan(50)]);
+    expect(judgeImageSize(imageSizeOf(behind))).toBe("too-big");
+    // A start of frame that is cut short, or has no size, is not read.
+    expect(imageSizeOf(new Uint8Array([...file(quant, frame(10, 10), scan(5)), 0xff, 0xc2, 0, 11]))).toBeNull();
+    expect(imageSizeOf(file(quant, frame(10, 10), segment(0xfe, [0xff, 0xc1, 0, 11, 8, 0, 0, 0, 5, 1, 1, 0x11, 0]), scan(5)))).toBeNull();
+  });
+
   it("is judged against the side and the pixel limit of the decoder", () => {
     expect(judgeImageSize({ width: 1, height: 1 })).toBe("ok");
     expect(judgeImageSize({ width: MAX_DECODE_SIDE, height: 4_000 })).toBe("ok");
@@ -439,6 +506,13 @@ describe("the size an image file declares", () => {
     expect(await checkImageHeader(new Blob([gif(100, 50)]))).toBe("ok");
     expect(await checkImageHeader(new Blob([gifBytes(1, 1, [gifFrame(16_000, 16_000)])]))).toBe("too-big");
     expect(await checkImageHeader(new Blob([gif(100, 50).subarray(0, 30)]))).toBe("unreadable");
+    // A JPEG is searched through all of it: a start of frame after the first 2 MiB counts too.
+    const jpegSegment = (marker: number, payload: number[]) => [0xff, marker, (2 + payload.length) >> 8, (2 + payload.length) & 255, ...payload];
+    const jpegFrame = (w: number, h: number) => jpegSegment(0xc0, [8, h >> 8, h & 255, w >> 8, w & 255, 1, 1, 0x11, 0]);
+    const padding = jpegSegment(0xfe, new Array(60_000).fill(0));
+    const lateJpeg = new Uint8Array([0xff, 0xd8, ...jpegFrame(100, 100), ...Array.from({ length: 40 }, () => padding).flat(), ...jpegSegment(0xfe, [0xff, 0xc0, 0, 17, 8, 0x3e, 0x80, 0x3e, 0x80, 1, 1, 0x11, 0]), 0xff, 0xd9]);
+    expect(lateJpeg.length).toBeGreaterThan(HEADER_BYTES);
+    expect(await checkImageHeader(new Blob([lateJpeg]))).toBe("too-big");
     // The frame that is too big comes after more than the first bytes that are read for a header.
     const filler = [0x2c, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, ...Array.from({ length: 9_000 }, () => [255, ...new Array(255).fill(0)]).flat(), 0];
     const late = gifBytes(1, 1, [filler, gifFrame(16_000, 16_000)]);

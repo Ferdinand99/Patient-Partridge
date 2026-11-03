@@ -337,8 +337,11 @@ const MAX_GIF_BLOCKS = 2_000_000;
 /**
  * The size of a GIF as a decoder will make it: the largest of the screen and of every frame (its
  * place plus its size). The walk goes from block to block, over the colour tables, the extensions
- * and the sub-blocks of data, to the trailer. A file that is cut short, has a block that is not
- * one, or has no frame at all gives `null`: it is not decoded.
+ * and the sub-blocks of data, to the trailer. Only the grammar the format gives is read: some
+ * decoders read a short graphic control extension, or a short sub-block of the loop extension, as
+ * longer than it says, and would then find a frame where this walk found a comment. A file that
+ * is cut short, has a block that is not one, has an extension that is not in its proper form, or
+ * has no frame at all gives `null`: it is not decoded.
  */
 function gifSize(bytes: Uint8Array): ImageSize | null {
   const n = bytes.length;
@@ -355,6 +358,34 @@ function gifSize(bytes: Uint8Array): ImageSize | null {
     }
     return -1;
   };
+  // The index after an extension that starts at `from` (the 0x21), or -1 when it is not in its
+  // proper form. The graphic control extension is a block of exactly 4 bytes and an end; the
+  // application extensions that loop and buffer an animation hold sub-blocks of 3 or of 5 bytes
+  // only; other application extensions, comments and plain text are runs of sub-blocks, and any
+  // other kind of extension is not read.
+  const skipExtension = (from: number): number => {
+    if (from + 2 >= n) return -1;
+    const label = bytes[from + 1];
+    const first = bytes[from + 2];
+    if (label === 0xf9) return first === 4 && from + 7 < n && bytes[from + 7] === 0 ? from + 8 : -1;
+    if (label === 0xff) {
+      if (first !== 11 || from + 14 > n) return -1;
+      let id = "";
+      for (let i = from + 3; i < from + 14; i++) id += String.fromCharCode(bytes[i]);
+      if (id !== "NETSCAPE2.0" && id !== "ANIMEXTS1.0") return skipSubBlocks(from + 14);
+      let at = from + 14;
+      while (at < n) {
+        const length = bytes[at];
+        if (length === 0) return at + 1;
+        if (length !== 3 && length !== 5) return -1;
+        at += 1 + length;
+      }
+      return -1;
+    }
+    if (label === 0x01) return first === 12 ? skipSubBlocks(from + 2) : -1;
+    if (label === 0xfe) return skipSubBlocks(from + 2);
+    return -1;
+  };
   let width = le16(6);
   let height = le16(8);
   let at = 13 + (bytes[10] & 0x80 ? 3 * (1 << ((bytes[10] & 7) + 1)) : 0);
@@ -366,8 +397,7 @@ function gifSize(bytes: Uint8Array): ImageSize | null {
       return frames > 0 && width > 0 && height > 0 ? { width, height } : null;
     }
     if (block === 0x21) {
-      // An extension: its label, then sub-blocks.
-      at = skipSubBlocks(at + 2);
+      at = skipExtension(at);
       if (at < 0) return null;
     } else if (block === 0x2c) {
       // A frame: left, top, width, height, a byte of flags, perhaps a colour table, the size of
@@ -444,7 +474,33 @@ export function imageSizeOf(bytes: Uint8Array): ImageSize | null {
     return null;
   }
   // JPEG: segments that each start with 0xFF and a marker; a "start of frame" holds the size.
+  // The walk finds the frame the way a strict reader does; a lenient decoder (libjpeg skips a
+  // 0xFF 0x00 and scans on) may find another one, so the whole file is searched for every
+  // start of frame too, and the largest size counts. In the data of a picture a 0xFF is always
+  // followed by 0x00 or by a restart marker, so a real picture holds no start of frame but its own
+  // (and those of thumbnails, which are small).
   if (u8(0) === 0xff && u8(1) === 0xd8) {
+    const walked = jpegWalk();
+    if (!walked) return null;
+    let width = walked.width;
+    let height = walked.height;
+    for (let i = 0; i + 1 < bytes.length; i++) {
+      if (bytes[i] !== 0xff) continue;
+      const marker = bytes[i + 1];
+      if (marker < 0xc0 || marker > 0xcf || marker === 0xc4 || marker === 0xc8 || marker === 0xcc) continue;
+      // Length, precision, height and width must all be there.
+      if (i + 9 > bytes.length) return null;
+      const w = be16(i + 7);
+      const h = be16(i + 5);
+      if (!(w > 0 && h > 0)) return null;
+      width = Math.max(width, w);
+      height = Math.max(height, h);
+    }
+    return size(width, height);
+  }
+  return null;
+
+  function jpegWalk(): ImageSize | null {
     let at = 2;
     while (at + 3 < bytes.length) {
       if (bytes[at] !== 0xff) return null;
@@ -455,6 +511,8 @@ export function imageSizeOf(bytes: Uint8Array): ImageSize | null {
         marker = bytes[at + 1];
       }
       at += 2;
+      // 0xFF 0x00 is not a marker: a decoder that skips it reads on from another place.
+      if (marker === 0x00) return null;
       // Markers that stand alone: no length follows.
       if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd8)) continue;
       // The end of the picture or the start of the data, and no size before it.
@@ -467,7 +525,6 @@ export function imageSizeOf(bytes: Uint8Array): ImageSize | null {
     }
     return null;
   }
-  return null;
 }
 
 /** What the header of an image file says about it. */
@@ -501,9 +558,12 @@ async function headOf(blob: Blob, length: number = HEADER_BYTES): Promise<Uint8A
 export async function checkImageHeader(blob: Blob): Promise<ImageHeader> {
   try {
     let head = await headOf(blob);
-    // The frames of a GIF follow one another through the whole file, and each is judged, so the
-    // whole file (which is held to its own size limit) is read.
-    if (head.length >= 4 && head[0] === 0x47 && head[1] === 0x49 && head[2] === 0x46 && head[3] === 0x38) {
+    // The frames of a GIF follow one another through the whole file and each is judged, and the
+    // starts of frame of a JPEG are searched for in all of it, so the whole file (which is held to
+    // its own size limit) is read for those two.
+    const gif = head.length >= 4 && head[0] === 0x47 && head[1] === 0x49 && head[2] === 0x46 && head[3] === 0x38;
+    const jpeg = head.length >= 2 && head[0] === 0xff && head[1] === 0xd8;
+    if (gif || jpeg) {
       head = await headOf(blob, MAX_IMAGE_FILE_BYTES);
     }
     return judgeImageSize(imageSizeOf(head));
