@@ -59,6 +59,10 @@ jobs:
           - target: protocol_roundtrip_response
             dict: protocol
             args: "-max_len=4096 -timeout=10 -malloc_limit_mb=8"
+          # A pure function over bytes: a low timeout, so that a pass that is not one pass fails.
+          - target: metadata_check
+            dict: pdf
+            args: "-max_len=100000 -timeout=5 -malloc_limit_mb=256"
           - target: engine_open_render
             dict: pdf
             # No more than the engine itself may use (3 GiB on Linux) in one allocation or in all.

@@ -231,6 +231,9 @@ pub enum ErrorCode {
     AnnotationRefused = 19,
     /// The document's own permissions do not allow annotations to be added or changed.
     AnnotationsNotAllowed = 20,
+    /// The document is protected and has an XMP metadata stream, which PDFium cannot write encrypted
+    /// and which must not be written in the clear. Nothing is serialised.
+    SaveMetadataNotEncrypted = 21,
 }
 
 impl ErrorCode {
@@ -258,6 +261,7 @@ impl ErrorCode {
             18 => ErrorCode::NoSuchAnnotation,
             19 => ErrorCode::AnnotationRefused,
             20 => ErrorCode::AnnotationsNotAllowed,
+            21 => ErrorCode::SaveMetadataNotEncrypted,
             _ => return None,
         })
     }
@@ -287,6 +291,7 @@ impl ErrorCode {
             ErrorCode::NoSuchAnnotation => "no_such_annotation",
             ErrorCode::AnnotationRefused => "annotation_refused",
             ErrorCode::AnnotationsNotAllowed => "annotations_not_allowed",
+            ErrorCode::SaveMetadataNotEncrypted => "save_metadata_not_encrypted",
         }
     }
 }
@@ -2569,17 +2574,22 @@ mod tests {
 
     #[test]
     fn error_codes_round_trip_and_have_names() {
-        for v in 1..=20u8 {
+        for v in (1..=21u8).chain([24, 25]) {
             let code = ErrorCode::from_u8(v).unwrap();
             assert_eq!(code as u8, v);
             assert!(!code.name().is_empty());
         }
         assert!(ErrorCode::from_u8(0).is_none());
-        assert!(ErrorCode::from_u8(21).is_none());
+        assert!(ErrorCode::from_u8(22).is_none());
+        assert!(ErrorCode::from_u8(23).is_none());
         assert_eq!(ErrorCode::from_u8(16).unwrap().name(), "source_changed");
         assert_eq!(ErrorCode::from_u8(17).unwrap().name(), "source_unreadable");
         assert_eq!(ErrorCode::from_u8(14).unwrap().name(), "save_failed");
         assert_eq!(ErrorCode::from_u8(15).unwrap().name(), "save_too_large");
+        assert_eq!(
+            ErrorCode::from_u8(21).unwrap().name(),
+            "save_metadata_not_encrypted"
+        );
     }
 }
 

@@ -61,8 +61,10 @@ const IDLE_LIMIT: usize = 70 * 1024;
 /// Header of a `Rendered` answer in front of the pixels.
 const RENDERED_HEADER: usize = 17;
 /// How many times a long request (`DocInfo`, `FormInfo`, `Fingerprint`, `SaveBegin`) may have to
-/// read the whole document: the check of the file before and after, and the serialising itself.
-const SAVE_PASSES: u64 = 4;
+/// read the whole document: the check of the file before and after, the serialising itself, and
+/// for a save the second writing (the bytes are read in again and written once more) and the
+/// check of both.
+const SAVE_PASSES: u64 = 6;
 
 /// What the error of an engine that was stopped for taking too long starts with. The app turns it
 /// into its own error code, so that the window can say what happened.

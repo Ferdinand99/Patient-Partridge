@@ -29,6 +29,7 @@ pub mod fonts;
 pub mod form_actions;
 pub mod forms;
 pub mod limits;
+pub mod metadata;
 pub mod sandbox;
 pub mod save;
 pub mod source;
@@ -137,6 +138,30 @@ fn fail<T>(code: ErrorCode, message: impl Into<String>) -> Result<T, Failure> {
     Err((code, message.into()))
 }
 
+/// Overwrites a string with zeros, so that what it held does not stay in memory.
+fn wipe(text: &mut str) {
+    // SAFETY: the bytes are overwritten in place with zeros, which are valid text, and the writes
+    // are volatile so that they are not removed.
+    unsafe {
+        for byte in text.as_bytes_mut() {
+            std::ptr::write_volatile(byte, 0);
+        }
+    }
+}
+
+/// A password kept in memory while its document is open (the engine has to load a copy of the
+/// document with it). It is overwritten with zeros when it is let go of, and so is the copy in the
+/// request once the document is open. This is best effort: the buffer the frame was read into, the
+/// C string that `pdfium-render` makes for each load and the copy in PDFium's parser are not in
+/// the engine's hands.
+struct Secret(String);
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        wipe(&mut self.0);
+    }
+}
+
 /// The engine state: the loaded PDFium library and the documents that are open.
 pub struct Engine {
     pdfium: Result<&'static Pdfium, String>,
@@ -147,6 +172,8 @@ pub struct Engine {
     docs: HashMap<u32, PdfDocument<'static>>,
     /// The serialised form of a document between `SaveBegin` and `SaveEnd`.
     saves: HashMap<u32, Vec<u8>>,
+    /// The passwords the documents were opened with, to load a copy of a document when it is saved.
+    passwords: HashMap<u32, Secret>,
     /// What the engine knows of the annotations of each document (their ids, and how to put back
     /// what it removed).
     annots: HashMap<u32, annots::DocAnnots>,
@@ -203,6 +230,7 @@ impl Engine {
             forms: HashMap::new(),
             docs: HashMap::new(),
             saves: HashMap::new(),
+            passwords: HashMap::new(),
             annots: HashMap::new(),
             next_doc: 1,
             document: None,
@@ -299,7 +327,13 @@ impl Engine {
                     sandbox: self.sandbox.clone(),
                 })
             }
-            RequestBody::Open { password } => self.open(pdfium, password.as_deref()),
+            RequestBody::Open { mut password } => {
+                let opened = self.open(pdfium, password.as_deref());
+                if let Some(password) = password.as_mut() {
+                    wipe(password);
+                }
+                opened
+            }
             RequestBody::Render {
                 doc,
                 page,
@@ -311,6 +345,7 @@ impl Engine {
                 self.forms.remove(&doc);
                 self.docs.remove(&doc);
                 self.saves.remove(&doc);
+                self.passwords.remove(&doc);
                 self.annots.remove(&doc);
                 Ok(ResponseBody::Closed)
             }
@@ -376,8 +411,9 @@ impl Engine {
                 // The file must be what it was when the parts that are in memory were read: the
                 // parts that are not are read now, and a mix of two versions is not a document.
                 self.check_source(progress)?;
-                let bytes =
-                    save::serialise_up_to(document, partridge_protocol::MAX_SAVE_BYTES, progress)?;
+                // Written twice, so that what nothing refers to is not in the file (see there).
+                let password = self.passwords.get(&doc).map(|s| s.0.as_str());
+                let bytes = save::serialise_clean(pdfium, document, password, progress)?;
                 self.check_source(progress)?;
                 let size = bytes.len() as u32;
                 self.saves.insert(doc, bytes);
@@ -651,6 +687,9 @@ impl Engine {
             .collect();
         let id = self.next_doc;
         self.next_doc = self.next_doc.wrapping_add(1).max(1);
+        if let Some(password) = password {
+            self.passwords.insert(id, Secret(password.to_string()));
+        }
         self.docs.insert(id, doc);
         Ok(ResponseBody::Opened { doc: id, pages })
     }

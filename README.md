@@ -100,7 +100,7 @@ The pen needs a pointer: there is no way to draw with the keyboard. The text to 
 
 The full list, with the reasons, is in [docs/known-limits.md](docs/known-limits.md). The ones to know first:
 
-- **Deleting an annotation is not redaction.** Saving after a delete leaves the text of the comment out of the new file, but nothing on the page itself is removed, and copies and backups made before the save still hold the text. A free text box that came without an appearance stream keeps its words in the saved file; the question before a delete says so. Real redaction is planned. [Details](docs/known-limits.md#annotations)
+- **Deleting an annotation is not redaction.** Saving after a delete leaves the text of the comment out of the new file, but nothing on the page itself is removed, and copies and backups made before the save still hold the text. Real redaction is planned. [Details](docs/known-limits.md#annotations)
 - **The engine on Windows is not blocked from the network in 0.2.x.** The sandbox keeps files, windows, the clipboard, other processes and memory away from it, but an exploited engine could send out what it can read. On Linux and macOS the network is blocked. [Details](docs/security.md#what-it-does-not-cover)
 - **Digital signatures.** A save always writes the whole document again, so saving a signed document breaks its signature. The app asks first (Cancel, Save a copy, Save anyway). Validating signatures is not there yet. [Details](docs/known-limits.md#saving-and-digital-signatures)
 - **A file that another program rewrites while it is open** loses every edit you made since you opened it: Save and Save a copy refuse, and you have to open the file again. [Details](docs/known-limits.md#a-file-that-changes-while-it-is-open)

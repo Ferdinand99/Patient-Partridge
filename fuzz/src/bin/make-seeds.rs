@@ -813,6 +813,120 @@ fn main() {
         .encode(),
     );
 
+    // The metadata check: files in the form PDFium writes (a classic table, `\r\n` line ends), a
+    // protected one with an XMP stream that is meant to be encrypted, one that says it is not, and
+    // the shapes that a search for words would be fooled by.
+    let shaped = |objects: &[&str], trailer: &str| -> Vec<u8> {
+        let mut out = b"%PDF-1.7\r\n%\xA1\xB3\xC5\xD7\r\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, body) in objects.iter().enumerate() {
+            out.extend_from_slice(b"\r\n");
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\r\n{body}\r\nendobj\r\n", i + 1).as_bytes());
+        }
+        let xref = out.len();
+        out.extend_from_slice(
+            format!("xref\r\n0 {}\r\n0000000000 65535 f\r\n", objects.len() + 1).as_bytes(),
+        );
+        for offset in offsets {
+            out.extend_from_slice(format!("{offset:010} 00000 n\r\n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!("trailer\r\n<<{trailer}>>\r\nstartxref\r\n{xref}\r\n%%EOF\r\n").as_bytes(),
+        );
+        out
+    };
+    let xmp = "<</Length 12/Subtype/XML/Type/Metadata>>stream\r\n<x:xmpmeta/>\r\nendstream";
+    let catalog = "<</Metadata 4 0 R /Pages 3 0 R /Type/Catalog>>";
+    let pages = "<</Type/Pages>>";
+    let trailer = "/Root 1 0 R /Encrypt 2 0 R /Size 5";
+    let metadata_seeds: Vec<(&str, Vec<u8>)> = vec![
+        (
+            "protected_xmp",
+            shaped(&[catalog, "<</Filter/Standard/V 4>>", pages, xmp], trailer),
+        ),
+        (
+            "protected_clear_xmp",
+            shaped(
+                &[catalog, "<</EncryptMetadata false/Filter/Standard>>", pages, xmp],
+                trailer,
+            ),
+        ),
+        (
+            "clear_not_xml",
+            shaped(
+                &[
+                    catalog,
+                    "<</EncryptMetadata false/Filter/Standard>>",
+                    pages,
+                    "<</Length 5/Subtype/XML/Type/Metadata>>stream\r\nx\u{9c}abc\r\nendstream",
+                ],
+                trailer,
+            ),
+        ),
+        (
+            "two_streams",
+            shaped(
+                &[catalog, "<</EncryptMetadata false/Filter/Standard>>", pages, xmp, xmp],
+                trailer,
+            ),
+        ),
+        (
+            "unprotected_xmp",
+            shaped(&[catalog, xmp, pages], "/Root 1 0 R /Size 4"),
+        ),
+        (
+            "name_like_keyword",
+            shaped(
+                &[
+                    catalog,
+                    "<</Filter/Standard/V 4>>",
+                    pages,
+                    "<</A/stream/Length 12/Subtype/XML/Type/Metadata>>stream\r\n<x:xmpmeta/>\r\nendstream",
+                ],
+                trailer,
+            ),
+        ),
+        (
+            "nested_encrypt_metadata",
+            shaped(
+                &[
+                    catalog,
+                    "<</Filter/Standard/CF<</StdCF<</EncryptMetadata false>>>>/Note(/EncryptMetadata false)>>",
+                    pages,
+                    xmp,
+                ],
+                trailer,
+            ),
+        ),
+        (
+            "trailer_in_array",
+            shaped(
+                &[catalog, "<</EncryptMetadata false/Filter/Standard>>", pages, xmp],
+                "/AAA[/Encrypt 5 0 R]/Root 1 0 R /Encrypt 2 0 R /Size 5",
+            ),
+        ),
+        (
+            "deep",
+            shaped(
+                &[
+                    catalog,
+                    &format!(
+                        "<</EncryptMetadata false/X{}{}>>",
+                        "[".repeat(40),
+                        "]".repeat(40)
+                    ),
+                    pages,
+                    xmp,
+                ],
+                trailer,
+            ),
+        ),
+    ];
+    for (name, bytes) in &metadata_seeds {
+        write(&dir, "metadata_check", &format!("{name}.pdf"), bytes);
+    }
+
     // Engine: PDF files from the test kit. Small ones, so the fuzzer can change them quickly.
     let target = "engine_open_render";
     // Documents whose destinations are page numbers that do not exist: a link and outline
@@ -845,6 +959,10 @@ fn main() {
         // `-max_len` of 100000).
         ("links_over_the_cap", kit::many_links_pdf(501)),
         ("encrypted", kit::encrypted_pdf("secret", 1)),
+        // A protected file with an XMP stream: encrypted as the dictionary says (a save is refused),
+        // and clear as `/EncryptMetadata false` says (a save keeps it).
+        ("encrypted_xmp", kit::encrypted_xmp_pdf("secret", false)),
+        ("encrypted_xmp_clear", kit::encrypted_xmp_pdf("secret", true)),
         ("truncated", kit::truncated_pdf()),
         // Forms: every kind of field, a turned page, XFA, scripts and actions, a signature, fields
         // that sit under a parent, and a page with many fields.

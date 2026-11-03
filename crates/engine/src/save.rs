@@ -18,6 +18,7 @@ use std::sync::Mutex;
 use partridge_protocol::{ErrorCode, ResponseBody, MAX_SAVE_BYTES};
 use pdfium_render::prelude::*;
 
+use crate::metadata;
 use crate::source::{fnv, Problem, SourceGuard};
 use crate::Failure;
 
@@ -72,13 +73,36 @@ impl Write for Capped {
     }
 }
 
-/// Writes the document out as PDFium would write a copy of it, with every change made so far.
+/// Writes the document out as PDFium would write a copy of it, with every change made so far, for
+/// bytes that leave the engine (see [`serialise_checked`]).
 pub fn serialise(document: &PdfDocument<'_>) -> Result<Vec<u8>, Failure> {
-    serialise_up_to(document, MAX_SAVE_BYTES, &mut |_| {})
+    serialise_checked(document, MAX_SAVE_BYTES, &mut |_| {})
 }
 
-/// As [`serialise`], with a limit of `limit` bytes (a test makes it small), and `progress` told
-/// how many bytes are written now and then.
+/// As [`serialise_up_to`], and the bytes are looked at before they are handed over: a protected
+/// document whose file would hold an XMP metadata stream that PDFium writes without encryption is
+/// refused (see the module `metadata`). Every write whose bytes leave the engine is made with this,
+/// and nothing that stays in the engine needs to be.
+pub fn serialise_checked(
+    document: &PdfDocument<'_>,
+    limit: usize,
+    progress: &mut dyn FnMut(u32),
+) -> Result<Vec<u8>, Failure> {
+    let bytes = serialise_up_to(document, limit, progress)?;
+    if metadata::leaves_metadata_in_the_clear(&bytes, progress) {
+        return Err((
+            ErrorCode::SaveMetadataNotEncrypted,
+            "the document is protected and has XMP metadata, which would be written without encryption, so it was not written"
+                .to_string(),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Writes the document out as PDFium would write a copy of it, with a limit of `limit` bytes (a
+/// test makes it small), and `progress` told how many bytes are written now and then. The bytes
+/// are not looked at: they are for what stays in the engine (the form actions are looked for in
+/// them). A write whose bytes leave the engine is made with [`serialise_checked`].
 pub fn serialise_up_to(
     document: &PdfDocument<'_>,
     limit: usize,
@@ -120,6 +144,42 @@ pub fn serialise_up_to(
         ));
     }
     Ok(out.bytes)
+}
+
+/// Writes the document for a save, without anything that nothing refers to.
+///
+/// PDFium writes every object that was made in this session, whether or not anything still refers
+/// to it: the picture of a signature that Undo took off, the drawing that was deleted, the
+/// appearance of a note that is gone. Those would stay in the saved file, whole, with the pixels or
+/// the lines in them. The objects of a file that was loaded are written only when something refers
+/// to them. So the bytes are written once, read in again as a document of their own, and written a
+/// second time; the second writing is the file. The cost is one more load and one more write of the
+/// same bytes, and the memory for a second copy of them.
+pub fn serialise_clean(
+    pdfium: &Pdfium,
+    document: &PdfDocument<'_>,
+    password: Option<&str>,
+    progress: &mut dyn FnMut(u32),
+) -> Result<Vec<u8>, Failure> {
+    let mut first = serialise_checked(document, MAX_SAVE_BYTES, progress)?;
+    // The buffer grew by doubling; the reload needs the room.
+    first.shrink_to_fit();
+    let pages = document.pages().len();
+    let reread = pdfium
+        .load_pdf_from_byte_vec(first, password)
+        .map_err(|_| {
+            (
+                ErrorCode::SaveFailed,
+                "the written document could not be read again".to_string(),
+            )
+        })?;
+    if reread.pages().len() != pages {
+        return Err((
+            ErrorCode::SaveFailed,
+            "the written document has another number of pages when it is read again".to_string(),
+        ));
+    }
+    serialise_checked(&reread, MAX_SAVE_BYTES, progress)
 }
 
 /// The failure to give when the file the document is read from is not to be trusted.

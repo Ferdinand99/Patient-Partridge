@@ -28,6 +28,7 @@ describe("describeError: saving", () => {
       "save_not_a_file",
       "save_busy",
       "save_failed",
+      "save_metadata_not_encrypted",
       "save_too_large",
       "save_source_changed",
       "save_source_touched",
@@ -47,6 +48,7 @@ describe("describeError: saving", () => {
       "save_disk_full",
       "save_verify_failed",
       "save_failed",
+      "save_metadata_not_encrypted",
       "save_too_large",
       "save_source_changed",
       "save_source_touched",
@@ -59,6 +61,9 @@ describe("describeError: saving", () => {
       expect(describeError({ code, message: "" }, "tax.pdf").detail, code).toContain('"tax.pdf"');
     }
     expect(describeError({ code: "save_write_failed", message: "no luck" }, "tax.pdf").detail).toContain("no luck");
+    const protectedFile = describeError({ code: "save_metadata_not_encrypted", message: "" }, "tax.pdf");
+    expect(protectedFile.detail).toContain("saving a copy does not help");
+    expect(protectedFile.detail).toContain("Nothing was saved");
   });
 });
 

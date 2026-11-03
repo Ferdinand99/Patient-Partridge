@@ -1327,7 +1327,7 @@ pub fn encrypted_pdf_with_permissions(
     pages: usize,
     permissions: i32,
 ) -> Vec<u8> {
-    encrypted_pdf_impl(user_password, None, pages, permissions)
+    encrypted_pdf_impl(user_password, None, pages, permissions, None)
 }
 
 /// As `encrypted_pdf_with_permissions`, with an owner password that opens the document with every
@@ -1338,7 +1338,13 @@ pub fn encrypted_pdf_with_owner(
     pages: usize,
     permissions: i32,
 ) -> Vec<u8> {
-    encrypted_pdf_impl(user_password, Some(owner_password), pages, permissions)
+    encrypted_pdf_impl(
+        user_password,
+        Some(owner_password),
+        pages,
+        permissions,
+        None,
+    )
 }
 
 fn encrypted_pdf_impl(
@@ -1346,6 +1352,7 @@ fn encrypted_pdf_impl(
     owner_password: Option<&str>,
     pages: usize,
     permissions: i32,
+    xmp: Option<bool>,
 ) -> Vec<u8> {
     let mut padded = [0u8; 32];
     let pw = user_password.as_bytes();
@@ -1382,8 +1389,14 @@ fn encrypted_pdf_impl(
     // Algorithm 4: the user entry is the padding string encrypted with the file key.
     let user = rc4(&key, &PADDING);
 
+    // `/EncryptMetadata false` is the word of a file whose XMP stream is meant to stay in the clear.
+    let clear = if xmp == Some(true) {
+        " /EncryptMetadata false"
+    } else {
+        ""
+    };
     let encrypt_object = format!(
-        "<< /Filter /Standard /V 1 /R 2 /P {permissions} /O <{}> /U <{}> >>",
+        "<< /Filter /Standard /V 1 /R 2 /P {permissions} /O <{}> /U <{}>{clear} >>",
         hex(&owner),
         hex(&user)
     )
@@ -1398,12 +1411,161 @@ fn encrypted_pdf_impl(
             extra: String::new(),
         })
         .collect();
+    // The XMP stream is the object after the encrypt dictionary. Its data is as it is in the file
+    // (this generator encrypts no stream), which a reader takes for encrypted data.
+    let mut extras = vec![encrypt_object];
+    let mut catalog = String::new();
+    if xmp.is_some() {
+        catalog = format!("/Metadata {} 0 R", encrypt_id + 1);
+        extras.push(stream_object(
+            "/Type /Metadata /Subtype /XML",
+            &xmp_packet(XMP_CATALOG_TITLE),
+        ));
+    }
     build(
         &specs,
-        "",
+        &catalog,
         &format!("/Encrypt {encrypt_id} 0 R /ID [<{0}> <{0}>]", hex(&id)),
-        vec![encrypt_object],
+        extras,
     )
+}
+
+/// A protected one page document (the user password is `user_password`) with an XMP metadata
+/// stream on the catalog, which is [`XMP_CATALOG_TITLE`] as it is in the file. With `clear` the
+/// encryption dictionary says `/EncryptMetadata false`, as a file that keeps its metadata readable
+/// does; without it the stream is meant to be encrypted, and a save of it has to be refused.
+pub fn encrypted_xmp_pdf(user_password: &str, clear: bool) -> Vec<u8> {
+    encrypted_pdf_impl(user_password, None, 1, -4, Some(clear))
+}
+
+/// The title in the XMP packet of the catalog of [`xmp_pdf`].
+pub const XMP_CATALOG_TITLE: &str = "Quokka Ledger 7731";
+/// The title in the XMP packet of the page of [`xmp_pdf`].
+pub const XMP_PAGE_TITLE: &str = "Wombat Folio 4410";
+/// One phrase in each of the other streams of [`xmp_pdf`]: the page content, the character map of
+/// the font, the colour profile and the embedded file.
+pub const XMP_OTHER_PHRASES: [&str; 4] = [
+    "Dingo Content 2208",
+    "Kiwi Cmap 9913",
+    "Emu Profile 5521",
+    "Numbat Attachment 3067",
+];
+
+/// An XMP packet with `title` as the title of the document.
+pub fn xmp_packet(title: &str) -> String {
+    format!(
+        "<?xpacket begin=\"\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n\
+<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\
+<rdf:Description rdf:about=\"\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:pdf=\"http://ns.adobe.com/pdf/1.3/\">\
+<dc:title><rdf:Alt><rdf:li xml:lang=\"x-default\">{title}</rdf:li></rdf:Alt></dc:title>\
+<dc:creator><rdf:Seq><rdf:li>Author of {title}</rdf:li></rdf:Seq></dc:creator>\
+<pdf:Keywords>keywords of {title}</pdf:Keywords>\
+</rdf:Description></rdf:RDF></x:xmpmeta>\n<?xpacket end=\"w\"?>"
+    )
+}
+
+/// A one page document with a stream of each kind that a protected file has to encrypt: the page
+/// content, a character map (`/ToUnicode`), a colour profile (`/ICCBased`) and an embedded file,
+/// each with a phrase of [`XMP_OTHER_PHRASES`] in it, and, when asked for, an XMP metadata stream
+/// on the catalog (object 10, [`XMP_CATALOG_TITLE`]) and one on the page ([`XMP_PAGE_TITLE`], the
+/// object after it). The file is not protected; a test protects it with another program.
+pub fn xmp_pdf(catalog_xmp: bool, page_xmp: bool) -> Vec<u8> {
+    xmp_pdf_with(catalog_xmp, page_xmp, false)
+}
+
+/// As [`xmp_pdf`]; with `compressed` the XMP streams are Flate compressed, as some writers make them.
+pub fn xmp_pdf_with(catalog_xmp: bool, page_xmp: bool, compressed: bool) -> Vec<u8> {
+    xmp_pdf_impl(catalog_xmp, page_xmp, compressed, false, "")
+}
+
+/// As [`xmp_pdf`] with a catalog stream whose `/Type` is an indirect reference to the name
+/// `/Metadata` (object 11). A reader that does not follow the reference does not take the stream
+/// for a metadata stream, and encrypts it like any other.
+pub fn xmp_indirect_type_pdf() -> Vec<u8> {
+    xmp_pdf_impl(true, false, false, true, "")
+}
+
+/// As [`xmp_pdf`] with a catalog stream and `keys` keys of no meaning in the trailer. A writer
+/// copies the keys of a trailer that it does not know, so their number is the file's own.
+pub fn xmp_pdf_with_trailer_keys(keys: usize) -> Vec<u8> {
+    let extra: String = (0..keys).map(|i| format!(" /K{i} 1")).collect();
+    xmp_pdf_impl(true, false, false, false, &extra)
+}
+
+fn xmp_pdf_impl(
+    catalog_xmp: bool,
+    page_xmp: bool,
+    compressed: bool,
+    indirect_type: bool,
+    trailer_extra: &str,
+) -> Vec<u8> {
+    let catalog_id = 10;
+    let page_id = if catalog_xmp { 11 } else { 10 };
+    let mut catalog = String::from(
+        "<< /Type /Catalog /Pages 2 0 R /Names << /EmbeddedFiles << /Names [(note.txt) 8 0 R] >> >>",
+    );
+    if catalog_xmp {
+        let _ = write!(catalog, " /Metadata {catalog_id} 0 R");
+    }
+    catalog.push_str(" >>");
+    let mut page = String::from(
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R \
+/Resources << /Font << /F1 5 0 R >> /ColorSpace << /CS0 [/ICCBased 7 0 R] >> >>",
+    );
+    if page_xmp {
+        let _ = write!(page, " /Metadata {page_id} 0 R");
+    }
+    page.push_str(" >>");
+    let content = format!(
+        "BT /F1 24 Tf 72 700 Td ({}) Tj ET\n/CS0 cs 0.1 0.2 0.3 sc 72 600 100 50 re f",
+        XMP_OTHER_PHRASES[0]
+    );
+    let cmap = format!(
+        "/CIDInit /ProcSet findresource begin 12 dict begin begincmap\n\
+/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
+/CMapName /Adobe-Identity-UCS def /CMapType 2 def\n\
+1 begincodespacerange <00> <FF> endcodespacerange\n\
+1 beginbfrange <20> <7E> <0020> endbfrange\n\
+endcmap CMapName currentdict /CMap defineresource pop end end\n% {}\n",
+        XMP_OTHER_PHRASES[1]
+    );
+    // Not a real profile (nothing draws this page), but a stream with a header-sized prefix of
+    // its own, which is what a save has to carry over.
+    let profile = format!("{}{}", "\u{1}".repeat(128), XMP_OTHER_PHRASES[2]);
+    let mut objects: Vec<Vec<u8>> = vec![
+        catalog.into_bytes(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        page.into_bytes(),
+        stream_object("", &content),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 6 0 R >>".to_vec(),
+        stream_object("", &cmap),
+        stream_object("/N 3 /Alternate /DeviceRGB", &profile),
+        b"<< /Type /Filespec /F (note.txt) /UF (note.txt) /EF << /F 9 0 R >> >>".to_vec(),
+        stream_object("/Type /EmbeddedFile", XMP_OTHER_PHRASES[3]),
+    ];
+    let xmp_stream = |title: &str| {
+        let packet = xmp_packet(title);
+        if compressed {
+            binary_stream(
+                "/Type /Metadata /Subtype /XML /Filter /FlateDecode",
+                &deflate(packet.as_bytes()),
+            )
+        } else if indirect_type {
+            stream_object("/Type 11 0 R /Subtype /XML", &packet)
+        } else {
+            stream_object("/Type /Metadata /Subtype /XML", &packet)
+        }
+    };
+    if catalog_xmp {
+        objects.push(xmp_stream(XMP_CATALOG_TITLE));
+    }
+    if page_xmp {
+        objects.push(xmp_stream(XMP_PAGE_TITLE));
+    }
+    if indirect_type {
+        objects.push(b"/Metadata".to_vec());
+    }
+    assemble(&objects, trailer_extra)
 }
 
 /// Folder name used for a platform in `vendor/pdfium` and in the pinned PDFium list.
