@@ -2,7 +2,7 @@
 
 This page lists what Patient Partridge does not do yet, and where its edges are. The [README](../README.md) names the main ones; here they are in full. What the app does is in [features.md](features.md); how it is protected is in [security.md](security.md).
 
-The rest of the editor (creating forms, signatures, editing text and images, redaction, page tools and the other steps on the roadmap) is planned and does not exist yet; see the [Roadmap](../README.md#roadmap).
+Making forms, pictures of signatures and the page tools are new in 0.3.0 and are not in a released version yet. Editing text and images, redaction, certificate signatures and the other steps on the roadmap are planned and do not exist yet; see the [Roadmap](../README.md#roadmap).
 
 - [Annotations](#annotations)
 - [Memory](#memory)
@@ -87,7 +87,11 @@ The document must be one the writer can read: an encrypted document, an XFA form
 
 ## A picture of a signature
 
-
+- *What it is.* A stamp annotation with an appearance made of lines, curves or an image, and the print flag. Another program that edits annotations can move, change or delete it, and one that hides annotations hides it. It proves nothing about who placed it.
+- *After a save.* Once the file is saved and opened again, a picture is an ordinary stamp: it can be removed, but not moved or resized. Moving and resizing work on the pictures placed in the session, with the same Undo as the other changes. A page of a signed document is edited like any other, and the check of the digital signatures drops its result (see below).
+- *Limits.* A drawing has at most 64 lines and 4,096 points; a typed name at most 40 characters, and only letters the font has (the Latin scripts: other letters are refused with a message); an imported image is scaled down to at most 1,024 by 1,024 pixels and 524,288 pixels in all, and a PNG, JPEG, WebP, GIF or BMP file that declares more than 8,192 pixels on a side or 16 million pixels is refused from its header before anything decodes it (for a GIF the largest of the screen and of every frame counts, the whole file is walked to find them, and a GIF that is cut short, has no frame, or has an extension that is not in the form the format gives is refused, because some decoders read such an extension differently and would find another frame; for a JPEG the segments up to the scan are read by their lengths, a 0xFF 0x00 or a stray byte where a marker should be is refused, and everything after the start of the scan (the data and what follows the end of the picture) is searched for every start of frame, the largest counting, so that no decoder finds a size the check did not see (a file with something after its end that looks like a start of frame, or that is cut short there, is refused); an animated GIF gives its first picture); at most 20 pictures are kept on the computer, each image at most about 400 KB as a PNG. The engine keeps the pictures of a document in memory to put them back after an Undo, at most 32 MiB of them. PDFium keeps what it made for a picture until the document is closed, even after the picture is taken off, so putting pictures on and off and back again is also held to 256 MiB in all for an open document, whatever is done to its pages meanwhile; past that the box says to save the document and open it again. SVG and other drawing files are not read as images.
+- *Fonts.* The three script fonts (Great Vibes, Allura and Kristi, all under the SIL Open Font License 1.1) are shipped as subsets, and their licences are in THIRD-PARTY-NOTICES. The window shows the typed name without kerning or ligatures, as the engine sets it, but the width of the preview is measured with the browser's own text engine, so the box can differ a little from the picture on the page.
+- *Other readers.* `qpdf` reads the files, Poppler draws the pictures where the engine put them and prints them (checked in CI). Commercial PDF readers were not tried.
 
 ## Page tools
 
@@ -108,6 +112,8 @@ All of it is tested against the bytes of the saved file with the real PDFium, in
 - *What is not proved.* The pages' behaviour is tested on Linux, Windows and macOS in CI (the engine and client tests run on all three); the check with qpdf and poppler runs on Linux only. A real file dialog, a real network drive and the keyboard and pointer of a real web view were not tried: the browser tests run the real window code in Chromium against a stand-in for the app process. A move of a document with thousands of long pages was timed only on made-up documents.
 
 ## Saving and digital signatures
+
+**Protected documents with XMP metadata (since 0.2.2).** PDFium writes the XMP metadata stream of a document (title, author, keywords) without encryption, also when the document has a password and its metadata should be encrypted. A save of such a document is refused with a message instead of writing the metadata in the clear; saving a copy does not help. A protected document without XMP metadata, or one whose file says its metadata is to stay unencrypted, is saved as before, with every other stream encrypted.
 
 A save always writes the whole document again. PDFium has an incremental save that appends the changes to the original bytes and so keeps a signature valid, but the Rust binding used here (pdfium-render, 0.9.5 and the newest, 0.9.6) always saves without it, and the document handle it would need is not public. So a save of a signed document breaks the signature: programs that check it will say the document was changed after it was signed. The app asks before it does that (Cancel, Save a copy, Save anyway). It cannot tell whether a signature allows the change; it warns for every signed document. The signature itself stays in the file. How signatures are shown and checked is described in [Digital signatures: what is checked](digital-signatures.md).
 
