@@ -35,6 +35,8 @@ struct Capped {
     overflowed: bool,
     /// The buffer could not grow although the document is within the limit.
     no_memory: bool,
+    /// Makes room for `more` bytes in the buffer; false when there is none. A test replaces it.
+    reserve: fn(&mut Vec<u8>, usize) -> bool,
     since_progress: usize,
     /// Called with the number of bytes written, about every MiB. The pointer lives only as long
     /// as the call to `serialise_up_to` that made it (see there).
@@ -54,7 +56,7 @@ impl Write for Capped {
         }
         // A buffer that cannot grow is a failed save, not an engine that aborts and takes the
         // changes of the document with it.
-        if self.bytes.try_reserve(data.len()).is_err() {
+        if !(self.reserve)(&mut self.bytes, data.len()) {
             self.no_memory = true;
             return Err(io::Error::other("no memory for the saved document"));
         }
@@ -72,6 +74,15 @@ impl Write for Capped {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+fn reserve_bytes(bytes: &mut Vec<u8>, more: usize) -> bool {
+    bytes.try_reserve(more).is_ok()
+}
+
+/// The failure to give when the writer stopped the write, or nothing when it did not.
+fn unfinished(out: &Capped) -> Option<Failure> {
+    (out.overflowed || out.no_memory).then(|| too_large(out.overflowed))
 }
 
 /// The failure for a document that could not be written out whole: it passed the limit, or the
@@ -110,12 +121,13 @@ pub fn serialise_up_to(
         limit,
         overflowed: false,
         no_memory: false,
+        reserve: reserve_bytes,
         since_progress: 0,
         progress,
     };
     let result = document.save_to_writer(&mut out);
-    if out.overflowed || out.no_memory {
-        return Err(too_large(out.overflowed));
+    if let Some(failure) = unfinished(&out) {
+        return Err(failure);
     }
     if result.is_err() {
         return Err((
@@ -301,5 +313,39 @@ mod tests {
         let (code, words) = too_large(true);
         assert_eq!(code, ErrorCode::SaveTooLarge);
         assert!(words.contains("too big"), "{words}");
+    }
+
+    fn writer(limit: usize, reserve: fn(&mut Vec<u8>, usize) -> bool) -> Capped {
+        // No progress is reported in these tests (that needs a megabyte).
+        let noop: &'static mut (dyn FnMut(u32) + 'static) = Box::leak(Box::new(|_: u32| {}));
+        let progress: *mut (dyn FnMut(u32) + 'static) = noop;
+        Capped {
+            bytes: Vec::new(),
+            limit,
+            overflowed: false,
+            no_memory: false,
+            reserve,
+            since_progress: 0,
+            progress,
+        }
+    }
+
+    #[test]
+    fn the_writer_tells_a_buffer_that_cannot_grow_from_a_document_over_the_limit() {
+        // Room for nothing, within the limit: the words are those of the memory.
+        let mut out = writer(1_000, |_, _| false);
+        assert!(out.write(b"abc").is_err());
+        let (_, words) = unfinished(&out).expect("the write was stopped");
+        assert!(words.contains("not enough memory"), "{words}");
+        assert!(!words.contains("too big"), "{words}");
+        // Over the limit, with room: the words are those of the size.
+        let mut out = writer(2, reserve_bytes);
+        assert!(out.write(b"abc").is_err());
+        let (_, words) = unfinished(&out).expect("the write was stopped");
+        assert!(words.contains("too big"), "{words}");
+        // A write that fits is not a failure.
+        let mut out = writer(10, reserve_bytes);
+        assert_eq!(out.write(b"abc").unwrap(), 3);
+        assert!(unfinished(&out).is_none());
     }
 }
