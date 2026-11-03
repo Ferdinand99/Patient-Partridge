@@ -122,14 +122,31 @@ fn a_check_that_runs_out_of_time_keeps_what_it_finished_and_never_calls_the_rest
     let (doc, controls) = open(engine, &big.bytes);
     let slow = controls.slow.clone();
     let mut signs = 0;
+    let started = Instant::now();
     let (body, took) = question(engine, doc, &mut |_| {
         signs += 1;
         if signs == 2 {
             slow.store(true, Ordering::SeqCst);
         }
     });
-    let report = report_of(body);
     assert!(signs >= 2, "{signs} signs of life");
+    // The look at the file may not begin a read after the end of the time limit. The bound is on
+    // when the last slow read began, not on when the request ended: a loaded machine can be late
+    // in finishing, which says nothing about the limit, while a look that ignores the limit goes
+    // on reading for seconds (about 3 more here). The read that was begun before the end of the
+    // limit is let finish, and the half second is for a thread that is not scheduled between the
+    // check of the time and the read.
+    let last_read = controls
+        .last_slow_read
+        .lock()
+        .unwrap()
+        .expect("the reads were slowed down, so one was made");
+    let last_read_began = last_read.saturating_duration_since(started);
+    assert!(
+        last_read_began < Duration::from_millis(2_000 + 500),
+        "a read began {last_read_began:?} into a check with a limit of 2 seconds (the request took {took:?})"
+    );
+    let report = report_of(body);
     let item = &report.items[0];
     assert_eq!(
         (item.state, item.reason),
@@ -137,10 +154,6 @@ fn a_check_that_runs_out_of_time_keeps_what_it_finished_and_never_calls_the_rest
         "{item:?}"
     );
     assert!(item.trust_anchor.is_none());
-    assert!(
-        took < Duration::from_millis(2_600),
-        "the look at the file after the report took {took:?}"
-    );
 
     // 3. A scan that does not finish in time leaves nothing to report: an error, as before.
     let (doc, controls) = open(engine, &big.bytes);

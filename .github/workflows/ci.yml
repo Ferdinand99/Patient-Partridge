@@ -122,6 +122,22 @@ jobs:
         env:
           PARTRIDGE_TEST_NO_LANDLOCK: "1"
         run: cargo test -p partridge-engine -p partridge-engine-client --locked
+      # With the empty root the engine counts as a process with one thread without a look, so the
+      # tests above cannot tell whether Landlock is applied before the first helper thread starts.
+      # Without the empty root the engine counts its threads, and the greeting names Landlock only
+      # when there was one. The step runs the greeting test that way, with the rule that insists on
+      # the empty root taken away, and fails first if this kernel does not list Landlock (the test
+      # would pass without looking then).
+      - name: Landlock before the threads (Linux)
+        if: always() && runner.os == 'Linux'
+        run: |
+          if ! tr ',' '\n' < /sys/kernel/security/lsm | grep -qx landlock; then
+            echo "This kernel does not list Landlock, so the order of Landlock and the threads is not tried." >&2
+            exit 1
+          fi
+          env -u PARTRIDGE_TEST_REQUIRE_EMPTY_ROOT PARTRIDGE_TEST_NO_EMPTY_ROOT=1 \
+            cargo test -p partridge-engine --locked --test sandbox -- --exact --nocapture \
+            the_real_engine_reports_the_sandbox_it_runs_in
       # A page in each script that needs a system font, drawn with the fonts of this system (what
       # the runner image has, and the Noto packages on Linux). The test says for each script which
       # file the app handed over, or that this system has none, and fails if the runner has none.

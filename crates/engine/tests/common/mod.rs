@@ -7,7 +7,7 @@ use std::fs::File;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use partridge_engine::source::{SourceFile, BLOCK};
 use partridge_engine::Engine;
@@ -261,6 +261,8 @@ pub struct Controls {
     pub fail_block: Arc<AtomicU64>,
     /// Every read takes a tenth of a second.
     pub slow: Arc<AtomicBool>,
+    /// When the last slow read began (reads made while [`Controls::slow`] was set).
+    pub last_slow_read: Arc<Mutex<Option<Instant>>>,
 }
 
 impl Controls {
@@ -283,6 +285,7 @@ impl ControlledFile {
             data: Arc::new(Mutex::new(bytes.to_vec())),
             fail_block: Arc::new(AtomicU64::new(NO_BLOCK)),
             slow: Arc::new(AtomicBool::new(false)),
+            last_slow_read: Arc::new(Mutex::new(None)),
         };
         (
             ControlledFile {
@@ -296,6 +299,7 @@ impl ControlledFile {
 impl SourceFile for ControlledFile {
     fn read_at(&mut self, pos: u64, buf: &mut [u8]) -> io::Result<usize> {
         if self.controls.slow.load(Ordering::SeqCst) {
+            *self.controls.last_slow_read.lock().unwrap() = Some(Instant::now());
             std::thread::sleep(Duration::from_millis(100));
         }
         if pos / BLOCK == self.controls.fail_block.load(Ordering::SeqCst) {
