@@ -91,6 +91,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "metadata_repair"
+path = "fuzz_targets/metadata_repair.rs"
+test = false
+doc = false
+bench = false
+
 # Same release settings as the app where they matter for finding bugs; overflow checks stay on
 # so that integer overflows in the decoders are reported instead of wrapping.
 [profile.release]
