@@ -279,6 +279,30 @@ fn a_signed_document_asks_before_its_signature_is_broken() {
 }
 
 #[test]
+fn a_form_with_an_empty_signature_field_is_saved_without_the_signed_question() {
+    let dir = Dir::new("emptysig");
+    let original = kit::forms_empty_signature_pdf();
+    let path = dir.write("a.pdf", &original);
+    let pool = pool();
+    let (handle, _) = pool.open(&text(&path), None).unwrap();
+    pool.save(handle, SaveOptions::default()).unwrap();
+    assert_eq!(dir.names(), vec!["a.pdf".to_string()]);
+    assert_eq!(describe(&path, None).signatures, 0);
+}
+
+#[test]
+fn a_form_with_a_signature_and_an_empty_field_still_asks_and_counts_one() {
+    let dir = Dir::new("sigandempty");
+    let original = kit::forms_signed_and_empty_signature_pdf();
+    let path = dir.write("a.pdf", &original);
+    let pool = pool();
+    let (handle, _) = pool.open(&text(&path), None).unwrap();
+    let err = save_error(pool.save(handle, SaveOptions::default()));
+    assert_eq!(err, SaveError::Signed { signatures: 1 });
+    assert_eq!(fs::read(&path).unwrap(), original, "the file was touched");
+}
+
+#[test]
 fn a_file_that_someone_else_changed_is_asked_about_not_overwritten() {
     let dir = Dir::new("changed");
     let path = dir.write("a.pdf", &kit::simple_pdf(2));
