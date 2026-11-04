@@ -872,6 +872,39 @@ fn a_page_with_too_many_annotations_lists_the_first_ones() {
     assert_eq!(after[3].id, items[4].id);
 }
 
+#[test]
+fn nothing_is_added_to_a_page_that_has_more_annotations_than_can_be_listed() {
+    let note = |e: &mut partridge_engine::Engine, doc: u32| {
+        ask(
+            e,
+            RequestBody::AddNote {
+                doc,
+                page: 0,
+                x: 300.0,
+                y: 700.0,
+                color: YELLOW,
+                text: "one more".into(),
+            },
+        )
+    };
+    let mut guard = engine();
+    let e = &mut guard.0;
+    // One short of the most that is looked at: the next one is added, and then no more.
+    let doc = open(e, &kit::many_annots_pdf(4_999), None).unwrap();
+    let added = annot(note(e, doc));
+    assert_eq!(added.text, "one more");
+    assert_eq!(
+        error_code(note(e, doc)),
+        ErrorCode::AnnotationRefused,
+        "the page holds 5,000 now"
+    );
+    // The page is as it was.
+    assert_eq!(list(e, doc, 0).len(), MAX_ANNOTS_PER_PAGE);
+    // A page that came with more than that takes nothing either.
+    let big = open(e, &kit::many_annots_pdf(5_100), None).unwrap();
+    assert_eq!(error_code(note(e, big)), ErrorCode::AnnotationRefused);
+}
+
 // ---- protected and signed documents ---------------------------------------------------------------
 
 #[test]

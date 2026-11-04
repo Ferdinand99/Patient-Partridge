@@ -898,6 +898,14 @@ impl DocAnnots {
         remember: bool,
     ) -> Result<AnnotInfo, Failure> {
         let before = page.annotations().len();
+        // The engine lists no more than MAX_SCANNED annotations of a page, so one added past that
+        // would be drawn and saved but never listed, and could not be picked, moved or removed.
+        if before >= MAX_SCANNED {
+            return fail(
+                ErrorCode::AnnotationRefused,
+                "this page has more annotations than can be listed, so no more can be added to it",
+            );
+        }
         if let Recipe::Signature { mark, .. } = &snapshot.recipe {
             // Each picture that is made stays in PDFium's memory until the document is closed, also
             // when it is taken off again, so a document that is put through undo and redo of a big
