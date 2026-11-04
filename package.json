@@ -1,6 +1,6 @@
 {
   "name": "patient-partridge",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "An open source PDF reader and editor: fast, small, no account, no cloud, no tracking",

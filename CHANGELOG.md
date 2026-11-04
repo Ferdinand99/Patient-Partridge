@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.3.0](https://github.com/Ferdinand99/Patient-Partridge/compare/v0.2.2...v0.3.0) (2026-11-04)
+
+
+### Features
+
+* a picture of a signature, drawn, typed or imported, placed on a page as a stamp that prints ([72a7a7b](https://github.com/Ferdinand99/Patient-Partridge/commit/72a7a7bc3e2f837779ed4a9c5b0c486805e85668))
+* create fillable forms with text fields, check boxes, radio buttons, lists and signature fields ([72a7a7b](https://github.com/Ferdinand99/Patient-Partridge/commit/72a7a7bc3e2f837779ed4a9c5b0c486805e85668))
+* page tools: insert, delete, move, turn and crop pages, add the pages of other files and copy pages out to a new file ([72a7a7b](https://github.com/Ferdinand99/Patient-Partridge/commit/72a7a7bc3e2f837779ed4a9c5b0c486805e85668))
+* sign a copy of a document with a certificate file; the key is held by a separate, locked-down program ([72a7a7b](https://github.com/Ferdinand99/Patient-Partridge/commit/72a7a7bc3e2f837779ed4a9c5b0c486805e85668))
+* the engine has no network access on Windows either ([72a7a7b](https://github.com/Ferdinand99/Patient-Partridge/commit/72a7a7bc3e2f837779ed4a9c5b0c486805e85668))
+* view the digital signatures of a document: whether each is intact, who signed according to the certificate, and whether the file changed after signing ([72a7a7b](https://github.com/Ferdinand99/Patient-Partridge/commit/72a7a7bc3e2f837779ed4a9c5b0c486805e85668))
+
+
+### Bug Fixes
+
+* copying pages out and Save As never write over a signed file or a file another tab has open ([72a7a7b](https://github.com/Ferdinand99/Patient-Partridge/commit/72a7a7bc3e2f837779ed4a9c5b0c486805e85668))
+* keep compressed XMP metadata readable when saving ([72a7a7b](https://github.com/Ferdinand99/Patient-Partridge/commit/72a7a7bc3e2f837779ed4a9c5b0c486805e85668))
+
 ## [0.2.2](https://github.com/Ferdinand99/Patient-Partridge/compare/v0.2.1...v0.2.2) (2026-11-03)
 
 
