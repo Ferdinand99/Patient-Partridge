@@ -457,8 +457,19 @@ fn listed_annotations_are_held_to_their_caps() {
     bad[5 + 4] = 0;
     assert!(Response::decode(bad).is_err());
     let mut bad = good.clone();
-    bad[5 + 4] = 8;
+    bad[5 + 4] = 9;
     assert!(Response::decode(bad).is_err());
+    // The kind of a signature picture is defined, and so is the ability to resize one.
+    let mut signature = info(1);
+    signature.kind = AnnotKind::Signature;
+    signature.abilities = ability::MOVE | ability::RESIZE | ability::REMOVE | ability::RESTORE;
+    let ResponseBody::Annot { item } = Response::decode(annot_answer(signature)).unwrap().body
+    else {
+        panic!("not an annotation");
+    };
+    assert_eq!(item.kind, AnnotKind::Signature);
+    assert_eq!(item.abilities & ability::RESIZE, ability::RESIZE);
+    assert_eq!(AnnotKind::Signature.name(), "signature");
     let text_at = 5 + 4 + 1 + 1 + 16 + 4;
     let mut bad = good[..text_at].to_vec();
     bad.extend((MAX_ANNOT_TEXT as u32 + 1).to_le_bytes());

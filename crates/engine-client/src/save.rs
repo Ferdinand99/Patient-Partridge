@@ -87,6 +87,10 @@ pub struct SaveOutcome {
     /// The file the document comes from was touched since it was opened, while parts of it were
     /// unread, and this is a copy of what the engine had read (see [`DocInfo::touched`]).
     pub touched: bool,
+    /// Other open documents that were read from the file that was replaced (the handles the pool
+    /// gave out). What their engines hold is no longer the file at that path. The pool fills this
+    /// in; a save on its own leaves it empty.
+    pub replaced: Vec<u64>,
 }
 
 /// Why a save did not happen. Whatever the reason, the file it was meant for is as it was.
@@ -128,6 +132,25 @@ pub enum SaveError {
     OwnerWouldChange,
     /// The access rights of the file could not be given to the new file.
     AccessNotKept,
+    /// The pages to copy out of a document come from a document that is protected by a password,
+    /// and the new document would not be.
+    Unprotected,
+    /// A document to insert pages from is protected by a password; its pages would join this
+    /// document without that protection.
+    InsertProtected,
+    /// A document to insert pages from is signed; its pages would come without the signature.
+    InsertSigned { signatures: u32 },
+    /// The user stopped the work.
+    Cancelled,
+    /// The new file would replace the document itself.
+    OverSource,
+    /// The new file would replace a file that another open document is read from.
+    TargetOpen,
+    /// The new file would replace a file that holds a digital signature.
+    TargetSigned,
+    /// The file the new file would replace could not be read, so it cannot be told whether it
+    /// holds a digital signature.
+    TargetUnreadable,
 }
 
 impl SaveError {
@@ -150,6 +173,14 @@ impl SaveError {
             SaveError::HardLink => "save_hard_link",
             SaveError::OwnerWouldChange => "save_owner_changes",
             SaveError::AccessNotKept => "save_access_kept",
+            SaveError::Unprotected => "save_unprotected",
+            SaveError::InsertProtected => "insert_protected",
+            SaveError::InsertSigned { .. } => "insert_signed",
+            SaveError::Cancelled => "cancelled",
+            SaveError::OverSource => "extract_over_source",
+            SaveError::TargetOpen => "save_target_open",
+            SaveError::TargetSigned => "save_target_signed",
+            SaveError::TargetUnreadable => "save_target_unreadable",
         }
     }
 }
@@ -205,6 +236,28 @@ impl fmt::Display for SaveError {
                 f,
                 "the access rights of the file could not be given to the new file"
             ),
+            SaveError::Unprotected => write!(
+                f,
+                "the document is protected by a password and the new file would not be"
+            ),
+            SaveError::InsertProtected => write!(
+                f,
+                "the document is protected by a password, and its pages would join this one without that protection"
+            ),
+            SaveError::InsertSigned { signatures } => write!(
+                f,
+                "the document has {signatures} digital signature{}, and its pages would come without {}",
+                if *signatures == 1 { "" } else { "s" },
+                if *signatures == 1 { "it" } else { "them" }
+            ),
+            SaveError::Cancelled => write!(f, "it was stopped"),
+            SaveError::OverSource => write!(
+                f,
+                "the new file would replace the document it is made from"
+            ),
+            SaveError::TargetOpen => write!(f, "the file is open as another document"),
+            SaveError::TargetSigned => write!(f, "the file holds a digital signature"),
+            SaveError::TargetUnreadable => write!(f, "the file could not be read"),
         }
     }
 }
@@ -215,6 +268,67 @@ impl From<SaveError> for ClientError {
     fn from(e: SaveError) -> Self {
         ClientError::Save(e)
     }
+}
+
+// ---- telling whether a file holds a signature --------------------------------------------------
+
+/// What a look at the bytes of a file found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileScan {
+    /// The file does not exist, is not a plain file, or has none of the words of a signature.
+    Clear,
+    /// The file mentions `/ByteRange` or `/DocMDP`, the words every signature (and every
+    /// certified document) has.
+    Signed,
+    /// The file could not be read, so nothing is known. It is not replaced either.
+    Unreadable,
+}
+
+/// Looks through the file at `path` for the words of a digital signature. A file that does not
+/// exist holds none. A file that cannot be read is neither said to hold one nor passed: the caller
+/// must not write over it, and says that it could not be read.
+pub fn scan_for_signature(path: &Path) -> FileScan {
+    use std::io::Read;
+    const WORDS: [&[u8]; 2] = [b"/ByteRange", b"/DocMDP"];
+    match fs::metadata(path) {
+        Ok(meta) if meta.is_file() => {}
+        // A folder or a device is not a file that can be replaced, and the write refuses it alone.
+        Ok(_) => return FileScan::Clear,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return FileScan::Clear,
+        Err(_) => return FileScan::Unreadable,
+    }
+    let Ok(mut file) = File::open(path) else {
+        return FileScan::Unreadable;
+    };
+    // The tail of one piece is kept in front of the next, so a word cut by the edge is found.
+    let keep = WORDS.iter().map(|w| w.len()).max().unwrap_or(1) - 1;
+    let mut buffer = vec![0u8; keep + (1 << 20)];
+    let mut held = 0usize;
+    loop {
+        let got = match file.read(&mut buffer[held..]) {
+            Ok(0) => return FileScan::Clear,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return FileScan::Unreadable,
+        };
+        let end = held + got;
+        let window = &buffer[..end];
+        if WORDS
+            .iter()
+            .any(|word| window.windows(word.len()).any(|w| w == *word))
+        {
+            return FileScan::Signed;
+        }
+        let tail = keep.min(end);
+        buffer.copy_within(end - tail..end, 0);
+        held = tail;
+    }
+}
+
+/// True when the file at `path` holds a digital signature, as far as its bytes say (see
+/// [`scan_for_signature`]).
+pub fn file_holds_signature(path: &Path) -> bool {
+    scan_for_signature(path) == FileScan::Signed
 }
 
 // ---- telling whether a file changed -----------------------------------------------------------
@@ -532,12 +646,19 @@ pub fn verify_written(
     print: Option<&Fingerprint>,
 ) -> Result<(), SaveError> {
     let verify = |why: String| SaveError::Verify(why);
+    // Whatever a bug above may have done to the document, a file of no pages is never put in place.
+    if expected.pages == 0 {
+        return Err(verify("the document has no pages".into()));
+    }
     let text = path.to_string_lossy();
     let client = EngineClient::new(config.clone());
     let result = (|| {
         let opened = client
             .open(&text, password)
             .map_err(|e| verify(format!("it does not open ({e})")))?;
+        if opened.pages.is_empty() {
+            return Err(verify("it has no pages".into()));
+        }
         if opened.pages.len() as u32 != expected.pages {
             return Err(verify(format!(
                 "it has {} pages, the document has {}",
@@ -618,6 +739,11 @@ pub(crate) fn save_document(
     original: Option<&Path>,
 ) -> Result<SaveOutcome, ClientError> {
     let info = client.doc_info(doc).map_err(from_engine)?;
+    // A document of no pages is not a document to write, whatever the engine believes: the check
+    // that follows compares the file with the engine's own description, and 0 equals 0.
+    if info.pages == 0 {
+        return Err(SaveError::Verify("the document has no pages".into()).into());
+    }
     // A file that was touched while parts of it were unread is not replaced: the engine's document
     // may not be the file's. A copy is the way out.
     let replaces_original = original.is_some_and(|o| same_file(o, target));
@@ -636,6 +762,49 @@ pub(crate) fn save_document(
     if print.failed > 0 {
         return Err(SaveError::SourceUnreadable.into());
     }
+    if print.pages == 0 || print.pages != info.pages {
+        return Err(SaveError::Verify(format!(
+            "the document has {} pages in one description and {} in the other",
+            info.pages, print.pages
+        ))
+        .into());
+    }
+    let outcome = write_checked(
+        target,
+        expected,
+        options,
+        info,
+        print,
+        &mut |sink| client.save_to(doc, sink),
+        verify,
+        still_open,
+    )?;
+    Ok(SaveOutcome {
+        touched: info.touched,
+        ..outcome
+    })
+}
+
+/// Something that hands the bytes of a new file to the function it is given, piece by piece, and
+/// says how many there were.
+pub(crate) type Streamer<'a> =
+    dyn FnMut(&mut dyn FnMut(&[u8]) -> io::Result<()>) -> Result<u64, SaveStreamError> + 'a;
+
+/// The common end of a save and of copying pages out to a new file: the bytes that `stream` hands
+/// over go to a new file next to `target`, which is flushed, read back, checked by `verify`, and
+/// only then put in place of `target` in one step (see the rules at the top of this module). `info`
+/// and `print` describe the document that is expected to be in the file.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_checked(
+    target: &Path,
+    expected: Option<&FileStamp>,
+    options: SaveOptions,
+    info: DocInfo,
+    print: Fingerprint,
+    stream: &mut Streamer<'_>,
+    verify: &dyn Fn(&Path, DocInfo, &Fingerprint) -> Result<(), SaveError>,
+    still_open: &dyn Fn() -> bool,
+) -> Result<SaveOutcome, ClientError> {
     let requested = target;
     let target = resolve(target);
     let existing = check_target(&target)?;
@@ -653,7 +822,7 @@ pub(crate) fn save_document(
     }
     let mut written: u64 = 0;
     let mut sum = Fnv::new();
-    let total = client.save_to(doc, &mut |piece| {
+    let total = stream(&mut |piece| {
         file.write_all(piece)?;
         sum.update(piece);
         written += piece.len() as u64;
@@ -711,7 +880,8 @@ pub(crate) fn save_document(
     Ok(SaveOutcome {
         path: requested.to_path_buf(),
         bytes: total,
-        touched: info.touched,
+        touched: false,
+        replaced: Vec::new(),
     })
 }
 
@@ -1127,6 +1297,54 @@ mod tests {
     // ---- the pieces ----------------------------------------------------------------------
 
     #[test]
+    fn a_file_with_the_words_of_a_signature_is_told_from_one_without_wherever_they_fall() {
+        let dir = std::env::temp_dir().join(format!("partridge-holds-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, bytes: &[u8]| {
+            let path = dir.join(name);
+            fs::write(&path, bytes).unwrap();
+            path
+        };
+        assert!(!file_holds_signature(&dir.join("missing.pdf")));
+        // A path that cannot even be looked at is neither clear nor signed.
+        assert_eq!(
+            scan_for_signature(Path::new("bad name.pdf")),
+            FileScan::Unreadable
+        );
+        assert!(!file_holds_signature(&write(
+            "plain.pdf",
+            b"%PDF-1.7\n%%EOF\n"
+        )));
+        assert!(!file_holds_signature(&write("empty.pdf", b"")));
+        assert!(file_holds_signature(&write(
+            "a.pdf",
+            b"%PDF-1.7\n/ByteRange [0 1 2 3]"
+        )));
+        assert!(file_holds_signature(&write("b.pdf", b"x /DocMDP y")));
+        // The word is cut by the edge of the first piece that is read (one mebibyte and the nine
+        // bytes kept for the next), at every place it can be cut.
+        const PIECE: usize = 1 << 20;
+        const FIRST: usize = PIECE + 9;
+        for cut in 1.."/ByteRange".len() {
+            let mut bytes = vec![b'x'; FIRST - cut];
+            bytes.extend_from_slice(b"/ByteRange");
+            bytes.extend_from_slice(&[b'y'; 100]);
+            assert!(
+                file_holds_signature(&write("cut.pdf", &bytes)),
+                "cut after {cut} bytes"
+            );
+        }
+        // Near the end of a large file, and a large file with nothing.
+        let mut big = vec![b'x'; 3 * PIECE + 17];
+        assert!(!file_holds_signature(&write("big.pdf", &big)));
+        big.extend_from_slice(b"/DocMDP");
+        assert!(file_holds_signature(&write("big2.pdf", &big)));
+        // A folder is not a file that holds anything (and the write refuses it by itself).
+        assert!(!file_holds_signature(&dir));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_full_disk_is_told_from_other_write_errors() {
         #[cfg(unix)]
         {
@@ -1450,6 +1668,38 @@ mod tests {
             assert!(err.to_string().contains(needle), "{mode}: {err}");
             assert_untouched(&dir, &path);
         }
+    }
+
+    #[test]
+    fn a_document_of_no_pages_is_never_written_whatever_the_engine_says() {
+        let dir = Dir::new("nopages");
+        let path = original_in(&dir);
+        let (client, doc) = client("save-no-pages");
+        let stamp = FileStamp::read(&path).unwrap();
+        // The engine describes the document as one of no pages, and a file of no pages would agree
+        // with that description. The file is not even started.
+        let err = save_error(save(
+            &client,
+            doc,
+            &path,
+            Some(&stamp),
+            SaveOptions::default(),
+        ));
+        assert!(matches!(err, SaveError::Verify(_)), "{err}");
+        assert_untouched(&dir, &path);
+        // The check of a written file refuses a description of no pages as well.
+        let config = EngineConfig::new(fake_engine());
+        let none = DocInfo {
+            pages: 0,
+            security: 0,
+            signatures: 0,
+            maybe_signed: false,
+            touched: false,
+        };
+        assert!(matches!(
+            verify_written(&config, &path, None, none, None),
+            Err(SaveError::Verify(_))
+        ));
     }
 
     #[test]

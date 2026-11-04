@@ -34,6 +34,10 @@ struct Capped {
     bytes: Vec<u8>,
     limit: usize,
     overflowed: bool,
+    /// The buffer could not grow although the document is within the limit.
+    no_memory: bool,
+    /// Makes room for `more` bytes in the buffer; false when there is none. A test replaces it.
+    reserve: fn(&mut Vec<u8>, usize) -> bool,
     since_progress: usize,
     /// Called with the number of bytes written, about every MiB. The pointer lives only as long
     /// as the call to `serialise_up_to` that made it (see there).
@@ -53,8 +57,8 @@ impl Write for Capped {
         }
         // A buffer that cannot grow is a failed save, not an engine that aborts and takes the
         // changes of the document with it.
-        if self.bytes.try_reserve(data.len()).is_err() {
-            self.overflowed = true;
+        if !(self.reserve)(&mut self.bytes, data.len()) {
+            self.no_memory = true;
             return Err(io::Error::other("no memory for the saved document"));
         }
         self.bytes.extend_from_slice(data);
@@ -73,6 +77,26 @@ impl Write for Capped {
     }
 }
 
+fn reserve_bytes(bytes: &mut Vec<u8>, more: usize) -> bool {
+    bytes.try_reserve(more).is_ok()
+}
+
+/// The failure to give when the writer stopped the write, or nothing when it did not.
+fn unfinished(out: &Capped) -> Option<Failure> {
+    (out.overflowed || out.no_memory).then(|| too_large(out.overflowed))
+}
+
+/// The failure for a document that could not be written out whole: it passed the limit, or the
+/// buffer for it could not grow (the same code, and words that say which it was).
+fn too_large(passed_limit: bool) -> Failure {
+    let words = if passed_limit {
+        "the document is too big to be saved"
+    } else {
+        "there was not enough memory to finish saving the document"
+    };
+    (ErrorCode::SaveTooLarge, words.to_string())
+}
+
 /// Writes the document out as PDFium would write a copy of it, with every change made so far, for
 /// bytes that leave the engine (see [`serialise_checked`]).
 pub fn serialise(document: &PdfDocument<'_>) -> Result<Vec<u8>, Failure> {
@@ -81,9 +105,22 @@ pub fn serialise(document: &PdfDocument<'_>) -> Result<Vec<u8>, Failure> {
 
 /// As [`serialise_up_to`], and the bytes are looked at before they are handed over: a protected
 /// document whose file would hold an XMP metadata stream that PDFium writes without encryption is
-/// refused (see the module `metadata`). Every write whose bytes leave the engine is made with this,
+/// refused (see the module `metadata`), and a compressed XMP stream that PDFium wrote without its
+/// filter is mended (see [`mended`]). Every write whose bytes leave the engine is made with this,
 /// and nothing that stays in the engine needs to be.
 pub fn serialise_checked(
+    document: &PdfDocument<'_>,
+    limit: usize,
+    progress: &mut dyn FnMut(u32),
+) -> Result<Vec<u8>, Failure> {
+    let bytes = serialise_unmended(document, limit, progress)?;
+    mended(bytes, limit, progress)
+}
+
+/// As [`serialise_checked`] but a damaged XMP stream is left as PDFium wrote it. It is for the
+/// first of the two writings of a save, whose bytes are read in again and written a second time:
+/// the second writing damages the stream again, so only its bytes are mended.
+fn serialise_unmended(
     document: &PdfDocument<'_>,
     limit: usize,
     progress: &mut dyn FnMut(u32),
@@ -97,6 +134,24 @@ pub fn serialise_checked(
         ));
     }
     Ok(bytes)
+}
+
+/// Mends the bytes PDFium wrote: an XMP metadata stream that was Flate compressed in the document
+/// is written by PDFium as compressed bytes without `/Filter`, which no reader can read. The stream
+/// is written again with its filter in an update that is added to the end (see
+/// [`metadata::repair`]). A stream that would inflate to more than the limit makes the save fail,
+/// rather than hand over metadata that is damaged. Every write whose bytes leave the engine ends
+/// with this.
+pub fn mended(
+    bytes: Vec<u8>,
+    limit: usize,
+    progress: &mut dyn FnMut(u32),
+) -> Result<Vec<u8>, Failure> {
+    use metadata::repair::{mend, Refusal};
+    mend(bytes, limit.min(MAX_SAVE_BYTES), progress).map_err(|refusal| match refusal {
+        Refusal::FileTooBig => too_large(true),
+        Refusal::StreamTooBig => (ErrorCode::SaveFailed, refusal.message().to_string()),
+    })
 }
 
 /// Writes the document out as PDFium would write a copy of it, with a limit of `limit` bytes (a
@@ -120,15 +175,14 @@ pub fn serialise_up_to(
         bytes: Vec::new(),
         limit,
         overflowed: false,
+        no_memory: false,
+        reserve: reserve_bytes,
         since_progress: 0,
         progress,
     };
     let result = document.save_to_writer(&mut out);
-    if out.overflowed {
-        return Err((
-            ErrorCode::SaveTooLarge,
-            "the document is too big to be saved".to_string(),
-        ));
+    if let Some(failure) = unfinished(&out) {
+        return Err(failure);
     }
     if result.is_err() {
         return Err((
@@ -155,13 +209,59 @@ pub fn serialise_up_to(
 /// to them. So the bytes are written once, read in again as a document of their own, and written a
 /// second time; the second writing is the file. The cost is one more load and one more write of the
 /// same bytes, and the memory for a second copy of them.
+///
+/// The bytes leave the engine, so both writings are looked at (see [`serialise_checked`]) and the
+/// second, which is the file, is mended. What stays in the engine is written with
+/// [`serialise_clean_in_engine`].
 pub fn serialise_clean(
     pdfium: &Pdfium,
     document: &PdfDocument<'_>,
     password: Option<&str>,
     progress: &mut dyn FnMut(u32),
 ) -> Result<Vec<u8>, Failure> {
-    let mut first = serialise_checked(document, MAX_SAVE_BYTES, progress)?;
+    write_twice(
+        pdfium,
+        document,
+        password,
+        progress,
+        serialise_unmended,
+        serialise_checked,
+    )
+}
+
+/// As [`serialise_clean`], for bytes that never leave the engine (the form designer writes the
+/// document out to put its fields after the bytes, and the result is loaded again): they are not
+/// looked at for metadata that would be written without encryption, so that such a document is not
+/// refused for a write that nobody sees. A save, which hands the bytes over, is made with
+/// [`serialise_clean`].
+pub fn serialise_clean_in_engine(
+    pdfium: &Pdfium,
+    document: &PdfDocument<'_>,
+    password: Option<&str>,
+    progress: &mut dyn FnMut(u32),
+) -> Result<Vec<u8>, Failure> {
+    write_twice(
+        pdfium,
+        document,
+        password,
+        progress,
+        serialise_up_to,
+        serialise_up_to,
+    )
+}
+
+/// A function that writes a document out within a limit and reports its progress.
+type Writer = fn(&PdfDocument<'_>, usize, &mut dyn FnMut(u32)) -> Result<Vec<u8>, Failure>;
+
+fn write_twice(
+    pdfium: &Pdfium,
+    document: &PdfDocument<'_>,
+    password: Option<&str>,
+    progress: &mut dyn FnMut(u32),
+    write_first: Writer,
+    write_last: Writer,
+) -> Result<Vec<u8>, Failure> {
+    let mut first = write_first(document, MAX_SAVE_BYTES, progress)?;
     // The buffer grew by doubling; the reload needs the room.
     first.shrink_to_fit();
     let pages = document.pages().len();
@@ -179,7 +279,7 @@ pub fn serialise_clean(
             "the written document has another number of pages when it is read again".to_string(),
         ));
     }
-    serialise_checked(&reread, MAX_SAVE_BYTES, progress)
+    write_last(&reread, MAX_SAVE_BYTES, progress)
 }
 
 /// The failure to give when the file the document is read from is not to be trusted.
@@ -192,6 +292,11 @@ pub fn source_failure(problem: Problem) -> Failure {
         Problem::Unreadable => (
             ErrorCode::SourceUnreadable,
             "a part of the file this document is read from could not be read".to_string(),
+        ),
+        Problem::TimedOut => (
+            ErrorCode::Internal,
+            "looking at the file this document is read from took longer than its time limit"
+                .to_string(),
         ),
     }
 }
@@ -280,6 +385,17 @@ pub fn doc_info(
 /// of page objects and of annotations. The same document written out and read again gives the
 /// same digest; a page that lost its text or its drawing instructions does not.
 pub fn fingerprint(document: &PdfDocument<'_>, progress: &mut dyn FnMut(u32)) -> ResponseBody {
+    fingerprint_with(document, false, progress)
+}
+
+/// As [`fingerprint`]. With `skip_signature_fields` a signature field is not counted among the
+/// annotations of its page: the document before it was signed and the file after it have the same
+/// description then, and anything else that is different shows.
+pub fn fingerprint_with(
+    document: &PdfDocument<'_>,
+    skip_signature_fields: bool,
+    progress: &mut dyn FnMut(u32),
+) -> ResponseBody {
     let pages = document.pages();
     let mut failed = 0u32;
     let mut digest: u64 = 0xcbf2_9ce4_8422_2325;
@@ -306,7 +422,18 @@ pub fn fingerprint(document: &PdfDocument<'_>, progress: &mut dyn FnMut(u32)) ->
             }
         }
         put(&(page.objects().len() as u64).to_le_bytes());
-        put(&(page.annotations().len() as u64).to_le_bytes());
+        let annotations = if skip_signature_fields {
+            page.annotations()
+                .iter()
+                .filter(|a| {
+                    !a.as_form_field()
+                        .is_some_and(|f| f.field_type() == PdfFormFieldType::Signature)
+                })
+                .count()
+        } else {
+            page.annotations().len()
+        };
+        put(&(annotations as u64).to_le_bytes());
         if index % 32 == 31 {
             progress(index as u32 + 1);
         }
@@ -315,5 +442,55 @@ pub fn fingerprint(document: &PdfDocument<'_>, progress: &mut dyn FnMut(u32)) ->
         pages: pages.len() as u32,
         failed,
         digest,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_save_that_ran_out_of_memory_does_not_say_the_document_is_too_big() {
+        let (code, words) = too_large(false);
+        assert_eq!(code, ErrorCode::SaveTooLarge);
+        assert!(words.contains("not enough memory"), "{words}");
+        assert!(!words.contains("too big"), "{words}");
+        let (code, words) = too_large(true);
+        assert_eq!(code, ErrorCode::SaveTooLarge);
+        assert!(words.contains("too big"), "{words}");
+    }
+
+    fn writer(limit: usize, reserve: fn(&mut Vec<u8>, usize) -> bool) -> Capped {
+        // No progress is reported in these tests (that needs a megabyte).
+        let noop: &'static mut (dyn FnMut(u32) + 'static) = Box::leak(Box::new(|_: u32| {}));
+        let progress: *mut (dyn FnMut(u32) + 'static) = noop;
+        Capped {
+            bytes: Vec::new(),
+            limit,
+            overflowed: false,
+            no_memory: false,
+            reserve,
+            since_progress: 0,
+            progress,
+        }
+    }
+
+    #[test]
+    fn the_writer_tells_a_buffer_that_cannot_grow_from_a_document_over_the_limit() {
+        // Room for nothing, within the limit: the words are those of the memory.
+        let mut out = writer(1_000, |_, _| false);
+        assert!(out.write(b"abc").is_err());
+        let (_, words) = unfinished(&out).expect("the write was stopped");
+        assert!(words.contains("not enough memory"), "{words}");
+        assert!(!words.contains("too big"), "{words}");
+        // Over the limit, with room: the words are those of the size.
+        let mut out = writer(2, reserve_bytes);
+        assert!(out.write(b"abc").is_err());
+        let (_, words) = unfinished(&out).expect("the write was stopped");
+        assert!(words.contains("too big"), "{words}");
+        // A write that fits is not a failure.
+        let mut out = writer(10, reserve_bytes);
+        assert_eq!(out.write(b"abc").unwrap(), 3);
+        assert!(unfinished(&out).is_none());
     }
 }

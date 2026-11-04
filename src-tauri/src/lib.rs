@@ -10,11 +10,16 @@
 //! starts again (a reload, whatever the cause), every engine is ended and the window starts clean.
 
 mod annotations;
+mod author;
+mod certsign;
 mod forms;
 mod links;
 mod locate;
+mod pages;
 mod positions;
 mod session;
+mod sigmarks;
+mod signatures;
 mod unsaved;
 mod updates;
 
@@ -29,6 +34,7 @@ use partridge_engine_client::{
 use positions::{Position, Positions};
 use serde::Serialize;
 use session::SessionStore;
+use sigmarks::{SignatureMarkStore, SignatureMarks};
 use tauri::webview::PageLoadEvent;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
@@ -300,6 +306,15 @@ impl From<ClientError> for CommandError {
                     message: why,
                 }
             }
+            // The same for a change to the pages: it went on, or was silent, for too long.
+            ClientError::EngineStopped(why)
+                if why.starts_with(partridge_engine_client::CHANGE_TOOK_TOO_LONG) =>
+            {
+                CommandError {
+                    code: "change_took_too_long".into(),
+                    message: why,
+                }
+            }
             ClientError::EngineStopped(why) => CommandError {
                 code: "engine_stopped".into(),
                 message: why,
@@ -311,6 +326,10 @@ impl From<ClientError> for CommandError {
             ClientError::Save(why) => CommandError {
                 code: why.code().into(),
                 message: why.to_string(),
+            },
+            ClientError::Signer { code, message } => CommandError {
+                code: code.into(),
+                message,
             },
         }
     }
@@ -326,6 +345,9 @@ struct OpenedInfo {
     name: String,
     /// Where this file was left the last time, if it was.
     position: Option<Position>,
+    /// Windows: an engine has run on this computer without being able to prove that the network is
+    /// blocked for it. The window tells the user once. Always false elsewhere.
+    network_not_proved: bool,
 }
 
 /// Runs a blocking engine call off the thread that handles the window.
@@ -377,6 +399,7 @@ async fn open_pdf(
         pages: pages.iter().map(|p| [p.width, p.height]).collect(),
         name,
         position,
+        network_not_proved: engine.0.network_not_proved(),
     })
 }
 
@@ -462,6 +485,9 @@ struct SavedInfo {
     /// The file was touched while the document was open, with parts of it unread: this is a copy
     /// of what the app had read of it.
     touched: bool,
+    /// Other open documents that were read from the file this save replaced. What the window
+    /// shows for them (a check of their signatures, say) is about a file that is no longer there.
+    replaced: Vec<u64>,
 }
 
 impl From<SaveOutcome> for SavedInfo {
@@ -474,6 +500,7 @@ impl From<SaveOutcome> for SavedInfo {
                 .unwrap_or_default(),
             path: outcome.path.to_string_lossy().into_owned(),
             touched: outcome.touched,
+            replaced: outcome.replaced,
         }
     }
 }
@@ -524,11 +551,58 @@ async fn save_pdf_as(
             message: "the document is not open".into(),
         }));
     };
-    let dialog_app = app.clone();
+    // A copy of a document that holds a signature starts from a name of its own, and never replaces
+    // the signed file itself: writing it again is what breaks the signature.
+    let signed = {
+        let pool = pool.clone();
+        blocking(move || Ok(pool.is_signed(doc))).await?
+    };
+    let start = if signed { copy_name(&current) } else { current };
     // The dialog is the user's to answer for as long as they like; the gate (which an update
     // install closes) is entered only afterwards, so the dialog never holds an update back.
+    let Some(target) = choose_save_target(&app, start).await? else {
+        return Ok(None);
+    };
+    if signed && pool.is_own_file(doc, &target) {
+        return Err(CommandError {
+            code: "save_same_file".into(),
+            message: "a copy of a signed document needs a name of its own".into(),
+        });
+    }
+    // Not while an update is being installed: it would end the engine in the middle of the save.
+    let _permit = update_state
+        .gate()
+        .enter()
+        .map_err(|_| updates::updating_error())?;
+    let options = SaveOptions {
+        allow_signed,
+        overwrite_changed: false,
+    };
+    let outcome = blocking(move || pool.save_as(doc, &target, options)).await?;
+    let info = SavedInfo::from(outcome);
+    update_state.move_doc(doc, &info.path);
+    Ok(Some(info))
+}
+
+/// `name.pdf` as `name (copy).pdf`, in the same folder.
+fn copy_name(current: &std::path::Path) -> PathBuf {
+    let stem = current
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "document".to_string());
+    current.with_file_name(format!("{stem} (copy).pdf"))
+}
+
+/// Asks the user where to write a file, with the dialog of the system, which the app opens itself:
+/// the window cannot name a file to write. `start` is the file the dialog starts from (its folder
+/// and its name). `None` when the user cancels.
+async fn choose_save_target(
+    app: &AppHandle,
+    start: PathBuf,
+) -> Result<Option<PathBuf>, CommandError> {
+    let dialog_app = app.clone();
     let chosen = tauri::async_runtime::spawn_blocking(move || {
-        let mut start = current;
+        let mut start = start;
         // A name typed without an ending gets `.pdf`. The dialog asked about replacing the name as
         // it was typed; when the name with the ending is another file that exists, the dialog is
         // shown again with that name, so the system asks the question about the right file and
@@ -565,29 +639,14 @@ async fn save_pdf_as(
         code: "internal".into(),
         message: e.to_string(),
     })?;
-    let target = match chosen {
-        None => return Ok(None),
-        Some(Ok(path)) => path,
-        Some(Err(())) => {
-            return Err(CommandError {
-                code: "save_write_failed".into(),
-                message: "the place that was chosen is not a file on this computer".into(),
-            })
-        }
-    };
-    // Not while an update is being installed: it would end the engine in the middle of the save.
-    let _permit = update_state
-        .gate()
-        .enter()
-        .map_err(|_| updates::updating_error())?;
-    let options = SaveOptions {
-        allow_signed,
-        overwrite_changed: false,
-    };
-    let outcome = blocking(move || pool.save_as(doc, &target, options)).await?;
-    let info = SavedInfo::from(outcome);
-    update_state.move_doc(doc, &info.path);
-    Ok(Some(info))
+    match chosen {
+        None => Ok(None),
+        Some(Ok(path)) => Ok(Some(path)),
+        Some(Err(())) => Err(CommandError {
+            code: "save_write_failed".into(),
+            message: "the place that was chosen is not a file on this computer".into(),
+        }),
+    }
 }
 
 /// Quits the app after the user has decided what happens to the changes that are not saved.
@@ -856,6 +915,26 @@ pub fn run() {
                 .map(|dir| dir.join("positions.json"));
             app.manage(LinkMemory(Mutex::new(KnownLinks::default())));
             app.manage(PositionStore(Mutex::new(Positions::load(positions_file))));
+            // The saved signatures are in the local data folder, which does not roam with a Windows
+            // profile (the app data folder does), so "kept on this computer only" holds. A file that
+            // an earlier version left in the app data folder is moved here at the start (again at the
+            // next start if that did not work, and removed once the new file is there). On macOS and
+            // Linux both folders are the same one and nothing moves.
+            let signatures_file = app
+                .path()
+                .app_local_data_dir()
+                .ok()
+                .map(|dir| dir.join("signatures.json"));
+            let earlier_signatures = app
+                .path()
+                .app_data_dir()
+                .ok()
+                .map(|dir| dir.join("signatures.json"));
+            app.manage(SignatureMarkStore(Mutex::new(SignatureMarks::load_moving(
+                signatures_file,
+                earlier_signatures,
+            ))));
+            app.manage(certsign::CertificateState::default());
             app.manage(Engine(Arc::new(EnginePool::new(
                 engine_config(app),
                 MAX_DOCUMENTS,
@@ -898,6 +977,19 @@ pub fn run() {
             set_dirty,
             save_pdf,
             save_pdf_as,
+            pages::pages_delete,
+            pages::pages_reorder,
+            pages::pages_rotate,
+            pages::pages_crop,
+            pages::pages_set_boxes,
+            pages::pages_insert_blank,
+            pages::pages_restore,
+            author::author_check,
+            author::author_list,
+            author::author_apply,
+            pages::pages_insert_pdf,
+            pages::pages_extract,
+            pages::pages_cancel,
             quit_app,
             stay_open,
             set_position,
@@ -909,6 +1001,14 @@ pub fn run() {
             get_outline,
             get_page_text,
             get_page_links,
+            signatures::get_signatures,
+            certsign::sign_pick_certificate,
+            certsign::sign_load_certificate,
+            certsign::sign_forget_certificate,
+            certsign::sign_certificate_open,
+            certsign::sign_set_image_mark,
+            certsign::sign_list_fields,
+            certsign::sign_document,
             forms::form_info,
             forms::get_form_fields,
             forms::set_form_field,
@@ -924,6 +1024,14 @@ pub fn run() {
             annotations::update_annotation,
             annotations::remove_annotation,
             annotations::restore_annotation,
+            sigmarks::list_signature_marks,
+            sigmarks::add_signature_mark,
+            sigmarks::rename_signature_mark,
+            sigmarks::delete_signature_mark,
+            sigmarks::clear_signature_marks,
+            sigmarks::add_signature,
+            sigmarks::add_signature_image,
+            sigmarks::place_signature,
             take_pending_paths,
             measure_mode,
             frontend_error,
@@ -963,6 +1071,10 @@ pub fn run() {
         if let tauri::RunEvent::Exit = &event {
             if let Some(engine) = handle.try_state::<Engine>() {
                 engine.0.kill_all();
+            }
+            // The key does not outlive the app either.
+            if let Some(certificate) = handle.try_state::<certsign::CertificateState>() {
+                certificate.forget();
             }
         }
         // A file opened from the dock or Finder on macOS arrives as an event, not as an argument.
@@ -1058,9 +1170,11 @@ mod tests {
             path: PathBuf::from("/docs/report.pdf"),
             bytes: 10,
             touched: false,
+            replaced: vec![3, 4],
         });
         assert_eq!(info.name, "report.pdf");
         assert_eq!(info.path, "/docs/report.pdf");
+        assert_eq!(info.replaced, vec![3, 4]);
     }
 
     #[test]
@@ -1441,6 +1555,11 @@ mod tests {
             partridge_engine_client::TOOK_TOO_LONG
         )));
         assert_eq!(too_long.code, "save_took_too_long");
+        let change = CommandError::from(ClientError::EngineStopped(format!(
+            "{}: it did not answer within 300 seconds",
+            partridge_engine_client::CHANGE_TOOK_TOO_LONG
+        )));
+        assert_eq!(change.code, "change_took_too_long");
         let password = CommandError::from(ClientError::Engine {
             code: ErrorCode::PasswordRequired,
             message: "locked".into(),

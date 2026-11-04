@@ -22,6 +22,8 @@ npm run build && npx playwright install chromium && npm run e2e   # the window i
 
 The browser tests (`e2e/`) run the real window code in Chromium with the content security policy of the app and a stand-in for the Rust side that serves two made-up documents. They cover tabs, the light and dark look, thumbnails and contents, selecting and copying with the mouse, search, the question before a link is opened, and printing. They do not start the Rust side, the engine or a real web view; the CI job "Build" does that for the release build (it opens a generated 500-page PDF and checks that the first page is drawn).
 
+The page tools are also tested against hostile files (huge page counts, a page tree that loops, odd rotations and boxes, a list of pages with something in it that is not a page) in `crates/engine/tests/pages.rs` and `crates/engine/tests/pages_process.rs`, against an engine that misbehaves in `crates/engine-client/tests/hostile_pages.rs`, and by the fuzz targets. `scripts/check-pages.sh` hands documents that the tools changed and saved to qpdf and poppler (CI runs it).
+
 The protocol decoders and the engine (with PDFium) are also fuzzed: see [fuzzing.md](fuzzing.md). The app and the engine sandbox are also run on Windows as a standard user, not only as the administrator of the CI runner: see [windows-standard-user.md](windows-standard-user.md).
 
 ## TypeScript versions

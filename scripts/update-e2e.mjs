@@ -262,9 +262,9 @@ async function waitFor(file, test, seconds) {
 
 function killApps() {
   if (win) {
-    for (const image of ["patient-partridge.exe", "partridge-engine.exe"]) spawnSync("taskkill", ["/IM", image, "/F", "/T"], { stdio: "ignore" });
+    for (const image of ["patient-partridge.exe", "partridge-engine.exe", "partridge-signer.exe"]) spawnSync("taskkill", ["/IM", image, "/F", "/T"], { stdio: "ignore" });
   } else {
-    spawnSync("pkill", ["-9", "-f", "patient-partridge|partridge-engine|Partridge.*AppImage"], { stdio: "ignore" });
+    spawnSync("pkill", ["-9", "-f", "patient-partridge|partridge-engine|partridge-signer|Partridge.*AppImage"], { stdio: "ignore" });
   }
 }
 

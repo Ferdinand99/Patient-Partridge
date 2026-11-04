@@ -13,6 +13,7 @@ import {
   npmEntries,
   render,
   rustEntries,
+  signatureFontsSection,
   webview2Section,
 } from "./third-party-notices.mjs";
 
@@ -235,6 +236,68 @@ describe("webview2Section", () => {
   });
 });
 
+describe("signatureFontsSection", () => {
+  const dir = "assets/fonts/signature";
+  const licence = "Copyright 2015 The Example Authors\n\nThis Font Software is licensed under the SIL Open Font License, Version 1.1.\n";
+  const entry = (over = {}) => ({
+    name: "Example",
+    file: `${dir}/Example-Regular.ttf`,
+    fileSha256: sha256("font bytes"),
+    licenseFile: `${dir}/OFL-example.txt`,
+    licenseSha256: sha256(licence.trim()),
+    copyright: "Copyright 2015 The Example Authors",
+    source: "https://example.org/example",
+    ...over,
+  });
+  const files = { [`${dir}/Example-Regular.ttf`]: "font bytes", [`${dir}/OFL-example.txt`]: licence };
+  const reader = (map) => (file) => Buffer.from(map[file] ?? "");
+  const lister = (names) => () => names;
+
+  it("gives the licence and the copyright of every font that is shipped", () => {
+    const sections = signatureFontsSection({ signatureFonts: [entry()] }, reader(files), lister(["Example-Regular.ttf", "OFL-example.txt"]));
+    expect(sections).toHaveLength(1);
+    expect(sections[0].file).toBe("Example-Regular.ttf");
+    expect(sections[0].text).toContain("SIL Open Font License");
+    expect(sections[0].copyright).toBe("Copyright 2015 The Example Authors");
+  });
+  it("fails for a font file that has no entry", () => {
+    expect(() => signatureFontsSection({ signatureFonts: [] }, reader(files), lister(["Example-Regular.ttf"]))).toThrow(
+      /Example-Regular.ttf is shipped but has no entry/,
+    );
+  });
+  it("fails when the font file is not the one that was described", () => {
+    const changed = { ...files, [`${dir}/Example-Regular.ttf`]: "other bytes" };
+    expect(() => signatureFontsSection({ signatureFonts: [entry()] }, reader(changed), lister(["Example-Regular.ttf"]))).toThrow(
+      /is not the file that notices-extra.json describes/,
+    );
+  });
+  it("fails when the licence text was changed, or does not start with the copyright line", () => {
+    const changed = { ...files, [`${dir}/OFL-example.txt`]: `${licence}\nand more` };
+    expect(() => signatureFontsSection({ signatureFonts: [entry()] }, reader(changed), lister(["Example-Regular.ttf"]))).toThrow(/does not have the hash/);
+    expect(() =>
+      signatureFontsSection({ signatureFonts: [entry({ copyright: "Copyright 1999 Somebody Else" })] }, reader(files), lister(["Example-Regular.ttf"])),
+    ).toThrow(/does not start with the copyright line/);
+  });
+  it("fails for an entry whose font is not shipped any more", () => {
+    expect(() => signatureFontsSection({ signatureFonts: [entry()] }, reader(files), lister([]))).toThrow(/which is not shipped/);
+  });
+  it("lists every font that the real folder holds, with the real licence text", () => {
+    const extra = JSON.parse(read("notices-extra.json"));
+    const sections = signatureFontsSection(extra);
+    expect(sections.map((s) => s.name)).toEqual(["Great Vibes", "Allura", "Kristi"]);
+    for (const s of sections) {
+      expect(s.text).toContain("SIL OPEN FONT LICENSE Version 1.1");
+      expect(s.copyright).toMatch(/^Copyright/);
+    }
+  });
+  it("shows them in the notices file of the repository", () => {
+    const text = read("THIRD-PARTY-NOTICES");
+    expect(text).toContain("Signature fonts (3 fonts)");
+    for (const name of ["Great Vibes (GreatVibes-Regular.ttf)", "Allura (Allura-Regular.ttf)", "Kristi (Kristi-Regular.ttf)"]) expect(text).toContain(name);
+    expect(text).toContain("Copyright 2010 The Great Vibes Pro Project Authors");
+  });
+});
+
 describe("npmEntries", () => {
   const lock = (packages) => ({ packages: { "": {}, ...packages } });
 
@@ -302,6 +365,19 @@ describe("render", () => {
     expect(text).toContain("WV2 text");
     expect(text).toContain("pdfium-licenses/");
   });
+  it("prints the signature fonts after the other fonts", () => {
+    const text = render({
+      rust,
+      npm: [],
+      fontLicense: "OFL text",
+      webview2,
+      signatureFonts: [{ name: "Example", file: "Example-Regular.ttf", copyright: "Copyright 2015 The Example Authors", source: "https://example.org", text: "OFL for example" }],
+    });
+    expect(text).toContain("Signature fonts (1 font)");
+    expect(text).toContain("--- Example (Example-Regular.ttf) ---");
+    expect(text).toContain("Source: https://example.org");
+    expect(text.indexOf("Signature fonts")).toBeGreaterThan(text.indexOf("OFL text"));
+  });
   it("fails when any text still has a placeholder, wherever it came from", () => {
     expect(() => render({ rust, npm: [{ licenseId: "MIT", text: "Copyright <year> <owner>", packages: [{ label: "n 1", url: "" }] }], fontLicense: "x", webview2 })).toThrow(
       /unfilled licence template/,
@@ -313,7 +389,7 @@ describe("notices.sh", () => {
   it("runs cargo-about with --fail, so a crate without a readable licence stops the build", () => {
     const script = read("scripts/notices.sh");
     const commands = script.split("cargo about generate").slice(1);
-    expect(commands).toHaveLength(2);
+    expect(commands).toHaveLength(3);
     for (const c of commands) expect(c.split("\n")[0] + c.split("\n")[1]).toContain("--fail");
   });
 });

@@ -18,12 +18,16 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # The test programs are many and each links the engine; the line tables are enough for a
+  # backtrace and keep the build folder small enough for the disk of a runner.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
   rust:
     name: Rust (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -33,6 +37,12 @@ jobs:
             lint: true
           - name: windows
             os: windows-latest
+            lint: false
+          # Windows Server 2022 (build 20348) is closer to Windows 10 and 11 than the newest
+          # image: the token calls and the list of known libraries that the sandbox depends on can
+          # differ between versions.
+          - name: windows-2022
+            os: windows-2022
             lint: false
           - name: macos
             os: macos-latest
@@ -44,6 +54,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      # The test builds fill the disk of a runner; software the job does not use is taken off while
+      # the job goes on with the rest (removing it takes minutes).
+      - name: Make room on the disk (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo nohup rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL > /dev/null 2>&1 &
+          df -h /
       - name: Install Tauri Linux dependencies
         if: runner.os == 'Linux'
         run: |
@@ -59,6 +76,16 @@ jobs:
         run: |
           sudo apt-get install -y qpdf poppler-utils
           echo "PARTRIDGE_REQUIRE_READERS=1" >> "$GITHUB_ENV"
+      # A third reader for the files that signing with a certificate makes: pyHanko, a validator of
+      # signed PDFs written by someone else, pinned like everything else
+      # (crates/engine/tests/sign_readers.rs).
+      - name: Install the validator of signatures (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/pyhanko"
+          "$RUNNER_TEMP/pyhanko/bin/pip" install --no-cache-dir pyhanko==0.38.0 pyhanko-certvalidator==0.33.0
+          echo "PARTRIDGE_PYHANKO_PYTHON=$RUNNER_TEMP/pyhanko/bin/python" >> "$GITHUB_ENV"
+          echo "PARTRIDGE_REQUIRE_PYHANKO=1" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
@@ -104,7 +131,7 @@ jobs:
           sudo mkdir -p /mnt/small
           sudo mount -t tmpfs -o size=1m,mode=1777 tmpfs /mnt/small
           PARTRIDGE_TEST_SMALL_DISK=/mnt/small cargo test -p partridge-engine-client --locked -- --ignored a_full_disk
-      # What the engine tried after it locked itself in (open a file, connect, start a program,
+      # What the engine tried after it locked itself in (open a file, connect, send, look up a name, start a program,
       # write a file) and what the system answered, on each system.
       - name: Sandbox proof
         if: always()
@@ -116,6 +143,22 @@ jobs:
         env:
           PARTRIDGE_TEST_NO_LANDLOCK: "1"
         run: cargo test -p partridge-engine -p partridge-engine-client --locked
+      # With the empty root the engine counts as a process with one thread without a look, so the
+      # tests above cannot tell whether Landlock is applied before the first helper thread starts.
+      # Without the empty root the engine counts its threads, and the greeting names Landlock only
+      # when there was one. The step runs the greeting test that way, with the rule that insists on
+      # the empty root taken away, and fails first if this kernel does not list Landlock (the test
+      # would pass without looking then).
+      - name: Landlock before the threads (Linux)
+        if: always() && runner.os == 'Linux'
+        run: |
+          if ! tr ',' '\n' < /sys/kernel/security/lsm | grep -qx landlock; then
+            echo "This kernel does not list Landlock, so the order of Landlock and the threads is not tried." >&2
+            exit 1
+          fi
+          env -u PARTRIDGE_TEST_REQUIRE_EMPTY_ROOT PARTRIDGE_TEST_NO_EMPTY_ROOT=1 \
+            cargo test -p partridge-engine --locked --test sandbox -- --exact --nocapture \
+            the_real_engine_reports_the_sandbox_it_runs_in
       # A page in each script that needs a system font, drawn with the fonts of this system (what
       # the runner image has, and the Noto packages on Linux). The test says for each script which
       # file the app handed over, or that this system has none, and fails if the runner has none.
@@ -124,9 +167,6 @@ jobs:
         env:
           PARTRIDGE_REQUIRE_FONT_SCRIPTS: all
         run: cargo test -p partridge-engine --locked --test system_fonts -- --nocapture --test-threads 1
-      - name: Does an AppContainer stop the network on Windows (diagnosis)
-        if: always() && runner.os == 'Windows'
-        run: cargo test -p partridge-engine --locked --test windows_appcontainer -- --ignored --nocapture
       - name: The sandbox log (macOS)
         if: failure() && runner.os == 'macOS'
         run: log show --last 10m --predicate 'sender == "Sandbox"' --style compact | grep -i 'engine|partridge' | tail -100 || true
@@ -141,6 +181,15 @@ jobs:
           fi
           ls target/release/examples 2>/dev/null | grep -q selftest && { echo "The self-test program was built in release." >&2; exit 1; }
           echo "ok: no test switches in the release engine"
+      - name: The release signer has no test code
+        if: matrix.lint
+        run: |
+          cargo build --release --locked -p partridge-signer
+          if grep -aq 'PARTRIDGE_TEST_' target/release/partridge-signer; then
+            echo "The release signer contains test switches." >&2
+            exit 1
+          fi
+          echo "ok: no test switches in the release signer"
       - name: The engine has no network code, the app does not link PDFium
         if: matrix.lint
         run: scripts/check-engine-deps.sh
@@ -198,9 +247,9 @@ jobs:
       - name: THIRD-PARTY-NOTICES is up to date
         run: scripts/notices.sh --check
 
-  # A form that was filled in and saved by the engine is handed to tools that are not PDFium: qpdf
-  # checks the structure, pdftk reads the field values, poppler draws the page. See
-  # scripts/check-forms.sh.
+  # A form that was filled in and saved by the engine, and a form that the designer made, are handed
+  # to tools that are not PDFium: qpdf checks the structure, pdftk reads the field values, poppler
+  # draws the page. See scripts/check-forms.sh and crates/engine/tests/author_readers.rs.
   forms-tools:
     name: Filled forms read by other tools (qpdf, pdftk, poppler)
     runs-on: ubuntu-24.04
@@ -233,6 +282,65 @@ jobs:
         run: cargo test -p partridge-engine --locked --test forms --test forms_process --test forms_actions
       - name: Read them with other tools
         run: scripts/check-forms.sh "$RUNNER_TEMP/forms"
+      # Forms that the designer made (fields of every kind, on a plain page and on turned pages) are
+      # read by qpdf (the structure), Poppler (opens and draws every field and what was filled in)
+      # and pdftk (kinds, flags, tooltips, states and defaults; fills them in, and the engine reads
+      # what it wrote). Each of the tools must be there.
+      - name: Forms made by the designer, read with other tools
+        env:
+          PARTRIDGE_REQUIRE_READERS: "1"
+          PARTRIDGE_REQUIRE_PDFTK: "1"
+        run: cargo test -p partridge-engine --locked --test author_readers
+
+  # Documents that the page tools changed and saved (a delete, a move, a turn, a crop, an insert and a
+  # copy of some pages) are handed to tools that are not PDFium: qpdf checks the structure, poppler
+  # reads the pages and draws them, and the bytes of a deleted page are searched for. See
+  # scripts/check-pages.sh.
+  pages-tools:
+    name: Changed pages read by other tools (qpdf, poppler)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: pages-tools
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+      - name: Install the tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qpdf poppler-utils
+      - name: Fetch PDFium
+        run: node scripts/fetch-pdfium.mjs
+      # The engine tests that use the sandbox need the same switch as the Rust job (see there).
+      - name: Allow user namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          echo "PARTRIDGE_TEST_REQUIRE_EMPTY_ROOT=1" >> "$GITHUB_ENV"
+      - name: Change and save the test documents
+        env:
+          PARTRIDGE_PAGES_OUT: ${{ runner.temp }}/pages
+        run: cargo test -p partridge-engine --locked --test pages_process
+      - name: Read them with other tools
+        run: scripts/check-pages.sh "$RUNNER_TEMP/pages"
+      # The check can fail: given a file that still holds the text of a page it was told is gone, it
+      # must say so.
+      - name: The check fails on a page that was not deleted
+        run: |
+          mkdir "$RUNNER_TEMP/negative"
+          cp "$RUNNER_TEMP/pages/original.pdf" "$RUNNER_TEMP/negative/deleted.pdf"
+          printf '%s\t%s\t%s\n' deleted.pdf 5 gone=1 > "$RUNNER_TEMP/negative/expected.txt"
+          if scripts/check-pages.sh "$RUNNER_TEMP/negative" >"$RUNNER_TEMP/negative.txt" 2>&1; then
+            cat "$RUNNER_TEMP/negative.txt"
+            echo "The check passed a page that was not deleted." >&2
+            exit 1
+          fi
+          grep -q "still has the text of deleted page 1" "$RUNNER_TEMP/negative.txt"
 
   # The real window code in a real browser (Chromium), with the content security policy of the app
   # and a stand-in for the Rust side. See e2e/.
@@ -316,6 +424,13 @@ jobs:
           [ "$RUNNER_OS" = "Windows" ] && bin=target/release/partridge-engine.exe
           if grep -aq 'PARTRIDGE_TEST_' "$bin"; then
             echo "The release engine contains test switches." >&2
+            exit 1
+          fi
+          echo "ok: no test switches in $bin"
+          bin=target/release/partridge-signer
+          [ "$RUNNER_OS" = "Windows" ] && bin=target/release/partridge-signer.exe
+          if grep -aq 'PARTRIDGE_TEST_' "$bin"; then
+            echo "The release signer contains test switches." >&2
             exit 1
           fi
           echo "ok: no test switches in $bin"
@@ -424,10 +539,14 @@ jobs:
   # its path), and runs the sandbox tests of the engine as that user. Steps and limits are in
   # scripts/windows-standard-user and docs/windows-standard-user.md.
   windows-standard-user:
-    name: Windows, as a standard user
+    name: Windows, as a standard user (${{ matrix.os }})
     needs: build
-    runs-on: windows-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-2022]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -435,7 +554,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          key: standard-user
+          key: standard-user-${{ matrix.os }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 22
@@ -462,6 +581,9 @@ jobs:
           $setup = Get-ChildItem installers -Filter '*-setup.exe' | Select-Object -First 1
           if (-not $setup) { throw 'The Build job made no NSIS installer.' }
           Copy-Item $setup.FullName C:\pp\in\
+          $msi = Get-ChildItem installers -Filter '*.msi' | Select-Object -First 1
+          if (-not $msi) { throw 'The Build job made no MSI.' }
+          Copy-Item $msi.FullName C:\pp\in\
           $library = Get-ChildItem vendor/pdfium -Recurse -Filter pdfium.dll | Select-Object -First 1
           Copy-Item "$($library.DirectoryName)\*" C:\pp\pdfium\ -Recurse
           Get-ChildItem C:\pp\in, C:\pp\pdfium | Format-Table Name, Length
@@ -470,6 +592,15 @@ jobs:
       - name: Build the engine tests
         shell: pwsh
         run: ./scripts/windows-standard-user/build-tests.ps1
+
+      # What a deployment tool or an administrator does: install in a folder outside Program Files,
+      # as an administrator. The files then belong to the administrators, and the standard user who
+      # runs the program cannot change who may read them. The installers add the entry for the
+      # engine's package themselves; the third copy has none (a control: the engine must fail there,
+      # which is what every installation outside Program Files did before the installers did this).
+      - name: Install outside the profile, as an administrator
+        shell: pwsh
+        run: ./scripts/windows-standard-user/install-as-admin.ps1
 
       - name: Run the checks as the standard user
         shell: powershell
@@ -492,7 +623,7 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
-          name: standard-user-logs
+          name: standard-user-logs-${{ matrix.os }}
           path: C:\pp\out\*
           if-no-files-found: ignore
           retention-days: 7
@@ -502,3 +633,134 @@ jobs:
         shell: powershell
         run: |
           if ($env:PP_USER) { Remove-LocalUser -Name $env:PP_USER -ErrorAction SilentlyContinue }
+
+  # The engine proves the network block with real attempts at start-up. That proof depends on the
+  # Windows Filtering Platform, which the firewall profiles, the firewall service (MpsSvc) and the
+  # filtering engine (BFE) feed. This job puts the runner in each of those states and records what
+  # the engine does: it must open the document in all of them, and it must say truthfully whether it
+  # could prove the block (docs/windows-sandbox.md).
+  windows-capture:
+    name: Windows, packet capture (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-2022]
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: capture-${{ matrix.os }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+      - name: Fetch PDFium
+        run: node scripts/fetch-pdfium.mjs
+      - name: Build the tests
+        run: |
+          cargo build -p partridge-engine --examples --locked
+          cargo test -p partridge-engine --locked --no-run --test sandbox
+      # pktmon is the packet monitor of Windows. It shows whether a raw echo request that a
+      # program sends leaves for the network card; the control shows that the capture sees it.
+      - name: Raw echo requests under pktmon
+        run: ./scripts/windows-packet-capture.ps1
+      - name: Stop the capture
+        if: always()
+        run: |
+          pktmon stop 2>&1 | Out-Null
+          pktmon filter remove 2>&1 | Out-Null
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: capture-${{ matrix.os }}
+          path: logs/*
+          if-no-files-found: ignore
+          retention-days: 7
+
+  windows-firewall:
+    name: Windows, firewall state (${{ matrix.state }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # In every state that a hosted runner allows, the engine still proves the block: TCP,
+          # UDP and raw sockets are refused. (The script fails when the runner did not reach the
+          # state, so a green leg is a state that was made.)
+          - { os: windows-latest, state: default, expect: proved }
+          - { os: windows-latest, state: profiles-off, expect: proved }
+          - { os: windows-latest, state: outbound-allowed, expect: proved }
+          - { os: windows-latest, state: package-allowed, expect: proved }
+          - { os: windows-latest, state: loopback-exempt, expect: proved }
+          - { os: windows-2022, state: default, expect: proved }
+          - { os: windows-2022, state: profiles-off, expect: proved }
+          # Not in the list, on purpose: a hosted runner refuses to stop the firewall service
+          # (MpsSvc) or the filtering engine (BFE), for an administrator and for the system account
+          # alike, so a leg for either would run in the default state. The script has both states
+          # and fails when the service is still running, for a runner that allows it.
+          # A debug engine told to take the answer of the network check as one that is not "blocked":
+          # the whole path after it (greeting, client, document) must work and say so.
+          - { os: windows-latest, state: simulated-answer, expect: not-proved }
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: firewall-${{ matrix.os }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+      - name: Fetch PDFium
+        run: node scripts/fetch-pdfium.mjs
+      - name: Build the tests
+        run: |
+          cargo build -p partridge-engine --examples --locked
+          cargo test -p partridge-engine --locked --no-run --test sandbox --test windows_start --test windows_network_states --test sandbox_refusal
+      - name: Put the runner in the state
+        run: ./scripts/windows-firewall-state.ps1 ${{ matrix.state }}
+      # A native command's exit code is checked by hand: a pipe into Tee-Object hides it.
+      - name: What the engine does in this state
+        env:
+          PARTRIDGE_FIREWALL_STATE: ${{ matrix.state }}
+          PARTRIDGE_NETWORK_EXPECT: ${{ matrix.expect }}
+          PARTRIDGE_TEST_NETWORK_UNPROVED: ${{ matrix.state == 'simulated-answer' && '1' || '' }}
+        run: |
+          cargo test -p partridge-engine --locked --test windows_network_states -- --nocapture 2>&1 | Tee-Object -FilePath logs/engine.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: The sandbox proof in this state
+        if: matrix.state != 'simulated-answer'
+        run: |
+          cargo test -p partridge-engine --locked --test sandbox -- --nocapture --test-threads 1 2>&1 | Tee-Object -FilePath logs/sandbox.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Many starts in this state
+        env:
+          PARTRIDGE_TEST_NETWORK_UNPROVED: ${{ matrix.state == 'simulated-answer' && '1' || '' }}
+        run: |
+          cargo test -p partridge-engine --locked --test windows_start -- --nocapture 2>&1 | Tee-Object -FilePath logs/starts.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Put the services back
+        if: always()
+        run: |
+          Set-NetFirewallProfile -Profile Domain, Public, Private -Enabled True -ErrorAction SilentlyContinue
+          Start-Service BFE -ErrorAction SilentlyContinue
+          Start-Service MpsSvc -ErrorAction SilentlyContinue
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: firewall-${{ matrix.os }}-${{ matrix.state }}
+          path: logs/*
+          if-no-files-found: ignore
+          retention-days: 7

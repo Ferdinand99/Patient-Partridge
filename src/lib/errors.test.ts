@@ -65,6 +65,69 @@ describe("describeError: saving", () => {
     expect(protectedFile.detail).toContain("saving a copy does not help");
     expect(protectedFile.detail).toContain("Nothing was saved");
   });
+
+  it("tells a name that is open in another tab, or holds a signature, from other failures and writes nothing", () => {
+    const open = describeError({ code: "save_target_open", message: "" }, "tax.pdf");
+    expect(open.title).toBe("That file is open");
+    expect(open.detail).toContain("another tab");
+    expect(open.detail).toContain("Nothing was written");
+    const signed = describeError({ code: "save_target_signed", message: "" }, "tax.pdf");
+    expect(signed.title).toBe("Choose another name");
+    expect(signed.detail).toContain("digital signature");
+    expect(signed.detail).toContain("Nothing was written");
+    const unreadable = describeError({ code: "save_target_unreadable", message: "" }, "tax.pdf");
+    expect(unreadable.title).toBe("That file cannot be read");
+    expect(unreadable.detail).toContain("could not be read");
+    expect(unreadable.detail).not.toContain("signature");
+    expect(unreadable.action).toBe("none");
+    expect(open.action).toBe("none");
+    expect(signed.action).toBe("none");
+  });
+
+  it("shows the engine's own words when a page cannot take another annotation, and the general ones otherwise", () => {
+    const full = describeError({
+      code: "annotation_refused",
+      message: "This page already has as many annotations as Patient Partridge can list, so no more can be added to it.",
+    });
+    expect(full.title).toBe("No more annotations fit on this page");
+    expect(full.detail).toContain("as many annotations as Patient Partridge can list");
+    expect(full.detail).toContain("Nothing was added");
+    const other = describeError({ code: "annotation_refused", message: "no" });
+    expect(other.title).toBe("The annotation was not changed");
+  });
+
+  it("explains a block of document details that is too big, and any other failed write generally", () => {
+    const big = describeError(
+      {
+        code: "save_failed",
+        message: "an XMP metadata stream of the document is too big to be written safely, so it was not written",
+      },
+      "tax.pdf",
+    );
+    expect(big.title).toContain("document details");
+    expect(big.detail).toContain('"tax.pdf"');
+    expect(big.detail).toContain("Nothing was saved");
+    expect(big.detail).toContain("compressed");
+    expect(big.detail).toContain("saving a copy does not help");
+    expect(big.action).toBe("none");
+    const other = describeError({ code: "save_failed", message: "the document could not be written" }, "tax.pdf");
+    expect(other.title).toBe("The document could not be written");
+  });
+});
+
+describe("describeError: a save that ran out of memory", () => {
+  it("says there was not enough memory, not that the document is too big", () => {
+    const d = describeError(
+      { code: "save_too_large", message: "there was not enough memory to finish saving the document" },
+      "atlas.pdf",
+    );
+    expect(d.detail).toContain("not enough memory");
+    expect(d.detail).toContain('"atlas.pdf"');
+    expect(d.detail).toContain("was not changed");
+    expect(`${d.title} ${d.detail}`).not.toMatch(/too big|512 MiB/);
+    const big = describeError({ code: "save_too_large", message: "the document is too big to be saved" }, "atlas.pdf");
+    expect(big.detail).toContain("512 MiB");
+  });
 });
 
 describe("describeError: a save that took too long", () => {
@@ -76,6 +139,19 @@ describe("describeError: a save that took too long", () => {
     expect(d.detail).toContain('"tax.pdf"');
     expect(d.detail).toContain("was not changed");
     expect(d.detail).toContain("changes made since it was opened are lost");
+  });
+});
+
+describe("describeError: a change to the pages that took too long", () => {
+  it("says that it took too long, not that the file may be damaged, and counts as a lost engine", () => {
+    const error = { code: "change_took_too_long", message: "a change to the pages took too long" };
+    expect(isEngineLost(error)).toBe(true);
+    const d = describeError(error, "atlas.pdf");
+    expect(d.title).toBe("The change took too long");
+    expect(d.detail).toContain('"atlas.pdf"');
+    expect(d.detail).toContain("was not changed");
+    expect(d.detail).toContain("changes made since it was opened are lost");
+    expect(d.detail).not.toContain("damaged");
   });
 });
 

@@ -347,6 +347,24 @@ button.outline-toggle {
   flex: 0 1 22rem;
 }
 
+/* One calm line under the toolbar: something the user may want to know, no action needed */
+.calm-line {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-1) var(--sp-3);
+  border-top: 1px solid var(--line);
+  font-size: 0.8125rem;
+}
+
+.calm-line[hidden] {
+  display: none;
+}
+
+.calm-line p {
+  flex: 1 1 auto;
+}
+
 .find-status {
   min-width: 7rem;
   font-size: 0.8125rem;
@@ -503,6 +521,14 @@ button.outline-toggle {
 .annotbar[hidden],
 .annotbar [hidden] {
   display: none;
+}
+
+.designbar .segmented > button {
+  gap: 4px;
+}
+
+.designbar .segmented > button > span {
+  font-size: 12px;
 }
 
 .annotbar-note {

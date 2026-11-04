@@ -4,7 +4,11 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import type { PageSizePt } from "../viewer/layout";
 import type { FormFieldInfo, FormInfo, FormValueIn } from "../viewer/forms";
 import type { PageLinkInfo } from "../viewer/overlays";
+import type { SignaturesInfo } from "./signatures";
+import type { CertificateInfo, SignField, SignRequestArgs, SignedFile } from "./certsign";
 import type { Annotation, AnnotKind, Rgba, StampName } from "./annotations";
+import type { DrawnPicture, Rect, SavedBody, SavedPicture, TypedPicture } from "./signpicture";
+import { bodyOf } from "./signpicture";
 
 /** Where the reader was in a file, as remembered on this computer. */
 export interface SavedPosition {
@@ -30,6 +34,8 @@ export interface SavedFile {
   name: string;
   /** The original was touched while it was open, with parts of it unread: this copy holds what was read. */
   touched?: boolean;
+  /** Other open documents (by their handle) that were read from the file this save replaced. */
+  replaced?: number[];
 }
 
 export interface OpenedDocument {
@@ -38,6 +44,11 @@ export interface OpenedDocument {
   name: string;
   /** Where this file was left the last time, if it was. */
   position?: SavedPosition | null;
+  /**
+   * Windows: the PDF reader runs in its sandbox, but this computer did not confirm that the network
+   * is blocked for it (a firewall setting can be the reason). The window says so once.
+   */
+  networkNotProved?: boolean;
 }
 
 /** One entry of the table of contents, in reading order. */
@@ -93,6 +104,7 @@ interface OpenedWire {
   pages: [number, number][];
   name: string;
   position: SavedPosition | null;
+  network_not_proved?: boolean;
 }
 
 export const api = {
@@ -103,6 +115,7 @@ export const api = {
       name: wire.name,
       pages: wire.pages.map(([width, height]) => ({ width, height })),
       position: wire.position,
+      networkNotProved: wire.network_not_proved === true,
     };
   },
 
@@ -229,6 +242,58 @@ export const api = {
   },
 
   /**
+   * A drawn or a typed picture of a signature, fitted into `rect` (`[left, top, right, bottom]` in
+   * points from the top left of the page as it is drawn). It is a picture and nothing more.
+   */
+  addSignature(doc: number, page: number, rect: Rect, color: Rgba, picture: DrawnPicture | TypedPicture): Promise<Annotation> {
+    return invoke<Annotation>("add_signature", { doc, page, rect, color, mark: bodyOf(picture) });
+  },
+
+  /** An imported picture of a signature as raw pixels (red, green, blue, alpha), fitted into `rect`. */
+  addSignatureImage(
+    doc: number,
+    page: number,
+    rect: Rect,
+    color: Rgba,
+    width: number,
+    height: number,
+    rgba: Uint8ClampedArray,
+  ): Promise<Annotation> {
+    // The pixels are the body of the request, as bytes; what they are for is in a header.
+    const bytes = new Uint8Array(rgba.buffer, rgba.byteOffset, rgba.byteLength);
+    return invoke<Annotation>("add_signature_image", bytes, {
+      headers: { "x-signature-image": JSON.stringify({ doc, page, rect, color, width, height }) },
+    });
+  },
+
+  /** Moves and resizes a picture of a signature: it takes the corner and the width of `rect`. */
+  placeSignature(doc: number, page: number, id: number, rect: Rect): Promise<Annotation> {
+    return invoke<Annotation>("place_signature", { doc, page, id, rect });
+  },
+
+  /** The signatures kept on this computer for later, oldest first. */
+  listSignatureMarks(): Promise<SavedPicture[]> {
+    return invoke<SavedPicture[]>("list_signature_marks");
+  },
+
+  addSignatureMark(name: string, mark: SavedBody): Promise<SavedPicture> {
+    return invoke<SavedPicture>("add_signature_mark", { name, mark });
+  },
+
+  renameSignatureMark(id: string, name: string): Promise<SavedPicture> {
+    return invoke<SavedPicture>("rename_signature_mark", { id, name });
+  },
+
+  async deleteSignatureMark(id: string): Promise<void> {
+    await invoke<void>("delete_signature_mark", { id });
+  },
+
+  /** Forgets every kept signature. */
+  async clearSignatureMarks(): Promise<void> {
+    await invoke<void>("clear_signature_marks");
+  },
+
+  /**
    * The scripts for which the engine of a document was asked for a font and had none to give
    * ("japanese", "korean", "chinese-simplified", ...): text in them that the PDF does not carry a
    * font for is drawn as blanks.
@@ -240,6 +305,64 @@ export const api = {
   /** The links of a page that lead to a web address or to a page of the document. */
   getPageLinks(doc: number, page: number): Promise<PageLinkInfo[]> {
     return invoke<PageLinkInfo[]>("get_page_links", { doc, page });
+  },
+
+  /**
+   * The digital signatures of a document, described and checked by its engine: the state of each
+   * as a code, and the text of the file (names, reasons, places) as plain text fields.
+   */
+  getSignatures(doc: number): Promise<SignaturesInfo> {
+    return invoke<SignaturesInfo>("get_signatures", { doc });
+  },
+
+  /**
+   * Asks which certificate file to use, in the dialog of the system (the app opens it: the window
+   * names no file). Resolves with the name of the file, or null when the person cancels.
+   */
+  signPickCertificate(): Promise<string | null> {
+    return invoke<string | null>("sign_pick_certificate");
+  },
+
+  /**
+   * Opens the chosen certificate file with its password, for signing the document `doc` (a key
+   * opened for one document signs no other). The password is not kept.
+   */
+  signLoadCertificate(doc: number, password: string): Promise<CertificateInfo> {
+    return invoke<CertificateInfo>("sign_load_certificate", { doc, password });
+  },
+
+  /**
+   * Whether a certificate file is still open for `doc`: the signer ends after the one signature it
+   * makes, and lets the key go when it has been open for some minutes.
+   */
+  signCertificateOpen(doc: number): Promise<boolean> {
+    return invoke<boolean>("sign_certificate_open", { doc });
+  },
+
+  /** Lets the key go and forgets the file that was chosen. */
+  async signForgetCertificate(): Promise<void> {
+    await invoke<void>("sign_forget_certificate");
+  },
+
+  /** An imported picture for the box of the signature, as raw pixels. Kept until the file is signed. */
+  async signSetImageMark(width: number, height: number, rgba: Uint8ClampedArray): Promise<void> {
+    const bytes = new Uint8Array(rgba.buffer, rgba.byteOffset, rgba.byteLength);
+    await invoke<void>("sign_set_image_mark", bytes, {
+      headers: { "x-signature-image": JSON.stringify({ width, height }) },
+    });
+  },
+
+  /** The signature fields of a document that nobody has signed. Names are text from the file. */
+  signListFields(doc: number): Promise<SignField[]> {
+    return invoke<SignField[]>("sign_list_fields", { doc });
+  },
+
+  /**
+   * Signs the document with the certificate that was opened and writes the signed copy where the
+   * person says (the app opens the dialog). Resolves with null when the person cancels the dialog.
+   */
+  signDocument(doc: number, args: SignRequestArgs): Promise<SignedFile | null> {
+    return invoke<SignedFile | null>("sign_document", { doc, args });
   },
 
   /** What kind of form a document has, and whether it has scripts or actions. */
@@ -387,3 +510,14 @@ export const api = {
     await invoke<void>("open_releases_page");
   },
 };
+
+/** What signing with a certificate needs from the app process. Without all of it the tool is off. */
+export interface CertSignApi {
+  signPickCertificate(): Promise<string | null>;
+  signLoadCertificate(doc: number, password: string): Promise<CertificateInfo>;
+  signCertificateOpen(doc: number): Promise<boolean>;
+  signForgetCertificate(): Promise<void>;
+  signSetImageMark(width: number, height: number, rgba: Uint8ClampedArray): Promise<void>;
+  signListFields(doc: number): Promise<SignField[]>;
+  signDocument(doc: number, args: SignRequestArgs): Promise<SignedFile | null>;
+}

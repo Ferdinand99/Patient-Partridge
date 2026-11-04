@@ -9,6 +9,9 @@ on:
   pull_request:
     paths:
       - "crates/protocol/**"
+      - "crates/signer/**"
+      - "crates/signer-protocol/**"
+      - "crates/sandbox/**"
       - "crates/engine/**"
       - "crates/testkit/**"
       - "pdfium.lock.json"
@@ -59,10 +62,30 @@ jobs:
           - target: protocol_roundtrip_response
             dict: protocol
             args: "-max_len=4096 -timeout=10 -malloc_limit_mb=8"
+          - target: form_author
+            dict: pdf
+            args: "-max_len=4096 -timeout=10 -malloc_limit_mb=256"
+          - target: signature_check
+            dict: protocol
+            args: "-max_len=2048 -timeout=10 -malloc_limit_mb=64"
+          - target: signer_protocol
+            dict: protocol
+            args: "-max_len=131072 -timeout=10 -malloc_limit_mb=16"
+          - target: signer_load
+            dict: protocol
+            # Opening a certificate file runs the key derivation of the file, up to a million rounds.
+            args: "-max_len=8192 -timeout=60 -malloc_limit_mb=1200"
+          - target: sign_prepare
+            dict: pdf
+            args: "-max_len=65536 -timeout=20 -malloc_limit_mb=256"
           # A pure function over bytes: a low timeout, so that a pass that is not one pass fails.
           - target: metadata_check
             dict: pdf
             args: "-max_len=100000 -timeout=5 -malloc_limit_mb=256"
+          # Also inflates data from the file, up to a limit: room for that in the allocation limit.
+          - target: metadata_repair
+            dict: pdf
+            args: "-max_len=100000 -timeout=5 -malloc_limit_mb=512"
           - target: engine_open_render
             dict: pdf
             # No more than the engine itself may use (3 GiB on Linux) in one allocation or in all.

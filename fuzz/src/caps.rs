@@ -10,16 +10,16 @@
 use arbitrary::{Result, Unstructured};
 use partridge_protocol::{
     ability, FontScript, FormValue, LinkTarget, Request, RequestBody, Response, ResponseBody,
-    MAX_ANNOTS_PER_PAGE, MAX_ANNOT_AUTHOR, MAX_ANNOT_TEXT, MAX_COORDINATE, MAX_FORM_ANSWER_BYTES,
-    MAX_FORM_FIELDS_PER_PAGE, MAX_FORM_NAME, MAX_FORM_OPTIONS, MAX_FORM_OPTION_LABEL,
-    MAX_FORM_TOOLTIP, MAX_FORM_VALUE, MAX_INK_POINTS, MAX_INK_STROKES, MAX_INK_WIDTH,
-    MAX_LINKS_PER_PAGE, MAX_MARKUP_CHARS,
-    MAX_MATCHES_PER_PAGE, MAX_OUTLINE_DEPTH, MAX_OUTLINE_ITEMS, MAX_OUTLINE_TITLE, MAX_PAGE_CHARS,
-    MAX_PAGE_TEXT_BYTES, MAX_QUERY_LEN, MAX_RENDER_PIXELS, MAX_RENDER_SIDE, MAX_SAVE_BYTES,
-    MAX_SAVE_CHUNK, MAX_STRING_LEN, MAX_URI_LEN, MIN_INK_WIDTH,
+    MAX_ANNOTS_PER_PAGE, MAX_ANNOT_AUTHOR, MAX_ANNOT_TEXT, MAX_BYTE_RANGE, MAX_COORDINATE,
+    MAX_FORM_ANSWER_BYTES, MAX_FORM_FIELDS_PER_PAGE, MAX_FORM_NAME, MAX_FORM_OPTIONS,
+    MAX_FORM_OPTION_LABEL, MAX_FORM_TOOLTIP, MAX_FORM_VALUE, MAX_INK_POINTS, MAX_INK_STROKES,
+    MAX_INK_WIDTH, MAX_LINKS_PER_PAGE, MAX_MARKUP_CHARS, MAX_MATCHES_PER_PAGE, MAX_OUTLINE_DEPTH,
+    MAX_OUTLINE_ITEMS, MAX_OUTLINE_TITLE, MAX_PAGES, MAX_PAGE_CHARS, MAX_PAGE_TEXT_BYTES,
+    MAX_QUERY_LEN, MAX_RENDER_PIXELS, MAX_RENDER_SIDE, MAX_SAVE_BYTES, MAX_SAVE_CHUNK,
+    MAX_SIGNATURES, MAX_SIG_NAME, MAX_STRING_LEN, MAX_UNIX_TIME, MAX_URI_LEN, MIN_INK_WIDTH,
 };
 
-use crate::chance;
+use crate::{chance, check_signature_report};
 
 // ---- the caps as assertions ----------------------------------------------------------
 
@@ -41,11 +41,22 @@ pub fn check_request_caps(request: &Request) {
         RequestBody::SaveChunk { len, .. } => {
             assert!(*len as usize <= MAX_SAVE_CHUNK, "piece of {len} bytes");
         }
+        RequestBody::Pages(request) => crate::pages::check_pages_request_caps(request),
+        RequestBody::Author(request) => crate::author::check_author_request_caps(request),
+        RequestBody::Sign(request) => crate::sign::check_sign_request_caps(request),
         RequestBody::SetFormField { name, value, .. } => {
-            assert!(name.len() <= MAX_FORM_NAME, "field name of {} bytes", name.len());
+            assert!(
+                name.len() <= MAX_FORM_NAME,
+                "field name of {} bytes",
+                name.len()
+            );
             match value {
                 FormValue::Text(text) => {
-                    assert!(text.len() <= MAX_FORM_VALUE, "value of {} bytes", text.len())
+                    assert!(
+                        text.len() <= MAX_FORM_VALUE,
+                        "value of {} bytes",
+                        text.len()
+                    )
                 }
                 FormValue::Choice(picked) => {
                     assert!(picked.len() <= MAX_FORM_OPTIONS, "{} choices", picked.len())
@@ -66,7 +77,10 @@ pub fn check_request_caps(request: &Request) {
             assert!(x.abs() <= MAX_COORDINATE && y.abs() <= MAX_COORDINATE);
         }
         RequestBody::AddInk { width, strokes, .. } => {
-            assert!((MIN_INK_WIDTH..=MAX_INK_WIDTH).contains(width), "width {width}");
+            assert!(
+                (MIN_INK_WIDTH..=MAX_INK_WIDTH).contains(width),
+                "width {width}"
+            );
             assert!(!strokes.is_empty() && strokes.len() <= MAX_INK_STROKES);
             assert!(strokes.iter().all(|s| !s.is_empty()));
             assert!(strokes.iter().map(Vec::len).sum::<usize>() <= MAX_INK_POINTS);
@@ -77,6 +91,13 @@ pub fn check_request_caps(request: &Request) {
         }
         RequestBody::AddStamp { x, y, .. } => {
             assert!(x.abs() <= MAX_COORDINATE && y.abs() <= MAX_COORDINATE);
+        }
+        RequestBody::AddSignature { rect, mark, .. } => {
+            assert!(rect.iter().all(|v| v.abs() <= MAX_COORDINATE));
+            crate::marks::check_mark_caps(mark);
+        }
+        RequestBody::PlaceSignature { rect, .. } => {
+            assert!(rect.iter().all(|v| v.abs() <= MAX_COORDINATE));
         }
         RequestBody::UpdateAnnot { text, dx, dy, .. } => {
             if let Some(text) = text {
@@ -115,8 +136,13 @@ pub fn check_response_caps(response: &Response) {
         }
         ResponseBody::Annot { item } => check_annot(item),
         ResponseBody::AnnotRemoved => {}
-        ResponseBody::Opened { .. }
-        | ResponseBody::Closed
+        ResponseBody::Opened { pages, .. } => {
+            assert!(pages.len() <= MAX_PAGES, "{} pages", pages.len());
+        }
+        ResponseBody::Pages(response) => crate::pages::check_pages_response_caps(response),
+        ResponseBody::Author(response) => crate::author::check_author_response_caps(response),
+        ResponseBody::Sign(response) => crate::sign::check_sign_response_caps(response),
+        ResponseBody::Closed
         | ResponseBody::DocInfo { .. }
         | ResponseBody::Progress { .. }
         | ResponseBody::Fingerprint { .. }
@@ -183,6 +209,7 @@ pub fn check_response_caps(response: &Response) {
                 matches.len()
             );
         }
+        ResponseBody::Signatures { report } => check_signature_report(report),
         ResponseBody::FormInfo { .. } => {}
         ResponseBody::FormFields { fields } => {
             assert!(
@@ -201,7 +228,11 @@ pub fn check_response_caps(response: &Response) {
             }
         }
         ResponseBody::FontReport { missed } => {
-            assert!(missed.len() <= FontScript::ALL.len(), "{} scripts", missed.len());
+            assert!(
+                missed.len() <= FontScript::ALL.len(),
+                "{} scripts",
+                missed.len()
+            );
         }
         ResponseBody::Error { message, .. } => {
             assert!(message.len() <= MAX_STRING_LEN);
@@ -210,13 +241,22 @@ pub fn check_response_caps(response: &Response) {
 }
 
 fn check_annot(item: &partridge_protocol::AnnotInfo) {
-    assert!(item.text.len() <= MAX_ANNOT_TEXT, "text of {} bytes", item.text.len());
+    assert!(
+        item.text.len() <= MAX_ANNOT_TEXT,
+        "text of {} bytes",
+        item.text.len()
+    );
     assert!(
         item.author.len() <= MAX_ANNOT_AUTHOR,
         "author of {} bytes",
         item.author.len()
     );
-    assert_eq!(item.abilities & !ability::ALL, 0, "abilities {}", item.abilities);
+    assert_eq!(
+        item.abilities & !ability::ALL,
+        0,
+        "abilities {}",
+        item.abilities
+    );
     assert!(item.rect.iter().all(|v| v.is_finite()));
 }
 
@@ -280,12 +320,17 @@ fn form_answer(id: u32, name: usize, value: usize, options: usize, label: usize)
 }
 
 /// How many cases `over_cap_request_case` has.
-pub const OVER_CAP_REQUESTS: usize = 14;
+pub const OVER_CAP_REQUESTS: usize =
+    15 + crate::marks::MARK_OVER_REQUESTS + crate::pages::PAGES_OVER_REQUESTS;
 
 /// A request that is valid except that one string is one byte over its cap. Returns a name and
 /// the payload; the decoder must return an error.
 pub fn over_cap_request_case(case: usize, id: u32) -> (&'static str, Vec<u8>) {
     match case % OVER_CAP_REQUESTS {
+        n if n >= 15 + crate::marks::MARK_OVER_REQUESTS => {
+            crate::pages::pages_over_cap_request_case(n - 15 - crate::marks::MARK_OVER_REQUESTS, id)
+        }
+        n if n >= 15 => crate::marks::mark_over_cap_request_case(n - 15, id),
         0 => {
             let mut p = header(2, id);
             p.push(1);
@@ -429,7 +474,7 @@ pub fn over_cap_request_case(case: usize, id: u32) -> (&'static str, Vec<u8>) {
             p.extend_from_slice(&[2, 1]);
             ("form field name over the cap", p)
         }
-        _ => {
+        13 => {
             // A text for a field that is one byte longer than a value may be.
             let mut p = header(42, id);
             for v in [1u32, 0, 0] {
@@ -440,11 +485,20 @@ pub fn over_cap_request_case(case: usize, id: u32) -> (&'static str, Vec<u8>) {
             push_str(&mut p, MAX_FORM_VALUE + 1);
             ("form field value over the cap", p)
         }
+        _ => {
+            // The time of the check is later than the end of the year 9999.
+            let mut p = header(60, id);
+            push_u32(&mut p, 1);
+            let now = MAX_UNIX_TIME as u64 + 1;
+            push_u32(&mut p, now as u32);
+            push_u32(&mut p, (now >> 32) as u32);
+            ("signature check time past the year 9999", p)
+        }
     }
 }
 
 /// How many cases `over_cap_response_case` has.
-pub const OVER_CAP_RESPONSES: usize = 31;
+pub const OVER_CAP_RESPONSES: usize = 37 + crate::pages::PAGES_OVER_RESPONSES;
 
 /// The two cases that are 1.7 MB.
 const PAGE_TEXT_OVER: usize = 6;
@@ -452,12 +506,15 @@ const PAGE_TEXT_AT_CAP: usize = 11;
 /// The two cases that are 1 MiB.
 const SAVE_PIECE_OVER: usize = 17;
 const SAVE_PIECE_AT_CAP: usize = 18;
+/// The three cases of the page tools that are 800 KB, 320 KB and 800 KB.
+const PAGES_BIG: [usize; 3] = [37, 38, 39];
 
 /// A response that is valid except for one thing, which is one over a cap. Two cases sit exactly
 /// at a cap instead (the biggest page text, the widest bitmap) and must be accepted. Returns a
 /// name, the payload, and whether the decoder must accept it.
 pub fn over_cap_response_case(case: usize, id: u32) -> (&'static str, Vec<u8>, bool) {
     match case % OVER_CAP_RESPONSES {
+        n if n >= 37 => crate::pages::pages_over_cap_response_case(n - 37, id),
         0 => {
             let mut p = header(133, id);
             push_u32(&mut p, MAX_OUTLINE_ITEMS as u32 + 1);
@@ -666,10 +723,26 @@ pub fn over_cap_response_case(case: usize, id: u32) -> (&'static str, Vec<u8>, b
             push_annot(&mut p, MAX_ANNOT_TEXT, MAX_ANNOT_AUTHOR);
             ("annotation with the longest text and author", p, true)
         }
-        26 => ("form field name over the cap", form_answer(id, MAX_FORM_NAME + 1, 1, 0, 0), false),
-        27 => ("form field value over the cap", form_answer(id, 1, MAX_FORM_VALUE + 1, 0, 0), false),
-        28 => ("form field with one choice too many", form_answer(id, 1, 1, MAX_FORM_OPTIONS + 1, 0), false),
-        29 => ("form field at every cap", form_answer(id, MAX_FORM_NAME, MAX_FORM_VALUE, MAX_FORM_OPTIONS, 4), true),
+        26 => (
+            "form field name over the cap",
+            form_answer(id, MAX_FORM_NAME + 1, 1, 0, 0),
+            false,
+        ),
+        27 => (
+            "form field value over the cap",
+            form_answer(id, 1, MAX_FORM_VALUE + 1, 0, 0),
+            false,
+        ),
+        28 => (
+            "form field with one choice too many",
+            form_answer(id, 1, 1, MAX_FORM_OPTIONS + 1, 0),
+            false,
+        ),
+        29 => (
+            "form field at every cap",
+            form_answer(id, MAX_FORM_NAME, MAX_FORM_VALUE, MAX_FORM_OPTIONS, 4),
+            true,
+        ),
         30 => {
             let mut p = header(171, id);
             push_u32(&mut p, MAX_FORM_FIELDS_PER_PAGE as u32 + 1);
@@ -678,8 +751,83 @@ pub fn over_cap_response_case(case: usize, id: u32) -> (&'static str, Vec<u8>, b
             }
             ("page with one form field too many", p, false)
         }
+        31 => {
+            let mut p = header(190, id);
+            for v in [MAX_SIGNATURES as u32 + 1, 0, 0, MAX_SIGNATURES as u32 + 1] {
+                push_u32(&mut p, v);
+            }
+            for index in 0..=MAX_SIGNATURES as u32 {
+                push_signature(&mut p, index, 0, 0);
+            }
+            ("signature report with one signature too many", p, false)
+        }
+        32 => {
+            let mut p = signature_report(id);
+            push_signature(&mut p, 0, MAX_SIG_NAME + 1, 0);
+            ("signer name one byte too long", p, false)
+        }
+        33 => {
+            let mut p = signature_report(id);
+            push_signature(&mut p, 0, MAX_SIG_NAME, 0);
+            ("signer name of the most bytes", p, true)
+        }
+        34 => {
+            let mut p = signature_report(id);
+            push_signature(&mut p, 0, 0, MAX_BYTE_RANGE + 1);
+            ("signature byte range of one number too many", p, false)
+        }
+        35 => {
+            // A tick for a signature whose reason is a broken one.
+            let mut p = signature_report(id);
+            push_signature(&mut p, 0, 0, 0);
+            p[1 + 4 + 12 + 4 + 4] = 1;
+            (
+                "trusted state with the reason of a broken signature",
+                p,
+                false,
+            )
+        }
+        36 => {
+            let mut p = signature_report(id);
+            push_signature(&mut p, 0, 0, 0);
+            // Make the signer a text with a line break in it.
+            let at = p.len() - 13;
+            p[at] = 1;
+            p.splice(at + 1..at + 1, [2, 0, 0, 0, b'a', 10]);
+            ("signer name with a line break", p, false)
+        }
         _ => unreachable!("the case number is taken modulo the number of cases"),
     }
+}
+
+/// The start of a report with one signature in it.
+fn signature_report(id: u32) -> Vec<u8> {
+    let mut p = header(190, id);
+    for v in [1u32, 0, 0, 1] {
+        push_u32(&mut p, v);
+    }
+    p
+}
+
+/// One described signature (unknown signer, no trust list) whose signer name has `name` bytes and
+/// whose byte range has `ranges` numbers; the rest is empty.
+fn push_signature(out: &mut Vec<u8>, index: u32, name: usize, ranges: usize) {
+    push_u32(out, index);
+    out.extend_from_slice(&[2, 50, 1, 0, 1]);
+    push_u32(out, 0);
+    out.push(ranges as u8);
+    for _ in 0..ranges {
+        out.extend_from_slice(&0u64.to_le_bytes());
+    }
+    out.extend_from_slice(&0u64.to_le_bytes());
+    // The signer, then twelve more optional texts, all absent.
+    if name > 0 {
+        out.push(1);
+        push_str(out, name);
+    } else {
+        out.push(0);
+    }
+    out.extend_from_slice(&[0; 12]);
 }
 
 /// One listed annotation: a note with the given lengths of text and author. Bytes of an entry:
@@ -708,7 +856,7 @@ pub fn over_cap_response(u: &mut Unstructured) -> Result<(&'static str, Vec<u8>,
     let big = matches!(
         case,
         PAGE_TEXT_OVER | PAGE_TEXT_AT_CAP | SAVE_PIECE_OVER | SAVE_PIECE_AT_CAP
-    );
+    ) || PAGES_BIG.contains(&case);
     if big && !chance(u, 16)? {
         case = 0;
     }

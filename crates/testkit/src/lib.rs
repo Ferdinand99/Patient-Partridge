@@ -7,6 +7,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use md5::{Digest, Md5};
 
+mod pages;
+pub use pages::*;
+pub mod signed;
+
 /// One page of a generated document.
 pub struct PageSpec {
     pub width: u32,
@@ -478,6 +482,48 @@ BT /F1 12 Tf 72 400 Td 16 TL (A needle in a haystack.) Tj T* (Another NEEDLE her
     build(&specs, "", "", extras)
 }
 
+/// A document whose first page lists its annotations in place (as dictionaries inside `/Annots`,
+/// the way a program that makes them with PDFium's calls writes them), with text and authors in
+/// PDFDocEncoding (single bytes above 127) and in UTF-16, and a trailer `/ID` of binary bytes. None
+/// of the strings is valid UTF-8.
+pub fn direct_annots_pdf() -> Vec<u8> {
+    let specs = [PageSpec {
+        width: 612,
+        height: 792,
+        content: Some(demo_content(1, 612, 792)),
+        extra: String::new(),
+    }];
+    let mut objects = build_objects(&specs, "", Vec::new());
+    let mut annots: Vec<u8> = b"/Annots [".to_vec();
+    for item in DIRECT_ANNOTS {
+        annots.extend_from_slice(item);
+        annots.push(b' ');
+    }
+    annots.extend_from_slice(b"] ");
+    let page = &mut objects[3];
+    page.truncate(page.len() - 2);
+    page.extend_from_slice(&annots);
+    page.extend_from_slice(b">>");
+    let mut out = assemble(&objects, "");
+    let marker = b" >>\nstartxref\n";
+    let at = out
+        .windows(marker.len())
+        .rposition(|w| w == marker)
+        .expect("the trailer ends where the table is pointed at");
+    out.splice(at..at, DIRECT_ID.iter().copied());
+    out
+}
+
+/// The annotations of [`direct_annots_pdf`], as written in the page's list.
+pub const DIRECT_ANNOTS: [&[u8]; 3] = [
+    b"<< /Type /Annot /Subtype /Text /Rect [300 700 320 720] /C [1 1 0] /Name /Comment /Contents (Bl\xE5b\xE6r) /T (\xC6rlig \xD8yvind) /F 4 >>",
+    b"<< /Type /Annot /Subtype /Highlight /Rect [72 650 200 670] /QuadPoints [72 670 200 670 72 650 200 650] /C [1 0 0] /Contents (\xFE\xFF\x00B\x00l\x00\xE5\x00b\x00\xE6\x00r\x03\xA9\x65\xE5) /T (\xFE\xFF\x00\xC6\x00r\x00l\x00i\x00g\x00 \x00\xD8) /F 4 >>",
+    b"<< /Type /Annot /Subtype /Stamp /Rect [400 600 500 650] /Name /Approved /Contents (St\xF8tte \xE6\xF8\xE5) /T (\xD8yvind) /F 4 >>",
+];
+
+/// The `/ID` that [`direct_annots_pdf`] has in its trailer: two strings of binary bytes.
+pub const DIRECT_ID: &[u8] = b" /ID [(\x80\xFF\x00\x01\xE5\xA0bin\x7F) (\xFE\xFF\xC3\xA8id2\xE6)]";
+
 /// A document with annotations that try to make a reader misbehave: a comment and an author far
 /// longer than any limit, control characters and direction marks in the text, text that looks like
 /// markup, and a box that is a million points wide. The first page has them; the engine has to
@@ -762,6 +808,46 @@ pub fn free_text_without_appearance_pdf() -> Vec<u8> {
     build(&specs, "", "", extras)
 }
 
+/// The content of every stream of a file that inflates (an empty or a damaged one is left out),
+/// in the order of the file, at most 64 MiB each. A stream that is not compressed is not here: look
+/// for it in the file itself.
+pub fn inflated_streams(file: &[u8]) -> Vec<Vec<u8>> {
+    use std::io::Read as _;
+    let mut found = Vec::new();
+    let mut at = 0;
+    while let Some(start) = file[at..]
+        .windows(6)
+        .position(|w| w == b"stream")
+        .map(|p| p + at)
+    {
+        let mut body = start + 6;
+        if file.get(body) == Some(&b'\r') {
+            body += 1;
+        }
+        if file.get(body) == Some(&b'\n') {
+            body += 1;
+        }
+        let Some(end) = file[body..]
+            .windows(9)
+            .position(|w| w == b"endstream")
+            .map(|p| p + body)
+        else {
+            break;
+        };
+        let mut out = Vec::new();
+        if flate2::read::ZlibDecoder::new(&file[body..end])
+            .take(64 << 20)
+            .read_to_end(&mut out)
+            .is_ok()
+            && !out.is_empty()
+        {
+            found.push(out);
+        }
+        at = end + 9;
+    }
+    found
+}
+
 /// The forms in which a text can be in a saved file: as it is, as UTF-16 and as the hex strings
 /// of both. A text is there when any form is in the file or in a stream that has been inflated.
 pub fn text_in_file(file: &[u8], text: &str) -> bool {
@@ -793,40 +879,7 @@ pub fn text_in_file(file: &[u8], text: &str) -> bool {
     ];
     let mut haystacks: Vec<Vec<u8>> = vec![file.to_vec()];
     // Every stream, inflated when it can be.
-    let mut at = 0;
-    while let Some(start) = file[at..]
-        .windows(6)
-        .position(|w| w == b"stream")
-        .map(|p| p + at)
-    {
-        let mut body = start + 6;
-        if file.get(body) == Some(&b'\r') {
-            body += 1;
-        }
-        if file.get(body) == Some(&b'\n') {
-            body += 1;
-        }
-        let Some(end) = file[body..]
-            .windows(9)
-            .position(|w| w == b"endstream")
-            .map(|p| p + body)
-        else {
-            break;
-        };
-        {
-            use std::io::Read as _;
-            let mut out = Vec::new();
-            if flate2::read::ZlibDecoder::new(&file[body..end])
-                .take(64 << 20)
-                .read_to_end(&mut out)
-                .is_ok()
-                && !out.is_empty()
-            {
-                haystacks.push(out);
-            }
-        }
-        at = end + 9;
-    }
+    haystacks.extend(inflated_streams(file));
     haystacks.iter().any(|h| needles.iter().any(|n| find(h, n)))
 }
 
@@ -1317,7 +1370,18 @@ fn rc4(key: &[u8], data: &[u8]) -> Vec<u8> {
 /// `user_password` to open. The pages are blank so nothing has to be encrypted besides the
 /// handler's own entries.
 pub fn encrypted_pdf(user_password: &str, pages: usize) -> Vec<u8> {
-    encrypted_pdf_with_permissions(user_password, pages, -4)
+    encrypted_pdf_impl(user_password, None, pages, -4, false, None)
+}
+
+/// As [`encrypted_pdf`], with the permissions `permissions` (the `/P` entry) and, when `r3` is true,
+/// the 128 bit RC4 handler of revision 3 instead of the 40 bit one of revision 2.
+pub fn encrypted_pdf_with(
+    user_password: &str,
+    pages: usize,
+    permissions: i32,
+    r3: bool,
+) -> Vec<u8> {
+    encrypted_pdf_impl(user_password, None, pages, permissions, r3, None)
 }
 
 /// As `encrypted_pdf`, with the permission bits the file grants (`-4` grants everything; clear
@@ -1327,11 +1391,11 @@ pub fn encrypted_pdf_with_permissions(
     pages: usize,
     permissions: i32,
 ) -> Vec<u8> {
-    encrypted_pdf_impl(user_password, None, pages, permissions, None)
+    encrypted_pdf_impl(user_password, None, pages, permissions, false, None)
 }
 
 /// As `encrypted_pdf_with_permissions`, with an owner password that opens the document with every
-/// permission whatever the file grants the user.
+/// permission whatever the file grants the user (the 40 bit handler of revision 2).
 pub fn encrypted_pdf_with_owner(
     user_password: &str,
     owner_password: &str,
@@ -1343,6 +1407,7 @@ pub fn encrypted_pdf_with_owner(
         Some(owner_password),
         pages,
         permissions,
+        false,
         None,
     )
 }
@@ -1352,6 +1417,7 @@ fn encrypted_pdf_impl(
     owner_password: Option<&str>,
     pages: usize,
     permissions: i32,
+    r3: bool,
     xmp: Option<bool>,
 ) -> Vec<u8> {
     let mut padded = [0u8; 32];
@@ -1379,16 +1445,45 @@ fn encrypted_pdf_impl(
     };
     let id: [u8; 16] = *b"partridge-test-1";
 
-    // Algorithm 2 for revision 2: the file key.
+    // Algorithm 2: the file key.
     let mut md5 = Md5::new();
     md5.update(padded);
     md5.update(&owner);
     md5.update(permissions.to_le_bytes());
     md5.update(id);
-    let key = md5.finalize()[..5].to_vec();
-    // Algorithm 4: the user entry is the padding string encrypted with the file key.
-    let user = rc4(&key, &PADDING);
+    let mut digest = md5.finalize().to_vec();
+    let key_len = if r3 { 16 } else { 5 };
+    if r3 {
+        for _ in 0..50 {
+            let mut again = Md5::new();
+            again.update(&digest[..key_len]);
+            digest = again.finalize().to_vec();
+        }
+    }
+    let key = digest[..key_len].to_vec();
+    // Algorithm 4 (revision 2): the user entry is the padding string encrypted with the file key.
+    // Algorithm 5 (revision 3): the hash of the padding and the file id, encrypted 20 times with
+    // the key changed by the round, then padded to 32 bytes.
+    let user = if r3 {
+        let mut seed = Md5::new();
+        seed.update(PADDING);
+        seed.update(id);
+        let mut data = rc4(&key, &seed.finalize());
+        for round in 1..=19u8 {
+            let k: Vec<u8> = key.iter().map(|b| b ^ round).collect();
+            data = rc4(&k, &data);
+        }
+        data.extend_from_slice(&[0u8; 16]);
+        data
+    } else {
+        rc4(&key, &PADDING)
+    };
 
+    let handler = if r3 {
+        "/V 2 /R 3 /Length 128"
+    } else {
+        "/V 1 /R 2"
+    };
     // `/EncryptMetadata false` is the word of a file whose XMP stream is meant to stay in the clear.
     let clear = if xmp == Some(true) {
         " /EncryptMetadata false"
@@ -1396,7 +1491,7 @@ fn encrypted_pdf_impl(
         ""
     };
     let encrypt_object = format!(
-        "<< /Filter /Standard /V 1 /R 2 /P {permissions} /O <{}> /U <{}>{clear} >>",
+        "<< /Filter /Standard {handler} /P {permissions} /O <{}> /U <{}>{clear} >>",
         hex(&owner),
         hex(&user)
     )
@@ -1435,7 +1530,7 @@ fn encrypted_pdf_impl(
 /// encryption dictionary says `/EncryptMetadata false`, as a file that keeps its metadata readable
 /// does; without it the stream is meant to be encrypted, and a save of it has to be refused.
 pub fn encrypted_xmp_pdf(user_password: &str, clear: bool) -> Vec<u8> {
-    encrypted_pdf_impl(user_password, None, 1, -4, Some(clear))
+    encrypted_pdf_impl(user_password, None, 1, -4, false, Some(clear))
 }
 
 /// The title in the XMP packet of the catalog of [`xmp_pdf`].
@@ -1475,21 +1570,61 @@ pub fn xmp_pdf(catalog_xmp: bool, page_xmp: bool) -> Vec<u8> {
 
 /// As [`xmp_pdf`]; with `compressed` the XMP streams are Flate compressed, as some writers make them.
 pub fn xmp_pdf_with(catalog_xmp: bool, page_xmp: bool, compressed: bool) -> Vec<u8> {
-    xmp_pdf_impl(catalog_xmp, page_xmp, compressed, false, "")
+    xmp_pdf_impl(catalog_xmp, page_xmp, compressed, false, "", None)
 }
 
 /// As [`xmp_pdf`] with a catalog stream whose `/Type` is an indirect reference to the name
 /// `/Metadata` (object 11). A reader that does not follow the reference does not take the stream
 /// for a metadata stream, and encrypts it like any other.
 pub fn xmp_indirect_type_pdf() -> Vec<u8> {
-    xmp_pdf_impl(true, false, false, true, "")
+    xmp_pdf_impl(true, false, false, true, "", None)
 }
 
 /// As [`xmp_pdf`] with a catalog stream and `keys` keys of no meaning in the trailer. A writer
 /// copies the keys of a trailer that it does not know, so their number is the file's own.
 pub fn xmp_pdf_with_trailer_keys(keys: usize) -> Vec<u8> {
     let extra: String = (0..keys).map(|i| format!(" /K{i} 1")).collect();
-    xmp_pdf_impl(true, false, false, false, &extra)
+    xmp_pdf_impl(true, false, false, false, &extra, None)
+}
+
+/// As [`xmp_pdf`] with a catalog XMP stream that holds `data` as it is, with `dict` (more keys,
+/// such as a `/Filter`) in its dictionary next to `/Type /Metadata /Subtype /XML`.
+pub fn xmp_pdf_raw(dict: &str, data: &[u8]) -> Vec<u8> {
+    xmp_pdf_impl(true, false, false, false, "", Some((dict, data)))
+}
+
+/// `data` compressed the way a PDF Flate filter does.
+pub fn flate(data: &[u8]) -> Vec<u8> {
+    deflate(data)
+}
+
+/// `data` the way the PDF filter `ASCIIHexDecode` writes it.
+pub fn ascii_hex(data: &[u8]) -> Vec<u8> {
+    let mut text: String = data.iter().map(|b| format!("{b:02X}")).collect();
+    text.push('>');
+    text.into_bytes()
+}
+
+/// `data` the way the PDF filter `ASCII85Decode` writes it.
+pub fn ascii_85(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for chunk in data.chunks(4) {
+        let mut block = [0u8; 4];
+        block[..chunk.len()].copy_from_slice(chunk);
+        let mut value = u32::from_be_bytes(block);
+        if chunk.len() == 4 && value == 0 {
+            out.push(b'z');
+            continue;
+        }
+        let mut digits = [0u8; 5];
+        for slot in digits.iter_mut().rev() {
+            *slot = (value % 85) as u8 + b'!';
+            value /= 85;
+        }
+        out.extend_from_slice(&digits[..chunk.len() + 1]);
+    }
+    out.extend_from_slice(b"~>");
+    out
 }
 
 fn xmp_pdf_impl(
@@ -1498,6 +1633,7 @@ fn xmp_pdf_impl(
     compressed: bool,
     indirect_type: bool,
     trailer_extra: &str,
+    raw: Option<(&str, &[u8])>,
 ) -> Vec<u8> {
     let catalog_id = 10;
     let page_id = if catalog_xmp { 11 } else { 10 };
@@ -1557,7 +1693,13 @@ endcmap CMapName currentdict /CMap defineresource pop end end\n% {}\n",
         }
     };
     if catalog_xmp {
-        objects.push(xmp_stream(XMP_CATALOG_TITLE));
+        match raw {
+            Some((dict, data)) => objects.push(binary_stream(
+                &format!("/Type /Metadata /Subtype /XML {dict}"),
+                data,
+            )),
+            None => objects.push(xmp_stream(XMP_CATALOG_TITLE)),
+        }
     }
     if page_xmp {
         objects.push(xmp_stream(XMP_PAGE_TITLE));
@@ -1566,6 +1708,55 @@ endcmap CMapName currentdict /CMap defineresource pop end end\n% {}\n",
         objects.push(b"/Metadata".to_vec());
     }
     assemble(&objects, trailer_extra)
+}
+
+/// What [`flate_streams_pdf`] holds in its streams once they are inflated.
+pub const FLATE_STREAM_PAYLOADS: [&str; 4] = [
+    "BT /F1 24 Tf 72 700 Td (Flate Content 6612) Tj ET",
+    "Font Program Marker 1187",
+    "Icc Profile Marker 4451",
+    "Image Samples Marker 9034",
+];
+
+/// A one page document whose page content, font program, colour profile and picture are all Flate
+/// compressed, with a Flate compressed XMP stream on the catalog ([`XMP_CATALOG_TITLE`]). The
+/// payloads, inflated, are [`FLATE_STREAM_PAYLOADS`].
+pub fn flate_streams_pdf() -> Vec<u8> {
+    let flated = |extra: &str, text: &str| {
+        binary_stream(
+            &format!("/Filter /FlateDecode {extra}"),
+            &deflate(text.as_bytes()),
+        )
+    };
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R /Metadata 8 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> /XObject << /Im0 7 0 R >> /ColorSpace << /CS0 [/ICCBased 6 0 R] >> >> >>"
+            .to_vec(),
+        // The picture and the colour profile are used, so that a page whose content is written
+        // again (an edit) keeps them.
+        flated(
+            "",
+            &format!(
+                "{}\n/CS0 cs 0.1 0.2 0.3 sc q 50 0 0 50 100 600 cm /Im0 Do Q",
+                FLATE_STREAM_PAYLOADS[0]
+            ),
+        ),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FontDescriptor 9 0 R >>".to_vec(),
+        flated("/N 3 /Alternate /DeviceRGB", FLATE_STREAM_PAYLOADS[2]),
+        flated(
+            "/Type /XObject /Subtype /Image /Width 5 /Height 5 /ColorSpace /DeviceGray /BitsPerComponent 8",
+            FLATE_STREAM_PAYLOADS[3],
+        ),
+        binary_stream(
+            "/Type /Metadata /Subtype /XML /Filter /FlateDecode",
+            &deflate(xmp_packet(XMP_CATALOG_TITLE).as_bytes()),
+        ),
+        b"<< /Type /FontDescriptor /FontName /Helvetica /Flags 32 /FontBBox [0 0 1000 1000] /ItalicAngle 0 /Ascent 900 /Descent -200 /CapHeight 700 /StemV 80 /FontFile 10 0 R >>"
+            .to_vec(),
+        flated("/Length1 24", FLATE_STREAM_PAYLOADS[1]),
+    ];
+    assemble(&objects, "")
 }
 
 /// Folder name used for a platform in `vendor/pdfium` and in the pinned PDFium list.

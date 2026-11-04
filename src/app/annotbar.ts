@@ -20,6 +20,8 @@ export interface AnnotBarHandlers {
   setColor(color: Rgba): void;
   setPenWidth(width: number): void;
   setStamp(stamp: StampName): void;
+  /** The signature picture tool was pressed: the box for making or picking a picture opens. */
+  openSignature(): void;
   editText(): void;
   remove(): void;
   undo(): void;
@@ -90,6 +92,11 @@ export class AnnotBar {
       const button = byId<HTMLButtonElement>(root, `tool-${info.id}`);
       this.toolButtons.set(info.id, button);
       if (info.id === "stamp") continue;
+      if (info.id === "signature") {
+        button.setAttribute("aria-haspopup", "dialog");
+        button.addEventListener("click", () => this.handlers.openSignature());
+        continue;
+      }
       button.addEventListener("click", () => this.handlers.setTool(info.id));
     }
 

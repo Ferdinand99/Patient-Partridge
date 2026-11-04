@@ -21,7 +21,7 @@ Read PDFs, mark them up and fill in forms, without an account, a cloud, advertis
 
 > The screenshots are taken from a real Linux build (Xvfb) with a generated sample PDF.
 
-Today Patient Partridge reads PDFs, marks them up with annotations and fills in their forms. The other editing tools are planned and do not exist yet (see the [Roadmap](#roadmap)). Patient Partridge is part of the Hedgerow family of apps, next to [Nimble Newt](https://github.com/Ferdinand99/Nimble-Newt).
+Today Patient Partridge reads PDFs, marks them up with annotations, fills in their forms, makes new fillable forms, puts a picture of your signature on a page, signs with a certificate, checks digital signatures and works on their pages (the last five are new in 0.3, which is not released yet; the released 0.2.x reads, annotates and fills in forms). The other editing tools are planned and do not exist yet (see the [Roadmap](#roadmap)). Patient Partridge is part of the Hedgerow family of apps, next to [Nimble Newt](https://github.com/Ferdinand99/Nimble-Newt).
 
 **Status: early release.** The latest version is on the [releases page](https://github.com/Ferdinand99/Patient-Partridge/releases/latest). Expect rough edges and missing features.
 
@@ -47,6 +47,11 @@ Every feature in detail is in [docs/features.md](docs/features.md).
 - **Passwords and damaged files.** Password-protected files ask for the password; a damaged file, or a file that is not a PDF, gives a clear message instead of a crash. [Details](docs/features.md#passwords-and-damaged-files)
 - **Annotations.** Highlight, underline, strike out, notes, a pen and stamps, in six colours. They are real PDF annotations written by PDFium with appearance streams, so other readers can show and edit them. Annotations a file already has can be changed or removed, with some limits. [Details](docs/features.md#annotations)
 - **Filling in forms.** Text fields, check boxes, radio buttons, drop-down lists and list boxes of a PDF form (AcroForm) are filled in and saved so that other readers show the result. [Details](docs/features.md#filling-in-forms)
+- **Making forms.** The Edit form button opens a bar with Text, Check box, Radio, Drop-down, List and Signature tools and a panel for the picked field. Click or drag on a page to place a field, move and resize it, name it and set its properties; the fields are real form fields written into the file. Version 0.3. [Details](docs/features.md#making-forms)
+- **Page tools.** Pick pages in the side panel and turn, delete, move, crop or copy them to a new file, add a blank page, or add all the pages of other PDF files (which is also how files are merged). Every change can be taken back with Ctrl+Z. Version 0.3. [Details](docs/features.md#page-tools)
+- **A picture of a signature.** The Signature picture tool of the annotation bar puts a drawn, typed or imported picture of your signature on a page. **It is a picture, not a digital signature.** Version 0.3. [Details](docs/features.md#a-picture-of-a-signature)
+- **Signing with a certificate.** The Sign with a certificate entry of the settings menu signs a copy of the open document with the key in a certificate file (.p12 or .pfx) and its password, which is not saved. RSA 2048 to 4096 and ECDSA P-256 and P-384; where the signature shows, and what it says, are your choice. The signing time is this computer's clock, no time stamp is added, and the document you had open is saved first if it has changes, and is not changed by the signing. Version 0.3. [Details](docs/certificate-signing.md)
+- **Digital signatures, read-only.** A signed document gets a badge and a panel that shows each signature as intact, changed or broken, with the certificate of the signer. The engine checks them in its sandbox. Version 0.3. [Details](docs/features.md#digital-signatures-read-only), [what is checked](docs/digital-signatures.md)
 - **Safe saving.** Save and Save a copy write a new file next to the old one, have a second sandboxed engine check it, and only then replace the old file in one step. If anything goes wrong, the file on disk is exactly as it was. [Details](docs/features.md#saving)
 - **Unsaved changes and undo.** A tab with unsaved changes shows a dot, and closing or quitting asks first. Undo and redo cover the last 200 changes of the open document. [Details](docs/features.md#unsaved-changes-and-undo)
 - **Updates.** The app updates itself from GitHub Releases with a signature check; see [Updates](#updates).
@@ -87,6 +92,7 @@ On macOS, `Cmd` takes the place of `Ctrl`. The annotation keys work with the doc
 | Ctrl+Plus, Ctrl+Minus, Ctrl+0, Ctrl+1 | Zoom in, zoom out, fit the width, 100 % |
 | Arrow keys, Page Up, Page Down, Space, Home, End | Move through the document |
 | Ctrl+Shift+A | Show or hide the annotation bar |
+| Arrow keys, Shift, Alt, Delete, Enter, Esc (a picked field in Edit form) | Move a field by a point (ten with Shift), resize it with Alt, delete it, move to the panel, let go or go back to Select |
 | V, H, U, T, N, P, M | Select, Highlight, Underline, Strike out, Note, Pen, Stamp (with the document in front, not while typing). M again opens the list of stamps |
 | Enter (Note or Stamp tool) | Place the note or the stamp in the middle of what is shown |
 | Tab, Enter, Delete, arrow keys (a picked annotation) | Pick an annotation, change its text, delete it, move a note by 4 points (24 with Shift) |
@@ -101,10 +107,14 @@ The pen needs a pointer: there is no way to draw with the keyboard. The text to 
 The full list, with the reasons, is in [docs/known-limits.md](docs/known-limits.md). The ones to know first:
 
 - **Deleting an annotation is not redaction.** Saving after a delete leaves the text of the comment out of the new file, but nothing on the page itself is removed, and copies and backups made before the save still hold the text. Real redaction is planned. [Details](docs/known-limits.md#annotations)
-- **The engine on Windows is not blocked from the network in 0.2.x.** The sandbox keeps files, windows, the clipboard, other processes and memory away from it, but an exploited engine could send out what it can read. On Linux and macOS the network is blocked. [Details](docs/security.md#what-it-does-not-cover)
-- **Digital signatures.** A save always writes the whole document again, so saving a signed document breaks its signature. The app asks first (Cancel, Save a copy, Save anyway). Validating signatures is not there yet. [Details](docs/known-limits.md#saving-and-digital-signatures)
+- **The engine on Windows is not blocked from the network in 0.2.x.** The sandbox keeps files, windows, the clipboard, other processes and memory away from it, but an exploited engine could send out what it can read. On Linux and macOS the network is blocked. From 0.3 the engine on Windows runs in an AppContainer without network capabilities; the details, including what is known and what is only inferred, are in the security page. [Details](docs/security.md#what-it-does-not-cover)
+- **Digital signatures.** A save always writes the whole document again, so saving a signed document breaks its signature. The app asks first (Cancel, Save a copy, Save anyway). Checking signatures is not there in 0.2.x; 0.3 checks them and can sign with a certificate, and its trust list is empty, so no signature is shown as trusted. [Details](docs/known-limits.md#saving-and-digital-signatures), [what is checked](docs/digital-signatures.md)
 - **A file that another program rewrites while it is open** loses every edit you made since you opened it: Save and Save a copy refuse, and you have to open the file again. [Details](docs/known-limits.md#a-file-that-changes-while-it-is-open)
 - **Forms.** XFA forms are shown but not filled in, and PDF JavaScript never runs, so fields that are calculated by script do not update. [Details](docs/known-limits.md#forms)
+- **Making forms (0.3).** Only documents the writer can read are changed (not encrypted ones, XFA forms or documents whose structure it does not understand), text a field draws must be in Latin-1, and only fields the designer made, with no action, can be changed by it. [Details](docs/known-limits.md#making-forms)
+- **Signing with a certificate (0.3).** Documents that already hold signatures, encrypted documents and XFA forms are not signed; no time stamp is written; a signature made today shows as "signer not verified" here. [Details](docs/known-limits.md#signing-with-a-certificate)
+- **A picture of a signature (0.3)** proves nothing about who placed it; after a save it is an ordinary stamp that can be removed but not moved; placed over a form field it may be hidden by the field in this program's own view, though it is in the file. [Details](docs/known-limits.md#a-picture-of-a-signature)
+- **Page tools (0.3).** Crop does not remove anything, a copy of pages carries no bookmarks, and pages added from a protected file lose its protection. [Details](docs/known-limits.md#page-tools)
 - **Fonts a PDF does not embed.** Chinese, Japanese, Korean, Arabic, Hebrew and Thai text without embedded fonts needs a font from a fixed list of system files; otherwise it shows as blanks (it can still be searched and copied). [Details](docs/known-limits.md#fonts-that-a-pdf-does-not-embed)
 - **Quitting.** Unsaved changes are lost without a question when macOS ends the app from the Dock menu, a log out, a restart or a shut down. Windows and Linux ask only when the window is closed; save before you log out, restart or shut down. [Details](docs/known-limits.md#quitting-with-unsaved-changes)
 - **Memory.** About 490 MB for the whole app with a 500-page file open on Linux; the goal of 150 MB is not met there. Windows and macOS have not been measured on real hardware. [Details](docs/known-limits.md#memory)
@@ -119,10 +129,11 @@ A PDF is untrusted input, and PDFium, the library that parses it, is the main at
 
 - **One engine process per document.** Each open document is read by an engine process of its own, locked into an operating system sandbox before it reads the first byte: a seccomp filter on Linux (plus Landlock where the kernel has it), a Seatbelt profile on macOS, and a restricted token, a job object and a desktop of its own on Windows. A file that crashes or hangs its engine closes only its own tab.
 - **No files, no programs.** The engine cannot open files, start programs or touch other processes. It reads the one document the app opens for it through a read-only handle, and it is started with an empty environment.
-- **No network on Linux and macOS.** The engine has no network code, and the sandbox stops any code in the process from making a socket. **On Windows the engine can use the network**; an AppContainer would stop it and is not built yet. This is the largest open item of the Windows sandbox.
+- **No network.** The engine has no network code (apart from the few attempts its own sandbox check makes on purpose, which must fail), and the sandbox stops any code in the process from reaching the network: it refuses to make a socket on Linux and macOS, and from 0.3 the engine on Windows runs in an AppContainer without network capabilities. **In 0.2.x the engine on Windows can use the network**; a restricted token alone does not stop it. [Details](docs/security.md#what-it-does-not-cover)
 - **Memory limit.** The engine cannot use more than 3 GiB (a job object on Windows, a data limit on Linux, a watch by the app on macOS).
 - **The engine checks itself.** A release build that cannot show a working sandbox does not open the document and tells you so.
 - **PDF JavaScript is off.** The PDFium build has no JavaScript engine, and a form is checked for actions that could change it before you can fill it in; the check is a reading of the file, not a guarantee.
+- **The signer holds the key in a process of its own.** The certificate file and its password go to `partridge-signer`, which is locked in like the engine, has no file and no network, signs a digest and never sees the document. [Details](docs/security.md#the-signer)
 - **The app itself is not sandboxed.** The sandbox protects you from a bad PDF, not from a bug in the app, and no sandbox protects against a bug in the operating system kernel.
 - **The only network use is the update check.** It runs at the start and every 6 hours, can be turned off, and never sends a document. A link in a PDF goes nowhere unless you say yes.
 
@@ -152,7 +163,7 @@ Installers for testing (not signed, no update files): `npm run bundle`. How the 
 crates/protocol       the message format between app and engine
 crates/engine         partridge-engine, the only code that parses PDFs
 crates/engine-client  starts the engine, talks to it, recovers when it crashes
-crates/testkit        generates small test PDFs (also a broken one and a password-protected one)
+crates/testkit        generates small test PDFs (also a broken one, a password-protected one, and signed ones with keys made in the tests)
 src-tauri             the app process (Rust)
 src                   the window (TypeScript)
 scripts               PDFium download, bundling, measurements
@@ -162,11 +173,11 @@ The window is a [Tauri 2](https://tauri.app/) app written in TypeScript (Vite) w
 
 ## Roadmap
 
-Version 0.2.0 is out. There are no dates for what comes next; each step is done when it works, and the order may change.
+Version 0.2.2 is out and 0.3 is in development. There are no dates for what comes next; each step is done when it works, and the order may change.
 
 - **Released, 0.1.0:** the reader (tabs, search, selecting and copying text, thumbnails, the table of contents, printing, dark mode and remembering your place).
 - **Released, 0.2.0:** annotations and filling in forms.
-- **Planned:** signatures (viewing, validating and making them), page tools (merging, splitting, reordering, cropping, rotating, extracting and deleting pages) and creating fillable forms.
+- **In development, 0.3:** creating fillable forms, a picture of a signature, signing a document with a certificate, checking digital signatures and page tools (merging, reordering, cropping, rotating, extracting, copying out and deleting pages).
 - **Planned:** editing text and images on the page, and real redaction that removes the content from the file, not just covers it.
 - **Planned:** compressing files, flattening documents, and converting to and from Word, Excel, PowerPoint and images, including images (JPG, PNG, HEIC), text and Office files into PDF, on your own computer.
 - **Planned:** watermarks and page numbers, protecting a file with a password, and removing a password you already know.

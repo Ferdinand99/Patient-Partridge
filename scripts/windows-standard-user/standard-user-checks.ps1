@@ -15,6 +15,14 @@ $script:failed = New-Object System.Collections.ArrayList
 function Log([string]$text) {
   Add-Content -LiteralPath $log -Value $text -Encoding UTF8
 }
+# True when this user can change the access list of the path (it can on what it owns).
+function Test-CanChangeAccess([string]$path) {
+  try {
+    $acl = Get-Acl -LiteralPath $path
+    $acl | Set-Acl -LiteralPath $path -ErrorAction Stop
+    return $true
+  } catch { return $false }
+}
 function Check([string]$name, [bool]$ok, [string]$detail = '') {
   $tag = if ($ok) { 'PASS' } else { 'FAIL' }
   Log "[$tag] $name $detail"
@@ -97,8 +105,8 @@ try {
   Copy-Item -LiteralPath $plain -Destination $unicodePdf -Force
   $asciiPdf = Join-Path $Root 'docs\plain.pdf'
 
-  function Open-InApp([string]$pdf, [string]$tag, [string]$reportFolder, [int]$waitSeconds = 90, [bool]$expectDrawn = $true) {
-    Log "--- case '$tag': $pdf ---"
+  function Open-InApp([string]$pdf, [string]$tag, [string]$reportFolder, [int]$waitSeconds = 90, [bool]$expectDrawn = $true, [string]$program = $exe) {
+    Log "--- case '$tag': $pdf (program $program) ---"
     $report = Join-Path $reportFolder "report-$tag.json"
     Remove-Item -LiteralPath $report -Force -ErrorAction SilentlyContinue
     # Every case starts as a first run: the app reopens the tabs of the last session, and the file of
@@ -108,7 +116,7 @@ try {
     }
     $env:PARTRIDGE_MEASURE_REPORT = $report
     $clock = [Diagnostics.Stopwatch]::StartNew()
-    $app = Start-Process -FilePath $exe -ArgumentList ('"' + $pdf + '"') -PassThru
+    $app = Start-Process -FilePath $program -ArgumentList ('"' + $pdf + '"') -PassThru
     $engineSeen = $null
     $reported = $false
     while ($clock.Elapsed.TotalSeconds -lt $waitSeconds) {
@@ -167,6 +175,28 @@ try {
   $notPdf = Join-Path $docs 'not a pdf.pdf'
   Set-Content -LiteralPath $notPdf -Value 'this is not a PDF file' -Encoding ascii
   Open-InApp $notPdf 'not-a-pdf' $out 20 $false
+
+  # ---- 3b. Programs that an administrator installed outside the profile --------------------------
+  # The files belong to the administrators, so this user cannot change who may read them. The
+  # installers added the entry for the engine's package (read and execute for "all application
+  # packages"); the third copy has none, and the engine must fail there: that is the control that
+  # shows the other two cases test the entry. See install-as-admin.ps1.
+  Log ''
+  Log '=== 3b. Programs installed by an administrator outside the profile ==='
+  foreach ($case in @(
+      @{ tag = 'msi-custom-folder'; folder = 'C:\Apps\pp-msi'; expect = $true },
+      @{ tag = 'nsis-custom-folder'; folder = 'C:\Apps\pp-nsis'; expect = $true },
+      @{ tag = 'no-entry-control'; folder = 'C:\Apps\pp-bare'; expect = $false })) {
+    $program = Join-Path $case.folder 'patient-partridge.exe'
+    Check "case '$($case.tag)': the program is there" (Test-Path -LiteralPath $program)
+    Check "case '$($case.tag)': this user cannot change the access list of the folder" (-not (Test-CanChangeAccess $case.folder))
+    if ($case.expect) {
+      Open-InApp $asciiPdf $case.tag $out 90 $true $program
+    } else {
+      # A failing start also shows a message in the app, and the app does not report.
+      Open-InApp $asciiPdf $case.tag $out 25 $false $program
+    }
+  }
 
   # ---- 4. The engine's own sandbox tests, as this user -------------------------------------------
   Log ''

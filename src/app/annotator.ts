@@ -27,6 +27,16 @@ import {
   stampSize,
 } from "../lib/annotations";
 import { describeError, isEngineLost, toAppError, type AppErrorLike } from "../lib/errors";
+import {
+  PICTURE_WORDS,
+  sameRect,
+  scaledRect,
+  startingRect,
+  type Chosen,
+  type DrawnPicture,
+  type Rect,
+  type TypedPicture,
+} from "../lib/signpicture";
 import type { AnnotLayerEvents } from "../viewer/annotlayer";
 import { MAX_SELECTION_RANGES } from "../viewer/overlays";
 import type { DocumentView } from "../viewer/viewer";
@@ -54,6 +64,20 @@ export interface AnnotatorApi {
   ): Promise<Annotation>;
   removeAnnotation(doc: number, page: number, id: number): Promise<void>;
   restoreAnnotation(doc: number, page: number, id: number): Promise<Annotation>;
+  /** A drawn or a typed picture of a signature, fitted into a box of the page. */
+  addSignature?(doc: number, page: number, rect: Rect, color: Rgba, picture: DrawnPicture | TypedPicture): Promise<Annotation>;
+  /** An imported picture of a signature as raw pixels. */
+  addSignatureImage?(
+    doc: number,
+    page: number,
+    rect: Rect,
+    color: Rgba,
+    width: number,
+    height: number,
+    rgba: Uint8ClampedArray,
+  ): Promise<Annotation>;
+  /** Moves and resizes a picture of a signature: it takes the corner and the width of the box. */
+  placeSignature?(doc: number, page: number, id: number, rect: Rect): Promise<Annotation>;
 }
 
 export interface AnnotatorHost {
@@ -70,6 +94,10 @@ export interface AnnotatorHost {
   /** The picture of a page changed (the thumbnail of it has to be drawn again). */
   pageChanged(page: number): void;
 }
+
+/** What is said when an annotation tool is used while the pages of the document are being changed. */
+export const PAGES_BUSY_NOTICE =
+  "The pages of this document are being changed. Annotations wait until that is done.";
 
 /** Answers of the engine that say it changed nothing. */
 export const CLEAN_REFUSALS = new Set([
@@ -138,6 +166,8 @@ export class Annotator implements AnnotLayerEvents {
   color: Rgba = PALETTE[0].rgba;
   penWidth: number = PEN_WIDTHS[1].width;
   stamp: StampName = "approved";
+  /** The picture of a signature the next click on a page places, if one was made or picked. */
+  signature: Chosen | null = null;
   selected: { page: number; id: number } | null = null;
 
   private chain: Promise<unknown> = Promise.resolve();
@@ -148,6 +178,8 @@ export class Annotator implements AnnotLayerEvents {
   private flow: Promise<void> | null = null;
   private destroyed = false;
   private blocked = false;
+  /** The pages of the document are being changed: no annotation is begun (see `setHeld`). */
+  private held = false;
   /** The bar is closed: the pages read as they do without annotations, and no key is taken. */
   private reading = false;
   /** Changes wait for this before they start (a save is being written). */
@@ -216,9 +248,50 @@ export class Annotator implements AnnotLayerEvents {
     } while (this.inflight > 0);
   }
 
-  /** Why the annotations cannot be changed, if the document says so; otherwise null. */
+  /** Why the annotations cannot be changed, if the document says so or its pages are changing; otherwise null. */
   get blockedReason(): string | null {
+    if (this.held) return PAGES_BUSY_NOTICE;
     return this.blocked ? "This PDF does not allow annotations." : null;
+  }
+
+  /** True while the pages of the document are being changed. */
+  get isHeld(): boolean {
+    return this.held;
+  }
+
+  /**
+   * Lets the annotations wait while the pages of the document are being changed (a change that
+   * would run after it would name pages that are not there any more), or go on. Nothing that is
+   * under way is lost: the box of a note keeps its text until it is saved by `flush`, and a stroke
+   * that was being drawn is dropped. Every way to begin a change says why it does nothing.
+   */
+  setHeld(held: boolean): void {
+    if (this.held === held) return;
+    this.held = held;
+    if (held) this.view.annotationLayer.abort();
+    this.host.changed();
+  }
+
+  /** True, and says so, when the pages are changing and no annotation may be begun. */
+  private refuseWhileHeld(): boolean {
+    if (!this.held) return false;
+    this.host.announce(PAGES_BUSY_NOTICE);
+    return true;
+  }
+
+  /**
+   * The pages of the document changed (some were deleted, moved, turned, cropped or added): what is
+   * kept by page number and by id means other things now. The pick goes, and so do the boxes the
+   * engine last answered with (a turned page has other boxes) and the annotations deleted for good.
+   */
+  pagesChanged(): void {
+    this.boxes.clear();
+    this.gone.clear();
+    if (this.selected) {
+      this.selected = null;
+      this.view.annotationLayer.setSelected(null);
+    }
+    this.host.changed();
   }
 
   /** A short line about the annotation that is picked when it cannot be changed, or null. */
@@ -226,7 +299,7 @@ export class Annotator implements AnnotLayerEvents {
     const a = this.current;
     if (!a) return null;
     if (a.can.locked) return "This annotation is locked in the file, so it cannot be changed.";
-    if (!a.can.editText && a.text !== "" && a.can.remove && a.kind !== "stamp") {
+    if (!a.can.editText && a.text !== "" && a.can.remove && a.kind !== "stamp" && a.kind !== "signature") {
       return "The text of this annotation is too long or is locked in the file, so it cannot be edited here.";
     }
     if (this.recolourRefused(a)) return RECOLOUR_REASON;
@@ -361,6 +434,7 @@ export class Annotator implements AnnotLayerEvents {
 
   setTool(tool: Tool): void {
     if (this.tool === tool) return;
+    if (tool !== "select" && this.refuseWhileHeld()) return;
     this.view.annotationLayer.abort();
     this.tool = tool;
     this.syncLayer();
@@ -371,6 +445,21 @@ export class Annotator implements AnnotLayerEvents {
     else if (tool === "pen") this.host.announce("Pen: draw on the page with the pointer.");
     else if (tool === "note") this.host.announce("Note: click on the page to place a note.");
     else if (tool === "stamp") this.host.announce("Stamp: click on the page to place the stamp.");
+    else if (tool === "signature") this.host.announce(PICTURE_WORDS.placing);
+  }
+
+  /**
+   * The picture the person made or picked for the signature tool. The tool is switched on, so that
+   * the next click on a page places it; while the pages are being changed nothing is begun.
+   */
+  setSignature(picture: Chosen): void {
+    this.signature = picture;
+    if (this.tool === "signature") {
+      this.host.announce(PICTURE_WORDS.placing);
+      this.host.changed();
+      return;
+    }
+    this.setTool("signature");
   }
 
   setColor(color: Rgba): void {
@@ -417,6 +506,7 @@ export class Annotator implements AnnotLayerEvents {
   onPlace(page: number, x: number, y: number, client: { x: number; y: number }): void {
     if (this.tool === "note") void this.placeNote(page, x, y, client);
     else if (this.tool === "stamp") void this.placeStamp(page, x, y);
+    else if (this.tool === "signature") void this.placePicture(page, x, y);
   }
 
   onStroke(page: number, points: [number, number][]): void {
@@ -425,6 +515,10 @@ export class Annotator implements AnnotLayerEvents {
 
   onMove(page: number, id: number, dx: number, dy: number): void {
     void this.moveBy(page, id, dx, dy);
+  }
+
+  onResize(page: number, id: number, rect: Rect): void {
+    void this.resizeTo(page, id, rect);
   }
 
   onEdit(page: number, id: number): void {
@@ -445,6 +539,7 @@ export class Annotator implements AnnotLayerEvents {
 
   /** Marks the text that is selected. Several pages of it make one edit. */
   async markSelection(kind: "highlight" | "underline" | "strikeout"): Promise<void> {
+    if (this.refuseWhileHeld()) return;
     const { ranges, truncated } = await this.view.selectedRanges();
     if (truncated) {
       await this.host.ask({
@@ -522,7 +617,7 @@ export class Annotator implements AnnotLayerEvents {
 
   /** `draft` is text typed in an earlier box that the engine refused: the box comes back with it. */
   private placeNote(page: number, x: number, y: number, client: { x: number; y: number }, draft = ""): Promise<void> {
-    if (this.editor) return Promise.resolve();
+    if (this.editor || this.refuseWhileHeld()) return Promise.resolve();
     // The note starts where it was clicked, its middle under the pointer.
     const at = { x: x - 10, y: y - 10 };
     const editor = openNoteEditor(this.host.popovers, {
@@ -582,6 +677,7 @@ export class Annotator implements AnnotLayerEvents {
   }
 
   private placeStamp(page: number, x: number, y: number): Promise<void> {
+    if (this.refuseWhileHeld()) return Promise.resolve();
     const size = stampSize(this.stamp);
     const pageSize = this.view.pageSizeOf(page);
     const [left, top] = keepOnPage(x - size.width / 2, y - size.height / 2, size, pageSize);
@@ -591,6 +687,29 @@ export class Annotator implements AnnotLayerEvents {
       this.refresh(page);
       this.record("Stamp", [{ page, id: a.id }], "remove");
       this.host.announce(`Stamp added on page ${page + 1}.`);
+      this.finishPlacing(page, a.id);
+    });
+  }
+
+  /** Puts the picture of a signature on the page, its middle at the point, and records it. */
+  private placePicture(page: number, x: number, y: number): Promise<void> {
+    if (this.refuseWhileHeld()) return Promise.resolve();
+    const picture = this.signature;
+    if (!picture) return Promise.resolve();
+    if (!this.api.addSignature || !this.api.addSignatureImage) {
+      this.host.announce("Signature pictures are not available.");
+      return Promise.resolve();
+    }
+    const rect = startingRect(picture.aspect, [x, y], this.view.pageSizeOf(page));
+    return this.queued(async () => {
+      const a =
+        picture.kind === "image"
+          ? await this.api.addSignatureImage!(this.doc, page, rect, picture.color, picture.width, picture.height, picture.rgba)
+          : await this.api.addSignature!(this.doc, page, rect, picture.color, picture);
+      this.boxes.set(`${page}:${a.id}`, a.rect);
+      this.refresh(page);
+      this.record("Signature picture", [{ page, id: a.id }], "remove");
+      this.host.announce(`${PICTURE_WORDS.placed} ${PICTURE_WORDS.resizeHint}`);
       this.finishPlacing(page, a.id);
     });
   }
@@ -615,10 +734,16 @@ export class Annotator implements AnnotLayerEvents {
       void this.placeNote(centre.page, centre.x, centre.y, { x: window.innerWidth / 2 - 144, y: window.innerHeight / 3 });
     } else if (this.tool === "stamp") {
       void this.placeStamp(centre.page, centre.x, centre.y);
+    } else if (this.tool === "signature") {
+      void this.placePicture(centre.page, centre.x, centre.y);
     }
   }
 
   private drawStroke(page: number, points: [number, number][]): Promise<void> {
+    if (this.refuseWhileHeld()) {
+      this.view.annotationLayer.endStroke(page);
+      return Promise.resolve();
+    }
     const { color, penWidth } = this;
     return this.queued(async () => {
       try {
@@ -638,6 +763,7 @@ export class Annotator implements AnnotLayerEvents {
 
   /** Moves a note by `dx`, `dy` points on the page as it is drawn. */
   moveBy(page: number, id: number, dx: number, dy: number): Promise<void> {
+    if (this.refuseWhileHeld()) return Promise.resolve();
     const a = this.view.annotationLayer.find(page, id);
     if (!a?.can.move || (dx === 0 && dy === 0)) return Promise.resolve();
     return this.queued(async () => {
@@ -658,8 +784,40 @@ export class Annotator implements AnnotLayerEvents {
     });
   }
 
+  /**
+   * Makes a picture of a signature bigger or smaller: it keeps its corner and its proportions, and
+   * `rect` says the width. The engine says the box it really has, which is what an undo goes back to.
+   */
+  resizeTo(page: number, id: number, rect: Rect): Promise<void> {
+    if (this.refuseWhileHeld()) return Promise.resolve();
+    const a = this.view.annotationLayer.find(page, id);
+    if (!a?.can.resize || !this.api.placeSignature) return Promise.resolve();
+    return this.queued(async () => {
+      const key = `${page}:${id}`;
+      const from = this.boxes.get(key) ?? a.rect;
+      const placed = await this.api.placeSignature!(this.doc, page, id, rect);
+      this.boxes.set(key, placed.rect);
+      this.refresh(page);
+      if (sameRect(from, placed.rect)) return;
+      this.push({
+        label: "Resize signature picture",
+        undo: () => this.replayPlace(page, id, from),
+        redo: () => this.replayPlace(page, id, placed.rect),
+      });
+    });
+  }
+
+  /** Undo or redo of a resize: skipped for an annotation that has been deleted for good. */
+  private async replayPlace(page: number, id: number, rect: Rect): Promise<void> {
+    if (this.gone.has(`${page}:${id}`) || !this.api.placeSignature) return;
+    const placed = await this.api.placeSignature(this.doc, page, id, rect);
+    this.boxes.set(`${page}:${id}`, placed.rect);
+    this.refresh(page);
+  }
+
   /** Opens the box for the text of an annotation and saves what the person writes. */
   editText(page: number, id: number, draft?: string): Promise<void> {
+    if (this.refuseWhileHeld()) return Promise.resolve();
     const a = this.view.annotationLayer.find(page, id);
     if (a && !a.can.editText) {
       this.host.announce(
@@ -697,6 +855,7 @@ export class Annotator implements AnnotLayerEvents {
   }
 
   private recolour(page: number, a: Annotation, color: Rgba): Promise<void> {
+    if (this.refuseWhileHeld()) return Promise.resolve();
     const before = a.color;
     if (before[0] === color[0] && before[1] === color[1] && before[2] === color[2]) return Promise.resolve();
     const id = a.id;
@@ -713,6 +872,7 @@ export class Annotator implements AnnotLayerEvents {
 
   /** Takes the picked annotation off the page. One that cannot be put back asks first. */
   async removeSelected(): Promise<void> {
+    if (this.refuseWhileHeld()) return;
     const sel = this.selected;
     const a = this.current;
     if (!sel || !a) {
@@ -748,7 +908,10 @@ export class Annotator implements AnnotLayerEvents {
         // Undo cannot bring this back, so there is no edit to take back: an entry whose undo is
         // always refused would stop every earlier edit from being undone. The document counts as
         // changed until it is saved. What was done to it before is skipped when it is undone.
+        // What could be made again goes: a copy of the document kept for a step forward may still
+        // hold the annotation, and making that step would put it back without being asked.
         this.gone.add(`${page}:${id}`);
+        this.history.dropRedo();
         this.history.markUnsaved();
       }
       this.host.announce(`${kindName(a.kind)} deleted.`);
@@ -777,7 +940,7 @@ export class Annotator implements AnnotLayerEvents {
       }
       return false;
     }
-    if ((this.tool === "note" || this.tool === "stamp") && e.key === "Enter") {
+    if ((this.tool === "note" || this.tool === "stamp" || this.tool === "signature") && e.key === "Enter") {
       this.placeAtCentre();
       return true;
     }
@@ -803,6 +966,16 @@ export class Annotator implements AnnotLayerEvents {
         void this.moveBy(page, id, dx, dy);
         return true;
       }
+      case "+":
+      case "=":
+      case "-":
+      case "_": {
+        if (!a.can.resize) return false;
+        const grow = e.key === "+" || e.key === "=";
+        const from = this.boxes.get(`${page}:${id}`) ?? a.rect;
+        void this.resizeTo(page, id, scaledRect(from, grow ? 1.1 : 1 / 1.1, this.view.pageSizeOf(page)));
+        return true;
+      }
       default:
         return false;
     }
@@ -821,7 +994,9 @@ export class Annotator implements AnnotLayerEvents {
  */
 function deleteWarning(): string {
   return (
-    "This annotation came with the file, and Undo cannot bring it back. If you delete it and save, the new file does not hold its comment or author. " +
+    "This annotation came with the file, and Undo cannot bring it back. Deleting it also clears Redo. " +
+    "Taking back a delete, a move or added pages that you made before it loads the document as it was then, with the annotation in it; taking back a turn or a crop never does. " +
+    "If you delete it and save, the new file does not hold its comment or author. " +
     "This is not redaction: copies and backups made before the save still hold the text."
   );
 }

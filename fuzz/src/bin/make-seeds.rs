@@ -15,10 +15,11 @@ use partridge_fuzz::{
     over_cap_request_case, over_cap_response_case, OVER_CAP_REQUESTS, OVER_CAP_RESPONSES,
 };
 use partridge_protocol::{
-    ability, field_flag, AnnotInfo, AnnotKind, ErrorCode, FontScript, FormField, FormFieldKind,
-    FormKind, FormOption, FormValue, LinkTarget, OutlineItem, PageLink, PageSize, Request,
-    RequestBody, Response, ResponseBody, StampKind, TextMatch, MAX_FRAME_LEN, MAX_LINKS_PER_PAGE,
-    MAX_MATCHES_PER_PAGE,
+    ability, field_flag, AuthorOp, AuthorRequest, AuthorResponse, DesignField, DesignKind,
+    DesignProps, DesignWidget, DesignedWidget, WidgetRef, AnnotInfo, AnnotKind, ErrorCode, FontScript, FormField, FormFieldKind,
+    FormKind, FormOption, FormValue, LinkTarget, OutlineItem, PageLink, PageSize, PagesRequest,
+    PagesResponse, Request, RequestBody, Response, ResponseBody, SignatureFont, SignatureMark,
+    StampKind, TextMatch, MAX_FRAME_LEN, MAX_LINKS_PER_PAGE, MAX_MATCHES_PER_PAGE,
     MAX_OUTLINE_DEPTH, MAX_OUTLINE_ITEMS, MAX_OUTLINE_TITLE, MAX_QUERY_LEN, MAX_SAVE_BYTES,
     MAX_SAVE_CHUNK, MAX_URI_LEN, PROTOCOL_VERSION,
 };
@@ -36,13 +37,7 @@ fn requests() -> Vec<(&'static str, Request)> {
                 },
             ),
         ),
-        (
-            "open",
-            b(
-                2,
-                RequestBody::Open { password: None },
-            ),
-        ),
+        ("open", b(2, RequestBody::Open { password: None })),
         (
             "open_password",
             b(
@@ -73,6 +68,16 @@ fn requests() -> Vec<(&'static str, Request)> {
         ),
         ("font_report", b(10, RequestBody::FontReport)),
         (
+            "signatures",
+            b(
+                11,
+                RequestBody::Signatures {
+                    doc: 1,
+                    now: 1_781_524_800,
+                },
+            ),
+        ),
+        (
             "search",
             b(
                 9,
@@ -98,7 +103,10 @@ fn requests() -> Vec<(&'static str, Request)> {
         ),
         ("save_end", b(13, RequestBody::SaveEnd { doc: 1 })),
         ("fingerprint", b(14, RequestBody::Fingerprint { doc: 1 })),
-        ("list_annots", b(15, RequestBody::ListAnnots { doc: 1, page: 0 })),
+        (
+            "list_annots",
+            b(15, RequestBody::ListAnnots { doc: 1, page: 0 }),
+        ),
         (
             "add_markup",
             b(
@@ -170,11 +178,91 @@ fn requests() -> Vec<(&'static str, Request)> {
         ),
         (
             "remove_annot",
-            b(21, RequestBody::RemoveAnnot { doc: 1, page: 0, id: 3 }),
+            b(
+                21,
+                RequestBody::RemoveAnnot {
+                    doc: 1,
+                    page: 0,
+                    id: 3,
+                },
+            ),
         ),
         (
             "restore_annot",
-            b(22, RequestBody::RestoreAnnot { doc: 1, page: 0, id: 3 }),
+            b(
+                22,
+                RequestBody::RestoreAnnot {
+                    doc: 1,
+                    page: 0,
+                    id: 3,
+                },
+            ),
+        ),
+        (
+            "add_signature_drawn",
+            b(
+                26,
+                RequestBody::AddSignature {
+                    doc: 1,
+                    page: 0,
+                    rect: [100.0, 100.0, 300.0, 180.0],
+                    color: [10, 40, 120, 255],
+                    mark: SignatureMark::Strokes {
+                        width: 240.0,
+                        height: 100.0,
+                        line: 4.0,
+                        strokes: vec![
+                            vec![[10.0, 50.0], [60.0, 20.0], [120.0, 80.0]],
+                            vec![[200.0, 60.0]],
+                        ],
+                    },
+                },
+            ),
+        ),
+        (
+            "add_signature_typed",
+            b(
+                27,
+                RequestBody::AddSignature {
+                    doc: 1,
+                    page: 0,
+                    rect: [100.0, 100.0, 300.0, 180.0],
+                    color: [0, 0, 0, 255],
+                    mark: SignatureMark::Typed {
+                        font: SignatureFont::GreatVibes,
+                        text: "Anna Alvorlig".into(),
+                    },
+                },
+            ),
+        ),
+        (
+            "add_signature_image",
+            b(
+                28,
+                RequestBody::AddSignature {
+                    doc: 1,
+                    page: 0,
+                    rect: [100.0, 100.0, 300.0, 180.0],
+                    color: [0, 0, 0, 255],
+                    mark: SignatureMark::Image {
+                        width: 4,
+                        height: 2,
+                        rgba: (0..32).map(|i| i as u8 * 8).collect(),
+                    },
+                },
+            ),
+        ),
+        (
+            "place_signature",
+            b(
+                29,
+                RequestBody::PlaceSignature {
+                    doc: 1,
+                    page: 0,
+                    id: 3,
+                    rect: [50.0, 60.0, 250.0, 60.0],
+                },
+            ),
         ),
         ("form_info", b(23, RequestBody::FormInfo { doc: 1 })),
         (
@@ -190,8 +278,11 @@ fn requests() -> Vec<(&'static str, Request)> {
                     page: 0,
                     index: 2,
                     name: "fullname".into(),
-                    value: FormValue::Text("Ada
-Lovelace".into()),
+                    value: FormValue::Text(
+                        "Ada
+Lovelace"
+                            .into(),
+                    ),
                 },
             ),
         ),
@@ -221,7 +312,161 @@ Lovelace".into()),
                 },
             ),
         ),
+        (
+            "pages_delete",
+            b(
+                15,
+                RequestBody::Pages(PagesRequest::Delete {
+                    doc: 1,
+                    pages: vec![0, 4, 5],
+                }),
+            ),
+        ),
+        (
+            "pages_reorder",
+            b(
+                16,
+                RequestBody::Pages(PagesRequest::Reorder {
+                    doc: 1,
+                    order: vec![2, 0, 1],
+                }),
+            ),
+        ),
+        (
+            "pages_rotate",
+            b(
+                17,
+                RequestBody::Pages(PagesRequest::Rotate {
+                    doc: 1,
+                    pages: vec![1],
+                    turns: 3,
+                }),
+            ),
+        ),
+        (
+            "pages_crop",
+            b(
+                18,
+                RequestBody::Pages(PagesRequest::Crop {
+                    doc: 1,
+                    pages: vec![0, 1],
+                    margins: [10.0, 20.0, 30.0, 40.0],
+                }),
+            ),
+        ),
+        (
+            "pages_set_boxes",
+            b(
+                19,
+                RequestBody::Pages(PagesRequest::SetBoxes {
+                    doc: 1,
+                    pages: vec![0],
+                    boxes: vec![[0.0, 0.0, 612.0, 792.0]],
+                }),
+            ),
+        ),
+        (
+            "pages_insert_blank",
+            b(
+                20,
+                RequestBody::Pages(PagesRequest::InsertBlank {
+                    doc: 1,
+                    at: 2,
+                    width: 612.0,
+                    height: 792.0,
+                }),
+            ),
+        ),
+        (
+            "pages_restore",
+            b(
+                21,
+                RequestBody::Pages(PagesRequest::Restore {
+                    doc: 1,
+                    snapshot: 3,
+                }),
+            ),
+        ),
+        (
+            "import_begin",
+            b(
+                22,
+                RequestBody::Pages(PagesRequest::ImportBegin { doc: 1, size: 5000 }),
+            ),
+        ),
+        (
+            "import_chunk",
+            b(
+                23,
+                RequestBody::Pages(PagesRequest::ImportChunk {
+                    doc: 1,
+                    offset: 0,
+                    data: b"%PDF-1.4".to_vec(),
+                }),
+            ),
+        ),
+        (
+            "import_end",
+            b(
+                24,
+                RequestBody::Pages(PagesRequest::ImportEnd { doc: 1, at: 0 }),
+            ),
+        ),
+        (
+            "import_abort",
+            b(25, RequestBody::Pages(PagesRequest::ImportAbort { doc: 1 })),
+        ),
+        (
+            "export_begin",
+            b(
+                26,
+                RequestBody::Pages(PagesRequest::ExportBegin {
+                    doc: 1,
+                    pages: vec![3, 1],
+                }),
+            ),
+        ),
     ]
+}
+
+fn signature_report() -> partridge_protocol::SignatureReport {
+    use partridge_protocol::{
+        CertificateTime, SignatureInfo, SignatureReason, SignatureReport, SignatureState,
+    };
+    let item = |index: u32, reason: SignatureReason, signer: &str| SignatureInfo {
+        index,
+        state: reason.state(),
+        reason,
+        certificate_time: CertificateTime::Valid,
+        sub_filter: "adbe.pkcs7.detached".into(),
+        byte_range: vec![0, 100, 300, 50],
+        file_len: 350,
+        doc_mdp: 2,
+        certificates: 2,
+        signer: Some(signer.into()),
+        organisation: Some("Example Ltd".into()),
+        issuer: Some("Example CA".into()),
+        serial: Some("01ab".into()),
+        fingerprint: Some("ab".repeat(32)),
+        valid_from: Some("2026-01-31 12:00 UTC".into()),
+        valid_to: Some("2027-01-31 12:00 UTC".into()),
+        key: Some("ECDSA P-256".into()),
+        digest: Some("SHA-256".into()),
+        claimed_time: Some("2026-02-01 08:00:00 +01:00".into()),
+        stated_reason: Some("I approve".into()),
+        stated_location: Some("Oslo".into()),
+        trust_anchor: None,
+    };
+    let _ = SignatureState::Broken;
+    SignatureReport {
+        total: 2,
+        unlisted: 1,
+        trust_anchors: 0,
+        items: vec![
+            item(0, SignatureReason::NoTrustList, "Test Signer"),
+            item(1, SignatureReason::DataAfterSignature, "Second Signer"),
+        ],
+    }
 }
 
 fn a_note(id: u32, text: &str) -> AnnotInfo {
@@ -234,6 +479,103 @@ fn a_note(id: u32, text: &str) -> AnnotInfo {
         text: text.into(),
         author: "Someone".into(),
     }
+}
+
+fn author_field() -> DesignField {
+    DesignField {
+        name: "name".into(),
+        kind: DesignKind::Text,
+        props: DesignProps {
+            tooltip: "Your name".into(),
+            required: true,
+            max_len: 20,
+            default_value: "Ola".into(),
+            ..DesignProps::default()
+        },
+        widgets: vec![DesignWidget {
+            page: 0,
+            rect: [72.0, 100.0, 232.0, 122.0],
+            export: String::new(),
+        }],
+    }
+}
+
+fn author_requests() -> Vec<(&'static str, Request)> {
+    let b = |id, body| Request { id, body };
+    vec![
+        ("author_check", b(60, RequestBody::Author(AuthorRequest::Check { doc: 1 }))),
+        ("author_list", b(61, RequestBody::Author(AuthorRequest::List { doc: 1, page: 0 }))),
+        (
+            "author_apply",
+            b(
+                62,
+                RequestBody::Author(AuthorRequest::Apply {
+                    doc: 1,
+                    ops: vec![
+                        AuthorOp::Add(author_field()),
+                        AuthorOp::Move {
+                            name: "name".into(),
+                            widget: 0,
+                            page: 0,
+                            rect: [80.0, 110.0, 240.0, 132.0],
+                        },
+                        AuthorOp::Update {
+                            name: "name".into(),
+                            new_name: "full_name".into(),
+                            props: DesignProps::default(),
+                            exports: vec![],
+                        },
+                        AuthorOp::Reorder {
+                            page: 0,
+                            order: vec![WidgetRef {
+                                name: "full_name".into(),
+                                widget: 0,
+                            }],
+                        },
+                        AuthorOp::Remove {
+                            name: "full_name".into(),
+                        },
+                    ],
+                }),
+            ),
+        ),
+    ]
+}
+
+fn author_responses() -> Vec<(&'static str, Response)> {
+    let b = |id, body| Response { id, body };
+    vec![
+        (
+            "author_ready",
+            b(
+                60,
+                ResponseBody::Author(AuthorResponse::Ready {
+                    names: vec!["a".into(), "person.first".into()],
+                }),
+            ),
+        ),
+        (
+            "author_widgets",
+            b(
+                61,
+                ResponseBody::Author(AuthorResponse::Widgets {
+                    items: vec![DesignedWidget {
+                        name: "size".into(),
+                        kind: DesignKind::Radio,
+                        widget: 1,
+                        widgets: 3,
+                        rect: [10.0, 20.0, 24.0, 34.0],
+                        export: "M".into(),
+                        editable: true,
+                        props: DesignProps {
+                            default_value: "M".into(),
+                            ..DesignProps::default()
+                        },
+                    }],
+                }),
+            ),
+        ),
+    ]
 }
 
 fn responses() -> Vec<(&'static str, Response)> {
@@ -362,6 +704,15 @@ fn responses() -> Vec<(&'static str, Response)> {
             ),
         ),
         (
+            "signatures",
+            b(
+                13,
+                ResponseBody::Signatures {
+                    report: signature_report(),
+                },
+            ),
+        ),
+        (
             "error",
             b(
                 9,
@@ -384,7 +735,10 @@ fn responses() -> Vec<(&'static str, Response)> {
                 },
             ),
         ),
-        ("save_ready", b(11, ResponseBody::SaveReady { size: 70_000 })),
+        (
+            "save_ready",
+            b(11, ResponseBody::SaveReady { size: 70_000 }),
+        ),
         (
             "save_data",
             b(
@@ -396,7 +750,10 @@ fn responses() -> Vec<(&'static str, Response)> {
             ),
         ),
         ("save_ended", b(13, ResponseBody::SaveEnded)),
-        ("progress", b(15, ResponseBody::Progress { done: 1_048_576 })),
+        (
+            "progress",
+            b(15, ResponseBody::Progress { done: 1_048_576 }),
+        ),
         (
             "fingerprint",
             b(
@@ -417,7 +774,15 @@ fn responses() -> Vec<(&'static str, Response)> {
                 },
             ),
         ),
-        ("annot", b(18, ResponseBody::Annot { item: a_note(3, "") })),
+        (
+            "annot",
+            b(
+                18,
+                ResponseBody::Annot {
+                    item: a_note(3, ""),
+                },
+            ),
+        ),
         ("annot_removed", b(19, ResponseBody::AnnotRemoved)),
         (
             "error_no_such_annotation",
@@ -455,7 +820,8 @@ fn responses() -> Vec<(&'static str, Response)> {
                             name: "person.first".into(),
                             tooltip: "First name".into(),
                             value: "Ada
-Lovelace".into(),
+Lovelace"
+                                .into(),
                             max_len: 40,
                             options: vec![],
                         },
@@ -492,6 +858,76 @@ Lovelace".into(),
                 ResponseBody::Error {
                     code: ErrorCode::SaveTooLarge,
                     message: "the document is too big to be saved".into(),
+                },
+            ),
+        ),
+        (
+            "pages_changed",
+            b(
+                30,
+                ResponseBody::Pages(PagesResponse::Changed {
+                    pages: vec![
+                        PageSize {
+                            width: 612.0,
+                            height: 792.0,
+                        };
+                        3
+                    ],
+                    snapshot: 2,
+                    count: 1,
+                    form_fields: 1,
+                }),
+            ),
+        ),
+        (
+            "pages_cropped",
+            b(
+                31,
+                ResponseBody::Pages(PagesResponse::Cropped {
+                    pages: vec![PageSize {
+                        width: 500.0,
+                        height: 700.0,
+                    }],
+                    before: vec![[0.0, 0.0, 612.0, 792.0]],
+                    after: vec![[10.0, 10.0, 510.0, 710.0]],
+                }),
+            ),
+        ),
+        (
+            "import_ready",
+            b(32, ResponseBody::Pages(PagesResponse::ImportReady)),
+        ),
+        (
+            "import_ack",
+            b(
+                33,
+                ResponseBody::Pages(PagesResponse::ImportAck { received: 8 }),
+            ),
+        ),
+        (
+            "exported",
+            b(
+                34,
+                ResponseBody::Pages(PagesResponse::Exported {
+                    size: 4096,
+                    pages: 2,
+                    signatures: 0,
+                    source_security: 3,
+                    digest: 0xAB,
+                }),
+            ),
+        ),
+        (
+            "pages_done",
+            b(35, ResponseBody::Pages(PagesResponse::Done)),
+        ),
+        (
+            "error_too_many_pages",
+            b(
+                36,
+                ResponseBody::Error {
+                    code: ErrorCode::TooManyPages,
+                    message: "the document has more pages than the page tools take".into(),
                 },
             ),
         ),
@@ -574,11 +1010,14 @@ fn main() {
             .unwrap_or_else(|| "seeds".to_string()),
     );
 
+    // Signing with a certificate: messages, certificate files and files that PDFium wrote.
+    partridge_fuzz::write_sign_seeds(&dir);
+
     // Decoders: one valid message of every kind.
-    for (name, request) in requests() {
+    for (name, request) in requests().into_iter().chain(author_requests()) {
         write(&dir, "protocol_request_decode", name, &request.encode());
     }
-    for (name, response) in responses() {
+    for (name, response) in responses().into_iter().chain(author_responses()) {
         write(&dir, "protocol_response_decode", name, &response.encode());
     }
 
@@ -669,7 +1108,7 @@ fn main() {
     );
 
     // Round trips: one input per kind of message.
-    for kind in 0..25u8 {
+    for kind in 0..29u8 {
         write(
             &dir,
             "protocol_roundtrip_request",
@@ -677,7 +1116,7 @@ fn main() {
             &generator_input(kind, kind as u32),
         );
     }
-    for kind in 0..21u8 {
+    for kind in 0..23u8 {
         write(
             &dir,
             "protocol_roundtrip_response",
@@ -690,6 +1129,10 @@ fn main() {
     // on one. The page text cases are 1.7 MB and are left to the round-trip target.
     for case in 0..OVER_CAP_REQUESTS {
         let (name, payload) = over_cap_request_case(case, 1);
+        // Not the picture with a row too many (2 MB): the unit tests of the fuzz crate decode it.
+        if payload.len() > 100_000 {
+            continue;
+        }
         write(
             &dir,
             "protocol_request_decode",
@@ -927,6 +1370,109 @@ fn main() {
         write(&dir, "metadata_check", &format!("{name}.pdf"), bytes);
     }
 
+    // The mend of a compressed XMP stream that PDFium wrote without its filter: the same shapes
+    // with data that is not text.
+    let shaped_data = |streams: &[Vec<u8>], trailer: &str| -> Vec<u8> {
+        let mut objects: Vec<Vec<u8>> = vec![
+            b"<</Metadata 3 0 R /Pages 2 0 R /Type/Catalog>>".to_vec(),
+            b"<</Type/Pages>>".to_vec(),
+        ];
+        objects.extend_from_slice(streams);
+        let mut out = b"%PDF-1.7\r\n%\xA1\xB3\xC5\xD7\r\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, body) in objects.iter().enumerate() {
+            out.extend_from_slice(b"\r\n");
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\r\n", i + 1).as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"\r\nendobj\r\n");
+        }
+        let xref = out.len();
+        out.extend_from_slice(
+            format!(
+                "xref\r\n0 {}\r\n0000000000 65535 f\r\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        for offset in offsets {
+            out.extend_from_slice(format!("{offset:010} 00000 n\r\n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!("trailer\r\n<<{trailer}>>\r\nstartxref\r\n{xref}\r\n%%EOF\r\n").as_bytes(),
+        );
+        out
+    };
+    let stream_of = |data: &[u8]| -> Vec<u8> {
+        let mut out = format!(
+            "<</Length {}/Subtype/XML/Type/Metadata>>stream\r\n",
+            data.len()
+        )
+        .into_bytes();
+        out.extend_from_slice(data);
+        out.extend_from_slice(b"\r\nendstream");
+        out
+    };
+    let packet = kit::xmp_packet(kit::XMP_CATALOG_TITLE);
+    let packed = kit::flate(packet.as_bytes());
+    let mut swells = String::from("<x><!--");
+    swells.push_str(&" ".repeat(5 * 1024 * 1024));
+    swells.push_str("--></x>");
+    let plain_trailer = "/Root 1 0 R /Size 4";
+    let damaged = shaped_data(&[stream_of(&packed)], plain_trailer);
+    let mended = partridge_engine::metadata::repair::mend(damaged.clone(), usize::MAX, &mut |_| {})
+        .expect("the seed is mended");
+    let repair_seeds: Vec<(&str, Vec<u8>)> = vec![
+        ("damaged_xmp", damaged),
+        ("mended_xmp", mended),
+        (
+            "two_damaged",
+            shaped_data(
+                &[stream_of(&packed), stream_of(&packed)],
+                "/Root 1 0 R /Size 5",
+            ),
+        ),
+        (
+            "hex_xmp",
+            shaped_data(&[stream_of(&kit::ascii_hex(packet.as_bytes()))], plain_trailer),
+        ),
+        (
+            "base85_flate_xmp",
+            shaped_data(&[stream_of(&kit::ascii_85(&packed))], plain_trailer),
+        ),
+        (
+            "xml_xmp",
+            shaped_data(&[stream_of(packet.as_bytes())], plain_trailer),
+        ),
+        (
+            "not_flate",
+            shaped_data(&[stream_of(b"x\x9c not data")], plain_trailer),
+        ),
+        (
+            "flate_not_xml",
+            shaped_data(&[stream_of(&kit::flate(b"plain words"))], plain_trailer),
+        ),
+        (
+            "swells",
+            shaped_data(&[stream_of(&kit::flate(swells.as_bytes()))], plain_trailer),
+        ),
+        (
+            "cut_short",
+            shaped_data(&[stream_of(&packed[..packed.len() - 4])], plain_trailer),
+        ),
+        (
+            "protected",
+            shaped_data(&[stream_of(&packed)], "/Root 1 0 R /Encrypt 2 0 R /Size 4"),
+        ),
+        (
+            "earlier_part",
+            shaped_data(&[stream_of(&packed)], "/Root 1 0 R /Prev 9 /Size 4"),
+        ),
+    ];
+    for (name, bytes) in &repair_seeds {
+        write(&dir, "metadata_repair", &format!("{name}.pdf"), bytes);
+    }
+
     // Engine: PDF files from the test kit. Small ones, so the fuzzer can change them quickly.
     let target = "engine_open_render";
     // Documents whose destinations are page numbers that do not exist: a link and outline
@@ -959,10 +1505,53 @@ fn main() {
         // `-max_len` of 100000).
         ("links_over_the_cap", kit::many_links_pdf(501)),
         ("encrypted", kit::encrypted_pdf("secret", 1)),
+        // Documents for the page tools: pages with everything a page tool must keep, a page tree
+        // that loops or is very deep, a count that lies, odd turns and odd boxes.
+        ("marked", kit::marked_pdf(4)),
+        ("circular_tree", kit::circular_tree_pdf()),
+        ("deep_tree", kit::deep_tree_pdf(300)),
+        ("page_count_lie", kit::page_count_lie_pdf(2_000_000_000)),
+        ("odd_rotation", kit::odd_rotation_pdf()),
+        ("odd_boxes", kit::odd_boxes_pdf()),
+        ("many_blank_pages", kit::blank_pages_pdf(300)),
+        ("signed", kit::signed_pdf()),
+        // What the page tools had to be made safe against: a copy of pages that points into the
+        // other document (a note with its pop-up, a field on two pages, an entry with /First), a
+        // text field with the look of its value, a tree whose list of kids ends with an entry that
+        // is not there, and a damaged protected file that reads back with no pages.
+        ("popup_note", kit::popup_note_pdf()),
+        ("shared_field", kit::shared_field_pdf()),
+        ("first_key", kit::first_key_pdf()),
+        ("form_leftovers", kit::form_leftovers_pdf()),
+        ("trailing_null_kid", kit::trailing_null_kid_pdf()),
+        ("junk_after_the_kids", kit::junk_after_the_kids_pdf()),
+        ("trailing_far_kid", kit::trailing_far_kid_pdf()),
+        ("far_object_number", kit::far_object_number_pdf()),
+        ("inherited_tree", kit::inherited_tree_pdf()),
+        ("root_inherited", kit::root_inherited_pdf()),
+        (
+            "dangling_resources",
+            kit::dangling_resources_pdf("/Resources 900 0 R"),
+        ),
+        (
+            "null_resources",
+            kit::dangling_resources_pdf("/Resources null"),
+        ),
+        ("outside_parent", kit::outside_parent_pdf(true, true)),
+        ("turned_root", kit::turned_root_pdf()),
+        ("listed_many_times", kit::listed_many_times_pdf(200, 300, 0)),
+        ("indirect_kids", kit::indirect_kids_pdf()),
+        ("words_in_node", kit::words_in_node_pdf(true)),
+        ("object_streams", kit::object_streams_pdf()),
+        ("inline_dictionaries", kit::inline_dictionaries_pdf()),
+        ("page_count_lost", kit::page_count_lost_pdf()),
+        ("mixed_sizes", kit::mixed_size_pdf()),
         // A protected file with an XMP stream: encrypted as the dictionary says (a save is refused),
         // and clear as `/EncryptMetadata false` says (a save keeps it).
         ("encrypted_xmp", kit::encrypted_xmp_pdf("secret", false)),
         ("encrypted_xmp_clear", kit::encrypted_xmp_pdf("secret", true)),
+        // A compressed XMP stream on the catalog and on the page: the save mends it (see the mend).
+        ("compressed_xmp", kit::xmp_pdf_with(true, true, true)),
         ("truncated", kit::truncated_pdf()),
         // Forms: every kind of field, a turned page, XFA, scripts and actions, a signature, fields
         // that sit under a parent, and a page with many fields.
@@ -992,5 +1581,16 @@ fn main() {
     }
     // Git must not change the line endings of binary files.
     fs::write(dir.join(".gitattributes"), "* binary\n").expect("write .gitattributes");
+
+    // The writer of form fields: the first bytes pick the document, the rest is the script.
+    let mut state = 0x2545_f491u32;
+    for fixture in 0..8u8 {
+        let mut script = vec![fixture];
+        for _ in 0..160 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            script.push((state >> 24) as u8);
+        }
+        write(&dir, "form_author", &format!("script_{fixture}"), &script);
+    }
     println!("seeds written to {}", dir.display());
 }

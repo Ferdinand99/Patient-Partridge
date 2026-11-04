@@ -7,6 +7,7 @@
 import type { StorageLike } from "../lib/theme";
 import type { PageSizePt } from "../viewer/layout";
 import { OutlineView, type OutlineEntry } from "./outline";
+import type { PagePanel } from "./pagepanel";
 import { ThumbnailList, type ThumbApi, type ThumbOptions } from "./thumbnails";
 
 export type Panel = "pages" | "contents";
@@ -44,6 +45,8 @@ export interface SidebarDeps {
   api: ThumbApi & { getOutline(doc: number): Promise<OutlineEntry[]> };
   storage: StorageLike | null;
   thumbs?: ThumbOptions;
+  /** The page tools on top of the thumbnails. Without it the thumbnails only go to a page. */
+  pagePanel?: PagePanel;
 }
 
 type OutlineCache =
@@ -142,6 +145,15 @@ export class Sidebar {
     this.thumbs?.setEnabled(this.thumbsWanted());
   }
 
+  /** The pages of a document changed (a page tool, taking a change back): the thumbnails are made again. */
+  pagesChanged(doc: number): void {
+    this.deps.pagePanel?.pagesChanged(doc);
+    this.outlines.delete(doc);
+    if (this.document?.doc !== doc) return;
+    this.dropThumbs();
+    this.apply();
+  }
+
   /** The picture of a page of a document changed: its thumbnail is drawn again if it is shown. */
   pageChanged(doc: number, page: number): void {
     if (this.document?.doc === doc) this.thumbs?.invalidate(page);
@@ -151,6 +163,7 @@ export class Sidebar {
   forget(doc: number): void {
     this.outlines.delete(doc);
     this.scrolled.delete(doc);
+    this.deps.pagePanel?.forget(doc);
   }
 
   private thumbsWanted(): boolean {
@@ -168,6 +181,7 @@ export class Sidebar {
   private dropThumbs(): void {
     if (!this.thumbs) return;
     if (this.document) this.scrolled.set(this.document.doc, this.thumbs.scrollTop);
+    this.deps.pagePanel?.detach();
     this.thumbs.destroy();
     this.thumbs = null;
   }
@@ -185,6 +199,7 @@ export class Sidebar {
     this.outlineRoot.hidden = !open || panel !== "contents";
 
     const document = this.document;
+    this.deps.pagePanel?.showTools(open && panel === "pages" && document !== null);
     if (!open || !document) {
       // Closed: nothing is built, nothing is drawn, nothing is asked from the engine.
       this.dropThumbs();
@@ -192,14 +207,19 @@ export class Sidebar {
     }
     if (panel === "pages") {
       if (!this.thumbs) {
+        const panel = this.deps.pagePanel;
         this.thumbs = new ThumbnailList(
           this.thumbsRoot,
           document.doc,
           document.pages,
           this.deps.api,
           (page) => document.goToPage(page),
-          this.deps.thumbs,
+          // A click that picks pages (Ctrl, Shift, the end of a drag) stays in the panel.
+          panel
+            ? { ...this.deps.thumbs, decorate: panel.decorate, pick: (p, e) => panel.select(p, e) }
+            : this.deps.thumbs,
         );
+        panel?.attach(this.thumbs, this.thumbsRoot, document.doc, document.pages);
         const saved = this.scrolled.get(document.doc);
         // A list the reader scrolled stays where it was; a new one shows the page in view.
         if (saved !== undefined) this.thumbs.scrollTop = saved;

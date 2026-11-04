@@ -2,7 +2,9 @@
 // Anything that touches the outside world (the engine, the file dialog, the window title, the
 // storage) comes in through `AppDeps`, so tests can run the whole flow with fakes.
 
-import type { OpenedDocument, OutlineEntry, SavedFile, SavedPosition } from "../lib/api";
+import type { CertSignApi, OpenedDocument, OutlineEntry, SavedFile, SavedPosition } from "../lib/api";
+import { CERT_WORDS, type SignedFile } from "../lib/certsign";
+import type { SignaturesInfo, StaleReason } from "../lib/signatures";
 import { PALETTE, PEN_WIDTHS, type Annotation, type Tool } from "../lib/annotations";
 import { describeError, fileNameOf, isEngineLost, toAppError, type AppErrorLike } from "../lib/errors";
 import { classifyUri, visibleAddress } from "../lib/linkPolicy";
@@ -21,10 +23,27 @@ import type { FormEdit, FormFieldInfo, FormInfo, FormValueIn, FormsApi } from ".
 import { actionForKey } from "../viewer/keys";
 import type { CopyResult, PageLinkInfo } from "../viewer/overlays";
 import { DocumentView, type ViewPosition, type ViewerOptions } from "../viewer/viewer";
+import type { PageSizePt } from "../viewer/layout";
 import { zoomLabel, type ZoomMode } from "../viewer/zoom";
 import { FindBar } from "./find";
+import type { PageToolsApi } from "../lib/pagesapi";
+import { describePageError } from "../lib/pageerrors";
+import { PICTURE_WORDS, type SavedBody, type SavedPicture } from "../lib/signpicture";
+import { PageOps, REFUSED_FIELD_CODE, type PageHost } from "./pageops";
+import { PagePanel, type PagePanelHost } from "./pagepanel";
 import { Annotator, CLEAN_REFUSALS, annotationNotice, type AnnotatorApi } from "./annotator";
+import {
+  askSignaturePicture,
+  decodeImage,
+  encodePng,
+  measureTyped,
+  scaleImage,
+  type PictureTools,
+} from "./signpicture";
 import { AnnotBar } from "./annotbar";
+import { askCertificateSignature } from "./certsign";
+import { DesignBar } from "./designbar";
+import { FormDesigner } from "./formdesigner";
 import { EditHistory, type Edit } from "./history";
 import { MenuController } from "./menu";
 import {
@@ -35,6 +54,7 @@ import {
   type PrintDeps,
 } from "./print";
 import { showNotice } from "./notice";
+import { SignaturePanel } from "./signatures";
 import { Sidebar, type SidebarDocument } from "./sidebar";
 import { TabStrip } from "./tabs";
 
@@ -51,6 +71,8 @@ export interface AppDeps {
     getOutline(doc: number): Promise<OutlineEntry[]>;
     getPageText(doc: number, page: number): Promise<{ text: string; rects: number[] }>;
     getPageLinks(doc: number, page: number): Promise<PageLinkInfo[]>;
+    /** The digital signatures of a document, checked by its engine. */
+    getSignatures?(doc: number): Promise<SignaturesInfo>;
     searchPage(doc: number, page: number, query: string): Promise<[number, number][]>;
     /** The form of a document, if the app can fill in forms (the three go together). */
     formInfo?(doc: number): Promise<FormInfo>;
@@ -63,6 +85,12 @@ export interface AppDeps {
       value: FormValueIn,
     ): Promise<FormFieldInfo[]>;
     openLink(doc: number, url: string): Promise<void>;
+    /** The signatures kept for later on this computer (the five go together). Without them nothing is kept. */
+    listSignatureMarks?(): Promise<SavedPicture[]>;
+    addSignatureMark?(name: string, mark: SavedBody): Promise<SavedPicture>;
+    renameSignatureMark?(id: string, name: string): Promise<SavedPicture>;
+    deleteSignatureMark?(id: string): Promise<void>;
+    clearSignatureMarks?(): Promise<void>;
     /** The scripts the engine of a document had no font for when PDFium asked. */
     missedFonts?(doc: number): Promise<string[]>;
     measureMode(): Promise<boolean>;
@@ -72,7 +100,8 @@ export interface AppDeps {
     saveAs(doc: number, allowSigned: boolean): Promise<SavedFile | null>;
     quitApp(): Promise<void>;
     stayOpen(): Promise<void>;
-  } & Partial<AnnotatorApi> & {
+  } & Partial<AnnotatorApi> &
+    Partial<CertSignApi> & {
       /** The annotations of a page. Without it, and without the other annotation calls, the annotation bar is off. */
       listAnnotations?(doc: number, page: number): Promise<Annotation[]>;
     };
@@ -100,8 +129,21 @@ export interface AppDeps {
    * SESSION_OPEN_LIMIT_MS.
    */
   sessionOpenLimitMs?: number;
+  /** How long after a document is shown its signatures are asked for, in milliseconds. Default: 1200. */
+  signaturesDelayMs?: number;
   /** Limits on the text kept for each document. For tests; the defaults are meant for the app. */
   viewLimits?: ViewerOptions["limits"];
+  /** How the box for a picture of a signature reads and writes images and measures a typed name. For tests. */
+  pictureTools?: Partial<Pick<PictureTools, "decode" | "encodePng" | "scale" | "measure">>;
+  /** The page tools (delete, move, turn, crop, insert, copy out). Without it the page panel only shows the pages. */
+  pages?: PageToolsApi;
+  /** How long a page tool may work before the box with the bar shows, in milliseconds. For tests. */
+  pageBusyDelayMs?: number;
+  /**
+   * How long a close, a quit, a save or a print waits for a page tool that is changing the document
+   * before it asks what to do, in milliseconds. Default: CHANGE_GRACE_MS. For tests.
+   */
+  changeGraceMs?: number;
 }
 
 interface Tab {
@@ -142,6 +184,11 @@ interface Tab {
   fontsAsking: boolean;
   /** True once the reader was told about text that cannot be drawn for lack of a font. */
   fontsTold: boolean;
+  /**
+   * True for a file that was signed in this window: it is shown as it was written, and editing is off
+   * until the file is opened again, because any change would break the signature.
+   */
+  signedHere: boolean;
 }
 
 /**
@@ -188,6 +235,11 @@ function samePlace(a: ViewPosition, b: ViewPosition): boolean {
 const APP_NAME = "Patient Partridge";
 /** How long a save is waited for before a box says that it is going on. */
 const SAVE_SHEET_DELAY_MS = 500;
+/**
+ * How long a close, a quit, a save or a print waits for a page tool that is changing the document
+ * before it asks the user what to do. A change that ends in a moment is waited for without a word.
+ */
+const CHANGE_GRACE_MS = 2000;
 const SAVE_SLOW_DETAIL =
   "A large file or a slow drive can take a while. You can wait, or give up the changes you made: the file on the disk stays as it is. Cancel keeps the program open and lets the save carry on.";
 
@@ -198,6 +250,83 @@ function byId<T extends HTMLElement>(root: Document, id: string): T {
   const el = root.getElementById(id);
   if (!el) throw new Error(`missing element #${id}`);
   return el as T;
+}
+
+/** The errors that only the page tools give when a change to the pages is taken back or made again. */
+const PAGE_TOOL_CODES = new Set([
+  "snapshot_gone",
+  "undo_unavailable",
+  "busy",
+  "save_busy",
+  "pages_not_allowed",
+  "page_change_failed",
+  "import_failed",
+  "too_many_pages",
+]);
+
+/** The codes after which the step cannot be tried again, whatever the user does: the copy is gone. */
+const NO_WAY_BACK = new Set(["snapshot_gone", "undo_unavailable"]);
+
+/**
+ * What to tell the user when taking a change back (or making it again) failed. The history keeps the
+ * order of all the changes (pages, annotations, form fields), so the edits `behind` the one that
+ * failed cannot be reached either, and that is said when it is true.
+ */
+export function undoFailure(
+  error: AppErrorLike,
+  direction: "undo" | "redo",
+  name: string,
+  behind = 0,
+): { title: string; detail: string; buttons: { id: string; label: string; primary: boolean }[] } {
+  const buttons = [{ id: "ok", label: "OK", primary: true }];
+  const generic = direction === "undo" ? "The change could not be taken back" : "The change could not be made again";
+  if (PAGE_TOOL_CODES.has(error.code)) {
+    const text = describePageError(error, name);
+    const known = ["snapshot_gone", "undo_unavailable", "busy", "save_busy", "pages_not_allowed"].includes(error.code);
+    let detail = known
+      ? text.detail
+      : `${error.message ? `${error.message.charAt(0).toUpperCase()}${error.message.slice(1)}. ` : ""}The document is as it was before.`;
+    if (NO_WAY_BACK.has(error.code) && behind > 0) {
+      detail += ` The ${behind === 1 ? "change" : `${behind} changes`} before it in the history (pages, annotations or form fields) ${
+        direction === "undo" ? "cannot be taken back" : "cannot be made again"
+      } either, because the history goes one step at a time. Save the document to keep it as it is, or close it without saving to go back to the file.`;
+    }
+    return { title: known ? text.title : generic, detail, buttons };
+  }
+  return {
+    title: generic,
+    detail: CLEAN_REFUSALS.has(error.code)
+      ? "The document is as it was before. Nothing was lost."
+      : "Part of the change may have been made. The document is marked as changed; close it without saving to go back to the file.",
+    buttons,
+  };
+}
+
+/**
+ * The commands of the app process, with every read from the file behind a document watched. When
+ * the engine refuses one because the file now has other bytes than the ones it was checked on
+ * (`source_changed`), or because a read of the file failed after the check, so that a page may have
+ * lost content (`source_unreadable`), `told` hears which document it was and why, and the error
+ * goes on to the caller as it would have without this.
+ */
+function watchReads(api: AppDeps["api"], told: (doc: number, why: StaleReason) => void): AppDeps["api"] {
+  const watch = <T>(call: Promise<T>, doc: number): Promise<T> =>
+    call.catch((error: unknown) => {
+      const code = toAppError(error).code;
+      if (code === "source_changed") told(doc, "file_changed");
+      else if (code === "source_unreadable") told(doc, "read_failed");
+      throw error;
+    });
+  const watched = {
+    render: (doc: number, page: number, width: number, height: number) =>
+      watch(api.render(doc, page, width, height), doc),
+    getOutline: (doc: number) => watch(api.getOutline(doc), doc),
+    getPageText: (doc: number, page: number) => watch(api.getPageText(doc, page), doc),
+    getPageLinks: (doc: number, page: number) => watch(api.getPageLinks(doc, page), doc),
+    searchPage: (doc: number, page: number, query: string) => watch(api.searchPage(doc, page, query), doc),
+  };
+  // Everything else is the original, looked up when it is called.
+  return Object.assign(Object.create(api) as AppDeps["api"], watched);
 }
 
 export class App {
@@ -221,11 +350,17 @@ export class App {
   private quitting = false;
   /** What a second request to quit does while the first is still being dealt with. */
   private quitReveal: (() => void) | null = null;
+  /** The tabs whose close is waiting for a change to end or asking what to do about it. */
+  private readonly closing = new Set<number>();
+  /** What brings up the question about a change at once, for the requests that are waiting. */
+  private readonly askAtOnce = new Set<() => void>();
 
   private readonly stage: HTMLElement;
   private readonly empty: HTMLElement;
   private readonly dropOverlay: HTMLElement;
   private readonly noticeLayer: HTMLElement;
+  private readonly protectionLine: HTMLElement;
+  private protectionTold = false;
   private readonly pageInput: HTMLInputElement;
   private readonly pageTotal: HTMLElement;
   private readonly zoomSelect: HTMLSelectElement;
@@ -234,9 +369,21 @@ export class App {
   private readonly tabStrip: TabStrip;
   private readonly menu: MenuController;
   private readonly sidebar: Sidebar;
+  private readonly pageOps: PageOps | null;
+  private readonly pagePanel: PagePanel | null;
+  private readonly pageAnnounce: HTMLElement;
+  private pageAnnounceFlip = false;
+  /** The document whose annotations and fields wait for a page tool (see `holdEdits`). */
+  private heldDoc: number | null = null;
   private readonly find: FindBar;
+  private readonly signatures: SignaturePanel;
+  /** The commands of the app process, with the reads of a document watched (see `watchReads`). */
+  private readonly api: AppDeps["api"];
   private readonly selectionProxy: HTMLElement;
   private readonly annotbar: AnnotBar;
+  private readonly designbar: DesignBar;
+  /** The form designer ("Edit form"), when the app process has it. */
+  private designer: FormDesigner | null = null;
   private readonly annotStatus: HTMLElement;
   private readonly popovers: HTMLElement;
   /** Whether the annotation bar is shown. */
@@ -267,12 +414,14 @@ export class App {
     this.empty = byId(root, "empty");
     this.dropOverlay = byId(root, "drop-overlay");
     this.noticeLayer = byId(root, "notice-layer");
+    this.protectionLine = byId(root, "protection-line");
     this.pageInput = byId(root, "page-input");
     this.pageTotal = byId(root, "page-total");
     this.zoomSelect = byId(root, "zoom-select");
     this.zoomIn = byId(root, "zoom-in");
     this.zoomOut = byId(root, "zoom-out");
     this.positionDelay = deps.positionDelayMs ?? DEFAULT_POSITION_DELAY_MS;
+    this.api = watchReads(deps.api, (doc, why) => this.sourceChanged(doc, why));
     this.tabStrip = new TabStrip(byId(root, "tabs"), {
       select: (id) => this.activate(id),
       close: (id) => void this.requestClose(id),
@@ -290,6 +439,7 @@ export class App {
         this.active?.annotator?.setStamp(stamp);
         this.active?.view.element.focus({ preventScroll: true });
       },
+      openSignature: () => void this.openSignature(),
       editText: () => {
         const a = this.active?.annotator;
         if (a?.selected) void a.editText(a.selected.page, a.selected.id);
@@ -298,24 +448,181 @@ export class App {
       undo: () => void this.undoActive(),
       redo: () => void this.redoActive(),
     });
+    this.designbar = new DesignBar(root, {
+      toggle: (open) => void this.setDesigning(open),
+      setTool: (tool, viaKeyboard) => this.designer?.setTool(tool, { place: viaKeyboard }),
+      remove: () => this.designer?.removeSelectedWidget(),
+      undo: () => void this.undoActive(),
+      redo: () => void this.redoActive(),
+    });
     this.copyStatus = byId(root, "copy-status");
     this.printRoot = byId(root, "print-root");
     this.find = new FindBar(root, {
-      searchPage: (doc, page, query) => deps.api.searchPage(doc, page, query),
+      searchPage: (doc, page, query) => this.api.searchPage(doc, page, query),
       onEngineLost: (target, error) => {
         const lost = this.tabs.find((t) => t.view === target.view);
         if (lost) void this.documentLost(lost, error);
       },
       debounceMs: deps.findDebounceMs,
     });
+    this.pageAnnounce = byId(root, "pt-announce");
+    this.pageOps = null;
+    this.pagePanel = null;
+    if (deps.pages) {
+      const host: PageHost & PagePanelHost = {
+        target: () => {
+          const t = this.active;
+          return t ? { doc: t.doc, name: t.name, history: t.history, pages: t.sidebarDoc.pages } : null;
+        },
+        // A change made for a document is made to that document, whichever tab is in front.
+        targetOf: (doc) => {
+          const t = this.tabs.find((x) => x.doc === doc);
+          return t ? { doc: t.doc, name: t.name, history: t.history, pages: t.sidebarDoc.pages } : null;
+        },
+        applyPages: (doc, pages, show) => this.applyPages(doc, pages, show),
+        notice: (options) => showNotice(this.noticeLayer, options),
+        lost: async (doc, error) => {
+          const tab = this.tabs.find((t) => t.doc === doc);
+          if (tab) await this.documentLost(tab, error);
+        },
+        settle: (doc, options) => this.settleBeforePages(doc, options?.copies === true),
+        keepsRefusedText: (doc) => this.keepRefusedText(doc),
+        pickFiles: () => deps.pickFiles(),
+        announce: (text) => this.announcePages(text),
+        layer: this.noticeLayer,
+        busyLayer: byId(root, "busy-strip"),
+        currentPage: () => this.active?.view.currentPageIndex ?? 0,
+        goToPage: (index) => this.active?.view.goToPage(index),
+        render: (doc, page, width, height) => deps.api.render(doc, page, width, height),
+      };
+      const ops = new PageOps(deps.pages, host, {
+        busyChanged: (busy) => {
+          this.pagePanel?.setBusy(busy);
+          this.holdEdits(busy);
+        },
+        busyDelayMs: deps.pageBusyDelayMs,
+      });
+      this.pageOps = ops;
+      this.pagePanel = new PagePanel(root, ops, host);
+      if (ops.canDesign) {
+        this.designer = new FormDesigner(root, {
+          target: () => {
+            const t = this.active;
+            return t ? { doc: t.doc, name: t.name, view: t.view, history: t.history, pages: t.sidebarDoc.pages } : null;
+          },
+          api: deps.pages,
+          ops,
+          pageText: (doc, page) => deps.api.getPageText(doc, page),
+          notice: (options) => showNotice(this.noticeLayer, options),
+          announce: (text) => this.announce(text),
+          changed: () => this.syncDesignBar(),
+          pendingChanged: (doc) => {
+            const tab = this.tabs.find((t) => t.doc === doc);
+            if (tab) this.historyChanged(tab);
+          },
+        });
+      }
+    }
     this.sidebar = new Sidebar(root, {
-      api: deps.api,
+      api: this.api,
       storage: deps.storage ?? null,
       thumbs: deps.thumbSettleMs === undefined ? undefined : { settleMs: deps.thumbSettleMs },
+      pagePanel: this.pagePanel ?? undefined,
+    });
+    this.signatures = new SignaturePanel(root, { api: deps.api, delayMs: deps.signaturesDelayMs });
+  }
+
+  /**
+   * The pages of a document changed (a page tool, or taking one back): the view and the side panel
+   * lay out again for the new list, and a search of the old pages is dropped, because page numbers
+   * now mean other pages.
+   */
+  private applyPages(doc: number, pages: PageSizePt[], show?: number): void {
+    const tab = this.tabs.find((t) => t.doc === doc);
+    if (!tab) return;
+    tab.sidebarDoc.pages = pages;
+    // The designer reads the fields again: it is told before the new layers ask for them.
+    this.designer?.pagesChanged(doc);
+    tab.view.replacePages(pages, show);
+    // What the annotations of the tab keep by page number and by id means other things now.
+    tab.annotator?.pagesChanged();
+    this.find.forget(tab.view);
+    if (this.active === tab) {
+      this.find.setTarget(null);
+      this.find.setTarget({ doc: tab.doc, view: tab.view });
+      this.pageTotal.textContent = `/ ${pages.length}`;
+      this.showCurrentPage();
+    }
+    this.sidebar.pagesChanged(doc);
+  }
+
+  /**
+   * A page tool (or taking one back) works on the document `busyDoc`: its annotation tools, the box
+   * for the text of a note and the fields of its form wait until it is done, and say so. A change
+   * begun meanwhile would run after the pages changed, with page numbers that mean other pages.
+   */
+  private holdEdits(busy: boolean): void {
+    this.designer?.setBusy(busy);
+    const doc = busy ? (this.pageOps?.busyDoc ?? null) : this.heldDoc;
+    this.heldDoc = busy ? doc : null;
+    const tab = doc === null ? undefined : this.tabs.find((t) => t.doc === doc);
+    if (!tab) return;
+    // A file that was signed here stays held, whatever a page tool does.
+    tab.view.holdEdits(busy || tab.signedHere);
+    tab.annotator?.setHeld(busy || tab.signedHere);
+    if (this.active === tab) this.syncAnnotBar();
+  }
+
+  /**
+   * Before a page tool begins: what was typed in a field is sent, the box of a note is saved or
+   * closed and the changes under way are made, so that they are part of the document first. Text a
+   * field refused is not in the document and would be lost with the pages it was typed on: the tool
+   * does not begin until the reader has dealt with it.
+   */
+  private async settleBeforePages(doc: number, copies = false): Promise<boolean> {
+    const tab = this.tabs.find((t) => t.doc === doc);
+    if (!tab) return true;
+    // The file that was just signed is not changed: a page tool would break the signature. Copying
+    // pages out writes a new file and leaves the signed one as it is.
+    if (tab.signedHere && !copies) {
+      await this.tellSigned("page changes");
+      return false;
+    }
+    await tab.view.flushForms().catch(() => undefined);
+    await tab.annotator?.flush();
+    if (!this.tabs.includes(tab)) return false;
+    return this.keepRefusedText(doc);
+  }
+
+  /** Says that what the person asked for is off in a file that was signed here. */
+  private async tellSigned(what: string): Promise<void> {
+    await showNotice(this.noticeLayer, {
+      title: CERT_WORDS.signedTitle,
+      detail: CERT_WORDS.signedOff(what),
+      buttons: [{ id: "ok", label: "OK", primary: true }],
     });
   }
 
+  /**
+   * False, after saying why, when a field of the document holds text the engine refused: the pages
+   * of a tool, or of a step back or forward, would replace the field and the text with it.
+   */
+  private async keepRefusedText(doc: number): Promise<boolean> {
+    const tab = this.tabs.find((t) => t.doc === doc);
+    if (!tab || !tab.view.hasRefusedFormInput) return true;
+    await this.tellRefusedField(tab, "pages");
+    return false;
+  }
+
+  private announcePages(text: string): void {
+    this.pageAnnounceFlip = !this.pageAnnounceFlip;
+    this.pageAnnounce.textContent = this.pageAnnounceFlip ? text : `${text}\u00a0`;
+  }
+
   init(): void {
+    byId(this.root, "protection-dismiss").addEventListener("click", () => {
+      this.protectionLine.hidden = true;
+    });
     byId(this.root, "open-button").addEventListener("click", () => void this.openDialog());
     byId(this.root, "print-button").addEventListener("click", () => void this.printActive());
     for (const [id, asCopy] of [
@@ -335,6 +642,10 @@ export class App {
       });
     }
     byId(this.root, "empty-open").addEventListener("click", () => void this.openDialog());
+    byId(this.root, "sign-button").addEventListener("click", () => {
+      this.menu.close();
+      void this.signWithCertificate();
+    });
     this.zoomIn.addEventListener("click", () => this.active?.view.stepZoom(1));
     this.zoomOut.addEventListener("click", () => this.active?.view.stepZoom(-1));
     this.zoomSelect.addEventListener("change", () => this.onZoomSelect());
@@ -346,6 +657,7 @@ export class App {
     this.initTheme();
     this.initReopenSetting();
     byId(this.root, "forget-positions").addEventListener("click", () => void this.forgetPositions());
+    byId(this.root, "forget-signatures").addEventListener("click", () => void this.forgetSignatures());
     // The reader's place is saved when they rest, and again when the window goes away.
     this.root.addEventListener("visibilitychange", () => {
       if (this.root.visibilityState === "hidden") this.saveAll();
@@ -378,6 +690,11 @@ export class App {
   /** Records an edit of the document that is shown. Does nothing when there is none. */
   recordEdit(edit: Edit): void {
     this.active?.history.push(edit);
+  }
+
+  /** Resolves when no page tool is working: what it changes counts as unsaved only when it is done. */
+  settled(): Promise<void> {
+    return this.pageOps?.busy ? this.pageOps.whenIdle() : Promise.resolve();
   }
 
   /**
@@ -670,6 +987,19 @@ export class App {
     this.addTab(opened, path, started, activate);
   }
 
+  /**
+   * Windows: the PDF reader is locked into its sandbox, but the computer did not confirm that the
+   * network is blocked for it. One calm line, once; the user can dismiss it. (The reason is in the
+   * engine's greeting, not shown here.)
+   */
+  private tellAboutNetworkBlock(opened: OpenedDocument): void {
+    if (!opened.networkNotProved || this.protectionTold) return;
+    this.protectionTold = true;
+    byId(this.root, "protection-text").textContent =
+      "Windows did not confirm that network access is blocked for the PDF reader on this computer. It still runs in its protective sandbox.";
+    this.protectionLine.hidden = false;
+  }
+
   private async openFailed(
     path: string,
     name: string,
@@ -718,6 +1048,7 @@ export class App {
     activate: boolean,
     rank = Infinity,
   ): void {
+    this.tellAboutNetworkBlock(opened);
     // A file named at the start that was in the last session's list goes back to its old place.
     if (rank === Infinity) rank = this.sessionRanks.get(path) ?? Infinity;
     const openedAfter = this.deps.now() - started;
@@ -740,10 +1071,11 @@ export class App {
       sawScripts: false,
       fontsAsking: false,
       fontsTold: false,
+      signedHere: false,
     };
     tab.view = new DocumentView(
       { doc: opened.doc, pages: opened.pages },
-      this.deps.api,
+      this.api,
       {
         onPageChange: (page) => {
           if (this.active !== tab) return;
@@ -783,6 +1115,7 @@ export class App {
           onPlace: (page, x, y, client) => tab.annotator?.onPlace(page, x, y, client),
           onStroke: (page, points) => tab.annotator?.onStroke(page, points),
           onMove: (page, id, dx, dy) => tab.annotator?.onMove(page, id, dx, dy),
+          onResize: (page, id, rect) => tab.annotator?.onResize(page, id, rect),
           onEdit: (page, id) => tab.annotator?.onEdit(page, id),
           onLoadFailed: (page, error) => tab.annotator?.onLoadFailed(page, error),
         },
@@ -903,6 +1236,9 @@ export class App {
     if (!next) return;
     const previous = this.active;
     if (previous && previous !== next) {
+      // What the designer holds for the tab that is left is sent for that tab, before the tab in front
+      // changes (the batch names its document, so it reaches the right one either way).
+      void this.designer?.flush(previous.doc);
       this.saveNow(previous);
       previous.view.setActive(false);
     }
@@ -915,6 +1251,7 @@ export class App {
       next.view.start();
     }
     this.syncChrome();
+    void this.designer?.followTab();
     next.view.element.focus({ preventScroll: true });
   }
 
@@ -923,6 +1260,33 @@ export class App {
    * save, give the changes up, or keep the tab. Resolves with true when the tab is closed.
    */
   async requestClose(id: number): Promise<boolean> {
+    const first = this.tabs.find((t) => t.id === id);
+    if (!first) return true;
+    // A page tool that is still working makes the document dirty when it is done. A tab that
+    // looks clean now is closed with that change lost, so a change that ends in a moment is waited
+    // for. One that takes long is put to the user: wait, or leave now and lose the change and what
+    // is not saved. A tool that works on another document is none of this tab's business.
+    if (this.pageOps?.busyOn(first.doc)) {
+      if (this.closing.has(id)) {
+        // Asked again while the first request is waiting: the question comes at once.
+        for (const ask of this.askAtOnce) ask();
+        return false;
+      }
+      this.closing.add(id);
+      try {
+        const ended = await this.changeEnded(first.doc);
+        if (!ended && this.tabs.includes(first) && this.pageOps.busyOn(first.doc)) {
+          if ((await this.askAboutChange(first, "close")) === "wait") return false;
+          // The change may have ended while the question was open; then the ordinary questions follow.
+          if (this.tabs.includes(first) && this.pageOps.busyOn(first.doc)) {
+            this.closeTab(first.id);
+            return true;
+          }
+        }
+      } finally {
+        this.closing.delete(id);
+      }
+    }
     const tab = this.tabs.find((t) => t.id === id);
     if (!tab) return true;
     // What was typed and not left yet is part of the document before the question is asked.
@@ -1029,6 +1393,53 @@ export class App {
     this.noticeLayer.lastElementChild?.querySelector<HTMLElement>("button:not(:disabled)")?.focus();
   }
 
+  /**
+   * Waits for the page tool that is changing the document `doc` (any document when null) for a
+   * moment. Resolves with true when no such tool is working any more, and with false when the
+   * moment has passed or a request that waits as well asked for the question at once.
+   */
+  private async changeEnded(doc: number | null): Promise<boolean> {
+    const ops = this.pageOps;
+    const busy = () => (doc === null ? ops?.busy === true : ops?.busyOn(doc) === true);
+    if (!ops || !busy()) return true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let asked!: () => void;
+    const late = new Promise<false>((resolve) => {
+      timer = setTimeout(() => resolve(false), this.deps.changeGraceMs ?? CHANGE_GRACE_MS);
+      asked = () => resolve(false);
+    });
+    this.askAtOnce.add(asked);
+    try {
+      const ended = await Promise.race([ops.whenIdle().then(() => true as const), late]);
+      return ended && !busy();
+    } finally {
+      clearTimeout(timer);
+      this.askAtOnce.delete(asked);
+    }
+  }
+
+  /**
+   * A page tool is still changing a document that the user is closing or leaving the program with.
+   * There is no Stop for such a change (it cannot be ended without ending the engine), so the user
+   * chooses: wait for it, or leave now and lose the change and the unsaved changes of that document.
+   */
+  private async askAboutChange(tab: Tab, what: "close" | "quit"): Promise<"wait" | "leave"> {
+    const leave = what === "close" ? "close the document" : "quit";
+    // Copying pages out changes nothing in the document: only what is not saved is at stake.
+    const copying = this.pageOps?.copyingOn(tab.doc) === true;
+    const answer = await showNotice(this.noticeLayer, {
+      title: copying ? `Pages are being copied out of "${tab.name}"` : `"${tab.name}" is still being changed`,
+      detail: copying
+        ? `If you ${leave} now, the copy is given up and the changes to this document that you have not saved are lost. To keep them, wait until the copy has finished, then ${leave}.`
+        : `A change to its pages is under way. If you ${leave} now, that change and the changes to this document that you have not saved are lost. To keep them, wait until the change has finished, then ${leave}.`,
+      buttons: [
+        { id: "wait", label: "Wait", safe: true },
+        { id: "leave", label: what === "close" ? "Close now" : "Quit now" },
+      ],
+    });
+    return answer.button === "leave" ? "leave" : "wait";
+  }
+
   /** Closes a tab at once, whatever it holds. The questions are asked by `requestClose`. */
   closeTab(id: number): void {
     const index = this.tabs.findIndex((t) => t.id === id);
@@ -1043,8 +1454,10 @@ export class App {
     }
     this.find.forget(tab.view);
     tab.annotator?.destroy();
+    this.designer?.forget(tab.doc);
     tab.view.destroy();
     this.sidebar.forget(tab.doc);
+    this.signatures.forget(tab.doc);
     void this.deps.api.close(tab.doc).catch(() => undefined);
     if (this.activeId === id) {
       this.activeId = null;
@@ -1111,6 +1524,8 @@ export class App {
 
   /** Shows or hides the annotation bar. Hiding it puts the pointer back to picking. */
   private setAnnotating(open: boolean, focus = false): void {
+    // The annotation tools and the form designer both take the pointer: one at a time.
+    if (open && this.designer?.open) void this.setDesigning(false);
     this.annotOpen = open;
     if (!open) {
       for (const tab of this.tabs) tab.annotator?.setTool("select");
@@ -1120,10 +1535,86 @@ export class App {
     if (open && focus) this.annotbar.focusBar();
   }
 
+  /** The box for making or picking a picture of a signature is open. */
+  private pictureOpen = false;
+
+  /**
+   * Opens the box for a picture of a signature, and when a picture is made or picked, switches the
+   * tool on so that the next click on a page places it. It does nothing while the pages of the
+   * document are being changed, or while the box is already open.
+   */
+  private async openSignature(): Promise<void> {
+    const tab = this.active;
+    const annotator = tab?.annotator;
+    if (!tab || !annotator || this.pictureOpen) return;
+    if (!this.annotOpen) this.setAnnotating(true);
+    if (annotator.blockedReason !== null) {
+      this.announce(annotator.blockedReason);
+      return;
+    }
+    this.pictureOpen = true;
+    try {
+      const answer = await askSignaturePicture({ layer: this.noticeLayer, tools: this.pictureTools() });
+      if (!answer || !this.tabs.includes(tab)) return;
+      annotator.setSignature(answer.picture);
+      if (this.active === tab) tab.view.element.focus({ preventScroll: true });
+    } finally {
+      this.pictureOpen = false;
+    }
+  }
+
+  /** What the box for a picture of a signature uses: the kept signatures, and the image functions of the window. */
+  private pictureTools(): PictureTools {
+    const api = this.deps.api;
+    const store =
+      api.listSignatureMarks && api.addSignatureMark && api.renameSignatureMark && api.deleteSignatureMark
+        ? {
+            list: () => api.listSignatureMarks!(),
+            add: (name: string, body: SavedBody) => api.addSignatureMark!(name, body),
+            rename: (id: string, name: string) => api.renameSignatureMark!(id, name),
+            remove: (id: string) => api.deleteSignatureMark!(id),
+          }
+        : null;
+    return {
+      store,
+      decode: this.deps.pictureTools?.decode ?? decodeImage,
+      encodePng: this.deps.pictureTools?.encodePng ?? encodePng,
+      scale: this.deps.pictureTools?.scale ?? scaleImage,
+      measure: this.deps.pictureTools?.measure ?? measureTyped,
+    };
+  }
+
+  /** Asks, and then forgets every signature that was kept for later. Pictures already on pages stay. */
+  private async forgetSignatures(): Promise<void> {
+    this.menu.close();
+    const answer = await showNotice(this.noticeLayer, {
+      title: PICTURE_WORDS.forgetTitle,
+      detail: PICTURE_WORDS.forgetDetail,
+      buttons: [
+        { id: "cancel", label: "Keep them", safe: true },
+        { id: "forget", label: "Forget signatures", primary: true },
+      ],
+    });
+    if (answer.button !== "forget") return;
+    try {
+      await this.deps.api.clearSignatureMarks?.();
+    } catch {
+      await showNotice(this.noticeLayer, {
+        title: "The saved signatures were not forgotten",
+        detail: "They could not be removed from this computer. Nothing was changed.",
+        buttons: [{ id: "ok", label: "OK", primary: true }],
+      });
+    }
+  }
+
   /** Picks a tool from the keyboard: the bar opens if it was closed. */
   private chooseTool(tool: Tool): void {
     const annotator = this.active?.annotator;
     if (!annotator) return;
+    if (tool === "signature") {
+      void this.openSignature();
+      return;
+    }
     if (!this.annotOpen) this.setAnnotating(true);
     if (tool === "stamp" && annotator.tool === "stamp") {
       this.annotbar.openStampMenu();
@@ -1154,6 +1645,43 @@ export class App {
       undoLabel: tab?.history.undoLabel ?? null,
       redoLabel: tab?.history.redoLabel ?? null,
     });
+    this.syncDesignBar();
+  }
+
+  /** Opens or closes the form designer ("Edit form"). Opening it closes the annotation bar. */
+  private async setDesigning(open: boolean): Promise<void> {
+    const designer = this.designer;
+    if (!designer) return;
+    if (open && this.active?.signedHere) {
+      await this.tellSigned("the form tools");
+      return;
+    }
+    if (open) {
+      if (this.annotOpen) this.setAnnotating(false);
+      await designer.openMode();
+    } else {
+      await designer.closeMode();
+    }
+    this.syncDesignBar();
+    if (open && designer.open) this.designbar.focusBar();
+  }
+
+  /** Brings the bar of the form designer in step with the document in front. */
+  private syncDesignBar(): void {
+    const designer = this.designer;
+    const tab = this.active;
+    this.designbar.render({
+      available: designer !== null,
+      open: designer?.open ?? false,
+      enabled: designer !== null && tab !== null,
+      tool: designer?.tool ?? "select",
+      canRemove: designer?.canRemove ?? false,
+      canUndo: tab?.history.canUndo ?? false,
+      canRedo: tab?.history.canRedo ?? false,
+      undoLabel: tab?.history.undoLabel ?? null,
+      redoLabel: tab?.history.redoLabel ?? null,
+      note: designer?.hint ? designer.hint : null,
+    });
   }
 
   /** The engine of one document stopped and took the document with it. The other tabs carry on. */
@@ -1173,11 +1701,23 @@ export class App {
     if (answer.button === "retry") await this.openPath(tab.path);
   }
 
+  /**
+   * The engine of a document found that the file it reads from has other bytes than the ones the
+   * signatures were checked on, or that a read of it failed, and refused to draw or read from it.
+   * What was found is dropped at once, whatever the tab shows.
+   */
+  private sourceChanged(doc: number, why: StaleReason): void {
+    if (this.tabs.some((t) => t.doc === doc)) this.signatures.invalidate(doc, why);
+  }
+
   // ---- changes that are not saved ---------------------------------------------
 
   /** The history of a tab changed: tell the app process if the document turned dirty or clean. */
   private historyChanged(tab: Tab): void {
     if (!this.tabs.includes(tab)) return;
+    // Any change of the document (an edit, an undo, a save) means the tab no longer holds the
+    // file whose signatures were checked.
+    this.signatures.invalidate(tab.doc);
     const dirty = this.isDirty(tab);
     if (dirty !== tab.dirtyTold) {
       tab.dirtyTold = dirty;
@@ -1196,7 +1736,9 @@ export class App {
     const tab = this.active;
     if (!tab) return true;
     if (tab.view.hasPendingFormInput) await this.flushForms([tab]);
-    if (!this.tabs.includes(tab) || !this.isDirty(tab)) return true;
+    // History turns dirty only when a change ends, so a document that a tool is changing right now
+    // still goes on: the save waits for the change, or says that it is under way.
+    if (!this.tabs.includes(tab) || (!this.isDirty(tab) && !this.pageOps?.busyOn(tab.doc))) return true;
     return this.saveTab(tab, false);
   }
 
@@ -1236,10 +1778,13 @@ export class App {
     return true;
   }
 
-  /** Saves every document that has changes. Resolves with true when all were saved. */
-  async saveAllChanges(halt?: AbortSignal): Promise<boolean> {
+  /**
+   * Saves every document that has changes, except `given`, a document the user gave up (its change
+   * was under way when the program was left). Resolves with true when all were saved.
+   */
+  async saveAllChanges(halt?: AbortSignal, given?: Tab): Promise<boolean> {
     if (this.tabs.some((t) => t.view.hasPendingFormInput)) await this.flushForms();
-    for (const tab of this.tabs.filter((t) => this.isDirty(t))) {
+    for (const tab of this.tabs.filter((t) => this.isDirty(t) && t !== given)) {
       // The user stopped waiting: what is running finishes, but no other document is begun.
       if (halt?.aborted) return false;
       if (!(await this.saveTab(tab, false))) return false;
@@ -1253,6 +1798,22 @@ export class App {
    * (a save breaks a signature). A failure is told to the user. Resolves with true when saved.
    */
   private async saveTab(tab: Tab, asCopy: boolean): Promise<boolean> {
+    // A page tool that is still changing this document would make the bytes of the save those of no
+    // one state. A change that ends in a moment is waited for; for a long one the user is told. A
+    // tool that works on another document does not matter: each document has an engine of its own.
+    if (this.pageOps?.busyOn(tab.doc) && !(await this.changeEnded(tab.doc))) {
+      if (this.pageOps.busyOn(tab.doc)) {
+        const copying = this.pageOps.copyingOn(tab.doc);
+        await showNotice(this.noticeLayer, {
+          title: copying ? `Pages are being copied out of "${tab.name}"` : `"${tab.name}" is being changed`,
+          detail: copying
+            ? "The document cannot be saved while its pages are being copied out. Save again when the copy has finished."
+            : "A change to its pages is under way, and a save would not write the document as it will be. Save again when the change has finished.",
+          buttons: [{ id: "ok", label: "OK", primary: true }],
+        });
+        return false;
+      }
+    }
     // Text a field refused is not in the document: a file written now would leave it out and the tab
     // would look saved. Nothing is written until the reader has dealt with the text.
     if (tab.view.hasRefusedFormInput) {
@@ -1262,6 +1823,8 @@ export class App {
     // What is under way is done first (an open box of a note is saved, running changes finish),
     // so that the file holds what the window shows.
     await tab.annotator?.flush();
+    // The change that was waited for may have left nothing to save (it failed, or it was undone).
+    if (!asCopy && !this.isDirty(tab)) return true;
     // A save that is running is waited for, and then the state is looked at again: it may have
     // saved everything, or an edit may have come after it.
     while (tab.saving) {
@@ -1288,15 +1851,31 @@ export class App {
     const began = tab.history.revision;
     // The engine is not changed while the file is written; changes made meanwhile wait.
     const release = tab.annotator?.hold();
+    const releaseDesign = this.designer?.hold(tab.doc);
     let saved: SavedFile | null;
     try {
       saved = asCopy ? await this.runSaveAs(tab, false) : await this.runSave(tab);
     } finally {
       release?.();
+      releaseDesign?.();
     }
     if (!saved) return false;
+    // The file that was written is not the one the signatures were checked on, whatever the tab
+    // shows from now on. This comes before anything else is done with the tab.
+    this.signatures.invalidate(tab.doc);
+    // So is the verdict of any other tab that was open on the file this save replaced.
+    for (const other of saved.replaced ?? []) {
+      if (other !== tab.doc && this.tabs.some((t) => t.doc === other)) this.signatures.invalidate(other, "file_changed");
+    }
     tab.history.markSaved(began);
     if (saved.path !== tab.path || saved.name !== tab.name) {
+      // The tab follows the copy, which is not the signed file: it can be changed again.
+      if (tab.signedHere && saved.path !== tab.path) {
+        tab.signedHere = false;
+        tab.view.holdEdits(false);
+        tab.annotator?.setHeld(false);
+        if (this.active === tab) this.syncAnnotBar();
+      }
       tab.path = saved.path;
       tab.name = saved.name;
       this.syncChrome();
@@ -1304,7 +1883,7 @@ export class App {
     return !this.isDirty(tab);
   }
 
-  private async tellRefusedField(tab: Tab): Promise<void> {
+  private async tellRefusedField(tab: Tab, action: "save" | "pages" = "save"): Promise<void> {
     const [first, ...others] = tab.view.refusedFormFields;
     const where = first ? `The field "${first.label}" on page ${first.page + 1}` : "A field";
     const more =
@@ -1313,7 +1892,7 @@ export class App {
         : ` ${others.length === 1 ? "One other field has" : `${others.length} other fields have`} the same problem.`;
     const answer = await showNotice(this.noticeLayer, {
       title: "A field has text that could not be added",
-      detail: `"${tab.name}" was not saved. ${where} holds text that is too long for the document, so that text is not in it.${more} Shorten the text, or press Escape in the field to put back what the document has, then save again.`,
+      detail: `${action === "save" ? `"${tab.name}" was not saved.` : `The pages of "${tab.name}" were not changed.`} ${where} holds text that is too long for the document, so that text is not in it.${more} Shorten the text, or press Escape in the field to put back what the document has, then ${action === "save" ? "save" : "change the pages"} again.`,
       buttons: first
         ? [
             { id: "ok", label: "OK" },
@@ -1386,6 +1965,18 @@ export class App {
   }
 
   private async askSigned(tab: Tab, copy = false): Promise<"copy" | "anyway" | "cancel"> {
+    // The file that was signed here is never saved over: only a copy is offered.
+    if (tab.signedHere && !copy) {
+      const only = await showNotice(this.noticeLayer, {
+        title: CERT_WORDS.signedTitle,
+        detail: CERT_WORDS.signedSaveOnlyCopy(tab.name),
+        buttons: [
+          { id: "cancel", label: "Cancel", safe: true },
+          { id: "copy", label: "Save a copy…", primary: true },
+        ],
+      });
+      return only.button === "copy" ? "copy" : "cancel";
+    }
     const answer = await showNotice(this.noticeLayer, {
       title: "This document is signed",
       detail: copy
@@ -1421,7 +2012,8 @@ export class App {
       buttons: [
         { id: "cancel", label: "Cancel", safe: true },
         { id: "copy", label: "Save a copy…", primary: true },
-        { id: "overwrite", label: "Replace the file" },
+        // Never over the file that was signed here: that file is the signature.
+        ...(tab.signedHere ? [] : [{ id: "overwrite", label: "Replace the file" }]),
       ],
     });
     return answer.button === "copy" || answer.button === "overwrite" ? answer.button : "cancel";
@@ -1456,8 +2048,31 @@ export class App {
     this.quitting = true;
     this.quitReveal = () => this.focusTopNotice();
     try {
+      // A page tool that is still working makes a document dirty when it is done: its change must
+      // not be missed because the answer had not come yet. A change that ends in a moment is waited
+      // for. One that takes long is put to the user: wait, or quit now and lose the change and the
+      // unsaved changes of that document. The other documents are asked about as usual.
+      let given: Tab | undefined;
+      const ops = this.pageOps;
+      if (ops?.busy) {
+        const working = this.tabs.find((t) => t.doc === ops.busyDoc);
+        this.quitReveal = () => {
+          for (const ask of this.askAtOnce) ask();
+          this.focusTopNotice();
+        };
+        const ended = await this.changeEnded(null);
+        this.quitReveal = () => this.focusTopNotice();
+        if (!ended && working && this.tabs.includes(working) && ops.busy) {
+          if ((await this.askAboutChange(working, "quit")) === "wait") {
+            await this.deps.api.stayOpen().catch(() => undefined);
+            return;
+          }
+          // The change may have ended while the question was open; then it counts like any other.
+          if (ops.busy) given = working;
+        }
+      }
       if (this.tabs.some((t) => t.view.hasPendingFormInput)) await this.flushForms();
-      const dirty = this.tabs.filter((t) => this.isDirty(t));
+      const dirty = this.tabs.filter((t) => this.isDirty(t) && t !== given);
       if (dirty.length === 0) {
         await this.deps.api.quitApp();
         return;
@@ -1483,7 +2098,7 @@ export class App {
         return;
       }
       if (answer.button === "save") {
-        const ended = await this.waitForSave((halt) => this.saveAllChanges(halt), {
+        const ended = await this.waitForSave((halt) => this.saveAllChanges(halt, given), {
           title: dirty.length === 1 ? `Saving "${dirty[0].name}"…` : `Saving ${dirty.length} documents…`,
           detail: SAVE_SLOW_DETAIL,
           leave: "Quit without saving",
@@ -1510,7 +2125,8 @@ export class App {
 
   private async stepHistory(direction: "undo" | "redo"): Promise<void> {
     const tab = this.active;
-    if (!tab || tab.saving) return;
+    // The file that was signed here has nothing to take back, and nothing to make again.
+    if (!tab || tab.saving || this.pageOps?.busy || tab.signedHere) return;
     const run = async (): Promise<void> => {
       // A form change that is on its way is part of the history first: Undo takes back that one,
       // not the one before it.
@@ -1520,20 +2136,18 @@ export class App {
     try {
       // After the changes asked for before it, and before the ones asked for later.
       await (tab.annotator ? tab.annotator.sequenced(run) : run());
-    } catch (error) {
-      // An engine that was lost ends the tab, as it does for any other change.
-      const lost = toAppError(error);
-      if (isEngineLost(lost)) {
-        await this.documentLost(tab, lost);
+    } catch (e) {
+      const error = toAppError(e);
+      // A field holds text that was refused: the reader was told, and the history stays where it was.
+      if (error.code === REFUSED_FIELD_CODE) return;
+      // The engine of the document was lost: the tab is closed (by the page tools, which told the
+      // user what that means for the changes that were not saved, or here, as for any other change).
+      if (isEngineLost(error)) {
+        await this.documentLost(tab, error);
         return;
       }
-      await showNotice(this.noticeLayer, {
-        title: direction === "undo" ? "The change could not be taken back" : "The change could not be made again",
-        detail: CLEAN_REFUSALS.has(toAppError(error).code)
-          ? "The document is as it was before. Nothing was lost."
-          : "Part of the change may have been made. The document is marked as changed; close it without saving to go back to the file.",
-        buttons: [{ id: "ok", label: "OK", primary: true }],
-      });
+      const behind = direction === "undo" ? tab.history.undoDepth - 1 : tab.history.redoDepth - 1;
+      await showNotice(this.noticeLayer, undoFailure(error, direction, tab.name, Math.max(0, behind)));
     }
   }
 
@@ -1670,6 +2284,7 @@ export class App {
     this.empty.hidden = this.tabs.length > 0;
     this.setControlsEnabled(active !== null);
     this.sidebar.setDocument(active?.sidebarDoc ?? null);
+    this.signatures.setDocument(active?.doc ?? null);
     this.find.setTarget(active ? { doc: active.doc, view: active.view } : null);
     this.selectionProxy.textContent = "";
     this.syncAnnotBar();
@@ -1720,6 +2335,92 @@ export class App {
     const active = this.active;
     byId<HTMLButtonElement>(this.root, "save-button").disabled = !active || !this.isDirty(active);
     byId<HTMLButtonElement>(this.root, "save-copy-button").disabled = !active || active.view.pageCount === 0;
+    // Signing with a certificate: only where the app process offers all of it.
+    const api = this.deps.api;
+    const signButton = byId<HTMLButtonElement>(this.root, "sign-button");
+    signButton.hidden = !(api.signPickCertificate && api.signLoadCertificate && api.signDocument);
+    signButton.disabled = !active || active.view.pageCount === 0 || this.signOpen;
+  }
+
+  private signOpen = false;
+
+  /**
+   * Signs the document in front with a certificate file. A document with changes that were not saved
+   * is saved first (what is signed is a file the person has). The signed copy is a new file, which is
+   * opened in a tab of its own; it is shown as it was written, with editing off.
+   */
+  async signWithCertificate(): Promise<void> {
+    const tab = this.active;
+    const api = this.deps.api;
+    if (!tab || tab.view.pageCount === 0 || this.signOpen) return;
+    if (!api.signPickCertificate || !api.signLoadCertificate || !api.signDocument || !api.signListFields) return;
+    if (!api.signForgetCertificate || !api.signSetImageMark) return;
+    this.signOpen = true;
+    this.syncSaveButtons();
+    try {
+      // A page tool that is still changing the document would be signed in a state of no one's
+      // making. A change that ends in a moment is waited for; for a long one the person is told.
+      if (this.pageOps?.busyOn(tab.doc) && !(await this.changeEnded(tab.doc))) {
+        if (this.pageOps.busyOn(tab.doc)) {
+          const copying = this.pageOps.copyingOn(tab.doc);
+          await showNotice(this.noticeLayer, {
+            title: copying ? `Pages are being copied out of "${tab.name}"` : `"${tab.name}" is being changed`,
+            detail: copying
+              ? "The document cannot be signed while its pages are being copied out. Sign again when the copy has finished."
+              : "A change to its pages is under way, and the signature would not be of the document as it will be. Sign again when the change has finished.",
+            buttons: [{ id: "ok", label: "OK", primary: true }],
+          });
+          return;
+        }
+      }
+      if (this.isDirty(tab)) {
+        const answer = await showNotice(this.noticeLayer, {
+          title: CERT_WORDS.unsavedTitle,
+          detail: CERT_WORDS.unsavedDetail(tab.name),
+          buttons: [
+            { id: "cancel", label: CERT_WORDS.cancel, safe: true },
+            { id: "save", label: CERT_WORDS.unsavedSave, primary: true },
+          ],
+        });
+        if (answer.button !== "save") return;
+        if (!(await this.saveTab(tab, false)) || this.isDirty(tab)) return;
+      }
+      const sizes = Array.from({ length: tab.view.pageCount }, (_, i) => tab.view.pageSizeOf(i));
+      const certApi = api as CertSignApi & { render(doc: number, page: number, width: number, height: number): Promise<ArrayBuffer> };
+      const signed = await askCertificateSignature({
+        layer: this.noticeLayer,
+        api: certApi,
+        doc: tab.doc,
+        fileName: tab.name,
+        pages: sizes,
+        page: tab.view.currentPageIndex,
+        pickPicture: async () => {
+          const answer = await askSignaturePicture({ layer: this.noticeLayer, tools: this.pictureTools() });
+          return answer?.picture ?? null;
+        },
+      });
+      if (signed) await this.openSigned(signed);
+    } finally {
+      this.signOpen = false;
+      this.syncSaveButtons();
+    }
+  }
+
+  /** Opens the signed copy as a tab of its own, with editing off, and says what was done. */
+  private async openSigned(signed: SignedFile): Promise<void> {
+    await this.openPath(signed.path);
+    const tab = this.tabs.find((t) => t.path === signed.path);
+    if (tab) {
+      tab.signedHere = true;
+      tab.view.holdEdits(true);
+      tab.annotator?.setHeld(true);
+      if (this.active === tab) this.syncAnnotBar();
+    }
+    await showNotice(this.noticeLayer, {
+      title: CERT_WORDS.doneTitle,
+      detail: `${CERT_WORDS.done(signed.name)} ${tab ? CERT_WORDS.doneOpened : ""} ${CERT_WORDS.readOnly}`.replace(/\s+/g, " ").trim(),
+      buttons: [{ id: "ok", label: "OK", primary: true }],
+    });
   }
 
   private setControlsEnabled(on: boolean): void {
@@ -1799,6 +2500,16 @@ export class App {
 
   private onKeyDown(e: KeyboardEvent): void {
     if (this.noticeLayer.childElementCount === 0 && this.annotationKey(e)) {
+      e.preventDefault();
+      return;
+    }
+    if (
+      e.key === "Escape" &&
+      this.noticeLayer.childElementCount === 0 &&
+      this.designer?.open &&
+      !(e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement || e.target instanceof HTMLTextAreaElement) &&
+      this.designer.handleEscape()
+    ) {
       e.preventDefault();
       return;
     }
@@ -1905,6 +2616,22 @@ export class App {
 
   /** Asks which pages, prepares them, and opens the print dialog of the system. */
   async printActive(): Promise<void> {
+    // A page tool that is still changing this document would have the print run on the old list of
+    // pages. A change that ends in a moment is waited for; for a long one the user is told.
+    const working = this.active;
+    if (working && this.pageOps?.busyOn(working.doc) && !(await this.changeEnded(working.doc))) {
+      if (this.pageOps.busyOn(working.doc)) {
+        const copying = this.pageOps.copyingOn(working.doc);
+        await showNotice(this.noticeLayer, {
+          title: copying ? `Pages are being copied out of "${working.name}"` : `"${working.name}" is being changed`,
+          detail: copying
+            ? "The document cannot be printed while its pages are being copied out. Print again when the copy has finished."
+            : "A change to its pages is under way, and the print would show the pages as they were. Print again when the change has finished.",
+          buttons: [{ id: "ok", label: "OK", primary: true }],
+        });
+        return;
+      }
+    }
     const tab = this.active;
     if (!tab || this.printing || tab.view.pageCount === 0) return;
     this.printing = true;
@@ -1920,7 +2647,7 @@ export class App {
       });
       if (!choice || choice.pages.length === 0) return;
       const job = (this.printJob ??= new PrintJob(this.printRoot, {
-        render: (doc, page, width, height) => this.deps.api.render(doc, page, width, height),
+        render: (doc, page, width, height) => this.api.render(doc, page, width, height),
         encode: this.deps.print?.encode ?? encodeJpeg,
         createUrl: this.deps.print?.createUrl ?? ((blob) => URL.createObjectURL(blob)),
         revokeUrl: this.deps.print?.revokeUrl ?? ((url) => URL.revokeObjectURL(url)),

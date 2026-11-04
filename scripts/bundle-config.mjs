@@ -1,4 +1,4 @@
-// What the installer build needs besides tauri.conf.json: the engine as a sidecar, the PDFium
+// What the installer build needs besides tauri.conf.json: the engine and the signer as sidecars, the PDFium
 // library and its licences as resources, and whether update files (and their signatures) are made.
 // Pure functions, so that they can be tested without building anything.
 
@@ -28,7 +28,7 @@ export function bundleConfig({ folder, file, env }) {
   return {
     bundle: {
       createUpdaterArtifacts: wantsUpdaterArtifacts(env),
-      externalBin: ["binaries/partridge-engine"],
+      externalBin: ["binaries/partridge-engine", "binaries/partridge-signer"],
       resources: {
         [`../vendor/pdfium/${folder}/${file}`]: file,
         [`../vendor/pdfium/${folder}/LICENSE`]: "pdfium-LICENSE",

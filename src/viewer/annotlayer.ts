@@ -20,6 +20,7 @@ import {
   simplifyStroke,
   snippet,
 } from "../lib/annotations";
+import { widenedRect, type Rect } from "../lib/signpicture";
 import type { PageSizePt } from "./layout";
 
 export interface AnnotLayerEvents {
@@ -33,6 +34,8 @@ export interface AnnotLayerEvents {
   onMove(page: number, id: number, dx: number, dy: number): void;
   /** A box was double clicked. */
   onEdit(page: number, id: number): void;
+  /** The corner of a box that can be resized was dragged: the box it now has, in points. */
+  onResize?(page: number, id: number, rect: Rect): void;
   /** The list of a page could not be had. */
   onLoadFailed?(page: number, error: unknown): void;
 }
@@ -63,6 +66,10 @@ export class AnnotationLayer {
   private stroke: { page: number; pointerId: number; points: [number, number][] } | null = null;
   private placing: { page: number; pointerId: number; x: number; y: number } | null = null;
   private destroyed = false;
+  /** A change to the pages is under way: nothing is asked for and nothing is picked or drawn. */
+  private held = false;
+  /** Puts a box that is being resized back and ends the drag, while one is going on. */
+  private resizing: (() => void) | null = null;
 
   constructor(
     private readonly pages: PageSizePt[],
@@ -79,7 +86,7 @@ export class AnnotationLayer {
     root.dataset.tool = this.tool;
     const boxes = document.createElement("div");
     boxes.className = "annot-boxes";
-    boxes.inert = this.reading;
+    boxes.inert = this.reading || this.held;
     const svg = document.createElementNS(SVG_NS, "svg");
     svg.setAttribute("class", "annot-ink");
     svg.setAttribute("viewBox", `0 0 ${size.width} ${size.height}`);
@@ -92,6 +99,7 @@ export class AnnotationLayer {
     svg.append(line);
     const capture = document.createElement("div");
     capture.className = "annot-capture";
+    capture.inert = this.held;
     root.append(boxes, svg, capture);
     pageEl.append(root);
     const layer: PageLayer = { root, boxes, svg, line, capture, el: pageEl };
@@ -115,13 +123,13 @@ export class AnnotationLayer {
 
   /** The picture of a page was drawn: now the list of its annotations is asked for. */
   pageDrawn(page: number): void {
-    if (this.destroyed || !this.load || this.data.has(page) || this.loading.has(page)) return;
+    if (this.destroyed || this.held || !this.load || this.data.has(page) || this.loading.has(page)) return;
     void this.reload(page);
   }
 
   /** Asks for the list of a page again and shows it. Resolves when it is shown. */
   reload(page: number): Promise<void> {
-    if (!this.load || this.destroyed) return Promise.resolve();
+    if (!this.load || this.destroyed || this.held) return Promise.resolve();
     const load = this.load;
     const pending = load(page)
       .then((list) => {
@@ -171,10 +179,41 @@ export class AnnotationLayer {
     if (this.stroke) this.cancelStroke();
   }
 
+  /**
+   * Takes the tool, the reading mode and the pen of the layer this one replaces (the pages changed).
+   * The pick is not taken: it names a page and an id that may stand for something else now.
+   */
+  inherit(from: AnnotationLayer): void {
+    this.setTool(from.tool);
+    this.setReading(from.reading);
+    this.ink = from.ink;
+  }
+
+  /**
+   * Lets the layer wait while the pages of the document are being changed: the boxes and the page
+   * take no pointer, a stroke in progress is dropped, and no list is asked for (page numbers may
+   * mean other pages by the time the engine answers). Going on asks for what was left.
+   */
+  setHeld(held: boolean): void {
+    if (this.held === held) return;
+    this.held = held;
+    for (const layer of this.layers.values()) {
+      layer.boxes.inert = this.reading || held;
+      layer.capture.inert = held;
+    }
+    if (held) {
+      if (this.stroke) this.cancelStroke();
+      this.resizing?.();
+      this.placing = null;
+    } else {
+      for (const page of this.layers.keys()) this.pageDrawn(page);
+    }
+  }
+
   /** While reading, the boxes are inert: no pointer, no Tab stop, nothing for a screen reader to land on. */
   setReading(reading: boolean): void {
     this.reading = reading;
-    for (const layer of this.layers.values()) layer.boxes.inert = reading;
+    for (const layer of this.layers.values()) layer.boxes.inert = reading || this.held;
     if (reading && this.stroke) this.cancelStroke();
   }
 
@@ -233,7 +272,65 @@ export class AnnotationLayer {
     el.addEventListener("focus", () => this.events.onSelect(page, a.id));
     el.addEventListener("pointerdown", (e) => this.onBoxDown(e, page, a, el));
     el.addEventListener("dblclick", () => this.events.onEdit(page, a.id));
+    // A picture of a signature can be made bigger or smaller by its corner.
+    if (a.can.resize) {
+      const handle = document.createElement("span");
+      handle.className = "annot-handle";
+      handle.dataset.handle = "se";
+      handle.setAttribute("aria-hidden", "true");
+      handle.addEventListener("pointerdown", (e) => this.onHandleDown(e, page, a, el, [l, t, r, b]));
+      el.append(handle);
+    }
     return el;
+  }
+
+  // ---- making a box bigger or smaller ---------------------------------------------------------
+
+  /**
+   * The bottom right corner of a picked box is dragged: the box grows or shrinks with its
+   * proportions and its top left corner kept, and shows it while the pointer moves. When the
+   * pointer is let go the new box is handed on; Escape or a cancelled pointer puts it back.
+   */
+  private onHandleDown(e: PointerEvent, page: number, a: Annotation, el: HTMLElement, rect: Rect): void {
+    if (e.button !== 0 || this.tool !== "select") return;
+    e.stopPropagation();
+    e.preventDefault();
+    this.events.onSelect(page, a.id);
+    const layer = this.layers.get(page);
+    if (!layer) return;
+    const size = this.pages[page];
+    const start = { x: e.clientX, y: e.clientY };
+    let latest: Rect = rect;
+    const show = (r: Rect) => {
+      el.style.left = percentOf(r[0], size.width);
+      el.style.top = percentOf(r[1], size.height);
+      el.style.width = percentOf(r[2] - r[0], size.width);
+      el.style.height = percentOf(r[3] - r[1], size.height);
+    };
+    const move = (m: PointerEvent) => {
+      const box = layer.el.getBoundingClientRect();
+      const [x0] = clientToPage(box, size, start.x, start.y);
+      const [x1] = clientToPage(box, size, m.clientX, m.clientY);
+      latest = widenedRect(rect, x1 - x0, size);
+      show(latest);
+    };
+    const finish = (cancelled: boolean) => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", cancel);
+      this.resizing = null;
+      if (cancelled || Math.abs(latest[2] - rect[2]) < 0.5) {
+        show(rect);
+        return;
+      }
+      this.events.onResize?.(page, a.id, latest);
+    };
+    const up = () => finish(false);
+    const cancel = () => finish(true);
+    this.resizing = () => finish(true);
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", cancel);
   }
 
   // ---- picking and moving a box ------------------------------------------------
@@ -299,7 +396,7 @@ export class AnnotationLayer {
       layer.line.setAttribute("stroke", rgbaCss(this.ink.color));
       layer.line.setAttribute("stroke-width", String(this.ink.width));
       this.showStroke(layer);
-    } else if (this.tool === "note" || this.tool === "stamp") {
+    } else if (this.tool === "note" || this.tool === "stamp" || this.tool === "signature") {
       this.placing = { page, pointerId: e.pointerId, x: e.clientX, y: e.clientY };
     }
   }
@@ -360,6 +457,10 @@ export class AnnotationLayer {
 
   /** The user pressed Escape in the middle of a stroke. */
   abort(): boolean {
+    if (this.resizing) {
+      this.resizing();
+      return true;
+    }
     if (!this.stroke && !this.placing) return false;
     this.placing = null;
     this.cancelStroke();

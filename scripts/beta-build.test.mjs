@@ -23,7 +23,7 @@ describe("the beta settings", () => {
     productName: "Patient Partridge",
     identifier: "com.ferdinand99.patientpartridge",
     version: "0.1.0",
-    bundle: { createUpdaterArtifacts: true, externalBin: ["binaries/partridge-engine"], fileAssociations: [{ ext: ["pdf"] }], icon: ["icons/icon.icns"] },
+    bundle: { createUpdaterArtifacts: true, externalBin: ["binaries/partridge-engine", "binaries/partridge-signer"], fileAssociations: [{ ext: ["pdf"] }], icon: ["icons/icon.icns"] },
     plugins: { updater: { endpoints: ["https://example.invalid/latest.json"], pubkey: "key" } },
   };
   const merged = mergeConfig(generated, betaOverride({ version: "0.1.0", build: "42" }));
@@ -43,7 +43,7 @@ describe("the beta settings", () => {
   });
 
   it("leave the rest of the signed build alone and use the beta icons", () => {
-    expect(merged.bundle.externalBin).toEqual(["binaries/partridge-engine"]);
+    expect(merged.bundle.externalBin).toEqual(["binaries/partridge-engine", "binaries/partridge-signer"]);
     expect(merged.plugins.updater.pubkey).toBe("key");
     expect(merged.bundle.icon.every((f) => f.startsWith("icons-beta/"))).toBe(true);
     expect(merged.bundle.icon).toContain("icons-beta/icon.icns");
