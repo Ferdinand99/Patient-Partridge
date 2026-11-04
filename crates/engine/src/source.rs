@@ -87,8 +87,19 @@ pub enum Problem {
     TimedOut,
 }
 
-/// FNV-1a over 64 bits: not a defence against an attacker (the one who changes the file is a
-/// program that saves it, not an adversary of the digest), only a way to see that bytes differ.
+/// The digest of a block of the file: SHA-256, so that a file which serves one version of a block
+/// to the reader and another to the check cannot be made to look the same by choosing both.
+pub type Digest = [u8; 32];
+
+fn digest(bytes: &[u8]) -> Digest {
+    let mut out = [0u8; 32];
+    out.copy_from_slice(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref());
+    out
+}
+
+/// FNV-1a over 64 bits: not a defence against an attacker, only a way to see that bytes differ.
+/// The guard of the source file does not use it (see [`Digest`]); the fingerprints that compare a
+/// document with the file made from it do.
 pub fn fnv(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in bytes {
@@ -103,7 +114,7 @@ pub struct SourceGuard {
     len: u64,
     modified: Option<SystemTime>,
     /// Digest of every block that was read, by block number.
-    blocks: HashMap<u64, u64>,
+    blocks: HashMap<u64, Digest>,
     cache: Option<(u64, Vec<u8>)>,
     failures: u32,
     changed: bool,
@@ -206,7 +217,7 @@ impl SourceGuard {
             }
         };
         data.truncate(got);
-        let digest = fnv(&data);
+        let digest = digest(&data);
         match self.blocks.get(&index) {
             Some(known) if *known != digest => self.changed = true,
             Some(_) => {}
@@ -273,10 +284,10 @@ impl SourceGuard {
             return Err(Problem::Changed);
         }
         self.cache = None;
-        let mut known: Vec<(u64, u64)> = self.blocks.iter().map(|(i, d)| (*i, *d)).collect();
+        let mut known: Vec<(u64, Digest)> = self.blocks.iter().map(|(i, d)| (*i, *d)).collect();
         known.sort_unstable();
         let mut data = vec![0u8; BLOCK as usize];
-        for (count, (index, digest)) in known.into_iter().enumerate() {
+        for (count, (index, expected)) in known.into_iter().enumerate() {
             if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
                 return Err(Problem::TimedOut);
             }
@@ -287,7 +298,7 @@ impl SourceGuard {
                 Ok(n) => n,
                 Err(_) => return Err(Problem::Unreadable),
             };
-            if fnv(&data[..got]) != digest {
+            if digest(&data[..got]) != expected {
                 self.changed = true;
                 return Err(Problem::Changed);
             }
@@ -765,6 +776,23 @@ mod tests {
     }
 
     #[test]
+    fn a_change_of_any_byte_of_a_block_that_was_read_is_seen_at_either_end_and_in_the_middle() {
+        // First byte, last byte of a block, a byte in the middle and the last byte of the file.
+        for at in [0usize, BLOCK as usize - 1, 12_345, usize::MAX] {
+            let rig = read_through(40);
+            let len = rig.data.lock().unwrap().len();
+            let at = at.min(len - 1);
+            assert_eq!(lock(&rig.guard).verify(&mut |_| {}), Ok(()));
+            rig.data.lock().unwrap()[at] ^= 0x01;
+            assert_eq!(
+                lock(&rig.guard).verify(&mut |_| {}),
+                Err(Problem::Changed),
+                "a change at byte {at} of {len}"
+            );
+        }
+    }
+
+    #[test]
     fn a_block_that_is_read_again_with_other_bytes_is_noted_at_once() {
         let rig = rig(100_000);
         let mut reader = GuardedReader::new(rig.guard.clone());
@@ -863,8 +891,17 @@ mod tests {
     }
 
     #[test]
-    fn digests_differ_for_different_bytes() {
-        assert_ne!(fnv(b"abc"), fnv(b"abd"));
+    fn digests_differ_for_different_bytes_and_are_sha_256() {
+        assert_ne!(digest(b"abc"), digest(b"abd"));
+        // The digest of "abc" in the standard's own example.
+        let abc: Digest = [
+            0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+            0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+            0xf2, 0x00, 0x15, 0xad,
+        ];
+        assert_eq!(digest(b"abc"), abc);
+        // The two-byte FNV collision pairs of the old digest are not a way in any more: a change
+        // of one bit in a block is seen whatever the rest of the block is.
         assert_eq!(fnv(b""), 0xcbf2_9ce4_8422_2325);
     }
 }
