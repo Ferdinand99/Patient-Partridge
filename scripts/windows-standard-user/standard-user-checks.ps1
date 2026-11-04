@@ -4,9 +4,17 @@
 # sandbox tests. Everything it finds goes to C:\pp\out\child.log; the exit code is 1 when a
 # check failed. This file is ASCII only (Windows PowerShell 5.1 reads it in the system code page):
 # letters outside ASCII are made from code points.
+# -Variant beta checks the Windows beta (.github/workflows/windows-beta.yml) instead of the stable
+# app: another program name and data folder, no MSI case, and a signing case with the installed
+# signer. The sandbox tests of the engine (section 4) are the same programs for both and are left
+# to the stable job. The default is the stable app, as it always was.
 param(
-  [Parameter(Mandatory)][string]$Root
+  [Parameter(Mandatory)][string]$Root,
+  [ValidateSet('stable', 'beta')][string]$Variant = 'stable'
 )
+$isBeta = $Variant -eq 'beta'
+$programFile = if ($isBeta) { 'patient-partridge-beta.exe' } else { 'patient-partridge.exe' }
+$identifier = if ($isBeta) { 'com.ferdinand99.patientpartridge.beta' } else { 'com.ferdinand99.patientpartridge' }
 $ErrorActionPreference = 'Continue'
 $out = Join-Path $Root 'out'
 $log = Join-Path $out 'child.log'
@@ -77,7 +85,7 @@ try {
     # The installer may hand the work to a copy of itself: wait for the program to appear.
     $deadline = (Get-Date).AddSeconds(60)
     while ((Get-Date) -lt $deadline -and -not $installed) {
-      $installed = Get-ChildItem -LiteralPath $env:LOCALAPPDATA -Recurse -Filter 'patient-partridge.exe' -ErrorAction SilentlyContinue |
+      $installed = Get-ChildItem -LiteralPath $env:LOCALAPPDATA -Recurse -Filter $programFile -ErrorAction SilentlyContinue |
         Select-Object -First 1
       if (-not $installed) { Start-Sleep -Seconds 2 }
     }
@@ -112,7 +120,7 @@ try {
     # Every case starts as a first run: the app reopens the tabs of the last session, and the file of
     # the case before would be drawn instead of the file of this case.
     foreach ($base in @($env:APPDATA, $env:LOCALAPPDATA)) {
-      Remove-Item -LiteralPath (Join-Path $base "com.ferdinand99.patientpartridge\session.json") -Force -ErrorAction SilentlyContinue
+      Remove-Item -LiteralPath (Join-Path $base "$identifier\session.json") -Force -ErrorAction SilentlyContinue
     }
     $env:PARTRIDGE_MEASURE_REPORT = $report
     $clock = [Diagnostics.Stopwatch]::StartNew()
@@ -160,7 +168,7 @@ try {
         Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = (Get-Date).AddMinutes(-3) } -MaxEvents 15 -ErrorAction Stop |
           ForEach-Object { Log "  $($_.TimeCreated) $($_.ProviderName): $(($_.Message -split "`n")[0])" }
       } catch { Log "  (cannot read the events: $_)" }
-      $data = Join-Path $env:LOCALAPPDATA 'com.ferdinand99.patientpartridge'
+      $data = Join-Path $env:LOCALAPPDATA $identifier
       if (Test-Path -LiteralPath $data) {
         Log (Get-ChildItem -LiteralPath $data | Select-Object Name | Format-Table -AutoSize | Out-String)
       }
@@ -183,11 +191,14 @@ try {
   # shows the other two cases test the entry. See install-as-admin.ps1.
   Log ''
   Log '=== 3b. Programs installed by an administrator outside the profile ==='
-  foreach ($case in @(
-      @{ tag = 'msi-custom-folder'; folder = 'C:\Apps\pp-msi'; expect = $true },
-      @{ tag = 'nsis-custom-folder'; folder = 'C:\Apps\pp-nsis'; expect = $true },
-      @{ tag = 'no-entry-control'; folder = 'C:\Apps\pp-bare'; expect = $false })) {
-    $program = Join-Path $case.folder 'patient-partridge.exe'
+  $cases = @(
+    @{ tag = 'msi-custom-folder'; folder = 'C:\Apps\pp-msi'; expect = $true },
+    @{ tag = 'nsis-custom-folder'; folder = 'C:\Apps\pp-nsis'; expect = $true },
+    @{ tag = 'no-entry-control'; folder = 'C:\Apps\pp-bare'; expect = $false })
+  # The beta has no MSI.
+  if ($isBeta) { $cases = @($cases | Where-Object { $_.tag -ne 'msi-custom-folder' }) }
+  foreach ($case in $cases) {
+    $program = Join-Path $case.folder $programFile
     Check "case '$($case.tag)': the program is there" (Test-Path -LiteralPath $program)
     Check "case '$($case.tag)': this user cannot change the access list of the folder" (-not (Test-CanChangeAccess $case.folder))
     if ($case.expect) {
@@ -198,14 +209,55 @@ try {
     }
   }
 
+  # ---- 3c. Sign with the installed beta's engine and signer (beta only) -------------------------------
+  # The driver (crates/engine/examples/sign_installed.rs) starts the engine and the signer of the
+  # folder it is given, each in its sandbox, signs the PDF with the test certificate file, and has a
+  # second engine of that folder check the signature. The folders: the install of this user, the one
+  # an administrator made outside the profile (the installer's entries for the package SID on the
+  # folder, the engine and the signer are what let the sandboxed programs start there), and the copy
+  # without the entry, where it has to fail.
+  if ($isBeta) {
+    Log ''
+    Log '=== 3c. Sign a PDF with the engine and the signer of the installed beta ==='
+    $driver = Join-Path $Root 'build\target\debug\examples\sign_installed.exe'
+    $p12 = Join-Path $Root 'docs\rsa2048.p12'
+    Check 'the signing driver is built' (Test-Path -LiteralPath $driver)
+    Check 'the test certificate file is there' (Test-Path -LiteralPath $p12)
+    Check 'the installed beta has a signer program' (Test-Path -LiteralPath (Join-Path $folder 'partridge-signer.exe'))
+    foreach ($case in @(
+        @{ tag = 'profile-install'; folder = $folder; expect = $true },
+        @{ tag = 'nsis-custom-folder'; folder = 'C:\Apps\pp-nsis'; expect = $true },
+        @{ tag = 'no-entry-control'; folder = 'C:\Apps\pp-bare'; expect = $false })) {
+      $signed = Join-Path $out "signed-$($case.tag).pdf"
+      $stdout = Join-Path $out "sign-$($case.tag).txt"
+      $stderr = Join-Path $out "sign-$($case.tag).err.txt"
+      Remove-Item -LiteralPath $signed -Force -ErrorAction SilentlyContinue
+      Log "--- signing with the programs in $($case.folder) ---"
+      $arguments = @('"' + $case.folder + '"', '"' + $asciiPdf + '"', '"' + $p12 + '"', 'test', '"' + $signed + '"')
+      $run = Start-Process -FilePath $driver -ArgumentList $arguments -PassThru -NoNewWindow `
+        -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+      $null = $run.Handle
+      $finished = $run.WaitForExit(180000)
+      if (-not $finished) { Stop-Process -Id $run.Id -Force -ErrorAction SilentlyContinue }
+      foreach ($line in (@(Get-Content -LiteralPath $stdout -ErrorAction SilentlyContinue) + @(Get-Content -LiteralPath $stderr -ErrorAction SilentlyContinue) | Select-Object -First 25)) { Log "  $line" }
+      if ($case.expect) {
+        Check "case '$($case.tag)': the PDF was signed and the signature checks out" ($finished -and $run.ExitCode -eq 0 -and (Test-Path -LiteralPath $signed)) "(exit code $($run.ExitCode))"
+      } else {
+        Check "case '$($case.tag)': nothing is signed without the entry (negative control)" (-not ($finished -and $run.ExitCode -eq 0) -and -not (Test-Path -LiteralPath $signed)) "(exit code $($run.ExitCode))"
+      }
+    }
+  }
+
   # ---- 4. The engine's own sandbox tests, as this user -------------------------------------------
   Log ''
   Log '=== 4. The sandbox tests of the engine, as this user ==='
+  if ($isBeta) { Log 'Not run for the beta: the test programs are built from the sources and do not use the installed copy.' }
   Log (Get-SessionInfo)
   $env:PARTRIDGE_PDFIUM_DIR = Join-Path $Root 'pdfium'
   # The system fonts test must find a font for every script here too (a missing one is a failure, not a skip).
   $env:PARTRIDGE_REQUIRE_FONT_SCRIPTS = 'all'
-  foreach ($test in (Get-Content -LiteralPath (Join-Path $Root 'tests.txt'))) {
+  $tests = if ($isBeta) { @() } else { Get-Content -LiteralPath (Join-Path $Root 'tests.txt') }
+  foreach ($test in $tests) {
     $name = [IO.Path]::GetFileNameWithoutExtension($test)
     $stdout = Join-Path $out "test-$name.txt"
     $stderr = Join-Path $out "test-$name.err.txt"

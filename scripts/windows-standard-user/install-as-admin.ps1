@@ -14,7 +14,16 @@
 #
 # The NSIS installer of this app is a per-user one (it has no per-machine mode); run by an
 # administrator into a folder outside the profile it leaves the same kind of files as the MSI.
+#
+# -Variant beta installs the Windows beta (.github/workflows/windows-beta.yml) instead: the NSIS
+# installer only (the MSI cannot take its version) and the program patient-partridge-beta.exe. The
+# control copy is then made from the NSIS folder. The default is the stable app, as it always was.
+param(
+  [ValidateSet('stable', 'beta')][string]$Variant = 'stable'
+)
 $ErrorActionPreference = 'Stop'
+$isBeta = $Variant -eq 'beta'
+$programFile = if ($isBeta) { 'patient-partridge-beta.exe' } else { 'patient-partridge.exe' }
 $log = 'C:\pp\out\admin-install.log'
 function Log([string]$text) {
   Write-Host $text
@@ -23,7 +32,7 @@ function Log([string]$text) {
 
 $msi = Get-ChildItem 'C:\pp\in' -Filter '*.msi' | Select-Object -First 1
 $setup = Get-ChildItem 'C:\pp\in' -Filter '*-setup.exe' | Select-Object -First 1
-if (-not $msi -or -not $setup) { throw 'The installers are missing in C:\pp\in.' }
+if (-not $setup -or (-not $msi -and -not $isBeta)) { throw 'The installers are missing in C:\pp\in.' }
 New-Item -ItemType Directory -Force -Path 'C:\Apps' | Out-Null
 
 # The package of the engine (see container.rs); icacls names "all application packages" in words.
@@ -85,6 +94,7 @@ function Show-Access([string]$folder) {
 }
 
 # ---- What the installers leave, and what the uninstall takes away ----------------------------------
+if (-not $isBeta) {
 # The MSI, into a folder of its own. The folder stays after the uninstall because of the user file.
 $install = Start-Process -FilePath msiexec.exe -Wait -PassThru -ArgumentList @(
   '/i', "`"$($msi.FullName)`"", '/qn', '/norestart', 'INSTALLDIR=C:\Apps\pp-msi-gone\', '/l*v', '"C:\pp\out\msi-gone.log"')
@@ -98,7 +108,9 @@ Log "msiexec exit code (uninstall): $($remove.ExitCode)"
 if (-not (Test-Path 'C:\Apps\pp-msi-gone\user-file-beside-the-install.txt')) { throw 'The uninstall removed the file of the user.' }
 Show-Access 'C:\Apps\pp-msi-gone'
 Assert-PackageAccess 'C:\Apps\pp-msi-gone' $false
+}
 
+if (-not $isBeta) {
 # ---- MSI -----------------------------------------------------------------------------------------
 $msiLog = 'C:\pp\out\msi-install.log'
 $install = Start-Process -FilePath msiexec.exe -Wait -PassThru -ArgumentList @(
@@ -114,6 +126,7 @@ if (-not (Test-Path 'C:\Apps\pp-msi\patient-partridge.exe')) {
   throw 'The MSI did not install into C:\Apps\pp-msi.'
 }
 Show-Access 'C:\Apps\pp-msi'
+}
 
 # The NSIS installer the same way. The uninstaller runs from the folder and waits (_?=). This comes
 # after the MSI is installed in its folder: the NSIS installer leaves the folder it was given in the
@@ -138,15 +151,15 @@ Assert-PackageAccess 'C:\Apps\pp-nsis-gone' $false
 $install = Start-Process -FilePath $setup.FullName -Wait -PassThru -ArgumentList @('/S', '/D=C:\Apps\pp-nsis')
 Log "NSIS installer exit code: $($install.ExitCode)"
 $deadline = (Get-Date).AddSeconds(60)
-while ((Get-Date) -lt $deadline -and -not (Test-Path 'C:\Apps\pp-nsis\patient-partridge.exe')) { Start-Sleep -Seconds 2 }
-if (-not (Test-Path 'C:\Apps\pp-nsis\patient-partridge.exe')) { throw 'The NSIS installer did not install into C:\Apps\pp-nsis.' }
+while ((Get-Date) -lt $deadline -and -not (Test-Path "C:\Apps\pp-nsis\$programFile")) { Start-Sleep -Seconds 2 }
+if (-not (Test-Path "C:\Apps\pp-nsis\$programFile")) { throw 'The NSIS installer did not install into C:\Apps\pp-nsis.' }
 Show-Access 'C:\Apps\pp-nsis'
 
 # ---- the control: the same files without the entry ------------------------------------------------
-Copy-Item -LiteralPath 'C:\Apps\pp-msi' -Destination 'C:\Apps\pp-bare' -Recurse
+Copy-Item -LiteralPath $(if ($isBeta) { 'C:\Apps\pp-nsis' } else { 'C:\Apps\pp-msi' }) -Destination 'C:\Apps\pp-bare' -Recurse
 Show-Access 'C:\Apps\pp-bare'
 
-foreach ($folder in 'C:\Apps\pp-msi', 'C:\Apps\pp-nsis') {
+foreach ($folder in $(if ($isBeta) { @('C:\Apps\pp-nsis') } else { @('C:\Apps\pp-msi', 'C:\Apps\pp-nsis') })) {
   foreach ($file in $folder, (Join-Path $folder 'partridge-engine.exe'), (Join-Path $folder 'partridge-signer.exe'), (Join-Path $folder 'pdfium.dll')) {
     if (-not (Test-PackageEntry $file)) { throw "$file has no entry for the package of the engine." }
     if (Test-AllPackagesEntry $file) { throw "$file has an entry for all application packages." }

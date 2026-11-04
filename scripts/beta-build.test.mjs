@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import {
   BETA_IDENTIFIER,
   BETA_PRODUCT_NAME,
+  BETA_WINDOWS_BINARY_NAME,
   badgeIcon,
   betaOverride,
   betaVersion,
@@ -58,6 +59,47 @@ describe("the beta settings", () => {
     expect(stable.productName).toBe("Patient Partridge");
     expect(stable.identifier).toBe("com.ferdinand99.patientpartridge");
     expect(stable.bundle.createUpdaterArtifacts).toBe(true);
+  });
+});
+
+describe("the Windows beta settings", () => {
+  const generated = {
+    productName: "Patient Partridge",
+    identifier: "com.ferdinand99.patientpartridge",
+    version: "0.1.0",
+    bundle: { createUpdaterArtifacts: false, externalBin: ["binaries/partridge-engine", "binaries/partridge-signer"], fileAssociations: [{ ext: ["pdf"] }], icon: ["icons/icon.ico"] },
+    plugins: { updater: { endpoints: ["https://example.invalid/latest.json"], pubkey: "key" } },
+  };
+  const merged = mergeConfig(generated, betaOverride({ version: "0.1.0", build: "42", platform: "windows" }));
+
+  it("keep everything the other systems get", () => {
+    expect(merged.productName).toBe("Patient Partridge Beta");
+    expect(merged.identifier).toBe("com.ferdinand99.patientpartridge.beta");
+    expect(merged.version).toBe("0.1.0-beta.42");
+    expect(merged.plugins.updater.endpoints).toEqual([]);
+    expect(merged.bundle.fileAssociations).toEqual([]);
+    expect(merged.bundle.createUpdaterArtifacts).toBe(false);
+  });
+
+  it("use the icon.ico of the ribbon icon set", () => {
+    expect(merged.bundle.icon).toContain("icons-beta/icon.ico");
+    expect(merged.bundle.icon.some((f) => !f.startsWith("icons-beta/"))).toBe(false);
+  });
+
+  it("keep the engine and the signer as they are, so the installer hooks and the lookup find them", () => {
+    expect(merged.bundle.externalBin).toEqual(["binaries/partridge-engine", "binaries/partridge-signer"]);
+  });
+
+  it("name the program differently from the stable one, so the installers never end each other's app", () => {
+    expect(merged.mainBinaryName).toBe(BETA_WINDOWS_BINARY_NAME);
+    expect(BETA_WINDOWS_BINARY_NAME).toBe("patient-partridge-beta");
+    expect(BETA_WINDOWS_BINARY_NAME).not.toBe("patient-partridge");
+    expect(stable.mainBinaryName).toBeUndefined();
+  });
+
+  it("leave the name of the program alone on the other systems", () => {
+    expect(betaOverride({ version: "0.1.0", build: "1" }).mainBinaryName).toBeUndefined();
+    expect(betaOverride({ version: "0.1.0", build: "1", platform: "macos" }).mainBinaryName).toBeUndefined();
   });
 });
 
