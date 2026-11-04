@@ -8,7 +8,7 @@
       content="default-src 'none'; script-src 'self' 'sha256-WZRJfWvsnNCPcxzZwvyhovnZGqhZaC+8gPGPRbx6wTk='; style-src 'self'; img-src 'self'; font-src 'self'; manifest-src 'self'; base-uri 'self'; form-action 'none'"
     />
     <title>Patient Partridge — an open source PDF reader and editor (early release)</title>
-    <meta name="description" content="Patient Partridge is an open source PDF reader and editor for Windows, macOS and Linux from the Hedgerow family. Reading, annotations and form filling work today; more editing tools are planned. It is meant to be fast and small, with no account, no cloud, no advertising and no tracking. Version 0.2.2 is an early release." /> <!-- x-release-please-version -->
+    <meta name="description" content="Patient Partridge is an open source PDF reader and editor for Windows, macOS and Linux from the Hedgerow family. Reading, annotations, forms, page tools and digital signatures work today; more editing tools are planned. It is meant to be fast and small, with no account, no cloud, no advertising and no tracking. Version 0.2.2 is an early release." /> <!-- x-release-please-version -->
     <script>document.documentElement.classList.add("js");</script>
     <link rel="canonical" href="https://hedgerow.tools/Patient-Partridge/" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
@@ -22,7 +22,7 @@
     <meta property="og:url" content="https://hedgerow.tools/Patient-Partridge/" />
     <meta property="og:site_name" content="Patient Partridge" />
     <meta property="og:title" content="Patient Partridge — an open source PDF reader and editor (early release)" />
-    <meta property="og:description" content="A PDF reader and editor that needs no account, no cloud and no tracking. Reading, annotations and form filling work today; more editing tools are planned. Open source, from the Hedgerow family. Version 0.2.2 is an early release." /> <!-- x-release-please-version -->
+    <meta property="og:description" content="A PDF reader and editor that needs no account, no cloud and no tracking. Reading, annotations, forms, page tools and digital signatures work today; more editing tools are planned. Open source, from the Hedgerow family. Version 0.2.2 is an early release." /> <!-- x-release-please-version -->
     <meta property="og:image" content="https://hedgerow.tools/Patient-Partridge/og-image.png" />
     <meta property="og:image:type" content="image/png" />
     <meta property="og:image:width" content="1200" />
@@ -30,7 +30,7 @@
     <meta property="og:image:alt" content="Patient Partridge: an amber partridge on a dark tile, next to the title, the tagline A PDF reader and editor that keeps to itself, the line No account, no cloud, no tracking, and the note Early release." />
     <meta name="twitter:card" content="summary_large_image" />
     <meta name="twitter:title" content="Patient Partridge — an open source PDF reader and editor (early release)" />
-    <meta name="twitter:description" content="A PDF reader and editor that needs no account, no cloud and no tracking. Reading, annotations and form filling work today; more editing tools are planned. Open source, from the Hedgerow family. Version 0.2.2 is an early release." /> <!-- x-release-please-version -->
+    <meta name="twitter:description" content="A PDF reader and editor that needs no account, no cloud and no tracking. Reading, annotations, forms, page tools and digital signatures work today; more editing tools are planned. Open source, from the Hedgerow family. Version 0.2.2 is an early release." /> <!-- x-release-please-version -->
     <meta name="twitter:image" content="https://hedgerow.tools/Patient-Partridge/og-image.png" />
     <link rel="preload" href="fonts/InterVariable.woff2" as="font" type="font/woff2" crossorigin />
     <link rel="stylesheet" href="styles.css" />
@@ -40,7 +40,7 @@
         "@context": "https://schema.org",
         "@type": "SoftwareApplication",
         "name": "Patient Partridge",
-        "description": "An open source PDF reader and editor for Windows, macOS and Linux. Reading, annotations and form filling work today; more editing tools are planned. Version 0.2.2 is an early release.",
+        "description": "An open source PDF reader and editor for Windows, macOS and Linux. Reading, annotations, forms, page tools and digital signatures work today; more editing tools are planned. Version 0.2.2 is an early release.",
         "url": "https://hedgerow.tools/Patient-Partridge/",
         "applicationCategory": "UtilitiesApplication",
         "operatingSystem": "Windows, macOS, Linux",
@@ -103,10 +103,10 @@
             <h1 class="display" id="hero-title">A PDF reader and editor<br class="br-wide" /> that keeps to itself.</h1>
             <p class="lead">
               Patient Partridge is an open source PDF reader and editor for Windows, macOS and Linux.
-              Today it reads PDFs, adds annotations and fills in forms; more editing tools are planned. It is meant to be fast and small,
+              Today it reads PDFs, adds annotations, fills in and makes forms, works on pages, and checks and makes digital signatures; more editing tools are planned. It is meant to be fast and small,
               and to work without an account, a cloud, advertising or tracking.
             </p>
-            <p class="hero-fine">Version 0.2.2 is out for Windows, macOS and Linux. It is an early release: reading, annotations and filling in forms work. Expect rough edges.</p> <!-- x-release-please-version -->
+            <p class="hero-fine">Version 0.2.2 is out for Windows, macOS and Linux. It is an early release: reading, annotations, forms, page tools and signatures work. Expect rough edges.</p> <!-- x-release-please-version -->
             <div class="hero-actions">
               <a class="btn btn-primary btn-lg" href="https://github.com/Ferdinand99/Patient-Partridge/releases/latest">
                 <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#download"></use></svg>
@@ -281,10 +281,35 @@
               <h3>Back where you were</h3>
               <p>Your tabs can reopen when you start the app.</p>
             </li>
+            <li class="card feature reveal d2">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#layers"></use></svg></span>
+              <h3>Page tools</h3>
+              <p>Insert a blank page, delete, move, turn and crop pages, add the pages of other files (which is also how files are merged) and copy pages out to a new file. Every step can be undone.</p>
+            </li>
+            <li class="card feature reveal">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#file"></use></svg></span>
+              <h3>Create fillable forms</h3>
+              <p>Place text fields, check boxes, radio buttons, drop-down lists, list boxes and signature lines on a page. They are real form fields, not drawings of boxes.</p>
+            </li>
+            <li class="card feature reveal d1">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#shield-check"></use></svg></span>
+              <h3>View digital signatures</h3>
+              <p>A signed document shows a badge and a panel: whether each signature is intact, who signed according to the certificate, and whether the file changed after signing. No signer is shown as trusted yet, because the list of trusted signers is empty.</p>
+            </li>
+            <li class="card feature reveal d2">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#pencil"></use></svg></span>
+              <h3>A picture of your signature</h3>
+              <p>Draw it, type your name in a script font or import an image, and place it on a page as a stamp. It is only a picture: it does not show who placed it.</p>
+            </li>
+            <li class="card feature reveal">
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#key"></use></svg></span>
+              <h3>Sign with a certificate</h3>
+              <p>Sign a copy of a document with the key in a certificate file (.p12 or .pfx). The key is held by a separate, locked-down program, and the document you had open is not changed. The signature shows that the file has not changed since it was signed and who holds the key; it says nothing about legal effect. No time stamp is added.</p>
+            </li>
           </ul>
 
           <p class="later reveal">
-            Printing, file association and links have only been tested automatically so far, not on every
+            Printing, file association, links, page tools and signing have only been tested automatically so far, not on every
             system by hand. Editing text and images on the page is not there yet: the tools below are planned.
           </p>
         </div>
@@ -303,15 +328,10 @@
           </header>
 
           <ul class="grid">
-            <li class="card feature reveal">
-              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#file"></use></svg></span>
-              <h3>Create fillable forms</h3>
-              <p>Create new forms that others can fill in, and save them so they still work in other PDF programs.</p>
-            </li>
             <li class="card feature reveal d1">
-              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#shield-check"></use></svg></span>
-              <h3>Signatures</h3>
-              <p>View and validate digital signatures, and sign documents, including filling in and signing a form.</p>
+              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#clock"></use></svg></span>
+              <h3>Time stamps for signatures</h3>
+              <p>Add a time that others can rely on to a signature. Today a signature carries only the time of your own computer’s clock.</p>
             </li>
             <li class="card feature reveal">
               <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#send"></use></svg></span>
@@ -327,11 +347,6 @@
               <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#eye-off"></use></svg></span>
               <h3>Real redaction</h3>
               <p>Black out sensitive text and images and remove the content from the file, not just cover it.</p>
-            </li>
-            <li class="card feature reveal d2">
-              <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#layers"></use></svg></span>
-              <h3>Page tools</h3>
-              <p>Merge, split and reorder pages, and crop, rotate, extract and delete them.</p>
             </li>
             <li class="card feature reveal">
               <span class="list-icon"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#archive"></use></svg></span>
@@ -410,12 +425,17 @@
             <li class="card feature reveal d2">
               <span class="list-icon status-accent"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#check-circle"></use></svg></span>
               <h3>Checked at build time</h3>
-              <p>PDFium is downloaded at a pinned release and its SHA-256 checksum is verified before use. CI checks that the engine’s code contains no network code.</p>
+              <p>PDFium is downloaded at a pinned release and its SHA-256 checksum is verified before use. CI checks that the engine’s code contains no network code, apart from the few attempts its own sandbox check makes on purpose, which must fail. The same check covers the program that signs.</p>
             </li>
             <li class="card feature reveal">
               <span class="list-icon status-accent"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#shield-check"></use></svg></span>
               <h3>An operating-system sandbox</h3>
-              <p>Each open document has its own engine, locked in before it reads the first byte. It cannot open your other files or start programs.</p>
+              <p>Each open document has its own engine, locked in before it reads the first byte. It cannot open your other files, start programs or use the network.</p>
+            </li>
+            <li class="card feature reveal d1">
+              <span class="list-icon status-accent"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#key"></use></svg></span>
+              <h3>The key stays apart</h3>
+              <p>When you sign with a certificate, the file and its password go to a small separate program, <code>partridge-signer</code>. It is locked in like the engine, has no file access and no network, and signs a digest without ever seeing the document.</p>
             </li>
           </ul>
 
@@ -424,10 +444,12 @@
               <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#alert"></use></svg>
               <p>
                 <span class="callout-title">What the sandbox does not cover</span>
-                On Windows the engine is not blocked from the network. If someone finds a bug in PDFium
-                and builds a PDF that exploits it, that code could use the internet, though it still
-                cannot open your other files. Linux and macOS block the network too. This gap will be
-                closed in a later version. The README lists what is and is not protected.
+                The engine still reads the one document it was given and can send back whatever it likes,
+                and no sandbox protects against a bug in the operating system itself. The app is not
+                sandboxed either: the sandbox protects you from a bad PDF, not from a bug in the app.
+                On Windows the network block is the system’s own, for a restricted kind of program, and
+                it has been tried automatically on two versions of Windows, not on every computer. Version
+                0.2.x did not have it on Windows. The README lists what is and is not protected.
               </p>
             </div>
             <div class="callout status-info reveal d1">
@@ -442,8 +464,8 @@
             <div class="callout status-info reveal d2">
               <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#info"></use></svg>
               <p>
-                <span class="callout-title">Deleting an annotation</span>
-                Deleting an annotation is not redaction. Copies and backups keep it, and some text boxes keep their words in the file.
+                <span class="callout-title">Deleting and cropping</span>
+                Deleting an annotation or a page is not redaction, and neither is cropping a page. Copies and backups keep the old content, a cropped page still holds what lies outside the box, and some text boxes and form fields keep their words in the file.
               </p>
             </div>
           </div>
@@ -479,12 +501,12 @@
                 <p>Highlights, underlines, strike-out, notes, drawing and stamps, and filling in forms, saved so that other PDF programs show the result.</p>
               </div>
             </li>
-            <li class="milestone reveal">
-              <span class="ms-marker" aria-hidden="true"></span>
+            <li class="milestone is-now reveal">
+              <span class="ms-marker" aria-hidden="true"><span class="dot is-live"></span></span>
               <div class="ms-body">
-                <p class="ms-status"><span class="pill">Planned</span></p>
-                <h3>Signatures, page tools and creating forms</h3>
-                <p>Viewing, validating and making digital signatures, merging, splitting, reordering, cropping, rotating, extracting and deleting pages, and creating fillable forms.</p>
+                <p class="ms-status"><span class="pill status-accent"><span class="dot"></span>Released: 0.3.0</span></p>
+                <h3>Page tools, forms and signatures</h3>
+                <p>Inserting, deleting, moving, turning and cropping pages, adding pages from other files and copying pages out; creating fillable forms; viewing digital signatures; a picture of a signature; signing with a certificate; and a network block for the engine on Windows.</p>
               </div>
             </li>
             <li class="milestone reveal">
@@ -566,7 +588,15 @@
               <details>
                 <summary>Is it safe to open PDFs from strangers?<svg class="icon" aria-hidden="true"><use href="assets/icons.svg#chevron-down"></use></svg></summary>
                 <div class="faq-body">
-                  <p>Safer than before, but no PDF reader is risk-free. The engine runs in a sandbox, but on Windows it can still reach the network, and this is early software. Read the <a href="#security">security section</a> first.</p>
+                  <p>Safer than before, but no PDF reader is risk-free. The engine runs in a sandbox that keeps it from your other files, other programs and the network, but no sandbox is perfect and this is early software. Read the <a href="#security">security section</a> first.</p>
+                </div>
+              </details>
+            </li>
+            <li>
+              <details>
+                <summary>What does a signature made with a certificate show?<svg class="icon" aria-hidden="true"><use href="assets/icons.svg#chevron-down"></use></svg></summary>
+                <div class="faq-body">
+                  <p>That the file has not changed since it was signed, and who holds the key of the certificate. It says nothing about legal effect, and what other programs make of the signature is up to them. The signing time is your computer’s clock, no time stamp is added, and for now the list of trusted signers is empty, so a signature that holds is shown as intact with the signer not verified.</p>
                 </div>
               </details>
             </li>
@@ -574,7 +604,7 @@
               <details>
                 <summary>What comes next?<svg class="icon" aria-hidden="true"><use href="assets/icons.svg#chevron-down"></use></svg></summary>
                 <div class="faq-body">
-                  <p>Signatures and page tools, then creating forms. There are no dates. Watch the <a href="https://github.com/Ferdinand99/Patient-Partridge">repository</a> to hear about progress.</p>
+                  <p>Editing text and images and real redaction, then compressing and converting files. There are no dates. Watch the <a href="https://github.com/Ferdinand99/Patient-Partridge">repository</a> to hear about progress.</p>
                 </div>
               </details>
             </li>
