@@ -286,6 +286,11 @@ export function describeSignError(error: AppErrorLike, fileName = "this file"): 
         title: "That file is open",
         detail: "The name you chose is a file that is open in another tab, and the signed copy would replace it. Close that tab, or choose another name.",
       };
+    case "sign_target_signed":
+      return {
+        title: "Choose another name",
+        detail: "The name you chose is a file with a digital signature, and the signed copy would replace it. Give the signed copy a name of its own.",
+      };
     case "sign_same_file":
       return {
         title: "Choose another name",

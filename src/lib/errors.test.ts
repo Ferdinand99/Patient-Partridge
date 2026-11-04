@@ -66,6 +66,19 @@ describe("describeError: saving", () => {
     expect(protectedFile.detail).toContain("Nothing was saved");
   });
 
+  it("tells a name that is open in another tab, or holds a signature, from other failures and writes nothing", () => {
+    const open = describeError({ code: "save_target_open", message: "" }, "tax.pdf");
+    expect(open.title).toBe("That file is open");
+    expect(open.detail).toContain("another tab");
+    expect(open.detail).toContain("Nothing was written");
+    const signed = describeError({ code: "save_target_signed", message: "" }, "tax.pdf");
+    expect(signed.title).toBe("Choose another name");
+    expect(signed.detail).toContain("digital signature");
+    expect(signed.detail).toContain("Nothing was written");
+    expect(open.action).toBe("none");
+    expect(signed.action).toBe("none");
+  });
+
   it("explains a block of document details that is too big, and any other failed write generally", () => {
     const big = describeError(
       {

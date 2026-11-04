@@ -436,7 +436,16 @@ fn extracted_pages_are_written_through_the_save_path_and_checked() {
     assert_eq!(sizes.len(), 2);
     assert!(has_page_text(&pool, copy, 0, 3));
     assert!(has_page_text(&pool, copy, 1, 1));
-    // The same name again replaces the file (the dialog of the system asked about that).
+    // The same name again is refused while a tab shows that file, and nothing is written.
+    let before = fs::read(&out).unwrap();
+    match client_error(pool.extract_pages(handle, &[0], &out, ExtractOptions::default(), &nothing))
+    {
+        ClientError::Save(SaveError::TargetOpen) => {}
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(fs::read(&out).unwrap(), before);
+    // With that tab closed it replaces the file (the dialog of the system asked about that).
+    pool.close(copy);
     pool.extract_pages(handle, &[0], &out, ExtractOptions::default(), &nothing)
         .unwrap();
     let (copy2, sizes) = pool.open(&text(&out), None).unwrap();
@@ -465,6 +474,82 @@ fn extracting_over_the_document_itself_is_refused() {
         other => panic!("{other:?}"),
     }
     assert_eq!(fs::read(&source).unwrap(), kit::marked_pdf(3));
+}
+
+#[test]
+fn extracting_onto_a_file_that_another_tab_has_open_is_refused_and_the_file_is_not_touched() {
+    let dir = Dir::new("other-tab");
+    let source = dir.write("a.pdf", &kit::marked_pdf(3));
+    let other_bytes = kit::marked_pdf(2);
+    let other = dir.write("b.pdf", &other_bytes);
+    let pool = pool();
+    let (handle, _) = pool.open(&text(&source), None).unwrap();
+    let (_other_handle, _) = pool.open(&text(&other), None).unwrap();
+    match client_error(pool.extract_pages(
+        handle,
+        &[0],
+        &other,
+        ExtractOptions::default(),
+        &nothing,
+    )) {
+        ClientError::Save(e @ SaveError::TargetOpen) => assert_eq!(e.code(), "save_target_open"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(fs::read(&other).unwrap(), other_bytes);
+    assert_eq!(
+        dir.names(),
+        vec!["a.pdf".to_string(), "b.pdf".to_string()],
+        "no stray file is left"
+    );
+}
+
+#[test]
+fn extracting_onto_a_file_that_holds_a_signature_is_refused_even_when_it_is_not_open() {
+    let dir = Dir::new("onto-signed");
+    let source = dir.write("a.pdf", &kit::marked_pdf(3));
+    let signed_bytes = kit::signed_pdf();
+    let signed = dir.write("s.pdf", &signed_bytes);
+    let pool = pool();
+    let (handle, _) = pool.open(&text(&source), None).unwrap();
+    match client_error(pool.extract_pages(
+        handle,
+        &[0],
+        &signed,
+        ExtractOptions::default(),
+        &nothing,
+    )) {
+        ClientError::Save(e @ SaveError::TargetSigned) => {
+            assert_eq!(e.code(), "save_target_signed")
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(fs::read(&signed).unwrap(), signed_bytes);
+}
+
+#[test]
+fn a_copy_of_a_document_cannot_replace_a_signed_file_that_is_open_in_a_tab() {
+    let dir = Dir::new("save-as-signed-tab");
+    let source = dir.write("a.pdf", &kit::marked_pdf(2));
+    let signed_bytes = kit::signed_pdf();
+    let signed = dir.write("s.pdf", &signed_bytes);
+    let pool = pool();
+    let (handle, _) = pool.open(&text(&source), None).unwrap();
+    let (_signed_handle, _) = pool.open(&text(&signed), None).unwrap();
+    match client_error(pool.save_as(handle, &signed, SaveOptions::default())) {
+        ClientError::Save(SaveError::TargetOpen) => {}
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(fs::read(&signed).unwrap(), signed_bytes);
+
+    // A file that another tab shows and that holds no signature may still be chosen: that is the
+    // person's own pick through Save As, and the other tab is told that its file was replaced.
+    let plain_bytes = kit::marked_pdf(3);
+    let plain = dir.write("p.pdf", &plain_bytes);
+    let (plain_handle, _) = pool.open(&text(&plain), None).unwrap();
+    let outcome = pool
+        .save_as(handle, &plain, SaveOptions::default())
+        .unwrap();
+    assert_eq!(outcome.replaced, vec![plain_handle]);
 }
 
 #[test]

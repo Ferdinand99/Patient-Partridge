@@ -144,6 +144,10 @@ pub enum SaveError {
     Cancelled,
     /// The new file would replace the document itself.
     OverSource,
+    /// The new file would replace a file that another open document is read from.
+    TargetOpen,
+    /// The new file would replace a file that holds a digital signature.
+    TargetSigned,
 }
 
 impl SaveError {
@@ -171,6 +175,8 @@ impl SaveError {
             SaveError::InsertSigned { .. } => "insert_signed",
             SaveError::Cancelled => "cancelled",
             SaveError::OverSource => "extract_over_source",
+            SaveError::TargetOpen => "save_target_open",
+            SaveError::TargetSigned => "save_target_signed",
         }
     }
 }
@@ -245,6 +251,8 @@ impl fmt::Display for SaveError {
                 f,
                 "the new file would replace the document it is made from"
             ),
+            SaveError::TargetOpen => write!(f, "the file is open as another document"),
+            SaveError::TargetSigned => write!(f, "the file holds a digital signature"),
         }
     }
 }
@@ -254,6 +262,50 @@ impl std::error::Error for SaveError {}
 impl From<SaveError> for ClientError {
     fn from(e: SaveError) -> Self {
         ClientError::Save(e)
+    }
+}
+
+// ---- telling whether a file holds a signature --------------------------------------------------
+
+/// True when the file at `path` holds a digital signature, as far as its bytes say: it mentions
+/// `/ByteRange` or `/DocMDP`, the words every signature (and every certified document) has. A file
+/// that does not exist holds none. A file that cannot be read is treated as one that does, because
+/// a write over a signature that was not looked for is the mistake that cannot be taken back.
+pub fn file_holds_signature(path: &Path) -> bool {
+    use std::io::Read;
+    const WORDS: [&[u8]; 2] = [b"/ByteRange", b"/DocMDP"];
+    match fs::metadata(path) {
+        Ok(meta) if meta.is_file() => {}
+        // A folder or a device is not a file that can be replaced, and the write refuses it alone.
+        Ok(_) => return false,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    }
+    let Ok(mut file) = File::open(path) else {
+        return true;
+    };
+    // The tail of one piece is kept in front of the next, so a word cut by the edge is found.
+    let keep = WORDS.iter().map(|w| w.len()).max().unwrap_or(1) - 1;
+    let mut buffer = vec![0u8; keep + (1 << 20)];
+    let mut held = 0usize;
+    loop {
+        let got = match file.read(&mut buffer[held..]) {
+            Ok(0) => return false,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return true,
+        };
+        let end = held + got;
+        let window = &buffer[..end];
+        if WORDS
+            .iter()
+            .any(|word| window.windows(word.len()).any(|w| w == *word))
+        {
+            return true;
+        }
+        let tail = keep.min(end);
+        buffer.copy_within(end - tail..end, 0);
+        held = tail;
     }
 }
 
@@ -1221,6 +1273,49 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     // ---- the pieces ----------------------------------------------------------------------
+
+    #[test]
+    fn a_file_with_the_words_of_a_signature_is_told_from_one_without_wherever_they_fall() {
+        let dir = std::env::temp_dir().join(format!("partridge-holds-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, bytes: &[u8]| {
+            let path = dir.join(name);
+            fs::write(&path, bytes).unwrap();
+            path
+        };
+        assert!(!file_holds_signature(&dir.join("missing.pdf")));
+        assert!(!file_holds_signature(&write(
+            "plain.pdf",
+            b"%PDF-1.7\n%%EOF\n"
+        )));
+        assert!(!file_holds_signature(&write("empty.pdf", b"")));
+        assert!(file_holds_signature(&write(
+            "a.pdf",
+            b"%PDF-1.7\n/ByteRange [0 1 2 3]"
+        )));
+        assert!(file_holds_signature(&write("b.pdf", b"x /DocMDP y")));
+        // The word is cut by the edge of the first piece that is read (one mebibyte and the nine
+        // bytes kept for the next), at every place it can be cut.
+        const PIECE: usize = 1 << 20;
+        const FIRST: usize = PIECE + 9;
+        for cut in 1.."/ByteRange".len() {
+            let mut bytes = vec![b'x'; FIRST - cut];
+            bytes.extend_from_slice(b"/ByteRange");
+            bytes.extend_from_slice(&[b'y'; 100]);
+            assert!(
+                file_holds_signature(&write("cut.pdf", &bytes)),
+                "cut after {cut} bytes"
+            );
+        }
+        // Near the end of a large file, and a large file with nothing.
+        let mut big = vec![b'x'; 3 * PIECE + 17];
+        assert!(!file_holds_signature(&write("big.pdf", &big)));
+        big.extend_from_slice(b"/DocMDP");
+        assert!(file_holds_signature(&write("big2.pdf", &big)));
+        // A folder is not a file that holds anything (and the write refuses it by itself).
+        assert!(!file_holds_signature(&dir));
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_full_disk_is_told_from_other_write_errors() {

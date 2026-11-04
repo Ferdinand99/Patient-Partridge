@@ -433,13 +433,13 @@ fn saving_over_a_file_that_is_open_in_another_tab_ends_the_verdict_of_that_tab()
     let pool = EnginePool::new(config(), 4);
     let signed = signed_file(&signer(KeyKind::P256), &SignOptions::default());
     let other = dir.write("other.pdf", &signed.bytes);
-    let target = dir.write("target.pdf", &signed.bytes);
     let unrelated = dir.write("unrelated.pdf", &signed.bytes);
 
+    // Two tabs show the same file, and a third shows another one.
     let (saved_from, _) = pool.open(&other, None).unwrap();
-    let (on_target, _) = pool.open(&target, None).unwrap();
+    let (same_file, _) = pool.open(&other, None).unwrap();
     let (apart, _) = pool.open(&unrelated, None).unwrap();
-    for handle in [saved_from, on_target, apart] {
+    for handle in [saved_from, same_file, apart] {
         assert!(pool.signatures(handle, NOW).is_ok());
     }
 
@@ -447,19 +447,45 @@ fn saving_over_a_file_that_is_open_in_another_tab_ends_the_verdict_of_that_tab()
         allow_signed: true,
         overwrite_changed: false,
     };
-    let outcome = pool
-        .save_as(saved_from, std::path::Path::new(&target), options)
-        .unwrap();
-    // The document that was open on the file is named, the one that was saved and the one on
+    let outcome = pool.save(saved_from, options).unwrap();
+    // The document that was open on the same file is named, the one that was saved and the one on
     // another file are not.
-    assert_eq!(outcome.replaced, vec![on_target]);
+    assert_eq!(outcome.replaced, vec![same_file]);
     // It is no longer answered for: its engine holds the file as it was, and the path is another.
     assert!(matches!(
-        pool.signatures(on_target, NOW),
+        pool.signatures(same_file, NOW),
         Err(ClientError::Engine {
             code: partridge_protocol::ErrorCode::SourceChanged,
             ..
         })
     ));
     assert!(pool.signatures(apart, NOW).is_ok());
+}
+
+#[test]
+fn a_copy_is_not_written_over_a_signed_file_that_another_tab_shows() {
+    let dir = Dir::new("copy-over-signed-tab");
+    let pool = EnginePool::new(config(), 4);
+    let signed = signed_file(&signer(KeyKind::P256), &SignOptions::default());
+    let other = dir.write("other.pdf", &signed.bytes);
+    let target = dir.write("target.pdf", &signed.bytes);
+    let (saved_from, _) = pool.open(&other, None).unwrap();
+    let (on_target, _) = pool.open(&target, None).unwrap();
+    let options = SaveOptions {
+        allow_signed: true,
+        overwrite_changed: false,
+    };
+    let error = pool
+        .save_as(saved_from, std::path::Path::new(&target), options)
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ClientError::Save(partridge_engine_client::SaveError::TargetOpen)
+        ),
+        "{error:?}"
+    );
+    // The file is as it was, and the tab that shows it still has its verdict.
+    assert_eq!(fs::read(&target).unwrap(), signed.bytes);
+    assert!(pool.signatures(on_target, NOW).is_ok());
 }
