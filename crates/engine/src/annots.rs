@@ -877,7 +877,9 @@ impl DocAnnots {
             let mut annotation = page.annotations().get(position).map_err(|_| no_such())?;
             annotation.set_bounds(rect_of(bounds)).map_err(refused)?;
         }
-        settle(&page);
+        // No `settle` here: the picture has its appearance since it was made, and moving it only
+        // changes the rectangle. Drawing the page after every step cost as much as drawing the page,
+        // seconds on a page with heavy content, for each step of a drag.
         let (_, info) = self.find(document, &page, page_index, id)?;
         if let Some(Recipe::Signature { rect, .. }) = self.made.get_mut(&id) {
             *rect = info.rect;
