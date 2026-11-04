@@ -2358,6 +2358,21 @@ export class App {
     this.signOpen = true;
     this.syncSaveButtons();
     try {
+      // A page tool that is still changing the document would be signed in a state of no one's
+      // making. A change that ends in a moment is waited for; for a long one the person is told.
+      if (this.pageOps?.busyOn(tab.doc) && !(await this.changeEnded(tab.doc))) {
+        if (this.pageOps.busyOn(tab.doc)) {
+          const copying = this.pageOps.copyingOn(tab.doc);
+          await showNotice(this.noticeLayer, {
+            title: copying ? `Pages are being copied out of "${tab.name}"` : `"${tab.name}" is being changed`,
+            detail: copying
+              ? "The document cannot be signed while its pages are being copied out. Sign again when the copy has finished."
+              : "A change to its pages is under way, and the signature would not be of the document as it will be. Sign again when the change has finished.",
+            buttons: [{ id: "ok", label: "OK", primary: true }],
+          });
+          return;
+        }
+      }
       if (this.isDirty(tab)) {
         const answer = await showNotice(this.noticeLayer, {
           title: CERT_WORDS.unsavedTitle,
