@@ -53,7 +53,7 @@ function Install-App([string]$installer, [string]$name) {
   if (-not $entry) { throw "$name has no uninstall entry after the installation (installer exit code $($p.ExitCode))." }
   $dir = if ($entry.InstallLocation) { First-Quoted $entry.InstallLocation } else { Split-Path (First-Quoted $entry.UninstallString) -Parent }
   Say "installed in $dir (installer exit code $($p.ExitCode))"
-  return $dir
+  $script:InstalledIn = [string]$dir
 }
 function Uninstall-App([string]$name) {
   Say "--- uninstall $name"
@@ -70,6 +70,7 @@ function Uninstall-App([string]$name) {
 }
 function Start-Open([string]$exe) {
   Remove-Item Env:\PARTRIDGE_MEASURE_REPORT -ErrorAction SilentlyContinue
+  Say "start: $exe"
   return Start-Process -FilePath $exe -ArgumentList ('"' + $Pdf + '"') -PassThru
 }
 function Stop-Tree([int]$id) {
@@ -146,7 +147,8 @@ try {
 
   Say ''
   Say '=== 1. Install the stable app and start it, then install the beta while it runs'
-  $stableDir = Install-App $Stable $StableName
+  Install-App $Stable $StableName
+  $stableDir = $script:InstalledIn
   $stableExe = Join-Path $stableDir $StableExe
   Check 'the stable program is installed' (Test-Path -LiteralPath $stableExe) "($stableExe)"
   $stableApp = Start-Open $stableExe
@@ -155,7 +157,8 @@ try {
   # Control of the check for the .pdf association below: the stable app must show up in the registry.
   Check 'control: the stable app registers its file type' (Registry-Mentions $StableExe)
 
-  $betaDir = Install-App $Beta $BetaName
+  Install-App $Beta $BetaName
+  $betaDir = $script:InstalledIn
   $betaExe = Join-Path $betaDir $BetaExe
   Check 'the beta program is installed' (Test-Path -LiteralPath $betaExe) "($betaExe)"
   Check 'installing the beta did not end the running stable app' (-not $stableApp.HasExited)
@@ -238,7 +241,8 @@ try {
 
   Say ''
   Say '=== 6. Install the beta again and remove the stable app while the beta runs'
-  $betaDir = Install-App $Beta $BetaName
+  Install-App $Beta $BetaName
+  $betaDir = $script:InstalledIn
   $betaExe = Join-Path $betaDir $BetaExe
   $betaApp = Start-Open $betaExe
   Wait-Window $betaApp $BetaId
