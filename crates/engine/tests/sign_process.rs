@@ -750,5 +750,48 @@ fn a_file_that_another_document_reads_is_not_a_target_and_a_signed_one_knows_its
         .unwrap();
     let (signed, _) = pool.open(&text(&target), None).unwrap();
     assert!(pool.is_signed(signed) && !pool.is_signed(a) && !pool.is_signed(b));
+    // A document that cannot be looked at (closed, or never open) counts as signed, so the copy
+    // name and the refusal to replace its own file are not lost when the engine cannot say.
+    pool.close(b);
+    assert!(pool.is_signed(b), "a closed document is taken as signed");
+    assert!(pool.is_signed(u64::MAX), "so is one that was never open");
     assert!(pool.is_own_file(signed, &target) && !pool.is_own_file(signed, &first));
+}
+
+#[test]
+fn a_signed_copy_does_not_replace_a_file_that_holds_a_signature() {
+    let dir = Dir::new("onto-signed");
+    let source = dir.write("a.pdf", &kit::simple_pdf(1));
+    let target = dir.0.join("a (signed).pdf");
+    let pool = EnginePool::new(config(), 4);
+    let (handle, _) = pool.open(&text(&source), None).unwrap();
+    let mut signer = loaded_signer("p256.p12");
+    pool.sign_as(
+        handle,
+        &target,
+        &mut signer,
+        &options(),
+        SaveOptions::default(),
+    )
+    .unwrap();
+    let signed = fs::read(&target).unwrap();
+    // The same name again: the file on disk holds a signature, and it is not open in any tab.
+    let mut again = loaded_signer("p256.p12");
+    let error = pool
+        .sign_as(
+            handle,
+            &target,
+            &mut again,
+            &options(),
+            SaveOptions::default(),
+        )
+        .unwrap_err();
+    assert_eq!(code_of(&error), "sign_target_signed");
+    assert_eq!(fs::read(&target).unwrap(), signed);
+    assert!(
+        again.certificate().is_some(),
+        "the key is there for another try"
+    );
+    signer.close();
+    again.close();
 }

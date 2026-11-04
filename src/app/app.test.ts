@@ -3705,6 +3705,53 @@ describe("App: signing with a certificate", () => {
     expect(api.signPickCertificate).not.toHaveBeenCalled();
   });
 
+  it("does not start while pages are being copied out of the document, and says so", async () => {
+    const pages = {
+      pagesExtract: vi.fn(() => new Promise<never>(() => undefined)),
+      pagesCancel: vi.fn(() => Promise.resolve("idle" as const)),
+    };
+    const m = make({ pages: pages as unknown as PageToolsApi, changeGraceMs: 20 });
+    const api = Object.assign(m.api, signing());
+    await m.app.openPath("/docs/book.pdf");
+    await flush();
+    const ops = (m.app as unknown as { pageOps: PageOps }).pageOps;
+    void ops.extract([0]);
+    await flush();
+    signButton().click();
+    await new Promise((r) => setTimeout(r, 80));
+    await flush();
+    expect(notice()?.textContent).toContain('Pages are being copied out of "book.pdf"');
+    expect(notice()?.textContent).toContain("Sign again when the copy has finished");
+    click(button("OK"));
+    await flush();
+    expect(document.querySelector("form.certsign")).toBeNull();
+    expect(api.signPickCertificate).not.toHaveBeenCalled();
+    expect(signButton().disabled).toBe(false);
+  });
+
+  it("does not start while a page change is still running after the wait, and says so", async () => {
+    const pages = {
+      pagesRotate: vi.fn(() => new Promise<never>(() => undefined)),
+      pagesCancel: vi.fn(() => Promise.resolve("idle" as const)),
+    };
+    const m = make({ pages: pages as unknown as PageToolsApi, changeGraceMs: 20 });
+    const api = Object.assign(m.api, signing());
+    await m.app.openPath("/docs/book.pdf");
+    await flush();
+    const ops = (m.app as unknown as { pageOps: PageOps }).pageOps;
+    void ops.rotate([0], 1);
+    await flush();
+    signButton().click();
+    await new Promise((r) => setTimeout(r, 80));
+    await flush();
+    expect(notice()?.textContent).toContain('"book.pdf" is being changed');
+    expect(notice()?.textContent).toContain("Sign again when the change has finished");
+    click(button("OK"));
+    await flush();
+    expect(document.querySelector("form.certsign")).toBeNull();
+    expect(api.signPickCertificate).not.toHaveBeenCalled();
+  });
+
   it("saves first when the person agrees, and then opens the box", async () => {
     const m = make();
     Object.assign(m.api, signing());

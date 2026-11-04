@@ -212,6 +212,27 @@ export function describeError(error: AppErrorLike, fileName?: string): Described
         detail: `${file} is signed, and a copy with its own name would replace it and break the signature. Give the copy a name of its own.`,
         action: "none",
       };
+    case "save_target_open":
+      return {
+        title: "That file is open",
+        detail:
+          "The name you chose is a file that is open in another tab, and the new file would replace it. Close that tab, or choose another name. Nothing was written.",
+        action: "none",
+      };
+    case "save_target_signed":
+      return {
+        title: "Choose another name",
+        detail:
+          "The name you chose is a file with a digital signature, and the new file would replace it. Give the new file a name of its own. Nothing was written.",
+        action: "none",
+      };
+    case "save_target_unreadable":
+      return {
+        title: "That file cannot be read",
+        detail:
+          "The file with the name you chose could not be read, so it is not replaced. Choose another name. Nothing was written.",
+        action: "none",
+      };
     case "save_too_large":
       if (/not enough memory/i.test(error.message)) {
         return {
@@ -239,6 +260,14 @@ export function describeError(error: AppErrorLike, fileName?: string): Described
         action: "none",
       };
     case "annotation_refused":
+      // The one refusal that the engine words for the reader: a page that cannot take more.
+      if (error.message.startsWith("This page already has as many annotations")) {
+        return {
+          title: "No more annotations fit on this page",
+          detail: `${error.message} Nothing was added.`,
+          action: "none",
+        };
+      }
       return {
         title: "The annotation was not changed",
         detail: "Patient Partridge could not make this change to the annotation. Nothing was lost.",

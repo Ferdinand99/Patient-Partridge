@@ -51,6 +51,16 @@ struct Inner {
     image: Option<SignatureMark>,
 }
 
+/// Says that a signature is being made, for as long as it lives, and says it is over when it ends
+/// by any road: the answer, an error, a panic of the signing thread or the command being dropped.
+struct SigningFlag<'a>(&'a CertificateState);
+
+impl Drop for SigningFlag<'_> {
+    fn drop(&mut self) {
+        state(self.0).signing = false;
+    }
+}
+
 /// How long a key stays in the signer when nothing is signed with it. The signer ends after one
 /// signature; a key that is opened and then forgotten about is let go by the app after this time.
 const KEY_LIFETIME: Duration = Duration::from_secs(5 * 60);
@@ -71,6 +81,28 @@ impl CertificateState {
         inner.doc = None;
         inner.opened = None;
         if let Some(signer) = inner.signer.take() {
+            signer.close();
+        }
+    }
+
+    /// Takes the signer out of the state to make a signature with it. The flag stays up until it is
+    /// dropped. `None` when there is no signer. The number says which opening the key belongs to.
+    fn take_for_signing(&self) -> Option<(SignerSession, u64, SigningFlag<'_>)> {
+        let mut inner = state(self);
+        let signer = inner.signer.take()?;
+        inner.signing = true;
+        Some((signer, inner.generation, SigningFlag(self)))
+    }
+
+    /// A signing that did not sign: the key goes back for another try when it is still wanted (the
+    /// same opening, not forgotten) and the signer still has it. It gets its five minutes again,
+    /// counted from now, so the watch of that opening goes on to guard it. Otherwise it is let go.
+    fn put_back(&self, generation: u64, signer: SignerSession) {
+        let mut inner = state(self);
+        if keep_after_failure(&mut inner, generation, signer.certificate().is_some()) {
+            inner.signer = Some(signer);
+        } else {
+            drop(inner);
             signer.close();
         }
     }
@@ -96,6 +128,17 @@ impl CertificateState {
             }
             return true;
         }
+        false
+    }
+}
+
+/// Decides whether a key comes back after a signing that failed, and starts its time again.
+fn keep_after_failure(inner: &mut Inner, generation: u64, usable: bool) -> bool {
+    let wanted = inner.generation == generation && inner.opened.is_some() && inner.signer.is_none();
+    if usable && wanted {
+        inner.opened = Some(Instant::now());
+        true
+    } else {
         false
     }
 }
@@ -532,12 +575,15 @@ pub async fn sign_document(
         .gate()
         .enter()
         .map_err(|_| updates::updating_error())?;
-    let Some(mut signer) = ({
-        let mut inner = state(&certificate);
-        let taken = inner.signer.take();
-        inner.signing = taken.is_some();
-        taken
-    }) else {
+    // Changes made while the dialog was open are not in the file that is signed.
+    if update_state.unsaved().is_dirty(doc) {
+        return Err(error(
+            "sign_unsaved",
+            "This document has changes that are not saved.",
+        ));
+    }
+    // The flag is down again when this function ends, whichever way it ends.
+    let Some((mut signer, generation, _signing)) = certificate.take_for_signing() else {
         return Err(error("signer_not_loaded", "No certificate file is open."));
     };
     let options = SignOptions {
@@ -556,7 +602,6 @@ pub async fn sign_document(
     .await
     .map_err(|e| error("internal", &e.to_string()))?;
     let (signer, result) = task;
-    state(&certificate).signing = false;
     match result {
         Ok(outcome) => {
             // Signed: the key is let go at once.
@@ -577,11 +622,7 @@ pub async fn sign_document(
         Err(e) => {
             // Not signed: the certificate stays open for another try, unless the signer is gone
             // (it ends after the one signature it makes, also when the file was not written).
-            if signer.certificate().is_some() {
-                state(&certificate).signer = Some(signer);
-            } else {
-                signer.close();
-            }
+            certificate.put_back(generation, signer);
             Err(CommandError::from(e))
         }
     }
@@ -590,6 +631,72 @@ pub async fn sign_document(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn old_by(minutes: u64) -> Instant {
+        Instant::now()
+            .checked_sub(Duration::from_secs(minutes * 60))
+            .expect("the clock has run for that long")
+    }
+
+    #[test]
+    fn the_signing_flag_goes_down_when_the_signing_thread_panics() {
+        let certs = CertificateState::default();
+        state(&certs).signing = true;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _flag = SigningFlag(&certs);
+            panic!("the signing thread died");
+        }));
+        assert!(outcome.is_err());
+        assert!(!state(&certs).signing);
+        // And on a plain return.
+        state(&certs).signing = true;
+        drop(SigningFlag(&certs));
+        assert!(!state(&certs).signing);
+    }
+
+    #[test]
+    fn a_key_that_comes_back_after_a_failed_signing_gets_its_five_minutes_again() {
+        let certs = CertificateState::default();
+        {
+            let mut inner = state(&certs);
+            inner.generation = 3;
+            inner.opened = Some(old_by(6));
+            inner.signing = true;
+        }
+        // While a signature is made, an old key is not let go, and the watch goes on.
+        assert!(!certs.let_go_if_old(3));
+        assert!(state(&certs).opened.is_some());
+        // The signing failed and the signer still has the key: it comes back with a fresh time.
+        assert!(keep_after_failure(&mut state(&certs), 3, true));
+        state(&certs).signing = false;
+        assert!(!certs.let_go_if_old(3), "the key was not let go at once");
+        assert!(state(&certs).opened.unwrap().elapsed() < Duration::from_secs(60));
+        // Five minutes later it is let go as before.
+        state(&certs).opened = Some(old_by(6));
+        assert!(certs.let_go_if_old(3));
+        assert!(state(&certs).opened.is_none());
+    }
+
+    #[test]
+    fn a_key_is_not_put_back_when_it_was_forgotten_or_replaced_or_the_signer_lost_it() {
+        let certs = CertificateState::default();
+        {
+            let mut inner = state(&certs);
+            inner.generation = 4;
+            inner.opened = Some(Instant::now());
+        }
+        // Another opening has come since.
+        assert!(!keep_after_failure(&mut state(&certs), 3, true));
+        // The signer does not have the key any more.
+        assert!(!keep_after_failure(&mut state(&certs), 4, false));
+        // The key was forgotten while the signature was made.
+        state(&certs).opened = None;
+        assert!(!keep_after_failure(&mut state(&certs), 4, true));
+        assert!(
+            state(&certs).opened.is_none(),
+            "no time was started for a key that is gone"
+        );
+    }
 
     #[test]
     fn the_signed_copy_is_named_after_the_document() {

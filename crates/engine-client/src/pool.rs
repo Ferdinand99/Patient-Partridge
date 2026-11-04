@@ -306,8 +306,15 @@ impl EnginePool {
         let (path, expected) = match target {
             None => (current_path, current_stamp),
             Some(t) if same_file(t, &current_path) => (current_path, current_stamp),
-            // Another file: whatever is there now is what the user chose to replace.
-            Some(t) => (t.to_path_buf(), FileStamp::read(t).ok()),
+            // Another file: whatever is there now is what the user chose to replace, unless a
+            // signed document is open from it (that tab would go on showing a signed file that is
+            // gone).
+            Some(t) => {
+                if self.signed_reader_of(handle, t) {
+                    return Err(SaveError::TargetOpen.into());
+                }
+                (t.to_path_buf(), FileStamp::read(t).ok())
+            }
         };
         let mut outcome = save_document(
             &client,
@@ -390,6 +397,22 @@ impl EnginePool {
                 message: "the file is open as another document".into(),
             });
         }
+        // Nor a file that holds a signature: the signed copy is a new file.
+        match crate::save::scan_for_signature(target) {
+            crate::save::FileScan::Clear => {}
+            crate::save::FileScan::Signed => {
+                return Err(ClientError::Signer {
+                    code: "sign_target_signed",
+                    message: "the file holds a digital signature".into(),
+                })
+            }
+            crate::save::FileScan::Unreadable => {
+                return Err(ClientError::Signer {
+                    code: "sign_target_unreadable",
+                    message: "the file could not be read".into(),
+                })
+            }
+        }
         // Whatever is there now is what the person chose to replace.
         let expected = FileStamp::read(target).ok();
         let mut outcome = crate::sign::sign_document(
@@ -428,6 +451,29 @@ impl EnginePool {
         })
     }
 
+    /// True when a document other than `handle` is read from the file at `path` and is signed. A
+    /// document that cannot say is taken to be signed.
+    pub(crate) fn signed_reader_of(&self, handle: u64, path: &Path) -> bool {
+        let others: Vec<(Arc<EngineClient>, u64, Arc<Mutex<Source>>)> = {
+            let st = state(&self.state);
+            st.docs
+                .iter()
+                .filter(|(other, _)| **other != handle)
+                .map(|(_, e)| (e.client.clone(), e.doc, e.source.clone()))
+                .collect()
+        };
+        others.iter().any(|(client, doc, source)| {
+            // The file the tab shows now. A tab that followed a copy no longer shows the file it
+            // was opened from, and does not stop it from being chosen.
+            let current = source
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .path
+                .clone();
+            same_file(&current, path) && client.doc_info(*doc).map_or(true, |info| info.is_signed())
+        })
+    }
+
     /// True when `path` is the file this document is read from or was opened from.
     pub fn is_own_file(&self, handle: u64, path: &Path) -> bool {
         let st = state(&self.state);
@@ -441,12 +487,18 @@ impl EnginePool {
         same_file(path, &current) || same_file(path, &original)
     }
 
-    /// True when the document holds a signature (or something that looks like one).
+    /// True when the document holds a signature (or something that looks like one). When the engine
+    /// cannot say (the document is gone, the engine does not answer), the answer is true: the
+    /// callers use it to keep a signed file from being replaced, and a document that cannot be
+    /// looked at is treated as the one that matters.
     pub fn is_signed(&self, handle: u64) -> bool {
-        self.entry(handle)
-            .ok()
-            .and_then(|(client, doc)| client.doc_info(doc).ok())
-            .is_some_and(|info| info.is_signed())
+        match self
+            .entry(handle)
+            .and_then(|(client, doc)| client.doc_info(doc))
+        {
+            Ok(info) => info.is_signed(),
+            Err(_) => true,
+        }
     }
 
     /// Every other open document whose engine reads the file at `path` is told apart: what its

@@ -389,6 +389,17 @@ impl EnginePool {
         if same_file(target, &current) || same_file(target, &original) {
             return Err(SaveError::OverSource.into());
         }
+        // Not a file that another tab shows (it would go on showing a file that is gone), and not
+        // a file that holds a signature: copying pages out makes a new file, never replaces one of
+        // those.
+        if self.read_by_another(handle, target) {
+            return Err(SaveError::TargetOpen.into());
+        }
+        match crate::save::scan_for_signature(target) {
+            crate::save::FileScan::Clear => {}
+            crate::save::FileScan::Signed => return Err(SaveError::TargetSigned.into()),
+            crate::save::FileScan::Unreadable => return Err(SaveError::TargetUnreadable.into()),
+        }
         let info = h.client.doc_info(h.doc)?;
         if info.is_signed() && !options.allow_signed {
             return Err(SaveError::Signed {

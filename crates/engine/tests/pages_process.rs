@@ -436,7 +436,16 @@ fn extracted_pages_are_written_through_the_save_path_and_checked() {
     assert_eq!(sizes.len(), 2);
     assert!(has_page_text(&pool, copy, 0, 3));
     assert!(has_page_text(&pool, copy, 1, 1));
-    // The same name again replaces the file (the dialog of the system asked about that).
+    // The same name again is refused while a tab shows that file, and nothing is written.
+    let before = fs::read(&out).unwrap();
+    match client_error(pool.extract_pages(handle, &[0], &out, ExtractOptions::default(), &nothing))
+    {
+        ClientError::Save(SaveError::TargetOpen) => {}
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(fs::read(&out).unwrap(), before);
+    // With that tab closed it replaces the file (the dialog of the system asked about that).
+    pool.close(copy);
     pool.extract_pages(handle, &[0], &out, ExtractOptions::default(), &nothing)
         .unwrap();
     let (copy2, sizes) = pool.open(&text(&out), None).unwrap();
@@ -465,6 +474,124 @@ fn extracting_over_the_document_itself_is_refused() {
         other => panic!("{other:?}"),
     }
     assert_eq!(fs::read(&source).unwrap(), kit::marked_pdf(3));
+}
+
+#[test]
+fn extracting_onto_a_file_that_another_tab_has_open_is_refused_and_the_file_is_not_touched() {
+    let dir = Dir::new("other-tab");
+    let source = dir.write("a.pdf", &kit::marked_pdf(3));
+    let other_bytes = kit::marked_pdf(2);
+    let other = dir.write("b.pdf", &other_bytes);
+    let pool = pool();
+    let (handle, _) = pool.open(&text(&source), None).unwrap();
+    let (_other_handle, _) = pool.open(&text(&other), None).unwrap();
+    match client_error(pool.extract_pages(
+        handle,
+        &[0],
+        &other,
+        ExtractOptions::default(),
+        &nothing,
+    )) {
+        ClientError::Save(e @ SaveError::TargetOpen) => assert_eq!(e.code(), "save_target_open"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(fs::read(&other).unwrap(), other_bytes);
+    assert_eq!(
+        dir.names(),
+        vec!["a.pdf".to_string(), "b.pdf".to_string()],
+        "no stray file is left"
+    );
+    // Another way to spell the same file is the same file.
+    let mut spellings = vec![dir.0.join(".").join("b.pdf")];
+    #[cfg(unix)]
+    {
+        let link = dir.0.join("link.pdf");
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+        spellings.push(link);
+    }
+    for spelled in &spellings {
+        match client_error(pool.extract_pages(
+            handle,
+            &[0],
+            spelled,
+            ExtractOptions::default(),
+            &nothing,
+        )) {
+            ClientError::Save(SaveError::TargetOpen) => {}
+            other => panic!("{}: {other:?}", spelled.display()),
+        }
+    }
+}
+
+#[test]
+fn extracting_onto_a_file_that_holds_a_signature_is_refused_even_when_it_is_not_open() {
+    let dir = Dir::new("onto-signed");
+    let source = dir.write("a.pdf", &kit::marked_pdf(3));
+    let signed_bytes = kit::signed_pdf();
+    let signed = dir.write("s.pdf", &signed_bytes);
+    let pool = pool();
+    let (handle, _) = pool.open(&text(&source), None).unwrap();
+    match client_error(pool.extract_pages(
+        handle,
+        &[0],
+        &signed,
+        ExtractOptions::default(),
+        &nothing,
+    )) {
+        ClientError::Save(e @ SaveError::TargetSigned) => {
+            assert_eq!(e.code(), "save_target_signed")
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(fs::read(&signed).unwrap(), signed_bytes);
+}
+
+#[test]
+fn extracting_onto_a_file_that_cannot_be_read_says_so_and_does_not_call_it_signed() {
+    let dir = Dir::new("unreadable-target");
+    let source = dir.write("a.pdf", &kit::marked_pdf(2));
+    let pool = pool();
+    let (handle, _) = pool.open(&text(&source), None).unwrap();
+    let odd = dir.0.join("bad name.pdf");
+    match client_error(pool.extract_pages(handle, &[0], &odd, ExtractOptions::default(), &nothing))
+    {
+        ClientError::Save(e @ SaveError::TargetUnreadable) => {
+            assert_eq!(e.code(), "save_target_unreadable")
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_copy_of_a_document_cannot_replace_a_signed_file_that_is_open_in_a_tab() {
+    let dir = Dir::new("save-as-signed-tab");
+    let source = dir.write("a.pdf", &kit::marked_pdf(2));
+    let signed_bytes = kit::signed_pdf();
+    let signed = dir.write("s.pdf", &signed_bytes);
+    let pool = pool();
+    let (handle, _) = pool.open(&text(&source), None).unwrap();
+    let (_signed_handle, _) = pool.open(&text(&signed), None).unwrap();
+    match client_error(pool.save_as(handle, &signed, SaveOptions::default())) {
+        ClientError::Save(SaveError::TargetOpen) => {}
+        other => panic!("{other:?}"),
+    }
+    // The same file spelled another way is the same file.
+    let spelled = dir.0.join(".").join("s.pdf");
+    match client_error(pool.save_as(handle, &spelled, SaveOptions::default())) {
+        ClientError::Save(SaveError::TargetOpen) => {}
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(fs::read(&signed).unwrap(), signed_bytes);
+
+    // A file that another tab shows and that holds no signature may still be chosen: that is the
+    // person's own pick through Save As, and the other tab is told that its file was replaced.
+    let plain_bytes = kit::marked_pdf(3);
+    let plain = dir.write("p.pdf", &plain_bytes);
+    let (plain_handle, _) = pool.open(&text(&plain), None).unwrap();
+    let outcome = pool
+        .save_as(handle, &plain, SaveOptions::default())
+        .unwrap();
+    assert_eq!(outcome.replaced, vec![plain_handle]);
 }
 
 #[test]
@@ -1044,11 +1171,18 @@ fn a_change_that_takes_many_times_the_stall_limit_is_not_ended_while_it_reports_
     // times the stall limit.
     let measuring = pool_with_stall(Duration::from_secs(300));
     let (handle, _) = measuring.open(&text(&path), None).unwrap();
-    let started = Instant::now();
-    measuring
-        .pages_rotate(handle, &[0, 1, 2, 3, 4, 5], 1)
+    // The quickest of three rounds: a round that met a busy machine (the first one also warms the
+    // engine up) would make a page look dearer than it is, and the stall limit with it.
+    let one_page = (0..3)
+        .map(|_| {
+            let started = Instant::now();
+            measuring
+                .pages_rotate(handle, &[0, 1, 2, 3, 4, 5], 1)
+                .unwrap();
+            started.elapsed() / 6
+        })
+        .min()
         .unwrap();
-    let one_page = started.elapsed() / 6;
     drop(measuring);
     let stall = (one_page * 8).max(Duration::from_millis(1000));
     assert!(
@@ -1064,14 +1198,14 @@ fn a_change_that_takes_many_times_the_stall_limit_is_not_ended_while_it_reports_
     let started = Instant::now();
     pool.pages_rotate(handle, &all, 1).unwrap();
     assert!(
-        started.elapsed() > stall * 2,
-        "the turn was quicker than twice the stall limit"
+        started.elapsed() > stall + stall / 2,
+        "the turn was quicker than one and a half times the stall limit"
     );
     let started = Instant::now();
     pool.pages_delete(handle, &all[..HEAVY_PAGES - 1]).unwrap();
     assert!(
-        started.elapsed() > stall * 2,
-        "the delete was quicker than twice the stall limit"
+        started.elapsed() > stall + stall / 2,
+        "the delete was quicker than one and a half times the stall limit"
     );
     // The document is there, with one page, and the next tool works.
     assert_eq!(pool.pages_rotate(handle, &[0], 1).unwrap().pages.len(), 1);

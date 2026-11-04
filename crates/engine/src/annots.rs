@@ -30,6 +30,11 @@ use crate::{fail, Failure};
 /// Most annotations of a page the engine looks at. The rest of a page that has more is ignored.
 const MAX_SCANNED: usize = 5_000;
 
+/// What is said when an annotation cannot be added because the page has as many as can be listed.
+/// The window shows this text as it is (see `describeError`), so it starts the way the window expects.
+pub const PAGE_FULL: &str =
+    "This page already has as many annotations as Patient Partridge can list, so no more can be added to it.";
+
 /// Most removed annotations the engine keeps so that they can be put back.
 const MAX_REMEMBERED: usize = 1_000;
 
@@ -540,6 +545,46 @@ impl DocAnnots {
         Ok(out)
     }
 
+    /// True when an annotation added to the page now would not be listed afterwards: the page has
+    /// `MAX_SCANNED` annotations of any kind, or the list already shows `MAX_ANNOTS_PER_PAGE` of
+    /// them (counted the way `list` counts, from the start of the page).
+    fn page_is_full(
+        &mut self,
+        document: &PdfDocument<'static>,
+        page: &PdfPage,
+        page_index: u32,
+        count: usize,
+    ) -> bool {
+        if count >= MAX_SCANNED {
+            return true;
+        }
+        if count < MAX_ANNOTS_PER_PAGE {
+            return false;
+        }
+        let mapper = Mapper::new(page);
+        let ids = self.ids(page_index, count).clone();
+        let allowed = changes_allowed(document);
+        let flags = flags_of(document, page_index, count);
+        let mut listed = 0;
+        #[allow(clippy::needless_range_loop)]
+        for index in 0..count {
+            let Ok(annotation) = page.annotations().get(index) else {
+                continue;
+            };
+            let flag = flags.get(index).copied().unwrap_or(FLAG_LOCKED);
+            if self
+                .describe(&annotation, ids[index], page, &mapper, flag, allowed)
+                .is_some()
+            {
+                listed += 1;
+                if listed >= MAX_ANNOTS_PER_PAGE {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// The annotation with `id`: its place in the list of the page, and what it is.
     fn find(
         &mut self,
@@ -900,6 +945,16 @@ impl DocAnnots {
         remember: bool,
     ) -> Result<AnnotInfo, Failure> {
         let before = page.annotations().len();
+        // Brings the list of ids in step before something is added to it.
+        self.ids(page_index, before);
+        // The list shows at most MAX_ANNOTS_PER_PAGE annotations, from the start, and looks at no
+        // more than MAX_SCANNED. One added to a page that has reached either would be drawn and
+        // saved but never listed, and could not be picked, moved or removed. Putting back what was
+        // taken away (`id` given) is not an addition: it goes back where it was, so an undo never
+        // loses it.
+        if id.is_none() && self.page_is_full(document, page, page_index, before) {
+            return fail(ErrorCode::AnnotationRefused, PAGE_FULL);
+        }
         if let Recipe::Signature { mark, .. } = &snapshot.recipe {
             // Each picture that is made stays in PDFium's memory until the document is closed, also
             // when it is taken off again, so a document that is put through undo and redo of a big
@@ -913,8 +968,6 @@ impl DocAnnots {
             }
             self.made_bytes += cost;
         }
-        // Brings the list of ids in step before something is added to it.
-        self.ids(page_index, before);
         let new_id = match id {
             Some(id) => id,
             None => self.fresh_id(),

@@ -399,6 +399,20 @@ describe("copying pages out", () => {
     expect(n.api.pagesExtract).toHaveBeenCalledOnce();
   });
 
+  it("explains a name that another tab has open, or that holds a signature, and asks nothing more", async () => {
+    for (const [code, title] of [
+      ["save_target_open", "That file is open"],
+      ["save_target_signed", "Choose another name"],
+    ] as const) {
+      const t = setup();
+      t.api.pagesExtract.mockRejectedValueOnce({ code, message: "" });
+      expect(await t.ops.extract([1])).toBeNull();
+      expect(t.api.pagesExtract).toHaveBeenCalledOnce();
+      expect(t.notices).toHaveLength(1);
+      expect(t.notices[0].title).toBe(title);
+    }
+  });
+
   it("explains a name that would replace the document", async () => {
     const t = setup();
     t.api.pagesExtract.mockRejectedValueOnce({ code: "extract_over_source", message: "" });
