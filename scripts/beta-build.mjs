@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// Makes the macOS signing check build a beta that installs next to the stable app. Used by
-// .github/workflows/macos-signing.yml when the "beta" input is on, and by nothing else; the files
-// of the stable app (src-tauri/tauri.conf.json, src-tauri/icons) are only read, never changed.
+// Makes a beta build that installs next to the stable app. Used by .github/workflows/macos-signing.yml
+// when the "beta" input is on and by .github/workflows/windows-beta.yml, and by nothing else; the
+// files of the stable app (src-tauri/tauri.conf.json, src-tauri/icons) are only read, never changed.
 //
 //   node scripts/beta-build.mjs prepare
 //
@@ -12,7 +12,8 @@
 //      makes the whole icon set from it with the Tauri CLI, into src-tauri/icons-beta.
 //   2. Merges the beta settings over that generated config, so the compile and the signing step
 //      need no change: another product name and identifier, no update files, no update server, no
-//      file association, the new icons, and a version that says it is a beta build.
+//      file association, the new icons, and a version that says it is a beta build. On Windows the
+//      program has a name of its own too (see BETA_WINDOWS_BINARY_NAME).
 //
 // No dependency is added: the PNG files are read and written with node:zlib, the ribbon is drawn
 // here, and the icon set comes from the Tauri CLI that package-lock.json pins.
@@ -29,6 +30,13 @@ export const BETA_PRODUCT_NAME = "Patient Partridge Beta";
 export const BETA_IDENTIFIER = "com.ferdinand99.patientpartridge.beta";
 /** Where the icon set is made, relative to src-tauri (where Tauri reads the paths of `bundle.icon`). */
 export const BETA_ICON_DIR = "icons-beta";
+/**
+ * The name of the program of the Windows beta (patient-partridge-beta.exe). The installer of the
+ * stable app looks for a running program by this name before it installs or removes anything, and
+ * ends it; with the same name the beta would end the stable app, and the other way round. The macOS
+ * app keeps the name of the program: nothing there looks it up by name.
+ */
+export const BETA_WINDOWS_BINARY_NAME = "patient-partridge-beta";
 const ICON_FILES = ["32x32.png", "128x128.png", "128x128@2x.png", "icon.icns", "icon.ico", "icon.png"];
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -50,9 +58,12 @@ export function betaVersion(version, build) {
  *  - createUpdaterArtifacts off and no update endpoint: nothing is made that an updater could
  *    install, and the app has no address to ask.
  *  - no file association: the beta does not offer itself for .pdf files.
+ *  - on Windows: the program is named patient-partridge-beta.exe. The install folder, the Start
+ *    menu entry and the uninstall entry are named after the product name already.
+ * `platform` is "windows" for the Windows build and left out for the others.
  */
-export function betaOverride({ version, build }) {
-  return {
+export function betaOverride({ version, build, platform }) {
+  const override = {
     productName: BETA_PRODUCT_NAME,
     identifier: BETA_IDENTIFIER,
     version: betaVersion(version, build),
@@ -63,6 +74,8 @@ export function betaOverride({ version, build }) {
     },
     plugins: { updater: { endpoints: [] } },
   };
+  if (platform === "windows") override.mainBinaryName = BETA_WINDOWS_BINARY_NAME;
+  return override;
 }
 
 /** JSON merge patch (RFC 7396), the way Tauri applies a `--config` file: objects merge, arrays and values replace. */
@@ -315,7 +328,7 @@ function prepare() {
   for (const file of ICON_FILES) if (!existsSync(join(iconDir, file))) throw new Error(`${file} was not made`);
 
   const build = process.env.GITHUB_RUN_NUMBER;
-  const merged = mergeConfig(JSON.parse(readFileSync(generated, "utf8")), betaOverride({ version: stable.version, build }));
+  const merged = mergeConfig(JSON.parse(readFileSync(generated, "utf8")), betaOverride({ version: stable.version, build, platform: process.platform === "win32" ? "windows" : undefined }));
   writeFileSync(generated, `${JSON.stringify(merged, null, 2)}\n`);
   console.log(`Beta build ${merged.version}: ${merged.productName}, ${merged.identifier}; update files, update endpoint and file association are off.`);
 }

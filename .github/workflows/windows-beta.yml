@@ -1,0 +1,182 @@
+# Makes a Windows beta build of Patient Partridge that installs next to the stable app (see
+# docs/signing.md, "A beta build next to the stable app"). Run it by hand from the Actions tab.
+# It also runs when the files that make the beta change, so a change is tested before it is merged.
+#
+# The beta is "Patient Partridge Beta": another identifier (its own settings, positions, session,
+# web view data and single-instance lock), its own install folder, Start menu entry and uninstall
+# entry, its own program name (patient-partridge-beta.exe), no update files and no update address,
+# no .pdf file association, and a "BETA" ribbon on the icon. Only the NSIS installer is made: the MSI
+# format takes no "-beta.N" in the version. Windows builds are not signed.
+#
+# Nothing is published: no release, no tag, no update file. The installer is in the artifact
+# patient-partridge-windows-beta (kept 14 days).
+#
+# A second job installs the beta silently next to an installed stable build, starts both, opens a PDF
+# in each (scripts/smoke.mjs), and checks that they keep apart (scripts/windows-beta/side-by-side.ps1).
+name: Windows beta build
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/windows-beta.yml
+      - scripts/windows-beta/**
+      - scripts/beta-build.mjs
+      - scripts/prepare-bundle.mjs
+      - scripts/bundle-config.mjs
+      - scripts/smoke.mjs
+      - src-tauri/tauri.conf.json
+
+concurrency:
+  group: windows-beta-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build the ${{ matrix.kind }} installer (Windows)
+    # Dependabot's branches get no run of this check; it runs again on main once the update is merged.
+    if: github.actor != 'dependabot[bot]'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # The stable installer is only the other half of the side-by-side test; it is built the way
+        # the Build job of ci.yml builds it.
+        kind: [stable, beta]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: windows-beta-${{ matrix.kind }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      # PDFium (checked against the pinned checksum) and the engine as a sidecar. No secret.
+      - name: Prepare the bundle
+        run: node scripts/prepare-bundle.mjs
+
+      # Beta only: the icon with its ribbon (icon.ico among the files) and the beta settings, merged
+      # over the config that the build below uses.
+      - name: Make the beta settings and icons
+        if: matrix.kind == 'beta'
+        run: node scripts/beta-build.mjs prepare
+
+      # NSIS only. Nothing that is left from an earlier build may end up in the artifact.
+      - name: Build the installer
+        run: |
+          rm -rf target/release/bundle
+          npx tauri build --config src-tauri/tauri.bundle.generated.conf.json --bundles nsis -- --locked
+          ls -la target/release/bundle/nsis target/release/*.exe
+
+      - name: Check the beta build
+        if: matrix.kind == 'beta'
+        run: |
+          fail() { echo "::error title=Beta build::$*"; exit 1; }
+          cd target/release
+          [ -f patient-partridge-beta.exe ] || fail "the program is not named patient-partridge-beta.exe"
+          n=$(ls bundle/nsis/*.exe | wc -l)
+          [ "$n" = 1 ] || fail "expected one installer, found $n"
+          setup=$(ls bundle/nsis/*.exe)
+          case "$(basename "$setup")" in "Patient Partridge Beta_"*-beta.*_x64-setup.exe) ;; *) fail "the installer is not named Patient Partridge Beta_<version>-beta.<n>_x64-setup.exe: $setup" ;; esac
+          if find bundle \( -name '*.msi' -o -name '*.sig' -o -name '*.zip' -o -name 'latest.json' \) | grep -q .; then fail "an MSI or an update file was made"; fi
+          # The configuration is part of the program: the public key must be found in it (so that this
+          # search can see the configuration at all) and the address of the update file must not.
+          grep -aq 'dW50cnVzdGVk' patient-partridge-beta.exe || fail "the search cannot see the configuration in the program"
+          if grep -aq 'releases/latest/download/latest.json' patient-partridge-beta.exe; then fail "the program still has the address of the update file"; fi
+          grep -aq 'com.ferdinand99.patientpartridge.beta' patient-partridge-beta.exe || fail "the program does not have the beta identifier"
+          {
+            echo "### Windows beta build"
+            echo
+            echo "- Installer: \`$(basename "$setup")\`"
+            echo "- Program \`patient-partridge-beta.exe\`, identifier \`com.ferdinand99.patientpartridge.beta\`."
+            echo "- No MSI, no update file, no update address in the program."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect the installer
+        run: |
+          mkdir -p out
+          cp target/release/bundle/nsis/*-setup.exe out/
+          ls -la out
+
+      # The stable half of the side-by-side test needs a PDF to open too.
+      - name: Make a test PDF
+        if: matrix.kind == 'stable'
+        run: cargo run --release --locked -p partridge-testkit --bin make-pdf -- 30 out/test.pdf
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: matrix.kind == 'beta'
+        with:
+          name: patient-partridge-windows-beta
+          path: out/*-setup.exe
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: matrix.kind == 'stable'
+        with:
+          name: windows-beta-test-stable
+          path: out/*
+          if-no-files-found: error
+          retention-days: 1
+
+  side-by-side:
+    name: The beta next to the stable app (Windows)
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-beta-test-stable
+          path: installers/stable
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: patient-partridge-windows-beta
+          path: installers/beta
+      - name: Install both, start both, remove one at a time
+        shell: pwsh
+        run: |
+          $stable = (Get-ChildItem installers/stable -Filter '*-setup.exe' | Select-Object -First 1).FullName
+          $beta = (Get-ChildItem installers/beta -Filter '*-setup.exe' | Select-Object -First 1).FullName
+          $pdf = (Resolve-Path installers/stable/test.pdf).Path
+          ./scripts/windows-beta/side-by-side.ps1 -Stable $stable -Beta $beta -Pdf $pdf -Out "$env:RUNNER_TEMP/side-by-side"
+      - name: Summary
+        if: always()
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'side-by-side/checks.txt'
+          if (Test-Path $log) {
+            '### The beta next to the stable app' | Add-Content $env:GITHUB_STEP_SUMMARY
+            '' | Add-Content $env:GITHUB_STEP_SUMMARY
+            '```' | Add-Content $env:GITHUB_STEP_SUMMARY
+            Get-Content $log -Encoding UTF8 | Where-Object { $_ -match '^\[(PASS|FAIL)\]|^===|^(FAILED|ALL CHECKS|STOPPED)' } | Add-Content $env:GITHUB_STEP_SUMMARY
+            '```' | Add-Content $env:GITHUB_STEP_SUMMARY
+          }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: windows-beta-side-by-side-logs
+          path: ${{ runner.temp }}/side-by-side/*
+          if-no-files-found: ignore
+          retention-days: 3

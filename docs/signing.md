@@ -111,6 +111,38 @@ What differs (`scripts/beta-build.mjs` merges it over the generated config; `src
 
 Nothing is set up. Since June 2023 publicly trusted code signing keys must be in hardware or in a cloud service, so a downloadable `.pfx` is rare. When it is time: Azure Trusted Signing or a certificate in a cloud HSM (a `bundle.windows.signCommand` in the Tauri config), or SignPath Foundation (free signing for open source projects, approved per release). None of this is wired up. Until then Windows users see the SmartScreen warning described above; updates inside the app work the same.
 
+### The Windows beta next to the stable app
+
+Run the **Windows beta build** workflow by hand from the Actions tab (on `main`, or on the branch to try). It builds the stable installer and the beta installer the way the Build job of CI does (nothing is signed), and the artifact **`patient-partridge-windows-beta`** holds the beta installer, `Patient Partridge Beta_<version>-beta.<run number>_x64-setup.exe`. The artifact is kept for 14 days. Nothing is published: no release, no tag, no update file.
+
+To install it: download the artifact from the run page, unzip it, and run the installer. It installs for the current user only (no administrator rights) into `%LOCALAPPDATA%\Patient Partridge Beta`. Windows SmartScreen shows the same warning as for the stable app ("More info", then "Run anyway"). To remove it, use "Patient Partridge Beta" in Settings, Apps, or the Start menu entry's uninstall. The stable app is never touched by either.
+
+What differs (`scripts/beta-build.mjs` merges it over the generated config, the same as for macOS; `src-tauri/tauri.conf.json` is not changed):
+
+| | Stable | Windows beta |
+|---|---|---|
+| Name (installer, Start menu, Apps list, window title) | Patient Partridge | Patient Partridge Beta |
+| Identifier | `com.ferdinand99.patientpartridge` | `com.ferdinand99.patientpartridge.beta` |
+| Version | `0.1.0` | `0.1.0-beta.<run number>` |
+| Install folder | `%LOCALAPPDATA%\Patient Partridge` | `%LOCALAPPDATA%\Patient Partridge Beta` |
+| Program | `patient-partridge.exe` | `patient-partridge-beta.exe` |
+| Settings, positions, session | `%APPDATA%\com.ferdinand99.patientpartridge` | `%APPDATA%\com.ferdinand99.patientpartridge.beta` |
+| Web view data | `%LOCALAPPDATA%\com.ferdinand99.patientpartridge` | `%LOCALAPPDATA%\com.ferdinand99.patientpartridge.beta` |
+| Update files, update server | made, and asked | none made, and the program has no address to ask |
+| File association (.pdf) | yes | none |
+| Icon | the bird | the bird with the violet "BETA" ribbon (`icon.ico` is drawn at build time from `assets/app-icon.png`) |
+| Installer formats | NSIS and MSI | NSIS only |
+
+**Only NSIS.** The MSI format needs a numeric version, and Tauri refuses `0.1.0-beta.7` for it. The beta is therefore built as an NSIS installer only; the stable app still has both.
+
+**The program has another name on purpose.** The NSIS installer and uninstaller look for a running program by its file name and end it before they change anything. If both apps were `patient-partridge.exe`, installing or removing the beta would close the stable app, and the other way round. With `patient-partridge-beta.exe` neither does. The engine (`partridge-engine.exe`) and the PDFium library are installed in the install folder of each app and found from the program's own folder, so the beta runs its own engine from its own folder. The engine's sandbox is a restricted token and a job object made at the start; it needs no grant from the installer and no name or path, so nothing about it differs in the beta. There is no signer program in this repository.
+
+**Settings are separate.** Tauri names the app data folder and the web view folder after the identifier, and the single-instance lock too, so the beta starts empty, neither app sees the other's files, and both can run at the same time. Removing one app leaves the data of the other (an uninstall in silent mode also keeps its own data).
+
+**It cannot update itself.** No update file and no update endpoint, so a check ends with "Updates are not set up in this build", and an automatic check stays quiet. The check of the build fails if the program still holds the address of `latest.json`, or if an MSI or any `.sig` file was made.
+
+**The workflow tests the side-by-side install.** After the build, a second job installs the stable build silently, starts it, installs the beta while it runs, and starts the beta next to it. Each opens a PDF through `scripts/smoke.mjs` and has to draw the first page. The job checks that the install folders, programs, Start menu entries and uninstall entries differ, that nothing in the registry offers the beta for .pdf files while the stable app does, that the beta program has no update address, that the data folders differ (a marker file in the stable app's folder is not in the beta's), and that the icon of the beta program has the ribbon. It then removes the beta while the stable app runs, checks that the stable app is intact and still opens a PDF, installs the beta again, removes the stable app while the beta runs, and checks the beta the same way. The steps are in `scripts/windows-beta/side-by-side.ps1`; the log is in the artifact `windows-beta-side-by-side-logs`.
+
 ## Where the secrets are
 
 The update key and the Apple certificate are the most valuable secrets of the project: the first signs code for every user, the second is the team's Developer ID, shared with the other Hedgerow apps. The workflows keep them away from third-party code as far as Tauri allows:
