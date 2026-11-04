@@ -398,11 +398,20 @@ impl EnginePool {
             });
         }
         // Nor a file that holds a signature: the signed copy is a new file.
-        if crate::save::file_holds_signature(target) {
-            return Err(ClientError::Signer {
-                code: "sign_target_signed",
-                message: "the file holds a digital signature".into(),
-            });
+        match crate::save::scan_for_signature(target) {
+            crate::save::FileScan::Clear => {}
+            crate::save::FileScan::Signed => {
+                return Err(ClientError::Signer {
+                    code: "sign_target_signed",
+                    message: "the file holds a digital signature".into(),
+                })
+            }
+            crate::save::FileScan::Unreadable => {
+                return Err(ClientError::Signer {
+                    code: "sign_target_unreadable",
+                    message: "the file could not be read".into(),
+                })
+            }
         }
         // Whatever is there now is what the person chose to replace.
         let expected = FileStamp::read(target).ok();
@@ -454,12 +463,14 @@ impl EnginePool {
                 .collect()
         };
         others.iter().any(|(client, doc, source)| {
-            let (original, current) = {
-                let source = source.lock().unwrap_or_else(|e| e.into_inner());
-                (source.original.clone(), source.path.clone())
-            };
-            (same_file(&original, path) || same_file(&current, path))
-                && client.doc_info(*doc).map_or(true, |info| info.is_signed())
+            // The file the tab shows now. A tab that followed a copy no longer shows the file it
+            // was opened from, and does not stop it from being chosen.
+            let current = source
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .path
+                .clone();
+            same_file(&current, path) && client.doc_info(*doc).map_or(true, |info| info.is_signed())
         })
     }
 

@@ -900,8 +900,6 @@ mod tests {
             0xf2, 0x00, 0x15, 0xad,
         ];
         assert_eq!(digest(b"abc"), abc);
-        // The two-byte FNV collision pairs of the old digest are not a way in any more: a change
-        // of one bit in a block is seen whatever the rest of the block is.
         assert_eq!(fnv(b""), 0xcbf2_9ce4_8422_2325);
     }
 }

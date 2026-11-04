@@ -75,8 +75,25 @@ describe("describeError: saving", () => {
     expect(signed.title).toBe("Choose another name");
     expect(signed.detail).toContain("digital signature");
     expect(signed.detail).toContain("Nothing was written");
+    const unreadable = describeError({ code: "save_target_unreadable", message: "" }, "tax.pdf");
+    expect(unreadable.title).toBe("That file cannot be read");
+    expect(unreadable.detail).toContain("could not be read");
+    expect(unreadable.detail).not.toContain("signature");
+    expect(unreadable.action).toBe("none");
     expect(open.action).toBe("none");
     expect(signed.action).toBe("none");
+  });
+
+  it("shows the engine's own words when a page cannot take another annotation, and the general ones otherwise", () => {
+    const full = describeError({
+      code: "annotation_refused",
+      message: "This page already has as many annotations as Patient Partridge can list, so no more can be added to it.",
+    });
+    expect(full.title).toBe("No more annotations fit on this page");
+    expect(full.detail).toContain("as many annotations as Patient Partridge can list");
+    expect(full.detail).toContain("Nothing was added");
+    const other = describeError({ code: "annotation_refused", message: "no" });
+    expect(other.title).toBe("The annotation was not changed");
   });
 
   it("explains a block of document details that is too big, and any other failed write generally", () => {

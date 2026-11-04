@@ -501,6 +501,26 @@ fn extracting_onto_a_file_that_another_tab_has_open_is_refused_and_the_file_is_n
         vec!["a.pdf".to_string(), "b.pdf".to_string()],
         "no stray file is left"
     );
+    // Another way to spell the same file is the same file.
+    let mut spellings = vec![dir.0.join(".").join("b.pdf")];
+    #[cfg(unix)]
+    {
+        let link = dir.0.join("link.pdf");
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+        spellings.push(link);
+    }
+    for spelled in &spellings {
+        match client_error(pool.extract_pages(
+            handle,
+            &[0],
+            spelled,
+            ExtractOptions::default(),
+            &nothing,
+        )) {
+            ClientError::Save(SaveError::TargetOpen) => {}
+            other => panic!("{}: {other:?}", spelled.display()),
+        }
+    }
 }
 
 #[test]
@@ -527,6 +547,22 @@ fn extracting_onto_a_file_that_holds_a_signature_is_refused_even_when_it_is_not_
 }
 
 #[test]
+fn extracting_onto_a_file_that_cannot_be_read_says_so_and_does_not_call_it_signed() {
+    let dir = Dir::new("unreadable-target");
+    let source = dir.write("a.pdf", &kit::marked_pdf(2));
+    let pool = pool();
+    let (handle, _) = pool.open(&text(&source), None).unwrap();
+    let odd = dir.0.join("bad name.pdf");
+    match client_error(pool.extract_pages(handle, &[0], &odd, ExtractOptions::default(), &nothing))
+    {
+        ClientError::Save(e @ SaveError::TargetUnreadable) => {
+            assert_eq!(e.code(), "save_target_unreadable")
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
 fn a_copy_of_a_document_cannot_replace_a_signed_file_that_is_open_in_a_tab() {
     let dir = Dir::new("save-as-signed-tab");
     let source = dir.write("a.pdf", &kit::marked_pdf(2));
@@ -536,6 +572,12 @@ fn a_copy_of_a_document_cannot_replace_a_signed_file_that_is_open_in_a_tab() {
     let (handle, _) = pool.open(&text(&source), None).unwrap();
     let (_signed_handle, _) = pool.open(&text(&signed), None).unwrap();
     match client_error(pool.save_as(handle, &signed, SaveOptions::default())) {
+        ClientError::Save(SaveError::TargetOpen) => {}
+        other => panic!("{other:?}"),
+    }
+    // The same file spelled another way is the same file.
+    let spelled = dir.0.join(".").join("s.pdf");
+    match client_error(pool.save_as(handle, &spelled, SaveOptions::default())) {
         ClientError::Save(SaveError::TargetOpen) => {}
         other => panic!("{other:?}"),
     }

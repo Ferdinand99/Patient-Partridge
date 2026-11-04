@@ -57,7 +57,8 @@ mod pool;
 pub use pool::{Cancelled, EnginePool, ExtractOptions, InsertOptions, InsertOutcome, PageProgress};
 mod save;
 pub use save::{
-    file_holds_signature, verify_written, DocInfo, Fingerprint, SaveError, SaveOptions, SaveOutcome,
+    file_holds_signature, scan_for_signature, verify_written, DocInfo, FileScan, Fingerprint,
+    SaveError, SaveOptions, SaveOutcome,
 };
 mod sign;
 pub use sign::{verify_signed, SignOptions, SignOutcome};

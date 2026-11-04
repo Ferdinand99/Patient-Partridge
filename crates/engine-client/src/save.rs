@@ -148,6 +148,9 @@ pub enum SaveError {
     TargetOpen,
     /// The new file would replace a file that holds a digital signature.
     TargetSigned,
+    /// The file the new file would replace could not be read, so it cannot be told whether it
+    /// holds a digital signature.
+    TargetUnreadable,
 }
 
 impl SaveError {
@@ -177,6 +180,7 @@ impl SaveError {
             SaveError::OverSource => "extract_over_source",
             SaveError::TargetOpen => "save_target_open",
             SaveError::TargetSigned => "save_target_signed",
+            SaveError::TargetUnreadable => "save_target_unreadable",
         }
     }
 }
@@ -253,6 +257,7 @@ impl fmt::Display for SaveError {
             ),
             SaveError::TargetOpen => write!(f, "the file is open as another document"),
             SaveError::TargetSigned => write!(f, "the file holds a digital signature"),
+            SaveError::TargetUnreadable => write!(f, "the file could not be read"),
         }
     }
 }
@@ -267,22 +272,33 @@ impl From<SaveError> for ClientError {
 
 // ---- telling whether a file holds a signature --------------------------------------------------
 
-/// True when the file at `path` holds a digital signature, as far as its bytes say: it mentions
-/// `/ByteRange` or `/DocMDP`, the words every signature (and every certified document) has. A file
-/// that does not exist holds none. A file that cannot be read is treated as one that does, because
-/// a write over a signature that was not looked for is the mistake that cannot be taken back.
-pub fn file_holds_signature(path: &Path) -> bool {
+/// What a look at the bytes of a file found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileScan {
+    /// The file does not exist, is not a plain file, or has none of the words of a signature.
+    Clear,
+    /// The file mentions `/ByteRange` or `/DocMDP`, the words every signature (and every
+    /// certified document) has.
+    Signed,
+    /// The file could not be read, so nothing is known. It is not replaced either.
+    Unreadable,
+}
+
+/// Looks through the file at `path` for the words of a digital signature. A file that does not
+/// exist holds none. A file that cannot be read is neither said to hold one nor passed: the caller
+/// must not write over it, and says that it could not be read.
+pub fn scan_for_signature(path: &Path) -> FileScan {
     use std::io::Read;
     const WORDS: [&[u8]; 2] = [b"/ByteRange", b"/DocMDP"];
     match fs::metadata(path) {
         Ok(meta) if meta.is_file() => {}
         // A folder or a device is not a file that can be replaced, and the write refuses it alone.
-        Ok(_) => return false,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return false,
-        Err(_) => return true,
+        Ok(_) => return FileScan::Clear,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return FileScan::Clear,
+        Err(_) => return FileScan::Unreadable,
     }
     let Ok(mut file) = File::open(path) else {
-        return true;
+        return FileScan::Unreadable;
     };
     // The tail of one piece is kept in front of the next, so a word cut by the edge is found.
     let keep = WORDS.iter().map(|w| w.len()).max().unwrap_or(1) - 1;
@@ -290,10 +306,10 @@ pub fn file_holds_signature(path: &Path) -> bool {
     let mut held = 0usize;
     loop {
         let got = match file.read(&mut buffer[held..]) {
-            Ok(0) => return false,
+            Ok(0) => return FileScan::Clear,
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => return true,
+            Err(_) => return FileScan::Unreadable,
         };
         let end = held + got;
         let window = &buffer[..end];
@@ -301,12 +317,18 @@ pub fn file_holds_signature(path: &Path) -> bool {
             .iter()
             .any(|word| window.windows(word.len()).any(|w| w == *word))
         {
-            return true;
+            return FileScan::Signed;
         }
         let tail = keep.min(end);
         buffer.copy_within(end - tail..end, 0);
         held = tail;
     }
+}
+
+/// True when the file at `path` holds a digital signature, as far as its bytes say (see
+/// [`scan_for_signature`]).
+pub fn file_holds_signature(path: &Path) -> bool {
+    scan_for_signature(path) == FileScan::Signed
 }
 
 // ---- telling whether a file changed -----------------------------------------------------------
@@ -1284,6 +1306,11 @@ mod tests {
             path
         };
         assert!(!file_holds_signature(&dir.join("missing.pdf")));
+        // A path that cannot even be looked at is neither clear nor signed.
+        assert_eq!(
+            scan_for_signature(Path::new("bad name.pdf")),
+            FileScan::Unreadable
+        );
         assert!(!file_holds_signature(&write(
             "plain.pdf",
             b"%PDF-1.7\n%%EOF\n"

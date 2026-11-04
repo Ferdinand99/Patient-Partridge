@@ -395,8 +395,10 @@ impl EnginePool {
         if self.read_by_another(handle, target) {
             return Err(SaveError::TargetOpen.into());
         }
-        if crate::save::file_holds_signature(target) {
-            return Err(SaveError::TargetSigned.into());
+        match crate::save::scan_for_signature(target) {
+            crate::save::FileScan::Clear => {}
+            crate::save::FileScan::Signed => return Err(SaveError::TargetSigned.into()),
+            crate::save::FileScan::Unreadable => return Err(SaveError::TargetUnreadable.into()),
         }
         let info = h.client.doc_info(h.doc)?;
         if info.is_signed() && !options.allow_signed {
