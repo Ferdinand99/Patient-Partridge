@@ -20,14 +20,17 @@ fi
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-# One report for the app process and one for the engine process: they are separate programs.
+# One report for the app process, one for the engine process and one for the signer: they are
+# separate programs.
 cargo about generate --config about.toml --locked --fail --format json \
   --manifest-path src-tauri/Cargo.toml --output-file "$tmp/app.json"
 cargo about generate --config about.toml --locked --fail --format json \
   --manifest-path crates/engine/Cargo.toml --output-file "$tmp/engine.json"
+cargo about generate --config about.toml --locked --fail --format json \
+  --manifest-path crates/signer/Cargo.toml --output-file "$tmp/signer.json"
 
 if [ "${1:-}" = "--check" ]; then
-  node scripts/third-party-notices.mjs --rust "$tmp/app.json" --rust "$tmp/engine.json" --check
+  node scripts/third-party-notices.mjs --rust "$tmp/app.json" --rust "$tmp/engine.json" --rust "$tmp/signer.json" --check
 else
-  node scripts/third-party-notices.mjs --rust "$tmp/app.json" --rust "$tmp/engine.json" --out THIRD-PARTY-NOTICES
+  node scripts/third-party-notices.mjs --rust "$tmp/app.json" --rust "$tmp/engine.json" --rust "$tmp/signer.json" --out THIRD-PARTY-NOTICES
 fi

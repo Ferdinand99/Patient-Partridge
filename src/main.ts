@@ -9,6 +9,7 @@ import "./styles/app.css";
 import "./styles/pages.css";
 import "./styles/signatures.css";
 import "./styles/signpicture.css";
+import "./styles/certsign.css";
 import "./styles/forms.css";
 import "./styles/design.css";
 import { App } from "./app/app";

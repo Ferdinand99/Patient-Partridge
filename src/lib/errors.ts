@@ -206,6 +206,12 @@ export function describeError(error: AppErrorLike, fileName?: string): Described
         detail: `${file} is protected, and it holds a block of document details (XMP metadata) that Patient Partridge cannot yet save in protected form. It will not save it without protection, and saving a copy does not help either. Nothing was saved, and the file on the disk was not changed. Your changes are still in the open document.`,
         action: "none",
       };
+    case "save_same_file":
+      return {
+        title: "Choose another name",
+        detail: `${file} is signed, and a copy with its own name would replace it and break the signature. Give the copy a name of its own.`,
+        action: "none",
+      };
     case "save_too_large":
       if (/not enough memory/i.test(error.message)) {
         return {

@@ -2,7 +2,8 @@
 // Anything that touches the outside world (the engine, the file dialog, the window title, the
 // storage) comes in through `AppDeps`, so tests can run the whole flow with fakes.
 
-import type { OpenedDocument, OutlineEntry, SavedFile, SavedPosition } from "../lib/api";
+import type { CertSignApi, OpenedDocument, OutlineEntry, SavedFile, SavedPosition } from "../lib/api";
+import { CERT_WORDS, type SignedFile } from "../lib/certsign";
 import type { SignaturesInfo, StaleReason } from "../lib/signatures";
 import { PALETTE, PEN_WIDTHS, type Annotation, type Tool } from "../lib/annotations";
 import { describeError, fileNameOf, isEngineLost, toAppError, type AppErrorLike } from "../lib/errors";
@@ -40,6 +41,7 @@ import {
   type PictureTools,
 } from "./signpicture";
 import { AnnotBar } from "./annotbar";
+import { askCertificateSignature } from "./certsign";
 import { DesignBar } from "./designbar";
 import { FormDesigner } from "./formdesigner";
 import { EditHistory, type Edit } from "./history";
@@ -98,7 +100,8 @@ export interface AppDeps {
     saveAs(doc: number, allowSigned: boolean): Promise<SavedFile | null>;
     quitApp(): Promise<void>;
     stayOpen(): Promise<void>;
-  } & Partial<AnnotatorApi> & {
+  } & Partial<AnnotatorApi> &
+    Partial<CertSignApi> & {
       /** The annotations of a page. Without it, and without the other annotation calls, the annotation bar is off. */
       listAnnotations?(doc: number, page: number): Promise<Annotation[]>;
     };
@@ -181,6 +184,11 @@ interface Tab {
   fontsAsking: boolean;
   /** True once the reader was told about text that cannot be drawn for lack of a font. */
   fontsTold: boolean;
+  /**
+   * True for a file that was signed in this window: it is shown as it was written, and editing is off
+   * until the file is opened again, because any change would break the signature.
+   */
+  signedHere: boolean;
 }
 
 /**
@@ -477,7 +485,7 @@ export class App {
           const tab = this.tabs.find((t) => t.doc === doc);
           if (tab) await this.documentLost(tab, error);
         },
-        settle: (doc) => this.settleBeforePages(doc),
+        settle: (doc, options) => this.settleBeforePages(doc, options?.copies === true),
         keepsRefusedText: (doc) => this.keepRefusedText(doc),
         pickFiles: () => deps.pickFiles(),
         announce: (text) => this.announcePages(text),
@@ -559,8 +567,9 @@ export class App {
     this.heldDoc = busy ? doc : null;
     const tab = doc === null ? undefined : this.tabs.find((t) => t.doc === doc);
     if (!tab) return;
-    tab.view.holdEdits(busy);
-    tab.annotator?.setHeld(busy);
+    // A file that was signed here stays held, whatever a page tool does.
+    tab.view.holdEdits(busy || tab.signedHere);
+    tab.annotator?.setHeld(busy || tab.signedHere);
     if (this.active === tab) this.syncAnnotBar();
   }
 
@@ -570,13 +579,28 @@ export class App {
    * field refused is not in the document and would be lost with the pages it was typed on: the tool
    * does not begin until the reader has dealt with it.
    */
-  private async settleBeforePages(doc: number): Promise<boolean> {
+  private async settleBeforePages(doc: number, copies = false): Promise<boolean> {
     const tab = this.tabs.find((t) => t.doc === doc);
     if (!tab) return true;
+    // The file that was just signed is not changed: a page tool would break the signature. Copying
+    // pages out writes a new file and leaves the signed one as it is.
+    if (tab.signedHere && !copies) {
+      await this.tellSigned("page changes");
+      return false;
+    }
     await tab.view.flushForms().catch(() => undefined);
     await tab.annotator?.flush();
     if (!this.tabs.includes(tab)) return false;
     return this.keepRefusedText(doc);
+  }
+
+  /** Says that what the person asked for is off in a file that was signed here. */
+  private async tellSigned(what: string): Promise<void> {
+    await showNotice(this.noticeLayer, {
+      title: CERT_WORDS.signedTitle,
+      detail: CERT_WORDS.signedOff(what),
+      buttons: [{ id: "ok", label: "OK", primary: true }],
+    });
   }
 
   /**
@@ -618,6 +642,10 @@ export class App {
       });
     }
     byId(this.root, "empty-open").addEventListener("click", () => void this.openDialog());
+    byId(this.root, "sign-button").addEventListener("click", () => {
+      this.menu.close();
+      void this.signWithCertificate();
+    });
     this.zoomIn.addEventListener("click", () => this.active?.view.stepZoom(1));
     this.zoomOut.addEventListener("click", () => this.active?.view.stepZoom(-1));
     this.zoomSelect.addEventListener("change", () => this.onZoomSelect());
@@ -1043,6 +1071,7 @@ export class App {
       sawScripts: false,
       fontsAsking: false,
       fontsTold: false,
+      signedHere: false,
     };
     tab.view = new DocumentView(
       { doc: opened.doc, pages: opened.pages },
@@ -1623,6 +1652,10 @@ export class App {
   private async setDesigning(open: boolean): Promise<void> {
     const designer = this.designer;
     if (!designer) return;
+    if (open && this.active?.signedHere) {
+      await this.tellSigned("the form tools");
+      return;
+    }
     if (open) {
       if (this.annotOpen) this.setAnnotating(false);
       await designer.openMode();
@@ -1836,6 +1869,13 @@ export class App {
     }
     tab.history.markSaved(began);
     if (saved.path !== tab.path || saved.name !== tab.name) {
+      // The tab follows the copy, which is not the signed file: it can be changed again.
+      if (tab.signedHere && saved.path !== tab.path) {
+        tab.signedHere = false;
+        tab.view.holdEdits(false);
+        tab.annotator?.setHeld(false);
+        if (this.active === tab) this.syncAnnotBar();
+      }
       tab.path = saved.path;
       tab.name = saved.name;
       this.syncChrome();
@@ -1925,6 +1965,18 @@ export class App {
   }
 
   private async askSigned(tab: Tab, copy = false): Promise<"copy" | "anyway" | "cancel"> {
+    // The file that was signed here is never saved over: only a copy is offered.
+    if (tab.signedHere && !copy) {
+      const only = await showNotice(this.noticeLayer, {
+        title: CERT_WORDS.signedTitle,
+        detail: CERT_WORDS.signedSaveOnlyCopy(tab.name),
+        buttons: [
+          { id: "cancel", label: "Cancel", safe: true },
+          { id: "copy", label: "Save a copy…", primary: true },
+        ],
+      });
+      return only.button === "copy" ? "copy" : "cancel";
+    }
     const answer = await showNotice(this.noticeLayer, {
       title: "This document is signed",
       detail: copy
@@ -1960,7 +2012,8 @@ export class App {
       buttons: [
         { id: "cancel", label: "Cancel", safe: true },
         { id: "copy", label: "Save a copy…", primary: true },
-        { id: "overwrite", label: "Replace the file" },
+        // Never over the file that was signed here: that file is the signature.
+        ...(tab.signedHere ? [] : [{ id: "overwrite", label: "Replace the file" }]),
       ],
     });
     return answer.button === "copy" || answer.button === "overwrite" ? answer.button : "cancel";
@@ -2072,7 +2125,8 @@ export class App {
 
   private async stepHistory(direction: "undo" | "redo"): Promise<void> {
     const tab = this.active;
-    if (!tab || tab.saving || this.pageOps?.busy) return;
+    // The file that was signed here has nothing to take back, and nothing to make again.
+    if (!tab || tab.saving || this.pageOps?.busy || tab.signedHere) return;
     const run = async (): Promise<void> => {
       // A form change that is on its way is part of the history first: Undo takes back that one,
       // not the one before it.
@@ -2281,6 +2335,77 @@ export class App {
     const active = this.active;
     byId<HTMLButtonElement>(this.root, "save-button").disabled = !active || !this.isDirty(active);
     byId<HTMLButtonElement>(this.root, "save-copy-button").disabled = !active || active.view.pageCount === 0;
+    // Signing with a certificate: only where the app process offers all of it.
+    const api = this.deps.api;
+    const signButton = byId<HTMLButtonElement>(this.root, "sign-button");
+    signButton.hidden = !(api.signPickCertificate && api.signLoadCertificate && api.signDocument);
+    signButton.disabled = !active || active.view.pageCount === 0 || this.signOpen;
+  }
+
+  private signOpen = false;
+
+  /**
+   * Signs the document in front with a certificate file. A document with changes that were not saved
+   * is saved first (what is signed is a file the person has). The signed copy is a new file, which is
+   * opened in a tab of its own; it is shown as it was written, with editing off.
+   */
+  async signWithCertificate(): Promise<void> {
+    const tab = this.active;
+    const api = this.deps.api;
+    if (!tab || tab.view.pageCount === 0 || this.signOpen) return;
+    if (!api.signPickCertificate || !api.signLoadCertificate || !api.signDocument || !api.signListFields) return;
+    if (!api.signForgetCertificate || !api.signSetImageMark) return;
+    this.signOpen = true;
+    this.syncSaveButtons();
+    try {
+      if (this.isDirty(tab)) {
+        const answer = await showNotice(this.noticeLayer, {
+          title: CERT_WORDS.unsavedTitle,
+          detail: CERT_WORDS.unsavedDetail(tab.name),
+          buttons: [
+            { id: "cancel", label: CERT_WORDS.cancel, safe: true },
+            { id: "save", label: CERT_WORDS.unsavedSave, primary: true },
+          ],
+        });
+        if (answer.button !== "save") return;
+        if (!(await this.saveTab(tab, false)) || this.isDirty(tab)) return;
+      }
+      const sizes = Array.from({ length: tab.view.pageCount }, (_, i) => tab.view.pageSizeOf(i));
+      const certApi = api as CertSignApi & { render(doc: number, page: number, width: number, height: number): Promise<ArrayBuffer> };
+      const signed = await askCertificateSignature({
+        layer: this.noticeLayer,
+        api: certApi,
+        doc: tab.doc,
+        fileName: tab.name,
+        pages: sizes,
+        page: tab.view.currentPageIndex,
+        pickPicture: async () => {
+          const answer = await askSignaturePicture({ layer: this.noticeLayer, tools: this.pictureTools() });
+          return answer?.picture ?? null;
+        },
+      });
+      if (signed) await this.openSigned(signed);
+    } finally {
+      this.signOpen = false;
+      this.syncSaveButtons();
+    }
+  }
+
+  /** Opens the signed copy as a tab of its own, with editing off, and says what was done. */
+  private async openSigned(signed: SignedFile): Promise<void> {
+    await this.openPath(signed.path);
+    const tab = this.tabs.find((t) => t.path === signed.path);
+    if (tab) {
+      tab.signedHere = true;
+      tab.view.holdEdits(true);
+      tab.annotator?.setHeld(true);
+      if (this.active === tab) this.syncAnnotBar();
+    }
+    await showNotice(this.noticeLayer, {
+      title: CERT_WORDS.doneTitle,
+      detail: `${CERT_WORDS.done(signed.name)} ${tab ? CERT_WORDS.doneOpened : ""} ${CERT_WORDS.readOnly}`.replace(/\s+/g, " ").trim(),
+      buttons: [{ id: "ok", label: "OK", primary: true }],
+    });
   }
 
   private setControlsEnabled(on: boolean): void {

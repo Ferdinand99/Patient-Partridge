@@ -527,6 +527,14 @@ fn main() {
                     message: "this stand-in has no form designer".into(),
                 },
             ),
+            RequestBody::Sign(_) => reply(
+                &mut output,
+                id,
+                ResponseBody::Error {
+                    code: ErrorCode::InvalidRequest,
+                    message: "this stand-in does not sign".into(),
+                },
+            ),
         }
     }
 }

@@ -48,8 +48,9 @@ function Get-PackageRights([string]$path) {
 function Assert-PackageAccess([string]$folder, [bool]$installed) {
   $engine = Join-Path $folder 'partridge-engine.exe'
   $library = Join-Path $folder 'pdfium.dll'
+  $signer = Join-Path $folder 'partridge-signer.exe'
   if ($installed) {
-    foreach ($path in @($folder, $engine, $library)) {
+    foreach ($path in @($folder, $engine, $library, $signer)) {
       $rights = Get-PackageRights $path
       Log "entry for the package on ${path}: $rights"
       if ($rights -ne '(RX)') { throw "$path should have the entry for the package with (RX) only, without inheritance: '$rights'." }
@@ -146,7 +147,7 @@ Copy-Item -LiteralPath 'C:\Apps\pp-msi' -Destination 'C:\Apps\pp-bare' -Recurse
 Show-Access 'C:\Apps\pp-bare'
 
 foreach ($folder in 'C:\Apps\pp-msi', 'C:\Apps\pp-nsis') {
-  foreach ($file in $folder, (Join-Path $folder 'partridge-engine.exe'), (Join-Path $folder 'pdfium.dll')) {
+  foreach ($file in $folder, (Join-Path $folder 'partridge-engine.exe'), (Join-Path $folder 'partridge-signer.exe'), (Join-Path $folder 'pdfium.dll')) {
     if (-not (Test-PackageEntry $file)) { throw "$file has no entry for the package of the engine." }
     if (Test-AllPackagesEntry $file) { throw "$file has an entry for all application packages." }
   }

@@ -18,12 +18,16 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # The test programs are many and each links the engine; the line tables are enough for a
+  # backtrace and keep the build folder small enough for the disk of a runner.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
   rust:
     name: Rust (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -50,6 +54,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      # The test builds fill the disk of a runner; software the job does not use is taken off while
+      # the job goes on with the rest (removing it takes minutes).
+      - name: Make room on the disk (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo nohup rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL > /dev/null 2>&1 &
+          df -h /
       - name: Install Tauri Linux dependencies
         if: runner.os == 'Linux'
         run: |
@@ -65,6 +76,16 @@ jobs:
         run: |
           sudo apt-get install -y qpdf poppler-utils
           echo "PARTRIDGE_REQUIRE_READERS=1" >> "$GITHUB_ENV"
+      # A third reader for the files that signing with a certificate makes: pyHanko, a validator of
+      # signed PDFs written by someone else, pinned like everything else
+      # (crates/engine/tests/sign_readers.rs).
+      - name: Install the validator of signatures (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/pyhanko"
+          "$RUNNER_TEMP/pyhanko/bin/pip" install --no-cache-dir pyhanko==0.38.0 pyhanko-certvalidator==0.33.0
+          echo "PARTRIDGE_PYHANKO_PYTHON=$RUNNER_TEMP/pyhanko/bin/python" >> "$GITHUB_ENV"
+          echo "PARTRIDGE_REQUIRE_PYHANKO=1" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
@@ -160,6 +181,15 @@ jobs:
           fi
           ls target/release/examples 2>/dev/null | grep -q selftest && { echo "The self-test program was built in release." >&2; exit 1; }
           echo "ok: no test switches in the release engine"
+      - name: The release signer has no test code
+        if: matrix.lint
+        run: |
+          cargo build --release --locked -p partridge-signer
+          if grep -aq 'PARTRIDGE_TEST_' target/release/partridge-signer; then
+            echo "The release signer contains test switches." >&2
+            exit 1
+          fi
+          echo "ok: no test switches in the release signer"
       - name: The engine has no network code, the app does not link PDFium
         if: matrix.lint
         run: scripts/check-engine-deps.sh
@@ -394,6 +424,13 @@ jobs:
           [ "$RUNNER_OS" = "Windows" ] && bin=target/release/partridge-engine.exe
           if grep -aq 'PARTRIDGE_TEST_' "$bin"; then
             echo "The release engine contains test switches." >&2
+            exit 1
+          fi
+          echo "ok: no test switches in $bin"
+          bin=target/release/partridge-signer
+          [ "$RUNNER_OS" = "Windows" ] && bin=target/release/partridge-signer.exe
+          if grep -aq 'PARTRIDGE_TEST_' "$bin"; then
+            echo "The release signer contains test switches." >&2
             exit 1
           fi
           echo "ok: no test switches in $bin"

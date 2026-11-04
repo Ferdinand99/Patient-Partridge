@@ -11,6 +11,7 @@
 
 mod annotations;
 mod author;
+mod certsign;
 mod forms;
 mod links;
 mod locate;
@@ -326,6 +327,10 @@ impl From<ClientError> for CommandError {
                 code: why.code().into(),
                 message: why.to_string(),
             },
+            ClientError::Signer { code, message } => CommandError {
+                code: code.into(),
+                message,
+            },
         }
     }
 }
@@ -546,11 +551,24 @@ async fn save_pdf_as(
             message: "the document is not open".into(),
         }));
     };
+    // A copy of a document that holds a signature starts from a name of its own, and never replaces
+    // the signed file itself: writing it again is what breaks the signature.
+    let signed = {
+        let pool = pool.clone();
+        blocking(move || Ok(pool.is_signed(doc))).await?
+    };
+    let start = if signed { copy_name(&current) } else { current };
     // The dialog is the user's to answer for as long as they like; the gate (which an update
     // install closes) is entered only afterwards, so the dialog never holds an update back.
-    let Some(target) = choose_save_target(&app, current).await? else {
+    let Some(target) = choose_save_target(&app, start).await? else {
         return Ok(None);
     };
+    if signed && pool.is_own_file(doc, &target) {
+        return Err(CommandError {
+            code: "save_same_file".into(),
+            message: "a copy of a signed document needs a name of its own".into(),
+        });
+    }
     // Not while an update is being installed: it would end the engine in the middle of the save.
     let _permit = update_state
         .gate()
@@ -564,6 +582,15 @@ async fn save_pdf_as(
     let info = SavedInfo::from(outcome);
     update_state.move_doc(doc, &info.path);
     Ok(Some(info))
+}
+
+/// `name.pdf` as `name (copy).pdf`, in the same folder.
+fn copy_name(current: &std::path::Path) -> PathBuf {
+    let stem = current
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "document".to_string());
+    current.with_file_name(format!("{stem} (copy).pdf"))
 }
 
 /// Asks the user where to write a file, with the dialog of the system, which the app opens itself:
@@ -907,6 +934,7 @@ pub fn run() {
                 signatures_file,
                 earlier_signatures,
             ))));
+            app.manage(certsign::CertificateState::default());
             app.manage(Engine(Arc::new(EnginePool::new(
                 engine_config(app),
                 MAX_DOCUMENTS,
@@ -974,6 +1002,13 @@ pub fn run() {
             get_page_text,
             get_page_links,
             signatures::get_signatures,
+            certsign::sign_pick_certificate,
+            certsign::sign_load_certificate,
+            certsign::sign_forget_certificate,
+            certsign::sign_certificate_open,
+            certsign::sign_set_image_mark,
+            certsign::sign_list_fields,
+            certsign::sign_document,
             forms::form_info,
             forms::get_form_fields,
             forms::set_form_field,
@@ -1036,6 +1071,10 @@ pub fn run() {
         if let tauri::RunEvent::Exit = &event {
             if let Some(engine) = handle.try_state::<Engine>() {
                 engine.0.kill_all();
+            }
+            // The key does not outlive the app either.
+            if let Some(certificate) = handle.try_state::<certsign::CertificateState>() {
+                certificate.forget();
             }
         }
         // A file opened from the dock or Finder on macOS arrives as an event, not as an argument.

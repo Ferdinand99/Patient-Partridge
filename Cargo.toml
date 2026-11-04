@@ -2,6 +2,9 @@
 resolver = "2"
 members = [
     "crates/protocol",
+    "crates/sandbox",
+    "crates/signer-protocol",
+    "crates/signer",
     "crates/engine",
     "crates/engine-client",
     "crates/testkit",

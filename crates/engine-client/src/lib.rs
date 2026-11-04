@@ -45,9 +45,9 @@ pub use spawn::{spawn_engine, EngineProcess, SandboxPolicy, SpawnRequest, Spawne
 
 pub use partridge_protocol::{
     ability, field_flag, AnnotInfo, AnnotKind, CertificateTime, FontScript, FormField,
-    FormFieldKind, FormKind, FormOption, FormValue, LinkTarget, OutlineItem, PageLink,
-    SignatureFont, SignatureInfo, SignatureMark, SignatureReason, SignatureReport, SignatureState,
-    StampKind, TextMatch,
+    FormFieldKind, FormKind, FormOption, FormValue, LinkTarget, OutlineItem, PageLink, SignField,
+    SignPlace, SignatureFont, SignatureInfo, SignatureMark, SignatureReason, SignatureReport,
+    SignatureState, StampKind, TextMatch,
 };
 
 mod author;
@@ -57,6 +57,15 @@ mod pool;
 pub use pool::{Cancelled, EnginePool, ExtractOptions, InsertOptions, InsertOutcome, PageProgress};
 mod save;
 pub use save::{verify_written, DocInfo, Fingerprint, SaveError, SaveOptions, SaveOutcome};
+mod sign;
+pub use sign::{verify_signed, SignOptions, SignOutcome};
+mod signer;
+pub use signer::{SignerConfig, SignerSession};
+/// The biggest certificate file the signer takes, in bytes.
+pub const MAX_CERTIFICATE_FILE: usize = partridge_signer_protocol::MAX_P12_BYTES;
+pub use partridge_signer_protocol::{
+    usage as certificate_usage, Certificate, HashKind as SignerHash, KeyKind as CertificateKey,
+};
 mod spawn;
 pub mod system_fonts;
 
@@ -92,6 +101,8 @@ const PAGES_ANSWER_LIMIT: usize = 2 * 1024 * 1024;
 
 /// Largest outline answer: 5 000 entries of at most 512 bytes of title and 9 bytes of framing.
 const MAX_OUTLINE_ANSWER: usize = 3 * 1024 * 1024;
+/// Largest answer about signing: the list of signature fields (256 of them, 300 bytes each).
+const SIGN_ANSWER_LIMIT: usize = 80 * 1024;
 /// Largest page text answer: 100 000 characters of at most 4 bytes and 16 bytes of box each.
 const MAX_TEXT_ANSWER: usize = 2_200_000;
 /// Largest links answer: 500 links with an address of at most 2 048 bytes.
@@ -174,6 +185,9 @@ pub enum ClientError {
     Engine { code: ErrorCode, message: String },
     /// A save did not happen, and the file it was meant for is as it was.
     Save(SaveError),
+    /// The signer (the process that holds a certificate and its key) refused, failed or stopped.
+    /// The code is stable, for the window; the message is for a log.
+    Signer { code: &'static str, message: String },
 }
 
 impl fmt::Display for ClientError {
@@ -182,6 +196,7 @@ impl fmt::Display for ClientError {
             ClientError::EngineStopped(why) => write!(f, "the PDF engine stopped: {why}"),
             ClientError::Engine { message, .. } => write!(f, "{message}"),
             ClientError::Save(why) => write!(f, "{why}"),
+            ClientError::Signer { message, .. } => write!(f, "{message}"),
         }
     }
 }
@@ -227,6 +242,19 @@ enum Event {
     Failed(String),
     /// The engine closed its output: it exited.
     Closed,
+}
+
+/// The file the engine prepared for a signature: every byte except the signature itself, with the
+/// byte range already written. The hole is where the signature goes: `<`, zeros, `>`.
+#[derive(Debug)]
+pub struct SignPrepared {
+    pub bytes: Vec<u8>,
+    /// The place of the `<` that opens the hole.
+    pub hole_start: usize,
+    /// The place just after the `>` that closes it.
+    pub hole_end: usize,
+    /// The name of the field the signature is in.
+    pub field: String,
 }
 
 /// Why [`EngineClient::save_to`] stopped.
@@ -971,6 +999,121 @@ impl EngineClient {
         result.map(|()| u64::from(size))
     }
 
+    /// The signature fields the pages of the document have, by name and place.
+    pub fn sign_fields(&self, doc: u64) -> Result<Vec<SignField>, ClientError> {
+        self.call(
+            doc,
+            "signature fields",
+            |doc| RequestBody::Sign(partridge_protocol::SignRequest::Fields { doc }),
+            |body| match body {
+                ResponseBody::Sign(partridge_protocol::SignResponse::Fields { fields }) => {
+                    Ok(fields)
+                }
+                other => Err(other),
+            },
+        )
+    }
+
+    /// As `fingerprint`, without counting a signature field among the annotations of a page: the
+    /// document before it was signed and the file after it have the same description.
+    pub fn sign_fingerprint(&self, doc: u64) -> Result<Fingerprint, ClientError> {
+        self.call(
+            doc,
+            "fingerprint",
+            |doc| RequestBody::Sign(partridge_protocol::SignRequest::Fingerprint { doc }),
+            |body| match body {
+                ResponseBody::Fingerprint {
+                    pages,
+                    failed,
+                    digest,
+                } => Ok(Fingerprint {
+                    pages,
+                    failed,
+                    digest,
+                }),
+                other => Err(other),
+            },
+        )
+    }
+
+    /// Has the engine write the document out with the empty signature added, and collects the
+    /// bytes. The engine is treated as hostile here too: the size it announces is held to
+    /// [`MAX_SAVE_BYTES`], every piece must be at the offset asked for and exactly as long as
+    /// asked, and the hole must be inside the file (the decoder of the answer sees to that) and hold
+    /// nothing but zeros.
+    pub fn sign_prepare(
+        &self,
+        doc: u64,
+        mut spec: partridge_protocol::SignSpec,
+    ) -> Result<SignPrepared, ClientError> {
+        let mut inner = lock(&self.inner);
+        let Some(engine_doc) = Self::engine_doc(&inner, doc) else {
+            return Err(stale_document());
+        };
+        spec.doc = engine_doc;
+        let (size, hole_start, hole_end, field) = match self.run(
+            &mut inner,
+            RequestBody::Sign(partridge_protocol::SignRequest::Begin(spec)),
+        )? {
+            ResponseBody::Sign(partridge_protocol::SignResponse::Ready {
+                size,
+                hole_start,
+                hole_end,
+                field,
+            }) if size as usize <= MAX_SAVE_BYTES => (size, hole_start, hole_end, field),
+            _ => return self.unexpected(&mut inner, "signing"),
+        };
+        let mut bytes: Vec<u8> = Vec::new();
+        if bytes.try_reserve_exact(size as usize).is_err() {
+            if inner.running.is_some() {
+                let _ = self.run(&mut inner, RequestBody::SaveEnd { doc: engine_doc });
+            }
+            return Err(ClientError::Engine {
+                code: ErrorCode::SaveTooLarge,
+                message: "there is not enough memory to sign this document".into(),
+            });
+        }
+        let mut done: u32 = 0;
+        let result = loop {
+            if done == size {
+                break Ok(());
+            }
+            let len = (size - done).min(MAX_SAVE_CHUNK as u32);
+            let body = RequestBody::SaveChunk {
+                doc: engine_doc,
+                offset: done,
+                len,
+            };
+            match self.run(&mut inner, body) {
+                Ok(ResponseBody::SaveData { offset, data })
+                    if offset == done && data.len() == len as usize =>
+                {
+                    bytes.extend_from_slice(&data);
+                    done += len;
+                }
+                Ok(_) => break Err(self.unexpected::<()>(&mut inner, "signing").unwrap_err()),
+                Err(e) => break Err(e),
+            }
+        };
+        if inner.running.is_some() {
+            let _ = self.run(&mut inner, RequestBody::SaveEnd { doc: engine_doc });
+        }
+        result?;
+        let (start, end) = (hole_start as usize, hole_end as usize);
+        let sound = bytes.get(start) == Some(&b'<')
+            && bytes.get(end - 1) == Some(&b'>')
+            && bytes[start + 1..end - 1].iter().all(|b| *b == b'0');
+        if !sound {
+            return self.unexpected(&mut inner, "signing");
+        }
+        Ok(SignPrepared {
+            bytes,
+            hole_start: start,
+            hole_end: end,
+            field,
+        })
+    }
+
     /// Stops the engine process now. The documents it held are gone; opening a file starts a new
     /// engine. This works while another
     /// thread is waiting for an answer: that request then fails with `EngineStopped`.
@@ -1025,6 +1168,8 @@ impl EngineClient {
             RequestBody::PageText { .. } => MAX_TEXT_ANSWER,
             RequestBody::PageLinks { .. } => MAX_LINKS_ANSWER,
             RequestBody::Signatures { .. } => MAX_SIGNATURE_REPORT.max(IDLE_LIMIT),
+            // At most 256 fields with a name of at most 256 bytes and a page and a box each.
+            RequestBody::Sign(_) => SIGN_ANSWER_LIMIT,
             RequestBody::ListFormFields { .. } | RequestBody::SetFormField { .. } => {
                 MAX_FORMS_ANSWER
             }
@@ -1069,6 +1214,7 @@ impl EngineClient {
             | RequestBody::Fingerprint { .. }
             | RequestBody::Signatures { .. }
             | RequestBody::SaveBegin { .. }
+            | RequestBody::Sign(_)
             | RequestBody::Pages(_)
             | RequestBody::Author(_) => self.config.save_stall,
             _ => self.config.timeout,

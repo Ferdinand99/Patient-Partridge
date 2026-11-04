@@ -1031,7 +1031,7 @@ pub fn format_time(unix: i64) -> String {
 }
 
 /// The date for a count of days since 1970-01-01 (proleptic Gregorian calendar).
-fn civil(days: i64) -> (i64, u32, u32) {
+pub(crate) fn civil(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);

@@ -340,6 +340,115 @@ impl EnginePool {
         Ok(outcome)
     }
 
+    /// The signature fields the pages of the document have.
+    pub fn sign_fields(&self, handle: u64) -> Result<Vec<crate::SignField>, ClientError> {
+        let (client, doc) = self.entry(handle)?;
+        client.sign_fields(doc)
+    }
+
+    /// Signs the document with the certificate the signer holds and writes the signed file to
+    /// `target`, a file that may exist already. The document itself is not changed and does not
+    /// belong to the new file: the caller opens the signed file as a document of its own. The
+    /// signed file cannot be the file this document was opened from.
+    pub fn sign_as(
+        &self,
+        handle: u64,
+        target: &Path,
+        signer: &mut crate::SignerSession,
+        options: &crate::SignOptions,
+        save_options: SaveOptions,
+    ) -> Result<crate::SignOutcome, ClientError> {
+        let (client, doc, source, saving) = {
+            let st = state(&self.state);
+            let entry = st.docs.get(&handle).ok_or_else(unknown)?;
+            (
+                entry.client.clone(),
+                entry.doc,
+                entry.source.clone(),
+                entry.saving.clone(),
+            )
+        };
+        // One save at a time per document, and a signature is one.
+        let _saving = saving
+            .try_lock()
+            .map_err(|_| ClientError::Save(SaveError::Busy))?;
+        let (current_path, original) = {
+            let source = source.lock().unwrap_or_else(|e| e.into_inner());
+            (source.path.clone(), source.original.clone())
+        };
+        if same_file(target, &current_path) || same_file(target, &original) {
+            return Err(ClientError::Signer {
+                code: "sign_same_file",
+                message: "the signed copy cannot replace the file that is open".into(),
+            });
+        }
+        // Nor a file that another document is read from: that document would go on showing the
+        // file as it was, and could be saved over the signed copy.
+        if self.read_by_another(handle, target) {
+            return Err(ClientError::Signer {
+                code: "sign_target_open",
+                message: "the file is open as another document".into(),
+            });
+        }
+        // Whatever is there now is what the person chose to replace.
+        let expected = FileStamp::read(target).ok();
+        let mut outcome = crate::sign::sign_document(
+            &self.config,
+            &client,
+            doc,
+            signer,
+            options,
+            target,
+            expected.as_ref(),
+            save_options,
+            &|| state(&self.state).docs.contains_key(&handle),
+        )?;
+        outcome.path = target.to_path_buf();
+        // Another open document that reads the file that was replaced no longer holds that file.
+        self.mark_replaced(handle, target);
+        Ok(outcome)
+    }
+
+    /// True when a document other than `handle` is read from the file at `path`.
+    pub fn read_by_another(&self, handle: u64, path: &Path) -> bool {
+        let others: Vec<Arc<Mutex<Source>>> = {
+            let st = state(&self.state);
+            st.docs
+                .iter()
+                .filter(|(other, _)| **other != handle)
+                .map(|(_, entry)| entry.source.clone())
+                .collect()
+        };
+        others.iter().any(|source| {
+            let (original, current) = {
+                let source = source.lock().unwrap_or_else(|e| e.into_inner());
+                (source.original.clone(), source.path.clone())
+            };
+            same_file(&original, path) || same_file(&current, path)
+        })
+    }
+
+    /// True when `path` is the file this document is read from or was opened from.
+    pub fn is_own_file(&self, handle: u64, path: &Path) -> bool {
+        let st = state(&self.state);
+        let Some(entry) = st.docs.get(&handle) else {
+            return false;
+        };
+        let source = entry.source.lock().unwrap_or_else(|e| e.into_inner());
+        let (current, original) = (source.path.clone(), source.original.clone());
+        drop(source);
+        drop(st);
+        same_file(path, &current) || same_file(path, &original)
+    }
+
+    /// True when the document holds a signature (or something that looks like one).
+    pub fn is_signed(&self, handle: u64) -> bool {
+        self.entry(handle)
+            .ok()
+            .and_then(|(client, doc)| client.doc_info(doc).ok())
+            .is_some_and(|info| info.is_signed())
+    }
+
     /// Every other open document whose engine reads the file at `path` is told apart: what its
     /// engine holds is the file as it was, and the path now leads to something else. Like a document
     /// that was saved itself, it is not asked about its signatures any more. Their handles are

@@ -3636,3 +3636,291 @@ describe("App: the verdict on a signature belongs to the bytes it was made from"
     expect(badge().textContent).toBe(INTACT);
   });
 });
+
+describe("App: signing with a certificate", () => {
+  const signing = () => ({
+    signPickCertificate: vi.fn(() => Promise.resolve("anna.p12")),
+    signLoadCertificate: vi.fn((_doc: number, _password: string) =>
+      Promise.reject({ code: "signer_wrong_password", message: "" }),
+    ),
+    signCertificateOpen: vi.fn(() => Promise.resolve(true)),
+    signForgetCertificate: vi.fn(() => Promise.resolve()),
+    signSetImageMark: vi.fn(() => Promise.resolve()),
+    signListFields: vi.fn(() => Promise.resolve([])),
+    signDocument: vi.fn(() => Promise.resolve(null)),
+  });
+  const signButton = () => document.getElementById("sign-button") as HTMLButtonElement;
+
+  it("has no button where the app process offers no signing, and one that needs a document where it does", async () => {
+    const plain = make();
+    await plain.app.openPath("/docs/book.pdf");
+    await flush();
+    expect(signButton().hidden).toBe(true);
+
+    document.body.replaceChildren();
+    installPage();
+    const m = make();
+    Object.assign(m.api, signing());
+    // The button follows the document in front: it is there, and off, until a document is open.
+    await m.app.openPath("/docs/book.pdf");
+    await flush();
+    expect(signButton().hidden).toBe(false);
+    expect(signButton().disabled).toBe(false);
+  });
+
+  it("opens the box for the document in front, and lets the key go when it is closed", async () => {
+    const m = make();
+    const api = Object.assign(m.api, signing());
+    await m.app.openPath("/docs/book.pdf");
+    await flush();
+    signButton().click();
+    await flush();
+    const box = document.querySelector<HTMLFormElement>("form.certsign");
+    expect(box).not.toBeNull();
+    expect(box?.textContent).toContain("Sign with a certificate");
+    expect(signButton().disabled).toBe(true);
+    click(button("Cancel"));
+    await flush();
+    expect(document.querySelector("form.certsign")).toBeNull();
+    expect(api.signForgetCertificate).toHaveBeenCalledTimes(1);
+    expect(signButton().disabled).toBe(false);
+    expect(api.signDocument).not.toHaveBeenCalled();
+  });
+
+  it("asks to save a document with changes first, and signs nothing when the person says no", async () => {
+    const m = make();
+    const api = Object.assign(m.api, signing());
+    await m.app.openPath("/docs/book.pdf");
+    await flush();
+    m.app.recordEdit({ label: "Change", undo: () => undefined, redo: () => undefined });
+    signButton().click();
+    await flush();
+    expect(notice()?.textContent).toContain("Save the document first");
+    expect(notice()?.textContent).toContain('"book.pdf" has changes that are not saved');
+    expect(document.querySelector("form.certsign")).toBeNull();
+    click(button("Cancel"));
+    await flush();
+    expect(document.querySelector("form.certsign")).toBeNull();
+    expect(api.save).not.toHaveBeenCalled();
+    expect(api.signPickCertificate).not.toHaveBeenCalled();
+  });
+
+  it("saves first when the person agrees, and then opens the box", async () => {
+    const m = make();
+    Object.assign(m.api, signing());
+    await m.app.openPath("/docs/book.pdf");
+    await flush();
+    m.app.recordEdit({ label: "Change", undo: () => undefined, redo: () => undefined });
+    signButton().click();
+    await flush();
+    click(button("Save and go on"));
+    await flush();
+    await flush();
+    expect(m.api.save).toHaveBeenCalledTimes(1);
+    expect(document.querySelector("form.certsign")).not.toBeNull();
+  });
+
+  it("opens the signed copy in a tab of its own, with editing held, and says what was done", async () => {
+    const m = make();
+    const api = Object.assign(m.api, signing());
+    api.signLoadCertificate.mockImplementation(() =>
+      Promise.resolve({
+        name: "Anna Alvorlig", issuer: "Anna Alvorlig", selfSigned: true, serial: "01",
+        fingerprint: "ab".repeat(32), notBefore: 1_577_836_800, notAfter: 4_733_510_400,
+        now: 1_781_524_800, key: "ECDSA P-256", maySign: true, chain: 1,
+      }) as never,
+    );
+    api.signDocument.mockImplementation(() =>
+      Promise.resolve({
+        path: "/docs/book (signed).pdf", name: "book (signed).pdf", field: "Signature1",
+        signer: "Anna Alvorlig", fingerprint: "ab".repeat(32),
+      }) as never,
+    );
+    await m.app.openPath("/docs/book.pdf");
+    await flush();
+    signButton().click();
+    await flush();
+    const box = document.querySelector<HTMLFormElement>("form.certsign") as HTMLFormElement;
+    click([...box.querySelectorAll("button")].find((b) => b.textContent === "Choose certificate file…") ?? null);
+    await flush();
+    const password = box.querySelector<HTMLInputElement>('input[type="password"]') as HTMLInputElement;
+    password.value = "test";
+    click([...box.querySelectorAll("button")].find((b) => b.textContent === "Open the file") ?? null);
+    await flush();
+    const none = box.querySelector<HTMLInputElement>('input[type="radio"][value="none"]') as HTMLInputElement;
+    none.checked = true;
+    none.dispatchEvent(new Event("change"));
+    box.dispatchEvent(new Event("submit", { cancelable: true }));
+    await flush();
+    await flush();
+    expect(api.signDocument).toHaveBeenCalledTimes(1);
+    expect(api.open).toHaveBeenLastCalledWith("/docs/book (signed).pdf", undefined);
+    expect(tabTitles()).toEqual(["book.pdf", "book (signed).pdf"]);
+    expect(selectedTab()).toBe("book (signed).pdf");
+    expect(notice()?.textContent).toContain('Signed copy saved as "book (signed).pdf". Signature intact; signer not verified.');
+    expect(notice()?.textContent).toContain("page changes are off here");
+  });
+});
+
+describe("App: a file that was signed here", () => {
+  const letterSize = { width: 612, height: 792 };
+  const changed = (pages: number): PagesChanged => ({
+    pages: Array.from({ length: pages }, () => letterSize),
+    snapshot: 0,
+    count: 1,
+    formFields: 0,
+  });
+  const fakePages = () => ({
+    pagesDelete: vi.fn(() => Promise.resolve(changed(2))),
+    pagesReorder: vi.fn(() => Promise.resolve(changed(3))),
+    pagesRotate: vi.fn(() => Promise.resolve(changed(3))),
+    pagesCrop: vi.fn(() => Promise.resolve({ pages: [letterSize], before: [], after: [] })),
+    pagesSetBoxes: vi.fn(() => Promise.resolve(changed(3))),
+    pagesInsertBlank: vi.fn(() => Promise.resolve(changed(4))),
+    pagesRestore: vi.fn(() => Promise.resolve(changed(3))),
+    pagesInsertPdf: vi.fn(() => Promise.resolve({ changed: changed(5), inserted: 2 })),
+    pagesExtract: vi.fn(() => Promise.resolve(null)),
+    pagesCancel: vi.fn(() => Promise.resolve("idle" as const)),
+  });
+  const signButton = () => document.getElementById("sign-button") as HTMLButtonElement;
+
+  /** Signs book.pdf with a stand-in for the app process, so that "book (signed).pdf" is open and held. */
+  async function signedTab() {
+    const pages = fakePages();
+    const m = make({ pages: pages as unknown as PageToolsApi });
+    Object.assign(m.api, {
+      signPickCertificate: vi.fn(() => Promise.resolve("anna.p12")),
+      signLoadCertificate: vi.fn(() =>
+        Promise.resolve({
+          name: "Anna Alvorlig", issuer: "Anna Alvorlig", selfSigned: true, serial: "01",
+          fingerprint: "ab".repeat(32), notBefore: 1_577_836_800, notAfter: 4_733_510_400,
+          now: 1_781_524_800, key: "ECDSA P-256", maySign: true, chain: 1,
+        }),
+      ),
+      signCertificateOpen: vi.fn(() => Promise.resolve(true)),
+      signForgetCertificate: vi.fn(() => Promise.resolve()),
+      signSetImageMark: vi.fn(() => Promise.resolve()),
+      signListFields: vi.fn(() => Promise.resolve([])),
+      signDocument: vi.fn(() =>
+        Promise.resolve({
+          path: "/docs/book (signed).pdf", name: "book (signed).pdf", field: "Signature1",
+          signer: "Anna Alvorlig", fingerprint: "ab".repeat(32),
+        }),
+      ),
+    });
+    await m.app.openPath("/docs/book.pdf");
+    await flush();
+    signButton().click();
+    await flush();
+    const box = document.querySelector<HTMLFormElement>("form.certsign") as HTMLFormElement;
+    click([...box.querySelectorAll("button")].find((b) => b.textContent === "Choose certificate file…") ?? null);
+    await flush();
+    (box.querySelector('input[type="password"]') as HTMLInputElement).value = "test";
+    click([...box.querySelectorAll("button")].find((b) => b.textContent === "Open the file") ?? null);
+    await flush();
+    const none = box.querySelector<HTMLInputElement>('input[type="radio"][value="none"]') as HTMLInputElement;
+    none.checked = true;
+    none.dispatchEvent(new Event("change"));
+    box.dispatchEvent(new Event("submit", { cancelable: true }));
+    await flush();
+    await flush();
+    // The question after signing is answered.
+    click(button("OK"));
+    await flush();
+    expect(selectedTab()).toBe("book (signed).pdf");
+    return { ...m, pages, ops: (m.app as unknown as { pageOps: PageOps }).pageOps };
+  }
+
+  it("does not run a page tool, and says why", async () => {
+    const { pages, ops } = await signedTab();
+    const turning = ops.rotate([0], 1);
+    await flush();
+    expect(pages.pagesRotate).not.toHaveBeenCalled();
+    expect(notice()?.textContent).toContain("This file is signed");
+    expect(notice()?.textContent).toContain("page changes are off here");
+    click(button("OK"));
+    expect(await turning).toBeNull();
+    // Every other page tool meets the same wall.
+    const removing = ops.remove([0]);
+    await flush();
+    expect(notice()?.textContent).toContain("This file is signed");
+    click(button("OK"));
+    expect(await removing).toBeNull();
+    expect(pages.pagesDelete).not.toHaveBeenCalled();
+  });
+
+  it("is never saved over: a save asks for a copy and offers no way to break the signature", async () => {
+    const { app, api } = await signedTab();
+    // Something got into the history (it should not, but the save must not rely on that).
+    app.recordEdit({ label: "Change", undo: () => undefined, redo: () => undefined });
+    api.save.mockImplementationOnce(() => Promise.reject({ code: "save_signed", message: "signed" }));
+    key("s", { ctrlKey: true });
+    await flush();
+    const labels = [...(notice()?.querySelectorAll("button") ?? [])].map((b) => b.textContent);
+    expect(notice()?.textContent).toContain("is the signed file");
+    expect(labels).toContain("Save a copy…");
+    expect(labels).not.toContain("Save anyway");
+    expect(labels).not.toContain("Save and break the signature");
+    click(button("Cancel"));
+    await flush();
+    // The signed file was not written, and nothing was said to the app process about a break.
+    expect(api.save).toHaveBeenCalledTimes(1);
+    expect(api.save).toHaveBeenLastCalledWith(expect.any(Number), false, false);
+  });
+
+  it("has nothing to take back or make again, whatever the history of a tab of that name held", async () => {
+    const { app } = await signedTab();
+    const undo = vi.fn();
+    app.recordEdit({ label: "Change", undo, redo: () => undefined });
+    key("z", { ctrlKey: true });
+    await flush();
+    expect(undo).not.toHaveBeenCalled();
+    key("y", { ctrlKey: true });
+    await flush();
+    expect(notice()).toBeNull();
+  });
+
+  it("is never replaced by the question about a file that changed on the disk", async () => {
+    const { app, api } = await signedTab();
+    app.recordEdit({ label: "Change", undo: () => undefined, redo: () => undefined });
+    api.save.mockImplementationOnce(() => Promise.reject({ code: "save_changed", message: "changed" }));
+    key("s", { ctrlKey: true });
+    await flush();
+    const labels = [...(notice()?.querySelectorAll("button") ?? [])].map((b) => b.textContent);
+    expect(labels).toContain("Save a copy…");
+    expect(labels).not.toContain("Replace the file");
+    click(button("Cancel"));
+    await flush();
+    expect(api.save).toHaveBeenCalledTimes(1);
+    expect(api.save).toHaveBeenLastCalledWith(expect.any(Number), false, false);
+  });
+
+  it("lets pages be copied out to a new file, which leaves the signed file as it is", async () => {
+    const { pages, ops } = await signedTab();
+    await ops.extract([0]);
+    await flush();
+    expect(pages.pagesExtract).toHaveBeenCalledTimes(1);
+    expect(notice()).toBeNull();
+  });
+
+  it("a copy of it is an ordinary document again, and can be changed", async () => {
+    const { app, api, pages, ops } = await signedTab();
+    app.recordEdit({ label: "Change", undo: () => undefined, redo: () => undefined });
+    api.save.mockImplementationOnce(() => Promise.reject({ code: "save_signed", message: "signed" }));
+    key("s", { ctrlKey: true });
+    await flush();
+    click(button("Save a copy…"));
+    await flush();
+    await flush();
+    // The copy is asked for as a copy; the tab follows it and is no longer held.
+    if (notice()) {
+      click(button("Save and break the signature"));
+      await flush();
+      await flush();
+    }
+    expect(api.saveAs).toHaveBeenCalled();
+    expect(tabTitles()).toContain("copy.pdf");
+    expect(await ops.rotate([0], 1)).not.toBeNull();
+    expect(pages.pagesRotate).toHaveBeenCalled();
+  });
+});

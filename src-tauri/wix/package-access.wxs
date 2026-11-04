@@ -10,7 +10,7 @@
   checks that it is the one the app uses), and only that:
 
     - read and execute for that package on the install folder, without inheritance,
-    - the same on the two files the engine opens by path: partridge-engine.exe and pdfium.dll.
+    - the same on the three files the engine and the signer open by path: partridge-engine.exe, partridge-signer.exe and pdfium.dll.
 
   Nothing else in the folder gets an entry, and no other application package gains anything, so
   choosing a folder with other files in it (Documents, the root of a drive) opens none of them. The
@@ -35,6 +35,8 @@
     <CustomAction Id="PackageAccessFolder" BinaryKey="WixCA" DllEntry="CAQuietExec" Execute="deferred" Impersonate="no" Return="ignore" />
     <CustomAction Id="PackageAccessEngineCommand" Property="PackageAccessEngine" Value="&quot;[SystemFolder]icacls.exe&quot; &quot;[INSTALLDIR]partridge-engine.exe&quot; /grant *S-1-15-2-1452645665-1071814252-341713739-2096083442-1079832312-2911523698-3580489556:(RX)" />
     <CustomAction Id="PackageAccessEngine" BinaryKey="WixCA" DllEntry="CAQuietExec" Execute="deferred" Impersonate="no" Return="ignore" />
+    <CustomAction Id="PackageAccessSignerCommand" Property="PackageAccessSigner" Value="&quot;[SystemFolder]icacls.exe&quot; &quot;[INSTALLDIR]partridge-signer.exe&quot; /grant *S-1-15-2-1452645665-1071814252-341713739-2096083442-1079832312-2911523698-3580489556:(RX)" />
+    <CustomAction Id="PackageAccessSigner" BinaryKey="WixCA" DllEntry="CAQuietExec" Execute="deferred" Impersonate="no" Return="ignore" />
     <CustomAction Id="PackageAccessPdfiumCommand" Property="PackageAccessPdfium" Value="&quot;[SystemFolder]icacls.exe&quot; &quot;[INSTALLDIR]pdfium.dll&quot; /grant *S-1-15-2-1452645665-1071814252-341713739-2096083442-1079832312-2911523698-3580489556:(RX)" />
     <CustomAction Id="PackageAccessPdfium" BinaryKey="WixCA" DllEntry="CAQuietExec" Execute="deferred" Impersonate="no" Return="ignore" />
     <CustomAction Id="PackageAccessRemoveCommand" Property="PackageAccessRemove" Value="&quot;[SystemFolder]icacls.exe&quot; &quot;[INSTALLDIR].&quot; /remove *S-1-15-2-1452645665-1071814252-341713739-2096083442-1079832312-2911523698-3580489556" />
@@ -45,8 +47,10 @@
       <Custom Action="PackageAccessFolder" After="InstallFiles">NOT (REMOVE="ALL")</Custom>
       <Custom Action="PackageAccessEngineCommand" Before="PackageAccessEngine">NOT (REMOVE="ALL")</Custom>
       <Custom Action="PackageAccessEngine" After="PackageAccessFolder">NOT (REMOVE="ALL")</Custom>
+      <Custom Action="PackageAccessSignerCommand" Before="PackageAccessSigner">NOT (REMOVE="ALL")</Custom>
+      <Custom Action="PackageAccessSigner" After="PackageAccessEngine">NOT (REMOVE="ALL")</Custom>
       <Custom Action="PackageAccessPdfiumCommand" Before="PackageAccessPdfium">NOT (REMOVE="ALL")</Custom>
-      <Custom Action="PackageAccessPdfium" After="PackageAccessEngine">NOT (REMOVE="ALL")</Custom>
+      <Custom Action="PackageAccessPdfium" After="PackageAccessSigner">NOT (REMOVE="ALL")</Custom>
       <!-- On uninstall, before the files are removed (and with them the folder, if it is empty). -->
       <Custom Action="PackageAccessRemoveCommand" Before="PackageAccessRemove">REMOVE="ALL"</Custom>
       <Custom Action="PackageAccessRemove" Before="RemoveFiles">REMOVE="ALL"</Custom>

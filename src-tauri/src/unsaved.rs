@@ -61,6 +61,11 @@ impl Unsaved {
         }
     }
 
+    /// True when the document has changes that are not saved, or is being changed now.
+    pub fn is_dirty(&self, doc: u64) -> bool {
+        self.docs().contains(&doc) || self.changing().contains_key(&doc)
+    }
+
     /// A document was closed.
     pub fn forget(&self, doc: u64) {
         self.docs().remove(&doc);

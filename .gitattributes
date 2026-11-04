@@ -9,3 +9,4 @@ notices-extra.json text eol=lf
 src/lib/formrules.cases.txt text eol=lf
 *.ttf binary
 assets/fonts/signature/*.txt text eol=lf
+*.p12 binary

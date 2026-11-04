@@ -151,7 +151,7 @@ impl MarkBody {
 
     /// The picture as the engine takes it, for a drawn or a typed one. An image goes to the engine
     /// as pixels, through `add_signature_image`.
-    fn to_mark(&self) -> Option<SignatureMark> {
+    pub fn to_mark(&self) -> Option<SignatureMark> {
         match self {
             MarkBody::Draw {
                 width,
@@ -753,6 +753,42 @@ struct ImageArgs {
     color: [u8; 4],
     width: u32,
     height: u32,
+}
+
+/// The size of an imported picture, the part of the header that every use of one needs.
+#[derive(Debug, Deserialize)]
+struct ImageSize {
+    width: u32,
+    height: u32,
+}
+
+/// The picture of a request that carries one in the way `add_signature_image` does: the size in the
+/// header and the pixels as the body. Used by the signature with a certificate, which keeps the
+/// picture until the file is signed.
+pub fn image_mark_of_request(
+    request: &tauri::ipc::Request<'_>,
+) -> Result<SignatureMark, CommandError> {
+    let size: ImageSize = request
+        .headers()
+        .get(IMAGE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| serde_json::from_str(v).ok())
+        .ok_or_else(|| bad("the description of the image is missing"))?;
+    if !mark_image_size_ok(size.width, size.height) {
+        return Err(bad("that image is bigger than a signature picture may be"));
+    }
+    let pixels = pixels_of(
+        request.body(),
+        size.width as usize * size.height as usize * 4,
+    )?;
+    if pixels.len() != size.width as usize * size.height as usize * 4 {
+        return Err(bad("the pixels do not fit the size of the image"));
+    }
+    Ok(SignatureMark::Image {
+        width: size.width,
+        height: size.height,
+        rgba: pixels.into_owned(),
+    })
 }
 
 /// The name of the header that carries [`ImageArgs`].

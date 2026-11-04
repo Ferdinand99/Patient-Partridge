@@ -2087,7 +2087,7 @@ fn write_stamp(
 
 /// A box on the page as it is drawn (`[left, top, right, bottom]`) as the box that holds it in
 /// page space (`[left, bottom, right, top]`).
-fn page_bounds(page: &PdfPage, mapper: &Mapper, r: [f32; 4]) -> Option<[f32; 4]> {
+pub(crate) fn page_bounds(page: &PdfPage, mapper: &Mapper, r: [f32; 4]) -> Option<[f32; 4]> {
     let corners = [
         mapper.to_page(page, r[0], r[1])?,
         mapper.to_page(page, r[2], r[1])?,
