@@ -3,7 +3,9 @@
 # and is put on the window station and desktop of this step's session. What the checks print is
 # written to a file by the checks themselves; this script prints it afterwards.
 param(
-  [int]$TimeoutSeconds = 1500
+  [int]$TimeoutSeconds = 1500,
+  # 'beta' runs the checks of the Windows beta (see standard-user-checks.ps1).
+  [ValidateSet('stable', 'beta')][string]$Variant = 'stable'
 )
 $ErrorActionPreference = 'Stop'
 $Root = 'C:\pp'
@@ -18,7 +20,7 @@ $credential = New-Object System.Management.Automation.PSCredential("$($env:COMPU
 $shell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $arguments = @(
   '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-  '-File', (Join-Path $Root 'scripts\standard-user-checks.ps1'), '-Root', $Root
+  '-File', (Join-Path $Root 'scripts\standard-user-checks.ps1'), '-Root', $Root, '-Variant', $Variant
 )
 $log = Join-Path $Root 'out\child.log'
 Remove-Item -LiteralPath $log -Force -ErrorAction SilentlyContinue

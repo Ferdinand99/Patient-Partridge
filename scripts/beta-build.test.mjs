@@ -67,7 +67,7 @@ describe("the Windows beta settings", () => {
     productName: "Patient Partridge",
     identifier: "com.ferdinand99.patientpartridge",
     version: "0.1.0",
-    bundle: { createUpdaterArtifacts: false, externalBin: ["binaries/partridge-engine"], fileAssociations: [{ ext: ["pdf"] }], icon: ["icons/icon.ico"] },
+    bundle: { createUpdaterArtifacts: false, externalBin: ["binaries/partridge-engine", "binaries/partridge-signer"], fileAssociations: [{ ext: ["pdf"] }], icon: ["icons/icon.ico"] },
     plugins: { updater: { endpoints: ["https://example.invalid/latest.json"], pubkey: "key" } },
   };
   const merged = mergeConfig(generated, betaOverride({ version: "0.1.0", build: "42", platform: "windows" }));
@@ -84,6 +84,10 @@ describe("the Windows beta settings", () => {
   it("use the icon.ico of the ribbon icon set", () => {
     expect(merged.bundle.icon).toContain("icons-beta/icon.ico");
     expect(merged.bundle.icon.some((f) => !f.startsWith("icons-beta/"))).toBe(false);
+  });
+
+  it("keep the engine and the signer as they are, so the installer hooks and the lookup find them", () => {
+    expect(merged.bundle.externalBin).toEqual(["binaries/partridge-engine", "binaries/partridge-signer"]);
   });
 
   it("name the program differently from the stable one, so the installers never end each other's app", () => {

@@ -3,13 +3,17 @@
 # program name, data folder and single-instance lock, no .pdf association and no update address for
 # the beta, and that removing one leaves the other working. Each app opens a PDF through
 # scripts/smoke.mjs (it must draw the first page) and is also started and left open while the other
-# is installed or removed. Run from the root of the repository (the job in
+# is installed or removed. It also checks the sandbox of the engine and the signer in each copy: the
+# installer's entries for the engine's AppContainer package on the folder and the programs, and a
+# signature made with the engine and signer of each copy. Run from the root of the repository (the job in
 # .github/workflows/windows-beta.yml does). This file is ASCII only.
 param(
   [Parameter(Mandatory)][string]$Stable,   # NSIS installer of the stable app
   [Parameter(Mandatory)][string]$Beta,     # NSIS installer of the beta
   [Parameter(Mandatory)][string]$Pdf,      # a PDF to open
-  [Parameter(Mandatory)][string]$Out       # a folder for logs and pictures
+  [Parameter(Mandatory)][string]$Out,      # a folder for logs and pictures
+  [Parameter(Mandatory)][string]$SignDriver, # crates/engine/examples/sign_installed.rs, built
+  [Parameter(Mandatory)][string]$Certificate # a PKCS#12 file of the tests (password "test")
 )
 $ErrorActionPreference = 'Stop'
 New-Item -ItemType Directory -Force -Path $Out | Out-Null
@@ -112,6 +116,32 @@ function File-Has([string]$file, [string]$text) {
   $bytes = [IO.File]::ReadAllBytes($file)
   return [Text.Encoding]::GetEncoding(28591).GetString($bytes).Contains($text)
 }
+# The AppContainer package of the engine and the signer (container.rs): the installer gives it read
+# and execute on the install folder, without inheritance, and on the programs the sandboxed
+# processes open by path. Both copies use the same package (its name is fixed); each has the entries
+# on its own files.
+$Package = 'S-1-15-2-1452645665-1071814252-341713739-2096083442-1079832312-2911523698-3580489556'
+function Package-Rights([string]$path) {
+  $line = (& icacls $path) | Where-Object { $_ -match [regex]::Escape($Package) } | Select-Object -First 1
+  if (-not $line) { return $null }
+  return ($line -replace ('^.*' + [regex]::Escape($Package) + ':'), '').Trim()
+}
+function Check-Package-Entries([string]$dir, [string]$label) {
+  foreach ($name in @('', 'partridge-engine.exe', 'partridge-signer.exe', 'pdfium.dll')) {
+    $path = if ($name) { Join-Path $dir $name } else { $dir }
+    $rights = Package-Rights $path
+    Check "the $label install gives the engine's package read and execute on $(if ($name) { $name } else { 'the folder' })" ($rights -eq '(RX)') "('$rights')"
+  }
+}
+function Sign-With([string]$dir, [string]$label, [string]$tag) {
+  $signed = Join-Path $Out "signed-$tag.pdf"
+  Remove-Item -LiteralPath $signed -Force -ErrorAction SilentlyContinue
+  Say "--- signing with the engine and the signer in $dir"
+  $text = & $SignDriver $dir $Pdf $Certificate test $signed 2>&1 | Out-String
+  $code = $LASTEXITCODE
+  Say $text.Trim()
+  Check "the $label engine and signer sign a PDF in their sandboxes" ($code -eq 0 -and (Test-Path -LiteralPath $signed)) "(exit code $code)"
+}
 function Local-Data([string]$identifier) { Join-Path $env:LOCALAPPDATA $identifier }
 function Roaming-Data([string]$identifier) { Join-Path $env:APPDATA $identifier }
 function List-Data([string]$identifier) {
@@ -174,6 +204,9 @@ try {
     Check "the PDF library is installed with the $($pair[1]) program" ((Get-ChildItem -LiteralPath $pair[0] -Recurse -Filter 'pdfium.dll' -ErrorAction SilentlyContinue | Measure-Object).Count -gt 0)
     Check "the uninstaller is installed with the $($pair[1]) program" (Test-Path -LiteralPath (Join-Path $pair[0] 'uninstall.exe'))
   }
+  Check 'the signer is installed next to each program' ((Test-Path -LiteralPath (Join-Path $stableDir 'partridge-signer.exe')) -and (Test-Path -LiteralPath (Join-Path $betaDir 'partridge-signer.exe')))
+  Check-Package-Entries $stableDir 'stable'
+  Check-Package-Entries $betaDir 'beta'
   $stableEntry = Get-Entry $StableName
   $betaEntry = Get-Entry $BetaName
   Check 'two uninstall entries, each with its own name' ($stableEntry -and $betaEntry -and ($stableEntry.PSChildName -ne $betaEntry.PSChildName)) "($($stableEntry.PSChildName) | $($betaEntry.PSChildName))"
@@ -222,6 +255,8 @@ try {
   Stop-Tree $stableApp.Id
   Start-Sleep -Seconds 3
   Smoke $stableExe 'the stable app (next to the installed beta)'
+  Sign-With $betaDir 'beta' 'beta'
+  Sign-With $stableDir 'stable' 'stable'
 
   Say ''
   Say '=== 5. Remove the beta while the stable app runs'
@@ -235,6 +270,7 @@ try {
   Check 'the stable app is still installed' ((Test-Path -LiteralPath $stableExe) -and $null -ne (Get-Entry $StableName) -and @(Find-Shortcut $StableName).Count -gt 0)
   Check 'the stable app kept running' (-not $stableApp.HasExited)
   Check 'the stable data is still there' (Test-Path -LiteralPath (Join-Path (Local-Data $StableId) 'marker-of-the-stable-app.txt'))
+  Check-Package-Entries $stableDir 'stable (after the beta was removed)'
   Stop-Tree $stableApp.Id
   Start-Sleep -Seconds 3
   Smoke $stableExe 'the stable app (after the beta was removed)'
@@ -253,9 +289,11 @@ try {
   Check 'the stable Start menu entry is gone' (@(Find-Shortcut $StableName).Count -eq 0)
   Check 'the beta is still installed' ((Test-Path -LiteralPath $betaExe) -and $null -ne (Get-Entry $BetaName) -and @(Find-Shortcut $BetaName).Count -gt 0)
   Check 'the beta kept running' (-not $betaApp.HasExited)
+  Check-Package-Entries $betaDir 'beta (after the stable app was removed)'
   Stop-Tree $betaApp.Id
   Start-Sleep -Seconds 3
   Smoke $betaExe 'the beta (after the stable app was removed)'
+  Sign-With $betaDir 'beta (after the stable app was removed)' 'beta-alone'
   Uninstall-App $BetaName
   Check 'the beta is removed' ($null -eq (Get-Entry $BetaName) -and -not (Test-Path -LiteralPath $betaExe))
 }

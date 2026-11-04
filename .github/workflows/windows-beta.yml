@@ -12,7 +12,9 @@
 # patient-partridge-windows-beta (kept 14 days).
 #
 # A second job installs the beta silently next to an installed stable build, starts both, opens a PDF
-# in each (scripts/smoke.mjs), and checks that they keep apart (scripts/windows-beta/side-by-side.ps1).
+# in each (scripts/smoke.mjs), signs a PDF with the engine and signer of each, and checks that they
+# keep apart (scripts/windows-beta/side-by-side.ps1). A third job runs the beta as a standard user
+# (the scripts of the "Windows, as a standard user" job of ci.yml with -Variant beta).
 name: Windows beta build
 
 on:
@@ -21,6 +23,9 @@ on:
     paths:
       - .github/workflows/windows-beta.yml
       - scripts/windows-beta/**
+      - scripts/windows-standard-user/**
+      - src-tauri/windows/**
+      - crates/engine/examples/sign_installed.rs
       - scripts/beta-build.mjs
       - scripts/prepare-bundle.mjs
       - scripts/bundle-config.mjs
@@ -114,10 +119,18 @@ jobs:
           cp target/release/bundle/nsis/*-setup.exe out/
           ls -la out
 
-      # The stable half of the side-by-side test needs a PDF to open too.
+      # The stable half of the side-by-side test brings what both halves need: a PDF to open, the
+      # program that signs it with the engine and the signer of an installed copy
+      # (crates/engine/examples/sign_installed.rs), and a certificate file of the tests.
       - name: Make a test PDF
         if: matrix.kind == 'stable'
         run: cargo run --release --locked -p partridge-testkit --bin make-pdf -- 30 out/test.pdf
+      - name: Build the signing check program
+        if: matrix.kind == 'stable'
+        run: |
+          cargo build --release --locked -p partridge-engine --example sign_installed
+          cp target/release/examples/sign_installed.exe out/
+          cp crates/signer/tests/fixtures/rsa2048.p12 out/
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: matrix.kind == 'beta'
@@ -160,7 +173,9 @@ jobs:
           $stable = (Get-ChildItem installers/stable -Filter '*-setup.exe' | Select-Object -First 1).FullName
           $beta = (Get-ChildItem installers/beta -Filter '*-setup.exe' | Select-Object -First 1).FullName
           $pdf = (Resolve-Path installers/stable/test.pdf).Path
-          ./scripts/windows-beta/side-by-side.ps1 -Stable $stable -Beta $beta -Pdf $pdf -Out "$env:RUNNER_TEMP/side-by-side"
+          $driver = (Resolve-Path installers/stable/sign_installed.exe).Path
+          $p12 = (Resolve-Path installers/stable/rsa2048.p12).Path
+          ./scripts/windows-beta/side-by-side.ps1 -Stable $stable -Beta $beta -Pdf $pdf -Out "$env:RUNNER_TEMP/side-by-side" -SignDriver $driver -Certificate $p12
       - name: Summary
         if: always()
         shell: pwsh
@@ -180,3 +195,93 @@ jobs:
           path: ${{ runner.temp }}/side-by-side/*
           if-no-files-found: ignore
           retention-days: 3
+
+  # The runners run everything as an administrator, and a user of the app usually is not one. This is
+  # the "Windows, as a standard user" job of ci.yml, for the beta (the same scripts with -Variant
+  # beta): a local standard user installs the beta with the NSIS installer, opens PDFs with it, and
+  # the beta is also installed by an administrator into a folder outside the profile (where the
+  # installer's entries for the engine's package decide whether the sandboxed engine and signer
+  # start), with a copy without the entries as the control. In each of them the engine and the signer
+  # of the installed beta sign a PDF with a PKCS#12 file of the tests. The sandbox tests of the
+  # engine are left to the job of ci.yml; they do not use an installed copy.
+  standard-user:
+    name: The beta as a standard user (Windows)
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: windows-beta-standard-user
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+
+      # The user and its folders come first, so that everything built later inherits the right
+      # permissions. The password is made here, masked, and kept only in this job.
+      - name: Create the standard user
+        shell: powershell
+        run: ./scripts/windows-standard-user/prepare.ps1
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: patient-partridge-windows-beta
+          path: installers
+      - name: Make a test PDF and put the files where the user can read them
+        shell: pwsh
+        run: |
+          cargo run --release --locked -p partridge-testkit --bin make-pdf -- 3 "C:/pp/docs/plain.pdf"
+          if ($LASTEXITCODE -ne 0) { throw 'make-pdf failed' }
+          Copy-Item crates/signer/tests/fixtures/rsa2048.p12 C:\pp\docs\
+          $setup = Get-ChildItem installers -Filter '*-setup.exe' | Select-Object -First 1
+          if (-not $setup) { throw 'The build job made no NSIS installer.' }
+          Copy-Item $setup.FullName C:\pp\in\
+          Get-ChildItem C:\pp\in, C:\pp\docs | Format-Table Name, Length
+
+      # The program that signs with the engine and the signer of a folder; the checks run it as the user.
+      - name: Build the signing check program
+        shell: pwsh
+        run: |
+          $env:CARGO_TARGET_DIR = 'C:\pp\build\target'
+          cargo build --locked -p partridge-engine --example sign_installed
+          if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
+
+      - name: Install outside the profile, as an administrator
+        shell: pwsh
+        run: ./scripts/windows-standard-user/install-as-admin.ps1 -Variant beta
+
+      - name: Run the checks as the standard user
+        shell: powershell
+        run: ./scripts/windows-standard-user/run-as-user.ps1 -Variant beta
+
+      - name: Summary
+        if: always()
+        shell: pwsh
+        run: |
+          $log = 'C:\pp\out\child.log'
+          if (Test-Path $log) {
+            '### The beta as a standard user' | Add-Content $env:GITHUB_STEP_SUMMARY
+            '' | Add-Content $env:GITHUB_STEP_SUMMARY
+            '```' | Add-Content $env:GITHUB_STEP_SUMMARY
+            Get-Content $log -Encoding UTF8 |
+              Where-Object { $_ -match '^\[(PASS|FAIL)\]|^===|^(user|process session|window station|desktop|token elevated|SESSIONNAME|FAILED|ALL CHECKS|report:|engine process)' } |
+              Add-Content $env:GITHUB_STEP_SUMMARY
+            '```' | Add-Content $env:GITHUB_STEP_SUMMARY
+          }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: windows-beta-standard-user-logs
+          path: C:\pp\out\*
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: Remove the standard user
+        if: always()
+        shell: powershell
+        run: |
+          if ($env:PP_USER) { Remove-LocalUser -Name $env:PP_USER -ErrorAction SilentlyContinue }
