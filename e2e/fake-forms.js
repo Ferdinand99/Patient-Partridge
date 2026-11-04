@@ -167,7 +167,7 @@
     for (const l of listeners) if (l.event === event) callbacks.get(l.handler)?.({ event, id: 1, payload });
   };
 
-  base.invoke = async (cmd, args = {}) => {
+  base.invoke = async (cmd, args = {}, options) => {
     if (cmd === "plugin:event|listen") listeners.push({ event: args.event, handler: args.handler });
     if (cmd === "quit_app") {
       forms.quits += 1;
@@ -216,6 +216,6 @@
         default:
       }
     }
-    return baseInvoke(cmd, args);
+    return baseInvoke(cmd, args, options);
   };
 })();

@@ -57,6 +57,16 @@ export class EditHistory {
     return !this.busy && this.pos < this.edits.length;
   }
 
+  /** How many edits can be taken back. */
+  get undoDepth(): number {
+    return this.pos;
+  }
+
+  /** How many edits can be made again. */
+  get redoDepth(): number {
+    return this.edits.length - this.pos;
+  }
+
   /** What undo would take back, for a menu: null when there is nothing. */
   get undoLabel(): string | null {
     return this.pos > 0 ? this.edits[this.pos - 1].edit.label : null;
@@ -95,6 +105,18 @@ export class EditHistory {
       this.edits.splice(0, excess);
       this.pos -= excess;
     }
+    this.changed();
+  }
+
+  /**
+   * Forgets what could be made again, without recording an edit. For a change that no edit can take
+   * back: what was taken back before it must not be made again over it. When the saved file was one
+   * of the states that could be made again, nothing matches it any more.
+   */
+  dropRedo(): void {
+    if (this.busy) throw new Error("an undo or redo is still running");
+    if (this.pos === this.edits.length) return;
+    this.edits.length = this.pos;
     this.changed();
   }
 

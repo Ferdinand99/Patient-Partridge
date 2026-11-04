@@ -5,9 +5,21 @@
 //! message, and the round-trip targets compare what comes out with what went in. The messages
 //! that go past a limit on purpose are in `caps`.
 
+mod author;
 mod caps;
+mod marks;
+mod pages;
+mod sign;
+mod sign_seeds;
+mod signatures;
 
+pub use author::*;
 pub use caps::*;
+pub use marks::*;
+pub use pages::*;
+pub use sign::*;
+pub use sign_seeds::write_sign_seeds;
+pub use signatures::*;
 
 use std::io::{self, Read};
 
@@ -20,7 +32,7 @@ use partridge_protocol::{
     MAX_FORM_OPTIONS, MAX_FORM_OPTION_LABEL, MAX_FORM_TOOLTIP, MAX_FORM_VALUE, MAX_INK_POINTS,
     MAX_INK_STROKES, MAX_INK_WIDTH, MAX_LINKS_PER_PAGE, MAX_MARKUP_CHARS, MAX_MATCHES_PER_PAGE,
     MAX_OUTLINE_DEPTH, MAX_OUTLINE_ITEMS, MAX_OUTLINE_TITLE, MAX_QUERY_LEN, MAX_SAVE_BYTES,
-    MAX_SAVE_CHUNK, MAX_STRING_LEN, MAX_URI_LEN, MIN_INK_WIDTH,
+    MAX_SAVE_CHUNK, MAX_SIGNATURES, MAX_STRING_LEN, MAX_UNIX_TIME, MAX_URI_LEN, MIN_INK_WIDTH,
 };
 /// True about one time in `n`, and never when the input has run out: `Unstructured` answers
 /// `true` to every `ratio` once its bytes are used up, which would make the biggest case the
@@ -130,7 +142,7 @@ fn arb_strokes(u: &mut Unstructured) -> Result<Vec<Vec<[f32; 2]>>> {
 /// A request that the encoder writes without cutting anything.
 pub fn arb_request(u: &mut Unstructured) -> Result<Request> {
     let id: u32 = u.arbitrary()?;
-    let body = match u.int_in_range(0..=24u8)? {
+    let body = match u.int_in_range(0..=30u8)? {
         0 => RequestBody::Hello {
             protocol_version: u.arbitrary()?,
         },
@@ -271,13 +283,47 @@ pub fn arb_request(u: &mut Unstructured) -> Result<Request> {
             doc: u.arbitrary()?,
             page: u.arbitrary()?,
         },
-        _ => RequestBody::SetFormField {
+        24 => RequestBody::SetFormField {
             doc: u.arbitrary()?,
             page: u.arbitrary()?,
             index: u.arbitrary()?,
             name: string_up_to(u, MAX_FORM_NAME)?,
             value: arb_form_value(u)?,
         },
+        25 => RequestBody::Signatures {
+            doc: u.arbitrary()?,
+            now: if chance(u, 8)? {
+                MAX_UNIX_TIME
+            } else {
+                u.int_in_range(0..=MAX_UNIX_TIME)?
+            },
+        },
+        26 => RequestBody::Pages(arb_pages_request(u)?),
+        27 => RequestBody::AddSignature {
+            doc: u.arbitrary()?,
+            page: u.arbitrary()?,
+            rect: [
+                coordinate(u)?,
+                coordinate(u)?,
+                coordinate(u)?,
+                coordinate(u)?,
+            ],
+            color: u.arbitrary()?,
+            mark: arb_mark(u)?,
+        },
+        28 => RequestBody::PlaceSignature {
+            doc: u.arbitrary()?,
+            page: u.arbitrary()?,
+            id: u.arbitrary()?,
+            rect: [
+                coordinate(u)?,
+                coordinate(u)?,
+                coordinate(u)?,
+                coordinate(u)?,
+            ],
+        },
+        29 => RequestBody::Sign(arb_sign_request(u)?),
+        _ => RequestBody::Author(arb_author_request(u)?),
     };
     Ok(Request { id, body })
 }
@@ -322,7 +368,7 @@ fn arb_annot(u: &mut Unstructured) -> Result<(AnnotInfo, AnnotInfo)> {
 
 pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
     let id: u32 = u.arbitrary()?;
-    let (sent, expected) = match u.int_in_range(0..=20u8)? {
+    let (sent, expected) = match u.int_in_range(0..=24u8)? {
         0 => {
             let b = ResponseBody::Hello {
                 protocol_version: u.arbitrary()?,
@@ -450,9 +496,11 @@ pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
             (b.clone(), b)
         }
         8 => {
-            let n = u.int_in_range(1..=22u8)?;
-            // The codes are 1 to 20, then 24 and 25.
-            let code = ErrorCode::from_u8(if n > 20 { n + 3 } else { n }).expect("a known code");
+            // Every code the protocol knows (the reader and the save, the annotations and the
+            // forms, the page tools, the form designer and signing), found by asking the protocol
+            // rather than from a list kept here, so a code added later is generated too.
+            let known: Vec<ErrorCode> = (0..=u8::MAX).filter_map(ErrorCode::from_u8).collect();
+            let code = *u.choose(&known)?;
             let b = ResponseBody::Error {
                 code,
                 message: string_up_to(u, MAX_STRING_LEN)?,
@@ -524,7 +572,10 @@ pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
         }
         16 => {
             let (s, e) = arb_annot(u)?;
-            (ResponseBody::Annot { item: s }, ResponseBody::Annot { item: e })
+            (
+                ResponseBody::Annot { item: s },
+                ResponseBody::Annot { item: e },
+            )
         }
         17 => (ResponseBody::AnnotRemoved, ResponseBody::AnnotRemoved),
         18 => {
@@ -549,7 +600,7 @@ pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
             };
             (b.clone(), b)
         }
-        _ => {
+        20 => {
             // The fields of a page. A long list gets short strings, so that the whole answer is
             // under the limit the encoder keeps to (it leaves out what does not fit).
             let count = count_up_to(u, MAX_FORM_FIELDS_PER_PAGE)?;
@@ -565,6 +616,25 @@ pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
                 ResponseBody::FormFields { fields: sent },
                 ResponseBody::FormFields { fields: expected },
             )
+        }
+        21 => {
+            let count = count_up_to(u, MAX_SIGNATURES)?;
+            let b = ResponseBody::Signatures {
+                report: arb_signature_report(u, count)?,
+            };
+            (b.clone(), b)
+        }
+        22 => {
+            let b = ResponseBody::Pages(arb_pages_response(u)?);
+            (b.clone(), b)
+        }
+        23 => {
+            let b = ResponseBody::Sign(arb_sign_response(u)?);
+            (b.clone(), b)
+        }
+        _ => {
+            let b = ResponseBody::Author(arb_author_response(u)?);
+            (b.clone(), b)
         }
     };
     Ok(GeneratedResponse {
@@ -675,7 +745,11 @@ fn arb_form_field(u: &mut Unstructured, index: u32, heavy: bool) -> Result<(Form
         Vec::new()
     };
     let rect = any_rect(u)?;
-    let font_size: f32 = if chance(u, 8)? { f32::NAN } else { finite(u)?.abs() };
+    let font_size: f32 = if chance(u, 8)? {
+        f32::NAN
+    } else {
+        finite(u)?.abs()
+    };
     let field = FormField {
         index,
         kind,
@@ -691,6 +765,10 @@ fn arb_form_field(u: &mut Unstructured, index: u32, heavy: bool) -> Result<(Form
     };
     let mut expected = field.clone();
     expected.rect = sanitized(rect);
-    expected.font_size = if font_size.is_finite() { font_size } else { 0.0 };
+    expected.font_size = if font_size.is_finite() {
+        font_size
+    } else {
+        0.0
+    };
     Ok((field, expected))
 }

@@ -26,7 +26,12 @@ export function toAppError(error: unknown): AppErrorLike {
 
 /** Errors that mean the engine process was lost and the open document with it. */
 export function isEngineLost(error: AppErrorLike): boolean {
-  return error.code === "engine_stopped" || error.code === "unknown_document" || error.code === "save_took_too_long";
+  return (
+    error.code === "engine_stopped" ||
+    error.code === "unknown_document" ||
+    error.code === "save_took_too_long" ||
+    error.code === "change_took_too_long"
+  );
 }
 
 export function describeError(error: AppErrorLike, fileName?: string): Described {
@@ -74,6 +79,12 @@ export function describeError(error: AppErrorLike, fileName?: string): Described
         detail: `The PDF engine was still working on ${fileName ? file : "this file"} when the time allowed for a file of that size ran out, so it was stopped. The file on the disk was not changed, but the changes made since it was opened are lost. A very slow drive or network connection can cause this. Open the file again, and save a copy to a local disk if it happens again.`,
         action: "retry",
       };
+    case "change_took_too_long":
+      return {
+        title: "The change took too long",
+        detail: `The PDF engine was still working on a change to the pages of ${fileName ? file : "this file"} when the time allowed for it ran out, or it said nothing for too long, so it was stopped. The file on the disk was not changed, but the changes made since it was opened are lost. Open the file again; changing fewer pages at a time can be quicker.`,
+        action: "retry",
+      };
     case "unknown_document":
       return {
         title: "The PDF engine was restarted",
@@ -89,7 +100,7 @@ export function describeError(error: AppErrorLike, fileName?: string): Described
     case "sandbox_unavailable":
       return {
         title: "The file was not opened",
-        detail: `Patient Partridge could not lock its PDF reader into the protective sandbox of this system, so it did not open ${fileName ? file : "this file"}. No part of the file was read.${error.message ? ` (${error.message})` : ""}`,
+        detail: `Patient Partridge could not lock its PDF reader into the protective sandbox of this system, so it did not open ${fileName ? file : "this file"}. No part of the file was read. Close Patient Partridge and start it again. If this keeps happening, reinstall it, and make sure no security program is changing how it starts.${error.message ? ` (${error.message})` : ""}`,
         action: "none",
       };
     case "save_read_only":
@@ -177,6 +188,13 @@ export function describeError(error: AppErrorLike, fileName?: string): Described
         action: "none",
       };
     case "save_failed":
+      if (/XMP metadata/i.test(error.message)) {
+        return {
+          title: "The document details are too big to be saved safely",
+          detail: `${file} has a block of document details (XMP metadata), stored compressed or in another encoded form, that is far bigger than usual. Patient Partridge will not write it out, because it could not be sure to write it correctly, and saving a copy does not help either. Nothing was saved, and the file on the disk was not changed. Your changes are still in the open document.`,
+          action: "none",
+        };
+      }
       return {
         title: "The document could not be written",
         detail: `The PDF engine could not write ${file} out. Nothing was saved, and the file on the disk was not changed. Your changes are still in the open document.`,
@@ -188,7 +206,41 @@ export function describeError(error: AppErrorLike, fileName?: string): Described
         detail: `${file} is protected, and it holds a block of document details (XMP metadata) that Patient Partridge cannot yet save in protected form. It will not save it without protection, and saving a copy does not help either. Nothing was saved, and the file on the disk was not changed. Your changes are still in the open document.`,
         action: "none",
       };
+    case "save_same_file":
+      return {
+        title: "Choose another name",
+        detail: `${file} is signed, and a copy with its own name would replace it and break the signature. Give the copy a name of its own.`,
+        action: "none",
+      };
+    case "save_target_open":
+      return {
+        title: "That file is open",
+        detail:
+          "The name you chose is a file that is open in another tab, and the new file would replace it. Close that tab, or choose another name. Nothing was written.",
+        action: "none",
+      };
+    case "save_target_signed":
+      return {
+        title: "Choose another name",
+        detail:
+          "The name you chose is a file with a digital signature, and the new file would replace it. Give the new file a name of its own. Nothing was written.",
+        action: "none",
+      };
+    case "save_target_unreadable":
+      return {
+        title: "That file cannot be read",
+        detail:
+          "The file with the name you chose could not be read, so it is not replaced. Choose another name. Nothing was written.",
+        action: "none",
+      };
     case "save_too_large":
+      if (/not enough memory/i.test(error.message)) {
+        return {
+          title: "Not enough memory to finish saving",
+          detail: `There was not enough memory to finish saving ${file}. Nothing was saved, and the file on the disk was not changed. Closing other documents or programs may help.`,
+          action: "none",
+        };
+      }
       return {
         title: "The document is too big to save",
         detail: `${file} would be larger than 512 MiB, which is more than Patient Partridge saves. Nothing was saved, and the file on the disk was not changed.`,
@@ -208,6 +260,14 @@ export function describeError(error: AppErrorLike, fileName?: string): Described
         action: "none",
       };
     case "annotation_refused":
+      // The one refusal that the engine words for the reader: a page that cannot take more.
+      if (error.message.startsWith("This page already has as many annotations")) {
+        return {
+          title: "No more annotations fit on this page",
+          detail: `${error.message} Nothing was added.`,
+          action: "none",
+        };
+      }
       return {
         title: "The annotation was not changed",
         detail: "Patient Partridge could not make this change to the annotation. Nothing was lost.",

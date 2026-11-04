@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# Guards two promises of the design:
+# Guards the promises of the design:
 #   1. The PDF engine has no network code: no networking crate in its dependency tree and no
 #      socket use in its own source.
 #   2. The app process never links the PDFium bindings: PDF parsing stays in the engine process.
+#   3. The signer (the program that holds a certificate key) has no network code and no PDF code,
+#      and the programs that do have PDF code or a window never link the code that opens a
+#      certificate file: the key is in one process only.
 # Checks the dependency tree of the Linux, Windows and macOS targets, not only this one.
 # Run from the repository root: scripts/check-engine-deps.sh
 set -euo pipefail
@@ -50,8 +53,50 @@ if echo "$app_crates" | grep -qx 'partridge-engine'; then
   fail=1
 fi
 
+# Signatures are read and checked in the engine, in the sandbox. The crates that parse the signature
+# data (CMS) and the certificates must not be in the app process: it never parses hostile data of
+# this kind. (The crypto library `ring` is not on this list: the app links it through its update
+# check, and it parses nothing from a PDF.)
+for crate in cms x509-cert; do
+  if echo "$app_crates" | grep -qx "$crate"; then
+    echo "The app process links $crate. Signature data must be parsed in the engine only." >&2
+    fail=1
+  fi
+done
+
+# The signer: no network, no PDF code, no window.
+signer_crates=$(tree_of partridge-signer)
+bad=$(echo "$signer_crates" | grep -E "$forbidden" || true)
+if [ -n "$bad" ]; then
+  echo "The signer depends on crates it must not use:" >&2
+  echo "$bad" >&2
+  fail=1
+fi
+for crate in pdfium-render partridge-engine partridge-engine-client; do
+  if echo "$signer_crates" | grep -qx "$crate"; then
+    echo "The signer links $crate. It must not have PDF code." >&2
+    fail=1
+  fi
+done
+if grep -rnE 'std::net|os::unix::net|TcpStream|TcpListener|UdpSocket|UnixStream|UnixListener|ToSocketAddrs|WSAStartup|fn socket|fn connect|Command::new|std::fs::|File::open' crates/signer/src crates/signer-protocol/src; then
+  echo "The signer source uses sockets, files or other programs." >&2
+  fail=1
+fi
+# The key, and the code that opens a certificate file, are in the signer and nowhere else.
+for crate in p12-keystore x509-parser partridge-signer; do
+  if echo "$app_crates" | grep -qx "$crate"; then
+    echo "The app process links $crate. A certificate file must be opened in the signer only." >&2
+    fail=1
+  fi
+  if echo "$engine_crates" | grep -qx "$crate"; then
+    echo "The engine links $crate. The engine must never have a key or a certificate file." >&2
+    fail=1
+  fi
+done
+
 if [ "$fail" -ne 0 ]; then
   exit 1
 fi
-echo "ok: the engine has no network code and the app does not link PDFium."
+echo "ok: the engine and the signer have no network code, the app does not link PDFium, and only the signer opens certificate files."
+echo "signer dependencies: $(echo "$signer_crates" | tr '\n' ' ')"
 echo "engine dependencies: $(echo "$engine_crates" | tr '\n' ' ')"

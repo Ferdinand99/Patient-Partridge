@@ -11,13 +11,17 @@
 //!   engines, and the changes with them);
 //! - a reload of the page forgets everything: the documents are gone, and so are their changes.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 #[derive(Default)]
 pub struct Unsaved {
     docs: Mutex<HashSet<u64>>,
+    /// Documents that a page tool is changing at this moment, and how many changes are under way.
+    /// What the tool changes counts as unsaved from the moment it starts: a quit, a close or an
+    /// update that looked at the documents in between would find a clean one and lose the change.
+    changing: Mutex<HashMap<u64, usize>>,
     /// Set when the user has answered the question and quitting may go on.
     exit_allowed: AtomicBool,
 }
@@ -25,6 +29,26 @@ pub struct Unsaved {
 impl Unsaved {
     fn docs(&self) -> std::sync::MutexGuard<'_, HashSet<u64>> {
         self.docs.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn changing(&self) -> std::sync::MutexGuard<'_, HashMap<u64, usize>> {
+        self.changing.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A page tool starts to change a document.
+    pub fn begin_change(&self, doc: u64) {
+        *self.changing().entry(doc).or_insert(0) += 1;
+    }
+
+    /// A page tool is done with a document, whether it changed it or not.
+    pub fn end_change(&self, doc: u64) {
+        let mut changing = self.changing();
+        if let Some(n) = changing.get_mut(&doc) {
+            *n -= 1;
+            if *n == 0 {
+                changing.remove(&doc);
+            }
+        }
     }
 
     /// The window says whether a document has unsaved changes.
@@ -35,6 +59,11 @@ impl Unsaved {
         } else {
             docs.remove(&doc);
         }
+    }
+
+    /// True when the document has changes that are not saved, or is being changed now.
+    pub fn is_dirty(&self, doc: u64) -> bool {
+        self.docs().contains(&doc) || self.changing().contains_key(&doc)
     }
 
     /// A document was closed.
@@ -48,9 +77,10 @@ impl Unsaved {
         self.exit_allowed.store(false, Ordering::SeqCst);
     }
 
-    /// How many documents have unsaved changes.
+    /// How many documents have unsaved changes, or are being changed.
     pub fn count(&self) -> usize {
-        self.docs().len()
+        let docs = self.docs();
+        docs.len() + self.changing().keys().filter(|d| !docs.contains(d)).count()
     }
 
     pub fn any(&self) -> bool {
@@ -98,6 +128,28 @@ mod tests {
         assert!(!unsaved.holds_exit(), "the user said to quit");
         unsaved.disallow_exit();
         assert!(unsaved.holds_exit());
+    }
+
+    #[test]
+    fn a_document_that_is_being_changed_counts_as_unsaved_until_the_change_is_done() {
+        let unsaved = Unsaved::default();
+        unsaved.begin_change(1);
+        assert!(unsaved.any() && unsaved.holds_exit());
+        assert_eq!(unsaved.count(), 1);
+        // Two changes at once on a document are one document.
+        unsaved.begin_change(1);
+        unsaved.set(1, true);
+        assert_eq!(unsaved.count(), 1);
+        unsaved.end_change(1);
+        assert!(unsaved.any());
+        unsaved.set(1, false);
+        assert!(unsaved.any(), "the second change is still under way");
+        unsaved.end_change(1);
+        assert!(!unsaved.any() && !unsaved.holds_exit());
+        // A change that is ended twice, or that never began, does no harm.
+        unsaved.end_change(1);
+        unsaved.end_change(9);
+        assert!(!unsaved.any());
     }
 
     #[test]

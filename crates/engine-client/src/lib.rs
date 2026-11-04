@@ -24,32 +24,51 @@ use std::fmt;
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use partridge_protocol::{
-    read_frame_limited, write_request, ErrorCode, PageSize, Request, RequestBody, Response,
-    ResponseBody, ANNOT_INFO_MIN, MAX_ANNOTS_PER_PAGE, MAX_ANNOT_AUTHOR, MAX_ANNOT_TEXT,
-    MAX_COORDINATE, MAX_FORM_ANSWER_BYTES, MAX_FORM_NAME, MAX_FORM_OPTIONS, MAX_FORM_VALUE,
-    MAX_INK_POINTS, MAX_INK_STROKES, MAX_INK_WIDTH, MAX_MARKUP_CHARS, MAX_QUERY_LEN,
-    MAX_SAVE_BYTES, MAX_SAVE_CHUNK, MAX_STRING_LEN, MIN_INK_WIDTH, PROTOCOL_VERSION,
-    SAVE_DATA_HEADER_LEN,
+    read_frame_limited, write_request, AuthorRequest, ErrorCode, PageSize, Request, RequestBody,
+    Response, ResponseBody, ANNOT_INFO_MIN, MAX_ANNOTS_PER_PAGE, MAX_ANNOT_AUTHOR, MAX_ANNOT_TEXT,
+    MAX_AUTHOR_ANSWER_BYTES, MAX_COORDINATE, MAX_FORM_ANSWER_BYTES, MAX_FORM_NAME,
+    MAX_FORM_OPTIONS, MAX_FORM_VALUE, MAX_INK_POINTS, MAX_INK_STROKES, MAX_INK_WIDTH,
+    MAX_MARKUP_CHARS, MAX_QUERY_LEN, MAX_SAVE_BYTES, MAX_SAVE_CHUNK, MAX_SIGNATURE_REPORT,
+    MAX_STRING_LEN, MIN_INK_WIDTH, PROTOCOL_VERSION, SAVE_DATA_HEADER_LEN,
 };
 
+#[cfg(all(windows, debug_assertions))]
+pub use spawn::allow_stand_in_to_use;
 pub use spawn::{spawn_engine, EngineProcess, SandboxPolicy, SpawnRequest, SpawnedEngine};
 
 pub use partridge_protocol::{
-    ability, field_flag, AnnotInfo, AnnotKind, FontScript, FormField, FormFieldKind, FormKind,
-    FormOption, FormValue, LinkTarget, OutlineItem, PageLink, StampKind, TextMatch,
+    ability, field_flag, AnnotInfo, AnnotKind, CertificateTime, FontScript, FormField,
+    FormFieldKind, FormKind, FormOption, FormValue, LinkTarget, OutlineItem, PageLink, SignField,
+    SignPlace, SignatureFont, SignatureInfo, SignatureMark, SignatureReason, SignatureReport,
+    SignatureState, StampKind, TextMatch,
 };
 
+mod author;
+mod pages;
+pub use pages::{ExportError, Exported, PagesChanged, PagesCropped};
 mod pool;
-pub use pool::EnginePool;
+pub use pool::{Cancelled, EnginePool, ExtractOptions, InsertOptions, InsertOutcome, PageProgress};
 mod save;
-pub use save::{verify_written, DocInfo, Fingerprint, SaveError, SaveOptions, SaveOutcome};
+pub use save::{
+    file_holds_signature, scan_for_signature, verify_written, DocInfo, FileScan, Fingerprint,
+    SaveError, SaveOptions, SaveOutcome,
+};
+mod sign;
+pub use sign::{verify_signed, SignOptions, SignOutcome};
+mod signer;
+pub use signer::{SignerConfig, SignerSession};
+/// The biggest certificate file the signer takes, in bytes.
+pub const MAX_CERTIFICATE_FILE: usize = partridge_signer_protocol::MAX_P12_BYTES;
+pub use partridge_signer_protocol::{
+    usage as certificate_usage, Certificate, HashKind as SignerHash, KeyKind as CertificateKey,
+};
 mod spawn;
 pub mod system_fonts;
 
@@ -65,13 +84,28 @@ const RENDERED_HEADER: usize = 17;
 /// for a save the second writing (the bytes are read in again and written once more) and the
 /// check of both.
 const SAVE_PASSES: u64 = 6;
+/// How many times the engine may have to read the whole document to check its signatures: the
+/// check of the file before and after, the scan for signature marks, and one pass for each of the
+/// 64 signatures it describes (the engine hashes at most 2 GiB in all).
+const SIGNATURE_PASSES: u64 = 70;
 
 /// What the error of an engine that was stopped for taking too long starts with. The app turns it
 /// into its own error code, so that the window can say what happened.
 pub const TOOK_TOO_LONG: &str = "it was still working when the overall time limit ended";
 
+/// What the error of an engine that was stopped in the middle of a change to the pages starts
+/// with, because it went on for too long or said nothing for too long. The app turns it into its
+/// own error code, so that the window says that the change took too long and not that the file
+/// may be damaged.
+pub const CHANGE_TOOK_TOO_LONG: &str = "a change to the pages took too long";
+
+/// Largest answer to a page tool: 100 000 page sizes of 8 bytes, or 10 000 pairs of boxes.
+const PAGES_ANSWER_LIMIT: usize = 2 * 1024 * 1024;
+
 /// Largest outline answer: 5 000 entries of at most 512 bytes of title and 9 bytes of framing.
 const MAX_OUTLINE_ANSWER: usize = 3 * 1024 * 1024;
+/// Largest answer about signing: the list of signature fields (256 of them, 300 bytes each).
+const SIGN_ANSWER_LIMIT: usize = 80 * 1024;
 /// Largest page text answer: 100 000 characters of at most 4 bytes and 16 bytes of box each.
 const MAX_TEXT_ANSWER: usize = 2_200_000;
 /// Largest links answer: 500 links with an address of at most 2 048 bytes.
@@ -107,6 +141,14 @@ pub struct EngineConfig {
     /// The slowest speed, in bytes a second, at which a long request still has to get through the
     /// document (see `save_floor`). A slow drive or a share is allowed to be this slow.
     pub save_slowest: u64,
+    /// The overall limit of a change to the pages, longer than `save_floor`: a change to a long
+    /// document of pages with a lot on them can take many minutes and still be healthy, and it tells
+    /// that it is working (the engine reports progress after each page it has done, and at most four
+    /// times a second), so it is only ended by `save_stall` when it says nothing, and by this when
+    /// it goes on and on. There is no way to stop such a change short of ending the engine, and the
+    /// window holds the document for as long as it lasts, so the limit is 20 minutes and no more.
+    /// `save_slowest` adds to it as for a save.
+    pub pages_floor: Duration,
     /// Most memory the engine may use, in bytes. `None` leaves the engine's own limit (3 GiB).
     pub memory_limit: Option<u64>,
     /// Whether an engine without a working sandbox is refused. Release builds always insist.
@@ -128,6 +170,7 @@ impl EngineConfig {
             save_stall: Duration::from_secs(300),
             save_floor: Duration::from_secs(600),
             save_slowest: 1024 * 1024,
+            pages_floor: Duration::from_secs(20 * 60),
             memory_limit: None,
             sandbox: SandboxPolicy::default_for_build(),
             system_fonts: true,
@@ -145,6 +188,9 @@ pub enum ClientError {
     Engine { code: ErrorCode, message: String },
     /// A save did not happen, and the file it was meant for is as it was.
     Save(SaveError),
+    /// The signer (the process that holds a certificate and its key) refused, failed or stopped.
+    /// The code is stable, for the window; the message is for a log.
+    Signer { code: &'static str, message: String },
 }
 
 impl fmt::Display for ClientError {
@@ -153,6 +199,7 @@ impl fmt::Display for ClientError {
             ClientError::EngineStopped(why) => write!(f, "the PDF engine stopped: {why}"),
             ClientError::Engine { message, .. } => write!(f, "{message}"),
             ClientError::Save(why) => write!(f, "{why}"),
+            ClientError::Signer { message, .. } => write!(f, "{message}"),
         }
     }
 }
@@ -198,6 +245,19 @@ enum Event {
     Failed(String),
     /// The engine closed its output: it exited.
     Closed,
+}
+
+/// The file the engine prepared for a signature: every byte except the signature itself, with the
+/// byte range already written. The hole is where the signature goes: `<`, zeros, `>`.
+#[derive(Debug)]
+pub struct SignPrepared {
+    pub bytes: Vec<u8>,
+    /// The place of the `<` that opens the hole.
+    pub hole_start: usize,
+    /// The place just after the `>` that closes it.
+    pub hole_end: usize,
+    /// The name of the field the signature is in.
+    pub field: String,
 }
 
 /// Why [`EngineClient::save_to`] stopped.
@@ -246,6 +306,9 @@ pub struct EngineClient {
     /// The running child, reachable without the request lock, so the engine can be killed while a
     /// request is waiting for it (when the app quits, or the user gives up).
     killer: Mutex<Option<SharedProcess>>,
+    /// How many times a start was tried again (see `start`). A start that works the first time does
+    /// not count.
+    start_retries: AtomicU64,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -261,12 +324,28 @@ impl EngineClient {
             config,
             inner: Mutex::new(Inner::default()),
             killer: Mutex::new(None),
+            start_retries: AtomicU64::new(0),
         }
+    }
+
+    /// How many starts of this client failed the first time and were tried again. The tests that
+    /// start the engine many times require zero: the new attempt hides a start that fails now and
+    /// then, which these tests exist to find.
+    pub fn start_retries(&self) -> u64 {
+        self.start_retries.load(Ordering::Relaxed)
     }
 
     /// How many engine processes this client has started. A jump tells that the engine was replaced.
     pub fn spawn_count(&self) -> u64 {
         lock(&self.inner).spawns
+    }
+
+    /// What the running engine said about its sandbox in the greeting, if there is an engine.
+    pub fn sandbox_report(&self) -> Option<String> {
+        lock(&self.inner)
+            .running
+            .as_ref()
+            .map(|r| r.info.sandbox.clone())
     }
 
     /// Process id of the running engine, if there is one. Used by the measurement tools.
@@ -584,6 +663,26 @@ impl EngineClient {
         )
     }
 
+    /// The digital signatures of the file the document was opened from, described and checked by
+    /// the engine at the time `now` (seconds since 1970; certificates are judged against it).
+    ///
+    /// The engine is treated as hostile here too: an answer that cannot be right is not passed on
+    /// and stops the engine. In particular no signature may be called trusted when there is no
+    /// trust list, none may be called trusted without naming the certificate it leads to, and the
+    /// signatures must come in the order of their numbers.
+    pub fn signatures(&self, doc: u64, now: i64) -> Result<SignatureReport, ClientError> {
+        let now = now.clamp(0, partridge_protocol::MAX_UNIX_TIME);
+        self.call(
+            doc,
+            "signatures",
+            |doc| RequestBody::Signatures { doc, now },
+            |body| match body {
+                ResponseBody::Signatures { report } if report_is_sound(&report) => Ok(report),
+                other => Err(other),
+            },
+        )
+    }
+
     /// The annotations of one page that the reader can show and change.
     pub fn list_annots(&self, doc: u64, page: u32) -> Result<Vec<AnnotInfo>, ClientError> {
         self.call(
@@ -733,6 +832,59 @@ impl EngineClient {
         )
     }
 
+    /// The picture of a signature, fitted into `rect` (`[left, top, right, bottom]` in points on
+    /// the page as it is drawn). The picture is held to the limits of the protocol here, because
+    /// the protocol would leave out what is over them without saying so.
+    pub fn add_signature(
+        &self,
+        doc: u64,
+        page: u32,
+        rect: [f32; 4],
+        color: [u8; 4],
+        mark: SignatureMark,
+    ) -> Result<AnnotInfo, ClientError> {
+        check_place(rect[0], rect[1])?;
+        check_place(rect[2], rect[3])?;
+        if !mark.within_caps() {
+            return Err(refused_request("that picture is outside the limits"));
+        }
+        self.annot_call(
+            doc,
+            "signature picture",
+            |doc| RequestBody::AddSignature {
+                doc,
+                page,
+                rect,
+                color,
+                mark,
+            },
+            |item| item.kind == AnnotKind::Signature,
+        )
+    }
+
+    /// Moves and resizes a signature picture: it takes the top left corner and the width of `rect`.
+    pub fn place_signature(
+        &self,
+        doc: u64,
+        page: u32,
+        id: u32,
+        rect: [f32; 4],
+    ) -> Result<AnnotInfo, ClientError> {
+        check_place(rect[0], rect[1])?;
+        check_place(rect[2], rect[3])?;
+        self.annot_call(
+            doc,
+            "signature picture change",
+            |doc| RequestBody::PlaceSignature {
+                doc,
+                page,
+                id,
+                rect,
+            },
+            |item| item.id == id && item.kind == AnnotKind::Signature,
+        )
+    }
+
     /// Changes the text, the colour or the place of an annotation.
     #[allow(clippy::too_many_arguments)]
     pub fn update_annot(
@@ -850,6 +1002,121 @@ impl EngineClient {
         result.map(|()| u64::from(size))
     }
 
+    /// The signature fields the pages of the document have, by name and place.
+    pub fn sign_fields(&self, doc: u64) -> Result<Vec<SignField>, ClientError> {
+        self.call(
+            doc,
+            "signature fields",
+            |doc| RequestBody::Sign(partridge_protocol::SignRequest::Fields { doc }),
+            |body| match body {
+                ResponseBody::Sign(partridge_protocol::SignResponse::Fields { fields }) => {
+                    Ok(fields)
+                }
+                other => Err(other),
+            },
+        )
+    }
+
+    /// As `fingerprint`, without counting a signature field among the annotations of a page: the
+    /// document before it was signed and the file after it have the same description.
+    pub fn sign_fingerprint(&self, doc: u64) -> Result<Fingerprint, ClientError> {
+        self.call(
+            doc,
+            "fingerprint",
+            |doc| RequestBody::Sign(partridge_protocol::SignRequest::Fingerprint { doc }),
+            |body| match body {
+                ResponseBody::Fingerprint {
+                    pages,
+                    failed,
+                    digest,
+                } => Ok(Fingerprint {
+                    pages,
+                    failed,
+                    digest,
+                }),
+                other => Err(other),
+            },
+        )
+    }
+
+    /// Has the engine write the document out with the empty signature added, and collects the
+    /// bytes. The engine is treated as hostile here too: the size it announces is held to
+    /// [`MAX_SAVE_BYTES`], every piece must be at the offset asked for and exactly as long as
+    /// asked, and the hole must be inside the file (the decoder of the answer sees to that) and hold
+    /// nothing but zeros.
+    pub fn sign_prepare(
+        &self,
+        doc: u64,
+        mut spec: partridge_protocol::SignSpec,
+    ) -> Result<SignPrepared, ClientError> {
+        let mut inner = lock(&self.inner);
+        let Some(engine_doc) = Self::engine_doc(&inner, doc) else {
+            return Err(stale_document());
+        };
+        spec.doc = engine_doc;
+        let (size, hole_start, hole_end, field) = match self.run(
+            &mut inner,
+            RequestBody::Sign(partridge_protocol::SignRequest::Begin(spec)),
+        )? {
+            ResponseBody::Sign(partridge_protocol::SignResponse::Ready {
+                size,
+                hole_start,
+                hole_end,
+                field,
+            }) if size as usize <= MAX_SAVE_BYTES => (size, hole_start, hole_end, field),
+            _ => return self.unexpected(&mut inner, "signing"),
+        };
+        let mut bytes: Vec<u8> = Vec::new();
+        if bytes.try_reserve_exact(size as usize).is_err() {
+            if inner.running.is_some() {
+                let _ = self.run(&mut inner, RequestBody::SaveEnd { doc: engine_doc });
+            }
+            return Err(ClientError::Engine {
+                code: ErrorCode::SaveTooLarge,
+                message: "there is not enough memory to sign this document".into(),
+            });
+        }
+        let mut done: u32 = 0;
+        let result = loop {
+            if done == size {
+                break Ok(());
+            }
+            let len = (size - done).min(MAX_SAVE_CHUNK as u32);
+            let body = RequestBody::SaveChunk {
+                doc: engine_doc,
+                offset: done,
+                len,
+            };
+            match self.run(&mut inner, body) {
+                Ok(ResponseBody::SaveData { offset, data })
+                    if offset == done && data.len() == len as usize =>
+                {
+                    bytes.extend_from_slice(&data);
+                    done += len;
+                }
+                Ok(_) => break Err(self.unexpected::<()>(&mut inner, "signing").unwrap_err()),
+                Err(e) => break Err(e),
+            }
+        };
+        if inner.running.is_some() {
+            let _ = self.run(&mut inner, RequestBody::SaveEnd { doc: engine_doc });
+        }
+        result?;
+        let (start, end) = (hole_start as usize, hole_end as usize);
+        let sound = bytes.get(start) == Some(&b'<')
+            && bytes.get(end - 1) == Some(&b'>')
+            && bytes[start + 1..end - 1].iter().all(|b| *b == b'0');
+        if !sound {
+            return self.unexpected(&mut inner, "signing");
+        }
+        Ok(SignPrepared {
+            bytes,
+            hole_start: start,
+            hole_end: end,
+            field,
+        })
+    }
+
     /// Stops the engine process now. The documents it held are gone; opening a file starts a new
     /// engine. This works while another
     /// thread is waiting for an answer: that request then fails with `EngineStopped`.
@@ -903,6 +1170,9 @@ impl EngineClient {
             RequestBody::Outline { .. } => MAX_OUTLINE_ANSWER,
             RequestBody::PageText { .. } => MAX_TEXT_ANSWER,
             RequestBody::PageLinks { .. } => MAX_LINKS_ANSWER,
+            RequestBody::Signatures { .. } => MAX_SIGNATURE_REPORT.max(IDLE_LIMIT),
+            // At most 256 fields with a name of at most 256 bytes and a page and a box each.
+            RequestBody::Sign(_) => SIGN_ANSWER_LIMIT,
             RequestBody::ListFormFields { .. } | RequestBody::SetFormField { .. } => {
                 MAX_FORMS_ANSWER
             }
@@ -910,6 +1180,12 @@ impl EngineClient {
             RequestBody::SaveChunk { len, .. } => {
                 (SAVE_DATA_HEADER_LEN + (*len as usize).min(MAX_SAVE_CHUNK)).max(IDLE_LIMIT)
             }
+            // The size of every page, for up to MAX_PAGES pages, and a list of boxes.
+            RequestBody::Pages(_) | RequestBody::Author(AuthorRequest::Apply { .. }) => {
+                PAGES_ANSWER_LIMIT
+            }
+            // The names of the fields, or the widgets of a page.
+            RequestBody::Author(_) => MAX_AUTHOR_ANSWER_BYTES + 64,
             // A search answer holds at most 2 000 matches of 8 bytes: it fits the idle limit.
             _ => IDLE_LIMIT,
         }
@@ -923,7 +1199,10 @@ impl EngineClient {
         // Anything waiting now was not asked for in this request.
         match running.events.try_recv() {
             Err(TryRecvError::Empty) => {}
-            Ok(Event::Closed) | Err(TryRecvError::Disconnected) => return Err("it exited".into()),
+            // With the exit code: a start that ends before the greeting is told from the code.
+            Ok(Event::Closed) | Err(TryRecvError::Disconnected) => {
+                return Err(exit_text(&running.child))
+            }
             Ok(Event::Failed(why)) => return Err(why),
             Ok(Event::Response(_)) => return Err("it sent an answer nobody asked for".into()),
         }
@@ -936,7 +1215,11 @@ impl EngineClient {
             RequestBody::DocInfo { .. }
             | RequestBody::FormInfo { .. }
             | RequestBody::Fingerprint { .. }
-            | RequestBody::SaveBegin { .. } => self.config.save_stall,
+            | RequestBody::Signatures { .. }
+            | RequestBody::SaveBegin { .. }
+            | RequestBody::Sign(_)
+            | RequestBody::Pages(_)
+            | RequestBody::Author(_) => self.config.save_stall,
             _ => self.config.timeout,
         };
         let result = self.wait_for_answer(running, id, body, patience);
@@ -952,6 +1235,15 @@ impl EngineClient {
         body: RequestBody,
         patience: Duration,
     ) -> Result<ResponseBody, String> {
+        let passes = if matches!(body, RequestBody::Signatures { .. }) {
+            SIGNATURE_PASSES
+        } else {
+            SAVE_PASSES
+        };
+        let is_change = matches!(
+            body,
+            RequestBody::Pages(_) | RequestBody::Author(AuthorRequest::Apply { .. })
+        );
         write_request(&mut running.stdin, &Request { id, body }).map_err(|e| {
             format!(
                 "the request could not be sent ({e}); {}",
@@ -966,9 +1258,16 @@ impl EngineClient {
         // The signs of life renew the patience, but not the overall time.
         let started = Instant::now();
         let overall = if may_report {
-            self.overall_limit(running.document_len)
+            self.overall_limit(running.document_len, passes, is_change)
         } else {
             Duration::MAX
+        };
+        let too_long = |limit: Duration| {
+            if is_change {
+                change_too_long(limit)
+            } else {
+                too_long(limit)
+            }
         };
         loop {
             let left = overall.saturating_sub(started.elapsed());
@@ -997,20 +1296,29 @@ impl EngineClient {
                     if started.elapsed() >= overall {
                         return Err(too_long(overall));
                     }
-                    return Err(format!(
-                        "it did not answer within {} seconds",
-                        patience.as_secs_f32().ceil()
-                    ));
+                    let seconds = patience.as_secs_f32().ceil();
+                    return Err(if is_change {
+                        format!(
+                            "{CHANGE_TOOK_TOO_LONG}: it did not answer within {seconds} seconds"
+                        )
+                    } else {
+                        format!("it did not answer within {seconds} seconds")
+                    });
                 }
             }
         }
     }
 
     /// The longest a long request may take altogether, for a document of `len` bytes.
-    fn overall_limit(&self, len: u64) -> Duration {
+    fn overall_limit(&self, len: u64, passes: u64, is_change: bool) -> Duration {
         let slowest = self.config.save_slowest.max(1);
-        let reading = Duration::from_secs(len.saturating_mul(SAVE_PASSES) / slowest);
-        self.config.save_floor.saturating_add(reading)
+        let reading = Duration::from_secs(len.saturating_mul(passes) / slowest);
+        let floor = if is_change {
+            self.config.pages_floor
+        } else {
+            self.config.save_floor
+        };
+        floor.saturating_add(reading)
     }
 
     /// Makes sure an engine runs. An engine that ended by itself while idle is replaced quietly;
@@ -1035,7 +1343,30 @@ impl EngineClient {
         self.start(inner, None)
     }
 
+    /// Starts an engine. On Windows a start that ends before the greeting because the system's
+    /// loader could not find a library (exit code `0xC0000135`) is tried again, up to three times
+    /// in all: the loader hands library loading to helper threads that have no rights in the
+    /// engine's locked-down token, and although the engine links the C runtime statically so that
+    /// nothing but the system's own libraries is left to load, a system that keeps one of them
+    /// outside its list of known libraries could still lose that race now and then. A start that
+    /// fails for another reason, or every time, is reported as it was. Nothing is relaxed by trying
+    /// again: every attempt starts the engine with all its restrictions.
     fn start(&self, inner: &mut Inner, document: Option<&File>) -> Result<(), ClientError> {
+        let mut attempt = 1;
+        loop {
+            match self.start_once(inner, document) {
+                Err(ClientError::EngineStopped(why))
+                    if attempt < 3 && cfg!(windows) && why.contains("exit code: 3221225781") =>
+                {
+                    attempt += 1;
+                    self.start_retries.fetch_add(1, Ordering::Relaxed);
+                }
+                other => return other,
+            }
+        }
+    }
+
+    fn start_once(&self, inner: &mut Inner, document: Option<&File>) -> Result<(), ClientError> {
         // The fonts are opened for this engine only and closed again when it has them.
         let fonts = if document.is_none() {
             // An engine that only says what it is has no document and needs no fonts.
@@ -1234,6 +1565,14 @@ fn spawn_reader(
     });
 }
 
+/// True when the greeting says that the engine runs, but that it could not prove that the network
+/// is blocked (Windows: `network-not-proved`, followed by what the system answered). Elsewhere the
+/// block is the system call filter or the profile, which the engine does not probe, so this is
+/// never true there.
+pub fn network_not_proved(report: &str) -> bool {
+    report.contains("network-not-proved")
+}
+
 /// True when the engine's greeting names a sandbox. An engine without one says `none` and why.
 pub fn sandbox_in_force(report: &str) -> bool {
     !report.is_empty() && !report.starts_with("none")
@@ -1242,6 +1581,13 @@ pub fn sandbox_in_force(report: &str) -> bool {
 /// Says how the engine ended. The pipe closes a moment before the system reports the exit, so this
 /// waits a little for the exit status.
 /// The error of a long request that was still going when its overall limit ended.
+fn change_too_long(limit: Duration) -> String {
+    format!(
+        "{CHANGE_TOOK_TOO_LONG}: it was still working after {} minutes",
+        limit.as_secs().div_ceil(60).max(1)
+    )
+}
+
 fn too_long(limit: Duration) -> String {
     format!(
         "{TOOK_TOO_LONG} ({} minutes)",
@@ -1278,6 +1624,25 @@ fn open_document(path: &str) -> Result<File, ClientError> {
         return Err(refuse("the path is not a file".into()));
     }
     Ok(file)
+}
+
+/// Whether a report of signatures can be what an honest engine sends. The decoder has already
+/// checked the sizes, the text and that every reason goes with its state.
+fn report_is_sound(report: &SignatureReport) -> bool {
+    use partridge_protocol::MAX_SIGNATURES;
+    if report.items.len() != (report.total as usize).min(MAX_SIGNATURES) {
+        return false;
+    }
+    report.items.iter().enumerate().all(|(place, item)| {
+        let trusted = item.state == SignatureState::Trusted;
+        item.index as usize == place
+            // A signature is trusted only through a certificate on a list that exists, and that
+            // certificate is named, and the signer's own certificate is valid.
+            && trusted == item.trust_anchor.is_some()
+            && (!trusted || (report.trust_anchors > 0 && item.certificate_time == CertificateTime::Valid))
+            // "No trust list" is a statement about an empty list, and only about it.
+            && ((item.reason == SignatureReason::NoTrustList) == (report.trust_anchors == 0 && item.state == SignatureState::UnknownSigner))
+    })
 }
 
 fn stale_document() -> ClientError {

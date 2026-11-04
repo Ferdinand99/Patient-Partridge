@@ -1,5 +1,5 @@
-# Patient Partridge protocol. Request tags (1 to 22, 40 to 42), answer tags (129 to 146, 170, 171, 255), the
-# presence byte of an optional string, error codes, link kinds, and the numbers where the
+# Patient Partridge protocol. Request tags (1 to 24, 40 to 42, 60, 80 to 91), answer tags (129 to 146,
+# 170, 171, 190, 200 to 205, 255), the presence byte of an optional string, error codes, link kinds, and the numbers where the
 # decoders have limits (little endian u32).
 
 req_hello="\x01"
@@ -24,6 +24,33 @@ req_add_stamp="\x13"
 req_update_annot="\x14"
 req_remove_annot="\x15"
 req_restore_annot="\x16"
+req_add_signature="\x17"
+req_place_signature="\x18"
+
+# The page tools: request tags 80 to 91, answer tags 200 to 205.
+req_pages_delete="\x50"
+req_pages_reorder="\x51"
+req_pages_rotate="\x52"
+req_pages_crop="\x53"
+req_pages_set_boxes="\x54"
+req_pages_insert_blank="\x55"
+req_pages_restore="\x56"
+req_import_begin="\x57"
+req_import_chunk="\x58"
+req_import_end="\x59"
+req_import_abort="\x5a"
+req_export_begin="\x5b"
+res_pages_changed="\xc8"
+res_pages_cropped="\xc9"
+res_import_ready="\xca"
+res_import_ack="\xcb"
+res_exported="\xcc"
+res_pages_done="\xcd"
+# Error codes of the page tools (50 to 56).
+err_too_many_pages="\x32"
+err_busy="\x36"
+err_insert_source_failed="\x37"
+err_pages_not_allowed="\x38"
 
 res_hello="\x81"
 res_opened="\x82"
@@ -102,6 +129,9 @@ utf8_4="\xf0\x9f\x93\x95"
 utf8_cut_2="\xc3"
 utf8_cut_4="\xf0\x9f\x93"
 utf8_bad="\xff\xfe"
+
+req_signatures="\x3c"
+res_signatures="\xbe"
 
 # Forms: request tags 40 to 42, answer tags 170 and 171, the three kinds of value of a change,
 # the error codes 24 and 25, and the caps of the field lists (512, 8192, 500, 1000, 256).

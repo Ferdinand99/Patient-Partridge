@@ -533,6 +533,24 @@
   }
 }
 
+/* The strip of the box that shows while a page tool works. A card at the foot of the window that takes no
+   clicks outside itself, so the tabs, the buttons and the keys of the window stay in use. */
+.busy-strip {
+  position: fixed;
+  left: 50%;
+  bottom: 16px;
+  transform: translateX(-50%);
+  z-index: var(--z-popover);
+  display: flex;
+  max-width: calc(100vw - 32px);
+}
+
+.busy-strip .sheet {
+  width: min(22rem, calc(100vw - 32px));
+  padding: var(--sp-4);
+  box-shadow: var(--shadow-pop);
+}
+
 /* Sheet: the box used for questions and notices. A centred card with a blurred scrim. */
 .sheet-layer {
   position: fixed;

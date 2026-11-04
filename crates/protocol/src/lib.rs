@@ -18,13 +18,29 @@ use std::io::{self, Read, Write};
 
 mod annots;
 pub use annots::*;
+mod author;
+pub use author::*;
 #[cfg(test)]
 mod annots_tests;
 mod forms;
 pub use forms::*;
+mod marks;
+pub use marks::*;
+#[cfg(test)]
+mod marks_tests;
+mod pages;
+pub use pages::*;
+mod sign;
+pub use sign::*;
+#[cfg(test)]
+mod sign_tests;
+mod signatures;
+pub use signatures::*;
+#[cfg(test)]
+mod signatures_tests;
 
 /// Version of this protocol. Both sides check it in the `Hello` exchange.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// Largest frame (payload) either side accepts: 128 MiB, enough for the biggest allowed bitmap.
 pub const MAX_FRAME_LEN: usize = 128 * 1024 * 1024;
@@ -92,6 +108,7 @@ const TAG_REQ_SAVE_BEGIN: u8 = 11;
 const TAG_REQ_SAVE_CHUNK: u8 = 12;
 const TAG_REQ_SAVE_END: u8 = 13;
 const TAG_REQ_FINGERPRINT: u8 = 14;
+const TAG_REQ_SIGNATURES: u8 = 60;
 const TAG_REQ_FORM_INFO: u8 = 40;
 const TAG_REQ_LIST_FORM_FIELDS: u8 = 41;
 const TAG_REQ_SET_FORM_FIELD: u8 = 42;
@@ -103,6 +120,8 @@ const TAG_REQ_ADD_STAMP: u8 = 19;
 const TAG_REQ_UPDATE_ANNOT: u8 = 20;
 const TAG_REQ_REMOVE_ANNOT: u8 = 21;
 const TAG_REQ_RESTORE_ANNOT: u8 = 22;
+const TAG_REQ_ADD_SIGNATURE: u8 = 23;
+const TAG_REQ_PLACE_SIGNATURE: u8 = 24;
 
 const TAG_RES_HELLO: u8 = 129;
 const TAG_RES_OPENED: u8 = 130;
@@ -119,6 +138,7 @@ const TAG_RES_SAVE_DATA: u8 = 140;
 const TAG_RES_SAVE_ENDED: u8 = 141;
 const TAG_RES_PROGRESS: u8 = 142;
 const TAG_RES_FINGERPRINT: u8 = 143;
+const TAG_RES_SIGNATURES: u8 = 190;
 const TAG_RES_FORM_INFO: u8 = 170;
 const TAG_RES_FORM_FIELDS: u8 = 171;
 const TAG_RES_ANNOTS: u8 = 144;
@@ -219,6 +239,30 @@ pub enum ErrorCode {
     /// Reading the file the document comes from failed at least once, so the document may be
     /// missing parts. Nothing is serialised.
     SourceUnreadable = 17,
+    /// The document has more pages than the page tools (or the reader) take.
+    TooManyPages = 50,
+    /// The copy of the document that a page change was to go back to is gone: the engine keeps
+    /// only a few, and the oldest are let go of.
+    SnapshotGone = 51,
+    /// The document to insert is not a usable PDF.
+    ImportFailed = 52,
+    /// PDFium refused a page change.
+    PageChangeFailed = 53,
+    /// A save, an insert or a copy of the document is under way.
+    Busy = 54,
+    /// The file to insert pages from could not be used: its engine stopped, took too long or could not
+    /// start, or the file does not allow its pages to be copied. The document itself is not affected.
+    InsertSourceFailed = 55,
+    /// The form designer cannot make the change (a name that is taken or not allowed, a box
+    /// outside the page, a value the font cannot draw, a field it did not make). The message says
+    /// why in words for the reader.
+    AuthorRefused = 70,
+    /// The form designer cannot work on this document at all: it is encrypted, it has an XFA form,
+    /// or its structure is not one the designer can write into.
+    AuthorUnsupported = 71,
+    /// The permissions of the document do not allow the change (inserting, deleting, moving or
+    /// turning pages, changing a page's boxes, or copying pages out).
+    PagesNotAllowed = 56,
     /// The document has no form the reader can fill in (it has none, or it is an XFA form).
     FormUnsupported = 24,
     /// The field is not there any more, is not the one named, is read only, or cannot be set to
@@ -231,6 +275,18 @@ pub enum ErrorCode {
     AnnotationRefused = 19,
     /// The document's own permissions do not allow annotations to be added or changed.
     AnnotationsNotAllowed = 20,
+    /// The document is encrypted, so the engine does not write a signature into it.
+    SignEncrypted = 90,
+    /// The document has an XFA form, which a signature would not survive.
+    SignXfa = 91,
+    /// The document holds signatures already (or something that looks like one), and signing it
+    /// again would break them.
+    SignAlreadySigned = 92,
+    /// The structure of the document is not one the engine can write a signature into (it could not
+    /// be checked, or it is damaged where the signature has to go).
+    SignStructure = 93,
+    /// The place, the field or the texts of the signature cannot be used.
+    SignRefused = 94,
     /// The document is protected and has an XMP metadata stream, which PDFium cannot write encrypted
     /// and which must not be written in the clear. Nothing is serialised.
     SaveMetadataNotEncrypted = 21,
@@ -256,11 +312,25 @@ impl ErrorCode {
             15 => ErrorCode::SaveTooLarge,
             16 => ErrorCode::SourceChanged,
             17 => ErrorCode::SourceUnreadable,
+            50 => ErrorCode::TooManyPages,
+            51 => ErrorCode::SnapshotGone,
+            52 => ErrorCode::ImportFailed,
+            53 => ErrorCode::PageChangeFailed,
+            54 => ErrorCode::Busy,
+            55 => ErrorCode::InsertSourceFailed,
+            56 => ErrorCode::PagesNotAllowed,
+            70 => ErrorCode::AuthorRefused,
+            71 => ErrorCode::AuthorUnsupported,
             24 => ErrorCode::FormUnsupported,
             25 => ErrorCode::FormFieldRefused,
             18 => ErrorCode::NoSuchAnnotation,
             19 => ErrorCode::AnnotationRefused,
             20 => ErrorCode::AnnotationsNotAllowed,
+            90 => ErrorCode::SignEncrypted,
+            91 => ErrorCode::SignXfa,
+            92 => ErrorCode::SignAlreadySigned,
+            93 => ErrorCode::SignStructure,
+            94 => ErrorCode::SignRefused,
             21 => ErrorCode::SaveMetadataNotEncrypted,
             _ => return None,
         })
@@ -286,11 +356,25 @@ impl ErrorCode {
             ErrorCode::SaveTooLarge => "save_too_large",
             ErrorCode::SourceChanged => "source_changed",
             ErrorCode::SourceUnreadable => "source_unreadable",
+            ErrorCode::TooManyPages => "too_many_pages",
+            ErrorCode::SnapshotGone => "snapshot_gone",
+            ErrorCode::ImportFailed => "import_failed",
+            ErrorCode::PageChangeFailed => "page_change_failed",
+            ErrorCode::Busy => "busy",
+            ErrorCode::InsertSourceFailed => "insert_source_failed",
+            ErrorCode::PagesNotAllowed => "pages_not_allowed",
+            ErrorCode::AuthorRefused => "author_refused",
+            ErrorCode::AuthorUnsupported => "author_unsupported",
             ErrorCode::FormUnsupported => "form_unsupported",
             ErrorCode::FormFieldRefused => "form_field_refused",
             ErrorCode::NoSuchAnnotation => "no_such_annotation",
             ErrorCode::AnnotationRefused => "annotation_refused",
             ErrorCode::AnnotationsNotAllowed => "annotations_not_allowed",
+            ErrorCode::SignEncrypted => "sign_encrypted",
+            ErrorCode::SignXfa => "sign_xfa",
+            ErrorCode::SignAlreadySigned => "sign_already_signed",
+            ErrorCode::SignStructure => "sign_structure",
+            ErrorCode::SignRefused => "sign_refused",
             ErrorCode::SaveMetadataNotEncrypted => "save_metadata_not_encrypted",
         }
     }
@@ -344,6 +428,11 @@ pub enum RequestBody {
     /// the number of objects and annotations. The app asks it of the engine that holds the
     /// document and of the engine that reads the saved file, and the two must agree.
     Fingerprint { doc: u32 },
+    /// Describe and check the digital signatures of the file the document was opened from.
+    /// `now` is the time of the check in seconds since 1970 (the engine does not read the clock):
+    /// the validity of certificates is judged against it. The check reads the whole file, so it
+    /// reports progress like `DocInfo`. `now` is at most [`MAX_UNIX_TIME`].
+    Signatures { doc: u32, now: i64 },
     /// What kind of form the document has, and whether it has scripts, which never run, or actions
     /// on fields.
     FormInfo { doc: u32 },
@@ -362,6 +451,13 @@ pub enum RequestBody {
     /// the script, a font that did not pass the check, or the budget of font data used up).
     /// Text in those scripts that the PDF does not carry a font for is drawn as blanks.
     FontReport,
+    /// A page tool: delete, reorder, rotate, crop, insert, extract (see the `pages` module).
+    Pages(PagesRequest),
+    /// Signing with a certificate: the engine prepares the file, the app and the signer make the
+    /// signature (see the `sign` module).
+    Sign(SignRequest),
+    /// The form designer: make, change and take away form fields (see the `author` module).
+    Author(AuthorRequest),
     /// The annotations of one page that the reader can show and change: markup (highlight,
     /// underline, strike-out), notes, drawings and stamps, and a few kinds that can only be removed.
     /// Links and form fields are not in the list.
@@ -403,6 +499,25 @@ pub enum RequestBody {
         x: f32,
         y: f32,
         stamp: StampKind,
+    },
+    /// A picture of a signature on a page, as a stamp that prints. `rect` is a box in points from
+    /// the top left of the page as it is drawn: the picture is fitted into it, whole, with its own
+    /// proportions, and the answer says the box it took. `color` is the colour of a drawn or typed
+    /// picture. The picture proves nothing about who placed it.
+    AddSignature {
+        doc: u32,
+        page: u32,
+        rect: [f32; 4],
+        color: [u8; 4],
+        mark: SignatureMark,
+    },
+    /// Moves and resizes a signature picture that was placed in this session: it takes the top left
+    /// corner and the width of `rect` and keeps its proportions. The answer says the box it has.
+    PlaceSignature {
+        doc: u32,
+        page: u32,
+        id: u32,
+        rect: [f32; 4],
     },
     /// Changes an annotation: its text, its colour and its place (`dx` and `dy` in points on the
     /// drawn page). What the annotation does not allow is refused.
@@ -530,6 +645,10 @@ pub enum ResponseBody {
         failed: u32,
         digest: u64,
     },
+    /// Answer to `Signatures`.
+    Signatures {
+        report: SignatureReport,
+    },
     /// Answer to `FormInfo`. `has_actions` is true when the document has scripts or actions on its
     /// fields, which the reader never runs: fields that add up or format values are not updated.
     FormInfo {
@@ -554,6 +673,11 @@ pub enum ResponseBody {
     FontReport {
         missed: Vec<FontScript>,
     },
+    /// The answer to a page tool.
+    Pages(PagesResponse),
+    /// The answer to a request about signing.
+    Sign(SignResponse),
+    Author(AuthorResponse),
     /// Answer to `ListAnnots`, at most [`MAX_ANNOTS_PER_PAGE`] entries.
     Annots {
         items: Vec<AnnotInfo>,
@@ -708,6 +832,13 @@ impl Request {
                 put_u32(&mut out, self.id);
                 put_u32(&mut out, *doc);
             }
+            RequestBody::Signatures { doc, now } => {
+                out.push(TAG_REQ_SIGNATURES);
+                put_u32(&mut out, self.id);
+                put_u32(&mut out, *doc);
+                put_u32(&mut out, *now as u32);
+                put_u32(&mut out, (*now >> 32) as u32);
+            }
             RequestBody::FormInfo { doc } => {
                 out.push(TAG_REQ_FORM_INFO);
                 put_u32(&mut out, self.id);
@@ -738,6 +869,9 @@ impl Request {
                 out.push(TAG_REQ_FONT_REPORT);
                 put_u32(&mut out, self.id);
             }
+            RequestBody::Pages(request) => request.encode(self.id, &mut out),
+            RequestBody::Sign(request) => request.encode(self.id, &mut out),
+            RequestBody::Author(request) => request.encode(self.id, &mut out),
             RequestBody::ListAnnots { doc, page } => {
                 out.push(TAG_REQ_LIST_ANNOTS);
                 put_u32(&mut out, self.id);
@@ -807,6 +941,38 @@ impl Request {
                 put_f32(&mut out, *x);
                 put_f32(&mut out, *y);
                 out.push(*stamp as u8);
+            }
+            RequestBody::AddSignature {
+                doc,
+                page,
+                rect,
+                color,
+                mark,
+            } => {
+                out.push(TAG_REQ_ADD_SIGNATURE);
+                put_u32(&mut out, self.id);
+                put_u32(&mut out, *doc);
+                put_u32(&mut out, *page);
+                for v in rect {
+                    put_f32(&mut out, *v);
+                }
+                out.extend_from_slice(color);
+                put_mark(&mut out, mark);
+            }
+            RequestBody::PlaceSignature {
+                doc,
+                page,
+                id,
+                rect,
+            } => {
+                out.push(TAG_REQ_PLACE_SIGNATURE);
+                put_u32(&mut out, self.id);
+                put_u32(&mut out, *doc);
+                put_u32(&mut out, *page);
+                put_u32(&mut out, *id);
+                for v in rect {
+                    put_f32(&mut out, *v);
+                }
             }
             RequestBody::UpdateAnnot {
                 doc,
@@ -887,6 +1053,23 @@ impl Request {
             }
             TAG_REQ_SAVE_END => RequestBody::SaveEnd { doc: r.u32()? },
             TAG_REQ_FINGERPRINT => RequestBody::Fingerprint { doc: r.u32()? },
+            TAG_REQ_SIGNATURES => {
+                let doc = r.u32()?;
+                let now = i64::from(r.u32()?) | (i64::from(r.u32()?) << 32);
+                if !(0..=MAX_UNIX_TIME).contains(&now) {
+                    return Err(ProtocolError::InvalidLength);
+                }
+                RequestBody::Signatures { doc, now }
+            }
+            t if (pages::FIRST_REQUEST_TAG..=pages::LAST_REQUEST_TAG).contains(&t) => {
+                RequestBody::Pages(PagesRequest::decode(t, &mut r)?)
+            }
+            t if (sign::FIRST_REQUEST_TAG..=sign::LAST_REQUEST_TAG).contains(&t) => {
+                RequestBody::Sign(SignRequest::decode(t, &mut r)?)
+            }
+            t if (author::FIRST_REQUEST_TAG..=author::LAST_REQUEST_TAG).contains(&t) => {
+                RequestBody::Author(AuthorRequest::decode(t, &mut r)?)
+            }
             TAG_REQ_FORM_INFO => RequestBody::FormInfo { doc: r.u32()? },
             TAG_REQ_LIST_FORM_FIELDS => RequestBody::ListFormFields {
                 doc: r.u32()?,
@@ -955,6 +1138,29 @@ impl Request {
                 y: r.coordinate()?,
                 stamp: StampKind::from_u8(r.u8()?)?,
             },
+            TAG_REQ_ADD_SIGNATURE => RequestBody::AddSignature {
+                doc: r.u32()?,
+                page: r.u32()?,
+                rect: [
+                    r.coordinate()?,
+                    r.coordinate()?,
+                    r.coordinate()?,
+                    r.coordinate()?,
+                ],
+                color: r.color()?,
+                mark: read_mark(&mut r)?,
+            },
+            TAG_REQ_PLACE_SIGNATURE => RequestBody::PlaceSignature {
+                doc: r.u32()?,
+                page: r.u32()?,
+                id: r.u32()?,
+                rect: [
+                    r.coordinate()?,
+                    r.coordinate()?,
+                    r.coordinate()?,
+                    r.coordinate()?,
+                ],
+            },
             TAG_REQ_UPDATE_ANNOT => {
                 let doc = r.u32()?;
                 let page = r.u32()?;
@@ -1019,6 +1225,7 @@ impl Response {
                 out.push(TAG_RES_OPENED);
                 put_u32(&mut out, self.id);
                 put_u32(&mut out, *doc);
+                let pages = &pages[..pages.len().min(MAX_PAGES)];
                 put_u32(&mut out, pages.len() as u32);
                 for p in pages {
                     put_f32(&mut out, p.width);
@@ -1108,6 +1315,11 @@ impl Response {
                 out.push(u8::from(*maybe_signed));
                 out.push(u8::from(*touched));
             }
+            ResponseBody::Signatures { report } => {
+                out.push(TAG_RES_SIGNATURES);
+                put_u32(&mut out, self.id);
+                report.encode(&mut out);
+            }
             ResponseBody::Progress { done } => {
                 out.push(TAG_RES_PROGRESS);
                 put_u32(&mut out, self.id);
@@ -1163,6 +1375,9 @@ impl Response {
                     out.push(script.code());
                 }
             }
+            ResponseBody::Pages(response) => response.encode(self.id, &mut out),
+            ResponseBody::Sign(response) => response.encode(self.id, &mut out),
+            ResponseBody::Author(response) => response.encode(self.id, &mut out),
             ResponseBody::Annots { items } => {
                 out.push(TAG_RES_ANNOTS);
                 put_u32(&mut out, self.id);
@@ -1229,6 +1444,9 @@ impl Response {
                 // Each page takes 8 bytes: check before reserving anything.
                 if count > r.remaining() / 8 {
                     return Err(ProtocolError::Truncated);
+                }
+                if count > MAX_PAGES {
+                    return Err(ProtocolError::InvalidLength);
                 }
                 let mut pages = Vec::with_capacity(count);
                 for _ in 0..count {
@@ -1395,6 +1613,9 @@ impl Response {
                     },
                 });
             }
+            TAG_RES_SIGNATURES => ResponseBody::Signatures {
+                report: SignatureReport::decode(&mut r)?,
+            },
             TAG_RES_SAVE_ENDED => ResponseBody::SaveEnded,
             TAG_RES_FORM_INFO => ResponseBody::FormInfo {
                 kind: FormKind::from_u8(r.u8()?)?,
@@ -1419,6 +1640,15 @@ impl Response {
                         .push(FontScript::from_code(raw).ok_or(ProtocolError::UnknownValue(raw))?);
                 }
                 ResponseBody::FontReport { missed }
+            }
+            t if (pages::FIRST_RESPONSE_TAG..=pages::LAST_RESPONSE_TAG).contains(&t) => {
+                ResponseBody::Pages(PagesResponse::decode(t, &mut r)?)
+            }
+            t if (sign::FIRST_RESPONSE_TAG..=sign::LAST_RESPONSE_TAG).contains(&t) => {
+                ResponseBody::Sign(SignResponse::decode(t, &mut r)?)
+            }
+            t if (author::FIRST_RESPONSE_TAG..=author::LAST_RESPONSE_TAG).contains(&t) => {
+                ResponseBody::Author(AuthorResponse::decode(t, &mut r)?)
             }
             TAG_RES_ANNOTS => {
                 let count = r.u32()? as usize;
@@ -1637,6 +1867,31 @@ mod tests {
     fn requests() -> Vec<Request> {
         vec![
             Request {
+                id: 90,
+                body: RequestBody::Sign(SignRequest::Begin(SignSpec {
+                    doc: 7,
+                    place: SignPlace::Rect {
+                        page: 1,
+                        rect: [10.0, 20.0, 210.0, 80.0],
+                    },
+                    name: "Anna".into(),
+                    reason: "Read".into(),
+                    location: "Oslo".into(),
+                    signed_at: 1_700_000_000,
+                    mark: None,
+                    color: [0, 0, 0, 255],
+                    reserve: 4_000,
+                })),
+            },
+            Request {
+                id: 91,
+                body: RequestBody::Sign(SignRequest::Fields { doc: 7 }),
+            },
+            Request {
+                id: 92,
+                body: RequestBody::Sign(SignRequest::Fingerprint { doc: 7 }),
+            },
+            Request {
                 id: 1,
                 body: RequestBody::Hello {
                     protocol_version: PROTOCOL_VERSION,
@@ -1694,6 +1949,25 @@ mod tests {
 
     fn responses() -> Vec<Response> {
         vec![
+            Response {
+                id: 90,
+                body: ResponseBody::Sign(SignResponse::Ready {
+                    size: 20_000,
+                    hole_start: 10_000,
+                    hole_end: 10_000 + 2 + 8_000,
+                    field: "Signature1".into(),
+                }),
+            },
+            Response {
+                id: 91,
+                body: ResponseBody::Sign(SignResponse::Fields {
+                    fields: vec![SignField {
+                        page: 0,
+                        rect: [1.0, 2.0, 3.0, 4.0],
+                        name: "S".into(),
+                    }],
+                }),
+            },
             Response {
                 id: 1,
                 body: ResponseBody::Hello {
@@ -2014,6 +2288,52 @@ mod tests {
         for res in responses() {
             let decoded = Response::decode(res.encode()).unwrap();
             assert_eq!(decoded, res);
+        }
+    }
+
+    /// Several features add messages to this protocol on branches of their own. Their numbers
+    /// must not meet when the branches are put together: the compiler cannot see it, because the
+    /// page tools keep their tags in a module of their own and `decode` reaches them through a
+    /// range. The ranges below are those the other features use (annotations, forms, signatures);
+    /// no tag of the page tools may fall in them, and no tag of the reader may fall in the ranges of
+    /// the page tools.
+    #[test]
+    fn the_numbers_of_the_page_tools_meet_no_other_feature() {
+        let pages_requests = pages::FIRST_REQUEST_TAG..=pages::LAST_REQUEST_TAG;
+        let pages_answers = pages::FIRST_RESPONSE_TAG..=pages::LAST_RESPONSE_TAG;
+        let others_requests: [std::ops::RangeInclusive<u8>; 4] =
+            [15..=22, 40..=42, 60..=60, 110..=112];
+        let others_answers: [std::ops::RangeInclusive<u8>; 4] =
+            [144..=146, 170..=171, 190..=190, 220..=221];
+        for other in &others_requests {
+            assert!(
+                other.end() < pages_requests.start() || other.start() > pages_requests.end(),
+                "{other:?}"
+            );
+        }
+        for other in &others_answers {
+            assert!(
+                other.end() < pages_answers.start() || other.start() > pages_answers.end(),
+                "{other:?}"
+            );
+        }
+        // The error codes of the other features: annotations 18 to 20, forms 24 and 25.
+        for code in [18u8, 19, 20, 24, 25] {
+            assert!(!(50..=56).contains(&code));
+        }
+        for req in requests() {
+            assert!(!pages_requests.contains(&req.encode()[0]));
+        }
+        for res in responses() {
+            assert!(!pages_answers.contains(&res.encode()[0]));
+        }
+        // Every code of the reader and the save is below the ones of the page tools, and every
+        // code that has a number is known by name.
+        for raw in 0..=u8::MAX {
+            if let Some(code) = ErrorCode::from_u8(raw) {
+                assert_eq!(code as u8, raw);
+                assert!(!code.name().is_empty());
+            }
         }
     }
 
@@ -2870,5 +3190,156 @@ mod font_script_tests {
             assert_eq!(FontScript::from_name(script.name()), Some(script));
         }
         assert_eq!(FontScript::from_name("latin"), None);
+    }
+}
+
+#[cfg(test)]
+mod tags {
+    use super::*;
+
+    /// The two lines of development that were merged each gave out tags and error codes, and no
+    /// tag may stand for two messages: the decoders tell messages apart by it alone.
+    #[test]
+    fn no_tag_or_error_code_stands_for_two_things() {
+        let requests: Vec<u8> = vec![
+            TAG_REQ_HELLO,
+            TAG_REQ_OPEN,
+            TAG_REQ_RENDER,
+            TAG_REQ_CLOSE,
+            TAG_REQ_OUTLINE,
+            TAG_REQ_PAGE_TEXT,
+            TAG_REQ_PAGE_LINKS,
+            TAG_REQ_SEARCH,
+            TAG_REQ_FONT_REPORT,
+            TAG_REQ_DOC_INFO,
+            TAG_REQ_SAVE_BEGIN,
+            TAG_REQ_SAVE_CHUNK,
+            TAG_REQ_SAVE_END,
+            TAG_REQ_FINGERPRINT,
+            TAG_REQ_SIGNATURES,
+            TAG_REQ_FORM_INFO,
+            TAG_REQ_LIST_FORM_FIELDS,
+            TAG_REQ_SET_FORM_FIELD,
+            TAG_REQ_LIST_ANNOTS,
+            TAG_REQ_ADD_MARKUP,
+            TAG_REQ_ADD_NOTE,
+            TAG_REQ_ADD_INK,
+            TAG_REQ_ADD_STAMP,
+            TAG_REQ_UPDATE_ANNOT,
+            TAG_REQ_REMOVE_ANNOT,
+            TAG_REQ_RESTORE_ANNOT,
+            TAG_REQ_ADD_SIGNATURE,
+            TAG_REQ_PLACE_SIGNATURE,
+        ];
+        let responses: Vec<u8> = vec![
+            TAG_RES_HELLO,
+            TAG_RES_OPENED,
+            TAG_RES_RENDERED,
+            TAG_RES_CLOSED,
+            TAG_RES_OUTLINE,
+            TAG_RES_PAGE_TEXT,
+            TAG_RES_PAGE_LINKS,
+            TAG_RES_MATCHES,
+            TAG_RES_FONT_REPORT,
+            TAG_RES_DOC_INFO,
+            TAG_RES_SAVE_READY,
+            TAG_RES_SAVE_DATA,
+            TAG_RES_SAVE_ENDED,
+            TAG_RES_PROGRESS,
+            TAG_RES_FINGERPRINT,
+            TAG_RES_SIGNATURES,
+            TAG_RES_FORM_INFO,
+            TAG_RES_FORM_FIELDS,
+            TAG_RES_ANNOTS,
+            TAG_RES_ANNOT,
+            TAG_RES_ANNOT_REMOVED,
+            TAG_RES_ERROR,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for tag in &requests {
+            assert!(seen.insert(*tag), "request tag {tag} is used twice");
+            assert!(
+                !(pages::FIRST_REQUEST_TAG..=pages::LAST_REQUEST_TAG).contains(tag),
+                "request tag {tag} is in the range of the page tools"
+            );
+            assert!(
+                !(author::FIRST_REQUEST_TAG..=author::LAST_REQUEST_TAG).contains(tag),
+                "request tag {tag} is in the range of the form designer"
+            );
+            assert!(
+                !(sign::FIRST_REQUEST_TAG..=sign::LAST_REQUEST_TAG).contains(tag),
+                "request tag {tag} is in the range of signing"
+            );
+        }
+        let mut seen = std::collections::HashSet::new();
+        for tag in &responses {
+            assert!(seen.insert(*tag), "answer tag {tag} is used twice");
+            assert!(
+                !(pages::FIRST_RESPONSE_TAG..=pages::LAST_RESPONSE_TAG).contains(tag),
+                "answer tag {tag} is in the range of the page tools"
+            );
+            assert!(
+                !(author::FIRST_RESPONSE_TAG..=author::LAST_RESPONSE_TAG).contains(tag),
+                "answer tag {tag} is in the range of the form designer"
+            );
+            assert!(
+                !(sign::FIRST_RESPONSE_TAG..=sign::LAST_RESPONSE_TAG).contains(tag),
+                "answer tag {tag} is in the range of signing"
+            );
+        }
+        // The three ranges (page tools, form designer, signing) do not touch one another, for
+        // requests or for answers, and none is empty or back to front.
+        let requests = [
+            (pages::FIRST_REQUEST_TAG, pages::LAST_REQUEST_TAG),
+            (author::FIRST_REQUEST_TAG, author::LAST_REQUEST_TAG),
+            (sign::FIRST_REQUEST_TAG, sign::LAST_REQUEST_TAG),
+        ];
+        let answers = [
+            (pages::FIRST_RESPONSE_TAG, pages::LAST_RESPONSE_TAG),
+            (author::FIRST_RESPONSE_TAG, author::LAST_RESPONSE_TAG),
+            (sign::FIRST_RESPONSE_TAG, sign::LAST_RESPONSE_TAG),
+        ];
+        for ranges in [requests, answers] {
+            for (i, (first, last)) in ranges.iter().enumerate() {
+                assert!(first <= last, "range {first}..={last} is back to front");
+                for (other_first, other_last) in &ranges[i + 1..] {
+                    assert!(
+                        last < other_first || other_last < first,
+                        "ranges {first}..={last} and {other_first}..={other_last} touch"
+                    );
+                }
+            }
+        }
+        // The signing ranges are the ones the decoders know.
+        assert_eq!(
+            (sign::FIRST_REQUEST_TAG, sign::LAST_REQUEST_TAG),
+            (110, 112)
+        );
+        assert_eq!(
+            (sign::FIRST_RESPONSE_TAG, sign::LAST_RESPONSE_TAG),
+            (220, 221)
+        );
+        // Every error code reads back as itself and has a name of its own.
+        let mut names = std::collections::HashSet::new();
+        for raw in 0..=255u8 {
+            if let Some(code) = ErrorCode::from_u8(raw) {
+                assert_eq!(code as u8, raw);
+                assert!(
+                    names.insert(code.name()),
+                    "two error codes are called {}",
+                    code.name()
+                );
+            }
+        }
+        // The codes of the annotations and forms, and those of the page tools, are all there.
+        for raw in [
+            18u8, 19, 20, 21, 24, 25, 50, 51, 52, 53, 54, 55, 56, 70, 71, 90, 91, 92, 93, 94,
+        ] {
+            assert!(
+                ErrorCode::from_u8(raw).is_some(),
+                "error code {raw} is missing"
+            );
+        }
+        assert_eq!(PROTOCOL_VERSION, 12);
     }
 }

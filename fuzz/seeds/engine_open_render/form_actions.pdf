@@ -1,7 +1,7 @@
 %PDF-1.4
 %‚„œ”
 1 0 obj
-<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [6 0 R 7 0 R 10 0 R 13 0 R 16 0 R 17 0 R 18 0 R 19 0 R 20 0 R 21 0 R 22 0 R 23 0 R 26 0 R 27 0 R 30 0 R 31 0 R ] /DA (/Helv 0 Tf 0 g) /DR << /Font << /Helv 3 0 R >> >> >> >>
+<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [6 0 R 7 0 R 10 0 R 13 0 R 16 0 R 17 0 R 18 0 R 19 0 R 22 0 R 23 0 R 26 0 R 27 0 R 30 0 R 31 0 R ] /DA (/Helv 0 Tf 0 g) /DR << /Font << /Helv 3 0 R >> >> >> >>
 endobj
 2 0 obj
 << /Type /Pages /Kids [4 0 R ] /Count 1 >>
@@ -10,7 +10,7 @@ endobj
 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
 endobj
 4 0 obj
-<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Resources << /Font << /F1 3 0 R >> >> /Annots [6 0 R 7 0 R 10 0 R 13 0 R 16 0 R 17 0 R 18 0 R 19 0 R 20 0 R 21 0 R 22 0 R 23 0 R 26 0 R 27 0 R 30 0 R 31 0 R ] >>
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Resources << /Font << /F1 3 0 R >> >> /Annots [6 0 R 7 0 R 10 0 R 13 0 R 16 0 R 17 0 R 18 0 R 19 0 R 22 0 R 23 0 R 26 0 R 27 0 R 30 0 R 31 0 R ] >>
 endobj
 5 0 obj
 << /Length 19 >>
@@ -77,16 +77,22 @@ endobj
 << /Type /Annot /Subtype /Widget /FT /Tx /T (text_bl)  /Rect [100 560 300 580] /F 4 /P 4 0 R /DA (/Helv 12 Tf 0 g) /AA << /Bl << /S /ResetForm >> >> >>
 endobj
 19 0 obj
-<< /Type /Annot /Subtype /Widget /FT /Tx /T (text_k)  /Rect [100 530 300 550] /F 4 /P 4 0 R /DA (/Helv 12 Tf 0 g) /AA << /K << /S /ResetForm >> >> >>
+<< /Type /Annot /Subtype /Widget /FT /Tx /T (text_script)  /Rect [100 500 300 520] /F 4 /P 4 0 R /DA (/Helv 12 Tf 0 g) /AA << /Bl << /S /JavaScript /JS (1;) >> /K << /S /JavaScript /JS (event.rc = true;) >> >> >>
 endobj
 20 0 obj
-<< /Type /Annot /Subtype /Widget /FT /Tx /T (text_f)  /Rect [100 500 300 520] /F 4 /P 4 0 R /DA (/Helv 12 Tf 0 g) /AA << /F << /S /ResetForm >> >> >>
+<< /Type /XObject /Subtype /Form /BBox [0 0 16 16] /Length 22 >>
+stream
+q 0 g 3 3 10 10 re f Q
+endstream
 endobj
 21 0 obj
-<< /Type /Annot /Subtype /Widget /FT /Tx /T (text_v)  /Rect [100 470 300 490] /F 4 /P 4 0 R /DA (/Helv 12 Tf 0 g) /AA << /V << /S /ResetForm >> >> >>
+<< /Type /XObject /Subtype /Form /BBox [0 0 16 16] /Length 0 >>
+stream
+
+endstream
 endobj
 22 0 obj
-<< /Type /Annot /Subtype /Widget /FT /Tx /T (text_c)  /Rect [100 440 300 460] /F 4 /P 4 0 R /DA (/Helv 12 Tf 0 g) /AA << /C << /S /ResetForm >> >> >>
+<< /Type /Annot /Subtype /Widget /FT /Btn /T (box_link) /V /Off /AS /Off /Rect [320 470 336 486] /F 4 /P 4 0 R /AP << /N << /Yes 20 0 R /Off 21 0 R >> >> /A << /S /URI /URI (https://example.com/) >> >>
 endobj
 23 0 obj
 << /Type /Annot /Subtype /Widget /FT /Tx /T (plain)  /Rect [100 410 300 430] /F 4 /P 4 0 R /DA (/Helv 12 Tf 0 g)  >>
@@ -133,38 +139,38 @@ xref
 0 32
 0000000000 65535 f 
 0000000015 00000 n 
-0000000256 00000 n 
-0000000314 00000 n 
-0000000384 00000 n 
-0000000631 00000 n 
-0000000700 00000 n 
-0000000847 00000 n 
-0000001004 00000 n 
-0000001124 00000 n 
-0000001221 00000 n 
-0000001412 00000 n 
-0000001533 00000 n 
-0000001631 00000 n 
-0000001834 00000 n 
-0000001955 00000 n 
-0000002053 00000 n 
-0000002271 00000 n 
-0000002439 00000 n 
-0000002607 00000 n 
-0000002773 00000 n 
-0000002939 00000 n 
-0000003105 00000 n 
-0000003271 00000 n 
-0000003404 00000 n 
-0000003525 00000 n 
-0000003623 00000 n 
-0000003798 00000 n 
-0000004006 00000 n 
-0000004127 00000 n 
-0000004225 00000 n 
-0000004400 00000 n 
+0000000242 00000 n 
+0000000300 00000 n 
+0000000370 00000 n 
+0000000603 00000 n 
+0000000672 00000 n 
+0000000819 00000 n 
+0000000976 00000 n 
+0000001096 00000 n 
+0000001193 00000 n 
+0000001384 00000 n 
+0000001505 00000 n 
+0000001603 00000 n 
+0000001806 00000 n 
+0000001927 00000 n 
+0000002025 00000 n 
+0000002243 00000 n 
+0000002411 00000 n 
+0000002579 00000 n 
+0000002808 00000 n 
+0000002929 00000 n 
+0000003027 00000 n 
+0000003245 00000 n 
+0000003378 00000 n 
+0000003499 00000 n 
+0000003597 00000 n 
+0000003772 00000 n 
+0000003980 00000 n 
+0000004101 00000 n 
+0000004199 00000 n 
+0000004374 00000 n 
 trailer
 << /Size 32 /Root 1 0 R  >>
 startxref
-4582
+4556
 %%EOF

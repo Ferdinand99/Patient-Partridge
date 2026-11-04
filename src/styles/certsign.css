@@ -1,0 +1,114 @@
+/* The box for signing with a certificate. Built on the sheet and notice styles. */
+
+.certsign {
+  max-width: 560px;
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
+}
+
+.certsign-section {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0 0;
+  padding: 0;
+  border: 0;
+}
+
+.certsign-legend {
+  font-weight: 600;
+  padding: 0;
+}
+
+.certsign-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.certsign-file {
+  overflow-wrap: anywhere;
+}
+
+.certsign-field {
+  display: grid;
+  gap: 4px;
+}
+
+.certsign-hint {
+  margin: 0;
+  font-size: 0.85em;
+}
+
+.certsign-summary {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 2px 12px;
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border, rgba(127, 127, 127, 0.35));
+  border-radius: 6px;
+}
+
+.certsign-summary dt {
+  color: var(--muted, inherit);
+  opacity: 0.8;
+}
+
+.certsign-summary dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.certsign-warnings {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.certsign-radio {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.certsign-panel {
+  display: grid;
+  gap: 6px;
+  margin: 0 0 4px 24px;
+}
+
+.certsign-page input {
+  width: 80px;
+}
+
+.certsign-stage {
+  position: relative;
+  width: min(100%, 260px);
+  line-height: 0;
+  border: 1px solid var(--border, rgba(127, 127, 127, 0.35));
+  background: #fff;
+}
+
+.certsign-preview {
+  display: block;
+  width: 100%;
+  height: auto;
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.certsign-box {
+  position: absolute;
+  box-sizing: border-box;
+  border: 2px solid #1d4ed8;
+  background: rgba(29, 78, 216, 0.15);
+  pointer-events: none;
+}
+
+.certsign-status {
+  margin: 10px 0 0;
+}
+
+.certsign-facts p {
+  margin: 6px 0 0;
+}

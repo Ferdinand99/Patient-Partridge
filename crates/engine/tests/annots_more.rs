@@ -872,6 +872,83 @@ fn a_page_with_too_many_annotations_lists_the_first_ones() {
     assert_eq!(after[3].id, items[4].id);
 }
 
+fn add_note(e: &mut partridge_engine::Engine, doc: u32) -> ResponseBody {
+    ask(
+        e,
+        RequestBody::AddNote {
+            doc,
+            page: 0,
+            x: 300.0,
+            y: 700.0,
+            color: YELLOW,
+            text: "one more".into(),
+        },
+    )
+}
+
+#[test]
+fn nothing_is_added_to_a_page_whose_list_is_already_full_and_what_is_added_is_listed() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    // One short of what the list shows: the next one is added, is in the list, and then no more.
+    let doc = open(e, &kit::many_annots_pdf(MAX_ANNOTS_PER_PAGE - 1), None).unwrap();
+    let added = annot(add_note(e, doc));
+    let items = list(e, doc, 0);
+    assert_eq!(items.len(), MAX_ANNOTS_PER_PAGE);
+    assert!(
+        items.iter().any(|i| i.id == added.id),
+        "the note that was added can be picked again"
+    );
+    match add_note(e, doc) {
+        ResponseBody::Error { code, message } => {
+            assert_eq!(code, ErrorCode::AnnotationRefused);
+            assert_eq!(message, partridge_engine::annots::PAGE_FULL);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(list(e, doc, 0).len(), MAX_ANNOTS_PER_PAGE);
+
+    // A page that came with exactly as many, and one with far more, take nothing either.
+    let full = open(e, &kit::many_annots_pdf(MAX_ANNOTS_PER_PAGE), None).unwrap();
+    assert_eq!(error_code(add_note(e, full)), ErrorCode::AnnotationRefused);
+    let big = open(e, &kit::many_annots_pdf(5_100), None).unwrap();
+    assert_eq!(error_code(add_note(e, big)), ErrorCode::AnnotationRefused);
+}
+
+#[test]
+fn putting_back_what_was_taken_away_is_never_refused_by_the_limits() {
+    let mut guard = engine();
+    let e = &mut guard.0;
+    // 498 notes from the file; two more are added in this session, and the page is full.
+    let doc = open(e, &kit::many_annots_pdf(MAX_ANNOTS_PER_PAGE - 2), None).unwrap();
+    let first = annot(add_note(e, doc));
+    let second = annot(add_note(e, doc));
+    assert_eq!(error_code(add_note(e, doc)), ErrorCode::AnnotationRefused);
+    // One is taken away and another added in its place: the page is full again.
+    ask(
+        e,
+        RequestBody::RemoveAnnot {
+            doc,
+            page: 0,
+            id: first.id,
+        },
+    );
+    let third = annot(add_note(e, doc));
+    assert_eq!(error_code(add_note(e, doc)), ErrorCode::AnnotationRefused);
+    // Undo of the removal brings the first one back all the same.
+    let back = annot(ask(
+        e,
+        RequestBody::RestoreAnnot {
+            doc,
+            page: 0,
+            id: first.id,
+        },
+    ));
+    assert_eq!(back.id, first.id);
+    let ids: Vec<u32> = list(e, doc, 0).iter().map(|i| i.id).collect();
+    assert!(ids.contains(&second.id) && ids.contains(&third.id));
+}
+
 // ---- protected and signed documents ---------------------------------------------------------------
 
 #[test]

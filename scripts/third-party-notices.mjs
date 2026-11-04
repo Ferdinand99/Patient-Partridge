@@ -211,6 +211,49 @@ export function webview2Section(extra, reports, readLicense = (file) => readFile
 }
 
 /**
+ * The script fonts of the signature picture (assets/fonts/signature). They are shipped with the
+ * window and the engine, subset to Latin letters, so each one is a modified version of a font under
+ * the SIL Open Font License. Every font file in the folder needs an entry in notices-extra.json
+ * (`signatureFonts`) that pins the file and its licence text by hash: a font added without a
+ * notice, or changed, fails here. Returns the sections to print.
+ */
+export function signatureFontsSection(
+  extra,
+  readFile = (file) => readFileSync(join(root, file)),
+  listFolder = (dir) => readdirSync(join(root, dir)),
+) {
+  const dir = extra.signatureFontsDir ?? "assets/fonts/signature";
+  const fonts = extra.signatureFonts ?? [];
+  const problems = [];
+  let shipped;
+  try {
+    shipped = listFolder(dir).filter((f) => /\.(ttf|otf|woff2?)$/i.test(f));
+  } catch {
+    shipped = [];
+  }
+  for (const f of shipped) {
+    if (!fonts.some((x) => x.file === `${dir}/${f}`)) problems.push(`${dir}/${f} is shipped but has no entry in notices-extra.json (signatureFonts).`);
+  }
+  const sections = [];
+  for (const font of fonts) {
+    if (!shipped.includes(font.file.slice(dir.length + 1))) {
+      problems.push(`notices-extra.json lists ${font.file}, which is not shipped. Remove the entry.`);
+      continue;
+    }
+    if (sha256(readFile(font.file)) !== font.fileSha256) {
+      problems.push(`${font.file} is not the file that notices-extra.json describes. Check the licence and the copyright line, then update the hash.`);
+    }
+    const licence = clean(readFile(font.licenseFile).toString("utf8"));
+    if (sha256(licence) !== font.licenseSha256) problems.push(`${font.licenseFile} does not have the hash in notices-extra.json`);
+    if (!licence.startsWith(font.copyright)) problems.push(`${font.licenseFile} does not start with the copyright line in notices-extra.json`);
+    if (!font.source || !font.name) problems.push(`${font.file}: an entry needs a name and a source`);
+    sections.push({ name: font.name, file: font.file.slice(dir.length + 1), copyright: font.copyright, source: font.source, text: licence });
+  }
+  if (problems.length > 0) throw new Error(problems.join("\n"));
+  return sections;
+}
+
+/**
  * The production npm packages of a package-lock.json, with licence files read from node_modules.
  * Throws for a licence that is not allowed and for a package without a licence text.
  */
@@ -278,7 +321,7 @@ function section(title, groups) {
 }
 
 /** The whole file. Same input, same text: no dates, no paths. */
-export function render({ rust, npm, fontLicense, webview2 }) {
+export function render({ rust, npm, fontLicense, webview2, signatureFonts = [] }) {
   const head = [
     "THIRD-PARTY NOTICES",
     "",
@@ -309,6 +352,21 @@ export function render({ rust, npm, fontLicense, webview2 }) {
     "",
     "",
   ].join("\n");
+  const scripts =
+    signatureFonts.length === 0
+      ? ""
+      : [
+          RULE,
+          `Signature fonts (${signatureFonts.length} ${signatureFonts.length === 1 ? "font" : "fonts"})`,
+          RULE,
+          "",
+          "The window and the engine ship the script fonts below for the typed picture of a signature. Each",
+          "file is a subset of the font named, with only the letters of the Latin scripts kept and no",
+          "outline changed, and each is used under the SIL Open Font License 1.1:",
+          "",
+          ...signatureFonts.flatMap((f) => [`--- ${f.name} (${f.file}) ---`, "", f.copyright, `Source: ${f.source}`, "", f.text, "", ""]),
+          "",
+        ].join("\n");
   const loader = [
     RULE,
     webview2.title,
@@ -322,7 +380,7 @@ export function render({ rust, npm, fontLicense, webview2 }) {
     "",
     "",
   ].join("\n");
-  const text = `${head}${section("Rust crates", group(rust))}${section("npm packages", group(npm))}${loader}${font}`.replace(/\n+$/, "\n");
+  const text = `${head}${section("Rust crates", group(rust))}${section("npm packages", group(npm))}${loader}${font}${scripts}`.replace(/\n+$/, "\n");
   if (hasPlaceholder(text)) throw new Error("THIRD-PARTY-NOTICES would contain an unfilled licence template (<year>, <owner> or <copyright holders>).");
   return text;
 }
@@ -350,6 +408,7 @@ function main() {
     rust: rustEntries(reports, extra),
     npm: npmEntries(lock, accepted, root),
     webview2: webview2Section(extra, reports),
+    signatureFonts: signatureFontsSection(extra),
     fontLicense: readFileSync(join(root, "public", "fonts", "Inter-LICENSE.txt"), "utf8"),
   });
   const target = join(root, options.out ?? "THIRD-PARTY-NOTICES");

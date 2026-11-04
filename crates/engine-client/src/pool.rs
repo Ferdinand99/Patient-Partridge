@@ -8,7 +8,11 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
+
+mod pages;
+pub use pages::{Cancelled, ExtractOptions, InsertOptions, InsertOutcome, PageProgress};
 
 use partridge_protocol::{ErrorCode, PageSize};
 
@@ -16,7 +20,7 @@ use crate::save::{save_document, verify_written, FileStamp};
 use crate::{
     AnnotInfo, AnnotKind, Bitmap, ClientError, EngineClient, EngineConfig, EngineInfo, FontScript,
     FormField, FormKind, FormValue, OutlineItem, PageLink, PageText, SaveError, SaveOptions,
-    SaveOutcome, StampKind, TextMatch,
+    SaveOutcome, SignatureMark, StampKind, TextMatch,
 };
 
 /// The file a document belongs to, and how it looked when the document was opened (or last saved).
@@ -25,6 +29,10 @@ struct Source {
     /// The file the document was opened from, which the engine keeps reading. Never changes.
     original: PathBuf,
     stamp: Option<FileStamp>,
+    /// True once a save has written this document out. The engine goes on reading the file the
+    /// document was opened from, so what it can say about the signatures is about that file, not
+    /// about the one that was written.
+    saved: bool,
 }
 
 struct Entry {
@@ -36,6 +44,41 @@ struct Entry {
     password: Option<Arc<Secret>>,
     /// Held while the document is being saved: one save at a time.
     saving: Arc<Mutex<()>>,
+    /// What a page tool is doing to the document, and how to stop it.
+    ops: Arc<Ops>,
+}
+
+/// What a page tool is doing to a document right now.
+pub(crate) struct Ops {
+    /// Set by the user stopping the work; looked at between the pieces of a document.
+    cancel: AtomicBool,
+    /// 0 nothing, 1 a document is being handed from one engine to another, 2 the engine of the
+    /// document is working on a change.
+    phase: AtomicU8,
+    /// The engines that read other documents for an insert. They end with the document.
+    transients: Mutex<Vec<Arc<EngineClient>>>,
+}
+
+impl Ops {
+    fn new() -> Ops {
+        Ops {
+            cancel: AtomicBool::new(false),
+            phase: AtomicU8::new(0),
+            transients: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn kill_transients(&self) {
+        let all: Vec<Arc<EngineClient>> = self
+            .transients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect();
+        for client in all {
+            client.kill();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -52,6 +95,8 @@ pub struct EnginePool {
     config: EngineConfig,
     max_documents: usize,
     state: Mutex<State>,
+    /// True once an engine has run without proving that the network is blocked (Windows).
+    network_not_proved: AtomicBool,
 }
 
 /// A password held in memory: overwritten when it is let go of, never copied (it is shared), and
@@ -93,7 +138,14 @@ impl EnginePool {
             config,
             max_documents,
             state: Mutex::new(State::default()),
+            network_not_proved: AtomicBool::new(false),
         }
+    }
+
+    /// True when an engine of this pool has run, since the app started, without being able to prove
+    /// that the network is blocked. The app tells the user once.
+    pub fn network_not_proved(&self) -> bool {
+        self.network_not_proved.load(Ordering::Relaxed)
     }
 
     /// Number of documents that are open.
@@ -132,10 +184,17 @@ impl EnginePool {
                 return Err(e);
             }
         };
+        if client
+            .sandbox_report()
+            .is_some_and(|report| crate::network_not_proved(&report))
+        {
+            self.network_not_proved.store(true, Ordering::Relaxed);
+        }
         let source = Source {
             path: PathBuf::from(path),
             original: PathBuf::from(path),
             stamp,
+            saved: false,
         };
         let handle = self.register(
             client,
@@ -183,6 +242,7 @@ impl EnginePool {
                 source: Arc::new(Mutex::new(source)),
                 password,
                 saving: Arc::new(Mutex::new(())),
+                ops: Arc::new(Ops::new()),
             },
         );
         Ok(handle)
@@ -246,10 +306,17 @@ impl EnginePool {
         let (path, expected) = match target {
             None => (current_path, current_stamp),
             Some(t) if same_file(t, &current_path) => (current_path, current_stamp),
-            // Another file: whatever is there now is what the user chose to replace.
-            Some(t) => (t.to_path_buf(), FileStamp::read(t).ok()),
+            // Another file: whatever is there now is what the user chose to replace, unless a
+            // signed document is open from it (that tab would go on showing a signed file that is
+            // gone).
+            Some(t) => {
+                if self.signed_reader_of(handle, t) {
+                    return Err(SaveError::TargetOpen.into());
+                }
+                (t.to_path_buf(), FileStamp::read(t).ok())
+            }
         };
-        let outcome = save_document(
+        let mut outcome = save_document(
             &client,
             doc,
             &path,
@@ -274,7 +341,197 @@ impl EnginePool {
         // file off): it equals no real state, so the next save asks.
         source.stamp =
             Some(FileStamp::read(&outcome.path).unwrap_or_else(|_| FileStamp::unknown()));
+        source.saved = true;
+        drop(source);
+        outcome.replaced = self.mark_replaced(handle, &outcome.path);
         Ok(outcome)
+    }
+
+    /// The signature fields the pages of the document have.
+    pub fn sign_fields(&self, handle: u64) -> Result<Vec<crate::SignField>, ClientError> {
+        let (client, doc) = self.entry(handle)?;
+        client.sign_fields(doc)
+    }
+
+    /// Signs the document with the certificate the signer holds and writes the signed file to
+    /// `target`, a file that may exist already. The document itself is not changed and does not
+    /// belong to the new file: the caller opens the signed file as a document of its own. The
+    /// signed file cannot be the file this document was opened from.
+    pub fn sign_as(
+        &self,
+        handle: u64,
+        target: &Path,
+        signer: &mut crate::SignerSession,
+        options: &crate::SignOptions,
+        save_options: SaveOptions,
+    ) -> Result<crate::SignOutcome, ClientError> {
+        let (client, doc, source, saving) = {
+            let st = state(&self.state);
+            let entry = st.docs.get(&handle).ok_or_else(unknown)?;
+            (
+                entry.client.clone(),
+                entry.doc,
+                entry.source.clone(),
+                entry.saving.clone(),
+            )
+        };
+        // One save at a time per document, and a signature is one.
+        let _saving = saving
+            .try_lock()
+            .map_err(|_| ClientError::Save(SaveError::Busy))?;
+        let (current_path, original) = {
+            let source = source.lock().unwrap_or_else(|e| e.into_inner());
+            (source.path.clone(), source.original.clone())
+        };
+        if same_file(target, &current_path) || same_file(target, &original) {
+            return Err(ClientError::Signer {
+                code: "sign_same_file",
+                message: "the signed copy cannot replace the file that is open".into(),
+            });
+        }
+        // Nor a file that another document is read from: that document would go on showing the
+        // file as it was, and could be saved over the signed copy.
+        if self.read_by_another(handle, target) {
+            return Err(ClientError::Signer {
+                code: "sign_target_open",
+                message: "the file is open as another document".into(),
+            });
+        }
+        // Nor a file that holds a signature: the signed copy is a new file.
+        match crate::save::scan_for_signature(target) {
+            crate::save::FileScan::Clear => {}
+            crate::save::FileScan::Signed => {
+                return Err(ClientError::Signer {
+                    code: "sign_target_signed",
+                    message: "the file holds a digital signature".into(),
+                })
+            }
+            crate::save::FileScan::Unreadable => {
+                return Err(ClientError::Signer {
+                    code: "sign_target_unreadable",
+                    message: "the file could not be read".into(),
+                })
+            }
+        }
+        // Whatever is there now is what the person chose to replace.
+        let expected = FileStamp::read(target).ok();
+        let mut outcome = crate::sign::sign_document(
+            &self.config,
+            &client,
+            doc,
+            signer,
+            options,
+            target,
+            expected.as_ref(),
+            save_options,
+            &|| state(&self.state).docs.contains_key(&handle),
+        )?;
+        outcome.path = target.to_path_buf();
+        // Another open document that reads the file that was replaced no longer holds that file.
+        self.mark_replaced(handle, target);
+        Ok(outcome)
+    }
+
+    /// True when a document other than `handle` is read from the file at `path`.
+    pub fn read_by_another(&self, handle: u64, path: &Path) -> bool {
+        let others: Vec<Arc<Mutex<Source>>> = {
+            let st = state(&self.state);
+            st.docs
+                .iter()
+                .filter(|(other, _)| **other != handle)
+                .map(|(_, entry)| entry.source.clone())
+                .collect()
+        };
+        others.iter().any(|source| {
+            let (original, current) = {
+                let source = source.lock().unwrap_or_else(|e| e.into_inner());
+                (source.original.clone(), source.path.clone())
+            };
+            same_file(&original, path) || same_file(&current, path)
+        })
+    }
+
+    /// True when a document other than `handle` is read from the file at `path` and is signed. A
+    /// document that cannot say is taken to be signed.
+    pub(crate) fn signed_reader_of(&self, handle: u64, path: &Path) -> bool {
+        let others: Vec<(Arc<EngineClient>, u64, Arc<Mutex<Source>>)> = {
+            let st = state(&self.state);
+            st.docs
+                .iter()
+                .filter(|(other, _)| **other != handle)
+                .map(|(_, e)| (e.client.clone(), e.doc, e.source.clone()))
+                .collect()
+        };
+        others.iter().any(|(client, doc, source)| {
+            // The file the tab shows now. A tab that followed a copy no longer shows the file it
+            // was opened from, and does not stop it from being chosen.
+            let current = source
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .path
+                .clone();
+            same_file(&current, path) && client.doc_info(*doc).map_or(true, |info| info.is_signed())
+        })
+    }
+
+    /// True when `path` is the file this document is read from or was opened from.
+    pub fn is_own_file(&self, handle: u64, path: &Path) -> bool {
+        let st = state(&self.state);
+        let Some(entry) = st.docs.get(&handle) else {
+            return false;
+        };
+        let source = entry.source.lock().unwrap_or_else(|e| e.into_inner());
+        let (current, original) = (source.path.clone(), source.original.clone());
+        drop(source);
+        drop(st);
+        same_file(path, &current) || same_file(path, &original)
+    }
+
+    /// True when the document holds a signature (or something that looks like one). When the engine
+    /// cannot say (the document is gone, the engine does not answer), the answer is true: the
+    /// callers use it to keep a signed file from being replaced, and a document that cannot be
+    /// looked at is treated as the one that matters.
+    pub fn is_signed(&self, handle: u64) -> bool {
+        match self
+            .entry(handle)
+            .and_then(|(client, doc)| client.doc_info(doc))
+        {
+            Ok(info) => info.is_signed(),
+            Err(_) => true,
+        }
+    }
+
+    /// Every other open document whose engine reads the file at `path` is told apart: what its
+    /// engine holds is the file as it was, and the path now leads to something else. Like a document
+    /// that was saved itself, it is not asked about its signatures any more. Their handles are
+    /// returned so that the window can say so.
+    fn mark_replaced(&self, handle: u64, path: &Path) -> Vec<u64> {
+        // Comparing two paths asks the file system (it resolves both), and a share that hangs would
+        // hold up every call that needs the lock of the pool for as long as that takes. So the lock
+        // is held only to take a list of the other documents, and the file system is asked after it
+        // is let go. The lock of a document is not held across the question either.
+        let others: Vec<(u64, Arc<Mutex<Source>>)> = {
+            let st = state(&self.state);
+            st.docs
+                .iter()
+                .filter(|(other, _)| **other != handle)
+                .map(|(other, entry)| (*other, entry.source.clone()))
+                .collect()
+        };
+        let mut replaced = Vec::new();
+        for (other, source) in others {
+            let original = source
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .original
+                .clone();
+            if same_file(&original, path) {
+                source.lock().unwrap_or_else(|e| e.into_inner()).saved = true;
+                replaced.push(other);
+            }
+        }
+        replaced.sort_unstable();
+        replaced
     }
 
     fn entry(&self, handle: u64) -> Result<(Arc<EngineClient>, u64), ClientError> {
@@ -305,6 +562,30 @@ impl EnginePool {
     pub fn font_report(&self, handle: u64) -> Result<Vec<FontScript>, ClientError> {
         let (client, doc) = self.entry(handle)?;
         client.font_report(doc)
+    }
+
+    /// The digital signatures of the document, checked at the time `now` (seconds since 1970).
+    ///
+    /// The answer is about the file the document was opened from, the only one the engine reads.
+    /// Once a save has written the document out, that is no longer the file the document stands
+    /// for, and a verdict about it would be a verdict about other bytes: the request is refused
+    /// (with `SourceChanged`) and the file that was written has to be opened to be checked.
+    pub fn signatures(&self, handle: u64, now: i64) -> Result<crate::SignatureReport, ClientError> {
+        let (client, doc) = self.entry(handle)?;
+        let saved = {
+            let st = state(&self.state);
+            let entry = st.docs.get(&handle).ok_or_else(unknown)?;
+            let source = entry.source.lock().unwrap_or_else(|e| e.into_inner());
+            source.saved
+        };
+        if saved {
+            return Err(ClientError::Engine {
+                code: ErrorCode::SourceChanged,
+                message: "the document was saved after it was opened; the signatures of the file it was opened from say nothing about the file that was written"
+                    .to_string(),
+            });
+        }
+        client.signatures(doc, now)
     }
 
     pub fn page_text(&self, handle: u64, page: u32) -> Result<PageText, ClientError> {
@@ -398,6 +679,29 @@ impl EnginePool {
         client.add_stamp(doc, page, x, y, stamp)
     }
 
+    pub fn add_signature(
+        &self,
+        handle: u64,
+        page: u32,
+        rect: [f32; 4],
+        color: [u8; 4],
+        mark: SignatureMark,
+    ) -> Result<AnnotInfo, ClientError> {
+        let (client, doc) = self.entry(handle)?;
+        client.add_signature(doc, page, rect, color, mark)
+    }
+
+    pub fn place_signature(
+        &self,
+        handle: u64,
+        page: u32,
+        id: u32,
+        rect: [f32; 4],
+    ) -> Result<AnnotInfo, ClientError> {
+        let (client, doc) = self.entry(handle)?;
+        client.place_signature(doc, page, id, rect)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn update_annot(
         &self,
@@ -449,6 +753,7 @@ impl EnginePool {
     pub fn close(&self, handle: u64) {
         let entry = state(&self.state).docs.remove(&handle);
         if let Some(entry) = entry {
+            entry.ops.kill_transients();
             entry.client.kill();
         }
     }
@@ -464,6 +769,7 @@ impl EnginePool {
             st.docs.drain().map(|(_, e)| e).collect()
         };
         for entry in all {
+            entry.ops.kill_transients();
             entry.client.kill();
         }
     }
@@ -504,6 +810,7 @@ mod tests {
             path: PathBuf::from("a.pdf"),
             original: PathBuf::from("a.pdf"),
             stamp: None,
+            saved: false,
         }
     }
 
@@ -532,6 +839,64 @@ mod tests {
             "{err:?}"
         );
         assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn page_changes_are_refused_while_the_document_is_being_saved() {
+        let pool = pool();
+        let handle = pool
+            .register(client(&pool), 1, epoch(&pool), no_source(), None)
+            .unwrap();
+        // The save holds this lock for as long as it runs.
+        let saving = state(&pool.state).docs.get(&handle).unwrap().saving.clone();
+        let _held = saving.lock().unwrap();
+        let busy = |r: Result<(), ClientError>| {
+            assert!(
+                matches!(r, Err(ClientError::Save(SaveError::Busy))),
+                "{r:?}"
+            );
+        };
+        busy(pool.pages_delete(handle, &[0]).map(|_| ()));
+        busy(pool.pages_reorder(handle, &[0]).map(|_| ()));
+        busy(pool.pages_rotate(handle, &[0], 1).map(|_| ()));
+        busy(pool.pages_crop(handle, &[0], [1.0; 4]).map(|_| ()));
+        busy(
+            pool.pages_set_boxes(handle, &[0], &[[0.0, 0.0, 9.0, 9.0]])
+                .map(|_| ()),
+        );
+        busy(pool.pages_insert_blank(handle, 0, 100.0, 100.0).map(|_| ()));
+        busy(pool.pages_restore(handle, 1).map(|_| ()));
+        busy(
+            pool.author_apply(
+                handle,
+                &[partridge_protocol::AuthorOp::Remove { name: "a".into() }],
+            )
+            .map(|_| ()),
+        );
+        busy(
+            pool.insert_pdf(handle, 0, "x.pdf", None, Default::default(), &|_, _| {})
+                .map(|_| ()),
+        );
+        busy(
+            pool.extract_pages(
+                handle,
+                &[0],
+                std::path::Path::new("y.pdf"),
+                Default::default(),
+                &|_, _| {},
+            )
+            .map(|_| ()),
+        );
+        // Nothing started an engine for any of them.
+        assert_eq!(
+            state(&pool.state)
+                .docs
+                .get(&handle)
+                .unwrap()
+                .client
+                .spawn_count(),
+            0
+        );
     }
 
     #[test]

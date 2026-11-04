@@ -6,10 +6,16 @@ import { open } from "@tauri-apps/plugin-dialog";
 import "./styles/tokens.css";
 import "./styles/components.css";
 import "./styles/app.css";
+import "./styles/pages.css";
+import "./styles/signatures.css";
+import "./styles/signpicture.css";
+import "./styles/certsign.css";
 import "./styles/forms.css";
+import "./styles/design.css";
 import { App } from "./app/app";
 import { Updater } from "./app/updater";
 import { api } from "./lib/api";
+import { pagesApi } from "./lib/pagesapi";
 import { blockReload } from "./lib/reload";
 
 function storage(): Storage | null {
@@ -43,6 +49,7 @@ const app = new App(document, {
     if (Array.isArray(picked)) return picked;
     return typeof picked === "string" ? [picked] : [];
   },
+  pages: pagesApi,
   setWindowTitle(title) {
     void getCurrentWindow().setTitle(title);
   },
@@ -69,6 +76,7 @@ new Updater(document, {
   api,
   openPaths: () => app.openDocumentPaths(),
   closeMenu: () => app.closeMenu(),
+  settled: () => app.settled(),
   unsavedCount: () => app.unsavedCount,
   saveAll: () => app.saveAllChanges(),
 }).init();

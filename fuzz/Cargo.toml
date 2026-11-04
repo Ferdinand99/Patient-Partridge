@@ -20,6 +20,8 @@ libfuzzer-sys = "=0.4.13"
 arbitrary = { version = "=1.5.0", features = ["derive"] }
 partridge-protocol = { path = "../crates/protocol" }
 partridge-engine = { path = "../crates/engine" }
+partridge-signer = { path = "../crates/signer" }
+partridge-signer-protocol = { path = "../crates/signer-protocol" }
 partridge-testkit = { path = "../crates/testkit" }
 
 [[bin]]
@@ -71,8 +73,50 @@ doc = false
 bench = false
 
 [[bin]]
+name = "form_author"
+path = "fuzz_targets/form_author.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "signature_check"
+path = "fuzz_targets/signature_check.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "signer_protocol"
+path = "fuzz_targets/signer_protocol.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "signer_load"
+path = "fuzz_targets/signer_load.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sign_prepare"
+path = "fuzz_targets/sign_prepare.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "metadata_check"
 path = "fuzz_targets/metadata_check.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "metadata_repair"
+path = "fuzz_targets/metadata_repair.rs"
 test = false
 doc = false
 bench = false
