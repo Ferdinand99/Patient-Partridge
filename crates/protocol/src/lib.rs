@@ -3266,6 +3266,10 @@ mod tags {
                 !(author::FIRST_REQUEST_TAG..=author::LAST_REQUEST_TAG).contains(tag),
                 "request tag {tag} is in the range of the form designer"
             );
+            assert!(
+                !(sign::FIRST_REQUEST_TAG..=sign::LAST_REQUEST_TAG).contains(tag),
+                "request tag {tag} is in the range of signing"
+            );
         }
         let mut seen = std::collections::HashSet::new();
         for tag in &responses {
@@ -3278,7 +3282,43 @@ mod tags {
                 !(author::FIRST_RESPONSE_TAG..=author::LAST_RESPONSE_TAG).contains(tag),
                 "answer tag {tag} is in the range of the form designer"
             );
+            assert!(
+                !(sign::FIRST_RESPONSE_TAG..=sign::LAST_RESPONSE_TAG).contains(tag),
+                "answer tag {tag} is in the range of signing"
+            );
         }
+        // The three ranges (page tools, form designer, signing) do not touch one another, for
+        // requests or for answers, and none is empty or back to front.
+        let requests = [
+            (pages::FIRST_REQUEST_TAG, pages::LAST_REQUEST_TAG),
+            (author::FIRST_REQUEST_TAG, author::LAST_REQUEST_TAG),
+            (sign::FIRST_REQUEST_TAG, sign::LAST_REQUEST_TAG),
+        ];
+        let answers = [
+            (pages::FIRST_RESPONSE_TAG, pages::LAST_RESPONSE_TAG),
+            (author::FIRST_RESPONSE_TAG, author::LAST_RESPONSE_TAG),
+            (sign::FIRST_RESPONSE_TAG, sign::LAST_RESPONSE_TAG),
+        ];
+        for ranges in [requests, answers] {
+            for (i, (first, last)) in ranges.iter().enumerate() {
+                assert!(first <= last, "range {first}..={last} is back to front");
+                for (other_first, other_last) in &ranges[i + 1..] {
+                    assert!(
+                        last < other_first || other_last < first,
+                        "ranges {first}..={last} and {other_first}..={other_last} touch"
+                    );
+                }
+            }
+        }
+        // The signing ranges are the ones the decoders know.
+        assert_eq!(
+            (sign::FIRST_REQUEST_TAG, sign::LAST_REQUEST_TAG),
+            (110, 112)
+        );
+        assert_eq!(
+            (sign::FIRST_RESPONSE_TAG, sign::LAST_RESPONSE_TAG),
+            (220, 221)
+        );
         // Every error code reads back as itself and has a name of its own.
         let mut names = std::collections::HashSet::new();
         for raw in 0..=255u8 {
@@ -3292,7 +3332,9 @@ mod tags {
             }
         }
         // The codes of the annotations and forms, and those of the page tools, are all there.
-        for raw in [18u8, 19, 20, 24, 25, 50, 51, 52, 53, 54, 55, 56, 70, 71] {
+        for raw in [
+            18u8, 19, 20, 21, 24, 25, 50, 51, 52, 53, 54, 55, 56, 70, 71, 90, 91, 92, 93, 94,
+        ] {
             assert!(
                 ErrorCode::from_u8(raw).is_some(),
                 "error code {raw} is missing"

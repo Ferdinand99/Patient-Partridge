@@ -862,6 +862,41 @@ fn added(signed: &[u8]) -> &[u8] {
     &signed[first..]
 }
 
+/// The dictionaries of the objects that say `/Type /Metadata`, in the order they come in the file
+/// (from the object header to the word `stream`). The catalog's own `/Metadata 3 0 R` is not one.
+fn metadata_dictionaries(bytes: &[u8]) -> Vec<Vec<u8>> {
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(at) = bytes[from..]
+        .windows(5)
+        .position(|w| w == b"/Type")
+        .map(|p| p + from)
+    {
+        from = at + 5;
+        let mut name = from;
+        while bytes.get(name).is_some_and(|b| b.is_ascii_whitespace()) {
+            name += 1;
+        }
+        let word = b"/Metadata";
+        let ends = bytes.get(name + word.len()).copied().unwrap_or(b'>');
+        if !bytes[name..].starts_with(word) || ends.is_ascii_alphanumeric() {
+            continue;
+        }
+        let Some(start) = bytes[..at].windows(4).rposition(|w| w == b" obj") else {
+            continue;
+        };
+        let Some(end) = bytes[at..]
+            .windows(6)
+            .position(|w| w == b"stream")
+            .map(|p| p + at)
+        else {
+            continue;
+        };
+        found.push(bytes[start..end].to_vec());
+    }
+    found
+}
+
 fn has(hay: &[u8], needle: &[u8]) -> bool {
     hay.windows(needle.len()).any(|w| w == needle)
 }
@@ -1122,10 +1157,26 @@ fn a_document_whose_metadata_is_mended_is_signed_after_the_mend() {
             );
             let range = &r.items[0].byte_range;
             assert_eq!(range[2] + range[3], signed.len() as u64, "{what}");
-            // The stream keeps its filter in the file the signature covers.
+            // The stream keeps its filter in the file the signature covers: the copy of the
+            // metadata object that the newest cross-reference section names is the last one in the
+            // file, and it has the `/Filter` that the copy PDFium wrote (still in the file, named
+            // by nothing) lacks. Other streams that carry filters cannot make this pass.
+            let copies = metadata_dictionaries(&signed);
             assert!(
-                has(&signed, b"FlateDecode") || has(&signed, b"ASCIIHexDecode"),
-                "{what}: the metadata lost its filter"
+                copies.len() >= 2,
+                "{what}: {} copies of the metadata",
+                copies.len()
+            );
+            assert!(
+                !has(&copies[0], b"/Filter"),
+                "{what}: the copy PDFium wrote is damaged, which is what the mend is for: {}",
+                String::from_utf8_lossy(&copies[0])
+            );
+            let newest = copies.last().unwrap();
+            assert!(
+                has(newest, b"/Filter"),
+                "{what}: the metadata lost its filter: {}",
+                String::from_utf8_lossy(newest)
             );
         }
     }

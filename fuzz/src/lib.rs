@@ -496,14 +496,11 @@ pub fn arb_response(u: &mut Unstructured) -> Result<GeneratedResponse> {
             (b.clone(), b)
         }
         8 => {
-            // The codes of the reader, the save, the annotations and the forms (1 to 20, then 24 and
-            // 25), and now and then those of the page tools (50 to 56).
-            let code = if chance(u, 6)? {
-                ErrorCode::from_u8(u.int_in_range(50..=56u8)?).expect("50 to 56 are codes")
-            } else {
-                let n = u.int_in_range(1..=22u8)?;
-                ErrorCode::from_u8(if n > 20 { n + 3 } else { n }).expect("a known code")
-            };
+            // Every code the protocol knows (the reader and the save, the annotations and the
+            // forms, the page tools, the form designer and signing), found by asking the protocol
+            // rather than from a list kept here, so a code added later is generated too.
+            let known: Vec<ErrorCode> = (0..=u8::MAX).filter_map(ErrorCode::from_u8).collect();
+            let code = *u.choose(&known)?;
             let b = ResponseBody::Error {
                 code,
                 message: string_up_to(u, MAX_STRING_LEN)?,
