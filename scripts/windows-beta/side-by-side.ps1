@@ -19,8 +19,8 @@ $StableName = 'Patient Partridge'
 $BetaName = 'Patient Partridge Beta'
 $StableId = 'com.ferdinand99.patientpartridge'
 $BetaId = 'com.ferdinand99.patientpartridge.beta'
-$StableExe = 'patient-partridge.exe'
-$BetaExe = 'patient-partridge-beta.exe'
+$StableProgram = 'patient-partridge.exe'
+$BetaProgram = 'patient-partridge-beta.exe'
 $failed = New-Object System.Collections.ArrayList
 
 function Say([string]$text) {
@@ -149,17 +149,17 @@ try {
   Say '=== 1. Install the stable app and start it, then install the beta while it runs'
   Install-App $Stable $StableName
   $stableDir = $script:InstalledIn
-  $stableExe = Join-Path $stableDir $StableExe
+  $stableExe = Join-Path $stableDir $StableProgram
   Check 'the stable program is installed' (Test-Path -LiteralPath $stableExe) "($stableExe)"
   $stableApp = Start-Open $stableExe
   Wait-Window $stableApp $StableId
   Check 'the stable app is running' (-not $stableApp.HasExited)
   # Control of the check for the .pdf association below: the stable app must show up in the registry.
-  Check 'control: the stable app registers its file type' (Registry-Mentions $StableExe)
+  Check 'control: the stable app registers its file type' (Registry-Mentions $StableProgram)
 
   Install-App $Beta $BetaName
   $betaDir = $script:InstalledIn
-  $betaExe = Join-Path $betaDir $BetaExe
+  $betaExe = Join-Path $betaDir $BetaProgram
   Check 'the beta program is installed' (Test-Path -LiteralPath $betaExe) "($betaExe)"
   Check 'installing the beta did not end the running stable app' (-not $stableApp.HasExited)
 
@@ -168,7 +168,7 @@ try {
   Check 'another install folder' ($stableDir -ne $betaDir) "($stableDir | $betaDir)"
   Check 'the beta folder is named after the beta' ((Split-Path $betaDir -Leaf) -eq $BetaName)
   Check 'the stable folder is not the beta folder or inside it' (-not $stableDir.StartsWith($betaDir, [StringComparison]::OrdinalIgnoreCase))
-  Check 'both programs are there, with another name' ((Test-Path -LiteralPath $stableExe) -and (Test-Path -LiteralPath $betaExe) -and ($StableExe -ne $BetaExe))
+  Check 'both programs are there, with another name' ((Test-Path -LiteralPath $stableExe) -and (Test-Path -LiteralPath $betaExe) -and ($StableProgram -ne $BetaProgram))
   foreach ($pair in @(@($stableDir, 'stable'), @($betaDir, 'beta'))) {
     Check "the engine is installed next to the $($pair[1]) program" (Test-Path -LiteralPath (Join-Path $pair[0] 'partridge-engine.exe'))
     Check "the PDF library is installed with the $($pair[1]) program" ((Get-ChildItem -LiteralPath $pair[0] -Recurse -Filter 'pdfium.dll' -ErrorAction SilentlyContinue | Measure-Object).Count -gt 0)
@@ -188,8 +188,8 @@ try {
   if ($stableLinks.Count -gt 0) {
     Check 'the stable entry starts the stable program' ((Shortcut-Target $stableLinks[0].FullName) -eq $stableExe) "($(Shortcut-Target $stableLinks[0].FullName))"
   }
-  Check 'no file type for the beta (nothing in the registry names the beta program)' (-not (Registry-Mentions $BetaExe))
-  Check 'the stable app keeps its file type' (Registry-Mentions $StableExe)
+  Check 'no file type for the beta (nothing in the registry names the beta program)' (-not (Registry-Mentions $BetaProgram))
+  Check 'the stable app keeps its file type' (Registry-Mentions $StableProgram)
 
   Say ''
   Say '=== 3. The update address and the icon'
@@ -243,7 +243,7 @@ try {
   Say '=== 6. Install the beta again and remove the stable app while the beta runs'
   Install-App $Beta $BetaName
   $betaDir = $script:InstalledIn
-  $betaExe = Join-Path $betaDir $BetaExe
+  $betaExe = Join-Path $betaDir $BetaProgram
   $betaApp = Start-Open $betaExe
   Wait-Window $betaApp $BetaId
   Check 'the beta is running' (-not $betaApp.HasExited)
