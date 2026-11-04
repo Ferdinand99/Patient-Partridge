@@ -39,9 +39,8 @@ fn run(args: &[String]) -> Result<(), String> {
     let password = &args[3];
     let output = PathBuf::from(&args[4]);
 
-    let mut signer_config = SignerConfig::new(
-        folder.join(format!("partridge-signer{}", std::env::consts::EXE_SUFFIX)),
-    );
+    let mut signer_config =
+        SignerConfig::new(folder.join(format!("partridge-signer{}", std::env::consts::EXE_SUFFIX)));
     signer_config.sandbox = SandboxPolicy::Required;
     let mut signer = SignerSession::start(&signer_config)
         .map_err(|e| format!("the signer did not start: {e:?}"))?;
@@ -68,7 +67,13 @@ fn run(args: &[String]) -> Result<(), String> {
         signed_at: NOW,
     };
     let outcome = pool
-        .sign_as(handle, &output, &mut signer, &options, SaveOptions::default())
+        .sign_as(
+            handle,
+            &output,
+            &mut signer,
+            &options,
+            SaveOptions::default(),
+        )
         .map_err(|e| format!("signing failed: {e:?}"))?;
     println!(
         "signed: {} ({} bytes, field {}, certificate {})",
