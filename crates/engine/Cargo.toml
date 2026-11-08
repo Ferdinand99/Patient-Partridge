@@ -27,7 +27,7 @@ pdfium-render = { version = "=0.9.5", default-features = false, features = ["pdf
 cms = "=0.2.3"
 x509-cert = "=0.2.5"
 der = { version = "=0.7.10", features = ["alloc", "oid"] }
-const-oid = "=0.9.6"
+const-oid = "=0.10.2"
 spki = "=0.7.3"
 ring = { version = "=0.17.14", default-features = false, features = ["alloc"] }
 
