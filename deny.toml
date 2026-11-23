@@ -11,6 +11,7 @@ ignore = [
     { id = "RUSTSEC-2026-0370", reason = "zbus stack via tauri-plugin-single-instance on Linux; unmaintained, no known vulnerability" },
     { id = "RUSTSEC-2026-0371", reason = "zbus stack via tauri-plugin-single-instance on Linux; unmaintained, no known vulnerability" },
     { id = "RUSTSEC-2026-0372", reason = "zbus stack via tauri-plugin-single-instance on Linux; unmaintained, no known vulnerability" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono via pdfium-render; unmaintained, no known vulnerability, no maintained release of pdfium-render without it" },
 ]
 
 [licenses]
