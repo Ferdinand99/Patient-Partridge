@@ -3045,7 +3045,7 @@ dependencies = [
  "skrifa",
  "spki 0.7.3",
  "windows-sys 0.61.2",
- "x509-cert 0.2.5",
+ "x509-cert 0.3.0",
 ]
 
 [[package]]
@@ -6000,7 +6000,6 @@ dependencies = [
  "const-oid 0.9.6",
  "der 0.7.10",
  "spki 0.7.3",
- "tls_codec",
 ]
 
 [[package]]
@@ -6012,6 +6011,7 @@ dependencies = [
  "const-oid 0.10.2",
  "der 0.8.3",
  "spki 0.8.1",
+ "tls_codec",
 ]
 
 [[package]]
