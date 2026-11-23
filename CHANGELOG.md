@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/Ferdinand99/Patient-Partridge/compare/v0.3.0...v0.3.1) (2026-11-23)
+
+
+### Bug Fixes
+
+* **deps:** update cookie and url for RUSTSEC-2026-0594 and RUSTSEC-2026-0592 ([#86](https://github.com/Ferdinand99/Patient-Partridge/issues/86)) ([a3dff76](https://github.com/Ferdinand99/Patient-Partridge/commit/a3dff76ab3b11e9b9971ae1947b0f9bbeb7fea92))
+
 ## [0.3.0](https://github.com/Ferdinand99/Patient-Partridge/compare/v0.2.2...v0.3.0) (2026-11-04)
 
 
