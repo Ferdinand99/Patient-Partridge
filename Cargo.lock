@@ -3043,7 +3043,7 @@ dependencies = [
  "pdfium-render",
  "ring",
  "skrifa",
- "spki 0.7.3",
+ "spki 0.8.1",
  "windows-sys 0.61.2",
  "x509-cert 0.2.5",
 ]

@@ -28,7 +28,7 @@ cms = "=0.2.3"
 x509-cert = "=0.2.5"
 der = { version = "=0.7.10", features = ["alloc", "oid"] }
 const-oid = "=0.9.6"
-spki = "=0.7.3"
+spki = "=0.8.1"
 ring = { version = "=0.17.14", default-features = false, features = ["alloc"] }
 
 # Inflating a compressed XMP stream to see what is in it (see src/metadata/repair.rs). Pure Rust,
